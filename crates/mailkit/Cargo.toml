@@ -1,0 +1,37 @@
+[package]
+name = "mailkit"
+version = "0.4.0"
+edition = "2024"
+
+[dependencies]
+# IMAP protocol (tokio runtime, no async-std)
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+# TLS for IMAP connections (tokio-native)
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+# Async runtime
+tokio = { version = "1", features = ["sync", "time", "rt", "net"] }
+# Email parsing from raw RFC822
+mail-parser = "0.11"
+# RFC822 message composition (for drafts)
+lettre = { version = "0.11", default-features = false, features = ["builder"] }
+# Credential storage (raw, shell command, or system keyring)
+secret-lib = { version = "1", features = ["tokio", "rustls", "command", "keyring", "derive"] }
+# Configuration file parsing
+toml = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+# HTML to markdown conversion
+fast_html2md = "0.0"
+# HTTP client (for RFC 8058 one-click unsubscribe)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Error handling
+thiserror = "2"
+# Logging
+tracing = "0.1"
+# Async utilities
+futures = "0.3"
+# Directory paths
+dirs = "6"

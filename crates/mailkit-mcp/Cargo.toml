@@ -1,0 +1,27 @@
+[package]
+name = "mailkit-app"
+version = "0.4.0"
+edition = "2024"
+
+[[bin]]
+name = "mailkit"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+mailkit = { path = "../mailkit" }
+rmcp = { version = "1.1", default-features = true, features = [
+  "transport-worker"
+] }
+schemars = "1.2"
+secret-lib = { version = "1", features = ["tokio", "rustls", "keyring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+  "io-std",
+  "macros",
+  "rt",
+  "rt-multi-thread"
+] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
