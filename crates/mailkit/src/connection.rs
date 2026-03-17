@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore, OwnedSemaphorePermit};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
+use crate::MailkitError;
 use crate::config::{AccountConfig, Config};
 use crate::imap_client::{self, ImapSession};
-use crate::MailkitError;
 
 /// Connection pool managing IMAP sessions across accounts.
 pub struct ConnectionPool {
@@ -47,30 +47,29 @@ impl ConnectionPool {
 
         // Acquire a concurrency permit (blocks if at cap)
         let sem = self.account_semaphore(account_name).await;
-        let permit = sem.acquire_owned().await.map_err(|_| {
-            MailkitError::Other("concurrency semaphore closed".to_string())
-        })?;
+        let permit = sem
+            .acquire_owned()
+            .await
+            .map_err(|_| MailkitError::Other("concurrency semaphore closed".to_string()))?;
 
         // Pop a candidate session while holding the lock briefly
         let maybe_session = {
             let mut pools = self.pools.lock().await;
-            pools
-                .get_mut(account_name)
-                .and_then(|pool| pool.pop())
+            pools.get_mut(account_name).and_then(|pool| pool.pop())
         }; // lock released here — before any network I/O
 
         // Validate the candidate outside the lock
-        if let Some(mut session) = maybe_session {
-            if imap_client::ping(&mut session).await.is_ok() {
-                return Ok(PooledSession {
-                    session: Some(session),
-                    account_name: account_name.to_string(),
-                    pool: Arc::clone(&self.pools),
-                    _permit: permit,
-                });
-            }
-            // Session was stale, drop it and create fresh
+        if let Some(mut session) = maybe_session
+            && imap_client::ping(&mut session).await.is_ok()
+        {
+            return Ok(PooledSession {
+                session: Some(session),
+                account_name: account_name.to_string(),
+                pool: Arc::clone(&self.pools),
+                _permit: permit,
+            });
         }
+        // Session was stale (or absent), drop it and create fresh
 
         // Create new connection
         let password = crate::credentials::get_password(account_name, account_config).await?;

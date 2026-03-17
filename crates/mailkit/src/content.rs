@@ -106,11 +106,14 @@ fn strip_markdown_images(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
     let mut i = 0usize;
     while i < chars.len() {
-        if chars[i] == '!' && i + 1 < chars.len() && chars[i + 1] == '['
-            && let Some(end) = skip_markdown_link(&chars, i + 1) {
-                i = end;
-                continue;
-            }
+        if chars[i] == '!'
+            && i + 1 < chars.len()
+            && chars[i + 1] == '['
+            && let Some(end) = skip_markdown_link(&chars, i + 1)
+        {
+            i = end;
+            continue;
+        }
         out.push(chars[i]);
         i += 1;
     }
@@ -125,14 +128,15 @@ fn strip_tracking_links(value: &str) -> String {
     while i < chars.len() {
         if chars[i] == '['
             && let Some((link_text, _url, url_len, end)) = parse_markdown_link(&chars, i)
-                && (link_text.trim().is_empty() || url_len > 150) {
-                    let clean = link_text.trim();
-                    if !clean.is_empty() {
-                        out.push_str(clean);
-                    }
-                    i = end;
-                    continue;
-                }
+            && (link_text.trim().is_empty() || url_len > 150)
+        {
+            let clean = link_text.trim();
+            if !clean.is_empty() {
+                out.push_str(clean);
+            }
+            i = end;
+            continue;
+        }
         out.push(chars[i]);
         i += 1;
     }

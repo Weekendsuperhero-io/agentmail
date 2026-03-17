@@ -2,22 +2,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_imap::Session;
+use futures::StreamExt;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
-use futures::StreamExt;
 use tracing::debug;
 
+use crate::MailkitError;
 use crate::config::AccountConfig;
 use crate::error::Result;
 use crate::parser;
 use crate::types::*;
-use crate::MailkitError;
 
 /// The concrete IMAP session type used throughout.
 pub type ImapSession = Session<TlsStream<TcpStream>>;
 
 /// Callback for reporting progress: `(completed, total)`.
 pub type ProgressFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// Type alias for raw fetch items: `(uid, size, flags, body_bytes)`.
+type RawFetchItems = Vec<(u32, Option<u32>, Vec<String>, Vec<u8>)>;
 
 /// Default timeout for IMAP operations (connect, login, fetch, etc.).
 const IMAP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -59,7 +62,10 @@ async fn timed_uid_fetch_collect(
 }
 
 /// Select a mailbox with timeout. Use this instead of calling `session.select()` directly.
-pub async fn select(session: &mut ImapSession, mailbox: &str) -> Result<async_imap::types::Mailbox> {
+pub async fn select(
+    session: &mut ImapSession,
+    mailbox: &str,
+) -> Result<async_imap::types::Mailbox> {
     imap_timeout(session.select(mailbox)).await
 }
 
@@ -191,12 +197,7 @@ pub async fn fetch_messages(
 ) -> Result<(Vec<MessageInfo>, u32)> {
     let mb = imap_timeout(session.select(mailbox)).await?;
     let total = mb.exists;
-    debug!(
-        mailbox,
-        account = account_name,
-        total,
-        "SELECT complete"
-    );
+    debug!(mailbox, account = account_name, total, "SELECT complete");
 
     if total == 0 {
         debug!("Mailbox is empty, returning early");
@@ -223,7 +224,15 @@ pub async fn fetch_messages(
         return Ok((Vec::new(), total));
     }
 
-    let messages = fetch_by_uids(session, page_uids, mailbox, account_name, include_content, include_headers).await?;
+    let messages = fetch_by_uids(
+        session,
+        page_uids,
+        mailbox,
+        account_name,
+        include_content,
+        include_headers,
+    )
+    .await?;
     debug!(fetched = messages.len(), "Messages parsed");
     Ok((messages, total))
 }
@@ -255,8 +264,15 @@ pub async fn search_messages(
         return Ok((Vec::new(), total_matches));
     }
 
-    let messages =
-        fetch_by_uids(session, page_uids, mailbox, account_name, include_content, include_headers).await?;
+    let messages = fetch_by_uids(
+        session,
+        page_uids,
+        mailbox,
+        account_name,
+        include_content,
+        include_headers,
+    )
+    .await?;
     Ok((messages, total_matches))
 }
 
@@ -345,17 +361,10 @@ pub async fn fetch_sender_dates(
 
 /// Fetch the parsed sender (email, display_name) for a single UID.
 /// Assumes mailbox is already selected.
-pub async fn fetch_sender(
-    session: &mut ImapSession,
-    uid: u32,
-) -> Result<(String, String)> {
+pub async fn fetch_sender(session: &mut ImapSession, uid: u32) -> Result<(String, String)> {
     let uid_str = uid.to_string();
-    let fetched = timed_uid_fetch_collect(
-        session,
-        &uid_str,
-        "BODY.PEEK[HEADER.FIELDS (FROM)]",
-    )
-    .await?;
+    let fetched =
+        timed_uid_fetch_collect(session, &uid_str, "BODY.PEEK[HEADER.FIELDS (FROM)]").await?;
 
     let fetch = fetched
         .into_iter()
@@ -382,12 +391,9 @@ pub async fn fetch_senders_batch(
             .collect::<Vec<_>>()
             .join(",");
 
-        let fetched = timed_uid_fetch_collect(
-            session,
-            &uid_set,
-            "(UID BODY.PEEK[HEADER.FIELDS (FROM)])",
-        )
-        .await?;
+        let fetched =
+            timed_uid_fetch_collect(session, &uid_set, "(UID BODY.PEEK[HEADER.FIELDS (FROM)])")
+                .await?;
 
         for item in fetched {
             let fetch = item.map_err(MailkitError::Imap)?;
@@ -473,10 +479,8 @@ pub async fn fetch_list_headers(
                 continue;
             }
 
-            let (sender_email, sender_name, date) = match parser::parse_sender_date(header_bytes) {
-                Ok(t) => t,
-                Err(_) => (String::new(), String::new(), None),
-            };
+            let (sender_email, sender_name, date) =
+                parser::parse_sender_date(header_bytes).unwrap_or_default();
 
             results.push(ListHeaderRow {
                 uid,
@@ -528,7 +532,7 @@ pub async fn fetch_by_uids(
     debug!(stream_items = fetched.len(), "UID FETCH stream collected");
 
     // Extract owned data from the IMAP fetch results so we can parse off-thread
-    let mut raw_items: Vec<(u32, Option<u32>, Vec<String>, Vec<u8>)> = Vec::with_capacity(fetched.len());
+    let mut raw_items: RawFetchItems = Vec::with_capacity(fetched.len());
     for item in fetched {
         match &item {
             Ok(f) => debug!(
@@ -559,13 +563,28 @@ pub async fn fetch_by_uids(
     let messages = tokio::task::spawn_blocking(move || -> Result<Vec<MessageInfo>> {
         let mut msgs = Vec::with_capacity(raw_items.len());
         for (uid, size, flags, raw) in raw_items {
-            let msg = parser::parse_rfc822(&raw, uid, flags, size, &mailbox, &account_name, include_content, include_headers)?;
+            let msg = parser::parse_rfc822(
+                &raw,
+                uid,
+                flags,
+                size,
+                &mailbox,
+                &account_name,
+                include_content,
+                include_headers,
+            )?;
             msgs.push(msg);
         }
         // Preserve the requested UID order (newest first)
         msgs.sort_by(|a, b| {
-            let pos_a = uid_order.iter().position(|u| *u == a.uid).unwrap_or(usize::MAX);
-            let pos_b = uid_order.iter().position(|u| *u == b.uid).unwrap_or(usize::MAX);
+            let pos_a = uid_order
+                .iter()
+                .position(|u| *u == a.uid)
+                .unwrap_or(usize::MAX);
+            let pos_b = uid_order
+                .iter()
+                .position(|u| *u == b.uid)
+                .unwrap_or(usize::MAX);
             pos_a.cmp(&pos_b)
         });
         Ok(msgs)
@@ -782,11 +801,7 @@ pub async fn bulk_delete_messages(
 // ---------------------------------------------------------------------------
 
 /// Move a message to another mailbox by UID.
-pub async fn move_message(
-    session: &mut ImapSession,
-    uid: u32,
-    destination: &str,
-) -> Result<()> {
+pub async fn move_message(session: &mut ImapSession, uid: u32, destination: &str) -> Result<()> {
     let uid_str = uid.to_string();
     imap_timeout(session.uid_mv(&uid_str, destination)).await?;
     Ok(())
@@ -956,7 +971,11 @@ pub async fn fetch_flags(
     let mut completed = 0u64;
 
     for chunk in uids.chunks(500) {
-        let uid_set: String = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let uid_set: String = chunk
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let fetched = timed_uid_fetch_collect(session, &uid_set, "(FLAGS)").await?;
 
         for item in fetched {

@@ -9,9 +9,9 @@ fn parse_mailbox(addr: &str) -> crate::Result<Mailbox> {
     }
     // If direct parse fails, try wrapping bare email in angle brackets
     let wrapped = format!("<{}>", addr.trim());
-    wrapped.parse::<Mailbox>().map_err(|e| {
-        crate::MailkitError::Other(format!("Invalid email address '{}': {}", addr, e))
-    })
+    wrapped
+        .parse::<Mailbox>()
+        .map_err(|e| crate::MailkitError::Other(format!("Invalid email address '{}': {}", addr, e)))
 }
 
 /// Build an RFC822 message suitable for IMAP APPEND with \Draft flag.
@@ -41,9 +41,9 @@ pub fn compose_draft(
         builder = builder.bcc(parse_mailbox(addr)?);
     }
 
-    let message = builder.body(body.to_string()).map_err(|e| {
-        crate::MailkitError::Other(format!("Failed to build message: {}", e))
-    })?;
+    let message = builder
+        .body(body.to_string())
+        .map_err(|e| crate::MailkitError::Other(format!("Failed to build message: {}", e)))?;
 
     Ok(message.formatted())
 }

@@ -1,13 +1,14 @@
 use clap::{Parser, Subcommand};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
-    handler::server::{router::prompt::PromptRouter, router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{
+        router::prompt::PromptRouter, router::tool::ToolRouter, wrapper::Parameters,
+    },
     model::{
         CallToolResult, ClientJsonRpcMessage, ClientNotification, ClientRequest, Content,
         GetPromptRequestParams, GetPromptResult, InitializedNotification, JsonRpcMessage,
-        ListPromptsResult, Meta, PaginatedRequestParams, ProgressNotificationParam,
-        PromptMessage, PromptMessageRole, ProtocolVersion, ServerCapabilities, ServerInfo,
-        ServerResult,
+        ListPromptsResult, Meta, PaginatedRequestParams, ProgressNotificationParam, PromptMessage,
+        PromptMessageRole, ProtocolVersion, ServerCapabilities, ServerInfo, ServerResult,
     },
     prompt, prompt_handler, prompt_router,
     service::RequestContext,
@@ -298,7 +299,9 @@ struct RankSendersArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     account: String,
-    #[schemars(description = "Maximum number of senders to return. If omitted, returns all senders.")]
+    #[schemars(
+        description = "Maximum number of senders to return. If omitted, returns all senders."
+    )]
     limit: Option<u64>,
 }
 
@@ -312,9 +315,7 @@ struct RankUnsubscribeArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     account: String,
-    #[schemars(
-        description = "Maximum number of lists to return. If omitted, returns all lists."
-    )]
+    #[schemars(description = "Maximum number of lists to return. If omitted, returns all lists.")]
     limit: Option<u64>,
 }
 
@@ -350,7 +351,9 @@ struct DownloadAttachmentsArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[schemars(description = "Arguments for setting a colored flag on a message (Apple Mail compatible).")]
+#[schemars(
+    description = "Arguments for setting a colored flag on a message (Apple Mail compatible)."
+)]
 struct SetFlagColorArgs {
     #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
     mailbox: Option<String>,
@@ -368,7 +371,9 @@ struct SetFlagColorArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[schemars(description = "Arguments for adding flags to a message (union — existing flags are preserved).")]
+#[schemars(
+    description = "Arguments for adding flags to a message (union — existing flags are preserved)."
+)]
 struct AddFlagsArgs {
     #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
     mailbox: Option<String>,
@@ -554,11 +559,12 @@ fn patch_initialize_value(raw: &str) -> Result<Option<Value>, CompatTransportErr
 fn parse_client_message(raw: &str) -> Result<ClientJsonRpcMessage, CompatTransportError> {
     let value: Value = serde_json::from_str(raw)?;
     if let Some(method) = value.get("method").and_then(Value::as_str)
-        && method == "initialize" {
-            let patched = patch_initialize_value(raw)?.unwrap_or(value);
-            return serde_json::from_value::<ClientJsonRpcMessage>(patched)
-                .map_err(CompatTransportError::Json);
-        }
+        && method == "initialize"
+    {
+        let patched = patch_initialize_value(raw)?.unwrap_or(value);
+        return serde_json::from_value::<ClientJsonRpcMessage>(patched)
+            .map_err(CompatTransportError::Json);
+    }
     serde_json::from_value::<ClientJsonRpcMessage>(value).map_err(CompatTransportError::Json)
 }
 
@@ -591,17 +597,17 @@ impl Worker for CompatStdioWorker {
 
         loop {
             if !hold_inbound_until_initialized
-                && let Some(next_msg) = pending_after_init.pop_front() {
-                    context.send_to_handler(next_msg).await?;
-                    continue;
-                }
+                && let Some(next_msg) = pending_after_init.pop_front()
+            {
+                context.send_to_handler(next_msg).await?;
+                continue;
+            }
 
             if should_inject_initialized {
-                let notif =
-                    ClientNotification::InitializedNotification(InitializedNotification {
-                        method: Default::default(),
-                        extensions: Default::default(),
-                    });
+                let notif = ClientNotification::InitializedNotification(InitializedNotification {
+                    method: Default::default(),
+                    extensions: Default::default(),
+                });
                 context
                     .send_to_handler(JsonRpcMessage::notification(notif))
                     .await?;
@@ -743,7 +749,11 @@ impl MailKitServer {
     #[tool(
         name = "create_mailbox",
         description = "Create a new mailbox (folder) on the IMAP server. Use delimiter (usually '/') for nested mailboxes.",
-        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn create_mailbox_tool(
         &self,
@@ -807,7 +817,14 @@ impl MailKitServer {
 
         match self
             .mailkit
-            .get_messages(&mailbox, &args.account, offset, limit, args.include_content, args.include_headers)
+            .get_messages(
+                &mailbox,
+                &args.account,
+                offset,
+                limit,
+                args.include_content,
+                args.include_headers,
+            )
             .await
         {
             Ok(value) => tool_success(value),
@@ -845,7 +862,15 @@ impl MailKitServer {
 
         match self
             .mailkit
-            .search_messages(&mailbox, &args.account, &criteria, offset, limit, args.include_content, args.include_headers)
+            .search_messages(
+                &mailbox,
+                &args.account,
+                &criteria,
+                offset,
+                limit,
+                args.include_content,
+                args.include_headers,
+            )
             .await
         {
             Ok(value) => tool_success(value),
@@ -866,7 +891,11 @@ impl MailKitServer {
     ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.as_deref().unwrap_or("INBOX");
         let progress = make_progress_fn(&meta, &client);
-        match self.mailkit.list_flags(mailbox, &args.account, progress.as_ref()).await {
+        match self
+            .mailkit
+            .list_flags(mailbox, &args.account, progress.as_ref())
+            .await
+        {
             Ok(value) => tool_success(value),
             Err(e) => tool_error(e.to_string()),
         }
@@ -918,7 +947,13 @@ impl MailKitServer {
         let progress = make_progress_fn(&meta, &client);
         match self
             .mailkit
-            .delete_by_sender(&mailbox, &args.account, args.uid, args.all_mailboxes, progress.as_ref())
+            .delete_by_sender(
+                &mailbox,
+                &args.account,
+                args.uid,
+                args.all_mailboxes,
+                progress.as_ref(),
+            )
             .await
         {
             Ok(value) => tool_success(value),
@@ -955,7 +990,11 @@ impl MailKitServer {
     #[tool(
         name = "download_attachments",
         description = "Download all attachments from a message to disk. Files are saved as {uid}_{originalname}. Returns file paths, content types, and sizes.",
-        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn download_attachments_tool(
         &self,
@@ -1029,7 +1068,6 @@ impl MailKitServer {
         }
     }
 
-
     #[tool(
         name = "unsubscribe_message",
         description = "Unsubscribe from a mailing list and delete matching messages across ALL mailboxes. Requires the message to have a List-Unsubscribe header. Attempts RFC 8058 one-click unsubscribe POST (best-effort — if it fails, messages are still deleted). When delete_matching is true, searches every mailbox for messages from the exact sender that have a List-Unsubscribe-Post header and deletes them. This ensures only bulk/marketing mail is removed, not legitimate messages from the same sender.",
@@ -1076,7 +1114,12 @@ impl MailKitServer {
 
         match self
             .mailkit
-            .group_by_sender(args.mailbox.as_deref(), &args.account, limit, progress.as_ref())
+            .group_by_sender(
+                args.mailbox.as_deref(),
+                &args.account,
+                limit,
+                progress.as_ref(),
+            )
             .await
         {
             Ok(value) => tool_success(value),
@@ -1100,7 +1143,12 @@ impl MailKitServer {
 
         match self
             .mailkit
-            .group_by_list(args.mailbox.as_deref(), &args.account, limit, progress.as_ref())
+            .group_by_list(
+                args.mailbox.as_deref(),
+                &args.account,
+                limit,
+                progress.as_ref(),
+            )
             .await
         {
             Ok(value) => tool_success(value),
@@ -1563,7 +1611,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .get(&account)
                 .ok_or_else(|| format!("Account '{}' not found in config", account))?;
 
-            eprint!("Enter password for {} ({}): ", account, acct_config.username);
+            eprint!(
+                "Enter password for {} ({}): ",
+                account, acct_config.username
+            );
             let mut password = String::new();
             std::io::stdin().read_line(&mut password)?;
             let password = password.trim();
@@ -1572,36 +1623,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Password stored successfully.");
             Ok(())
         }
-        CliCommand::Configure { provider } => {
-            configure_account(provider.as_deref()).await
-        }
+        CliCommand::Configure { provider } => configure_account(provider.as_deref()).await,
         CliCommand::ListFlags { account, mailbox } => {
             let mk = mailkit::Mailkit::from_default_config()?;
             let value = mk.list_flags(&mailbox, &account, None).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        CliCommand::DownloadAttachments { account, mailbox, uid, output_dir } => {
+        CliCommand::DownloadAttachments {
+            account,
+            mailbox,
+            uid,
+            output_dir,
+        } => {
             let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.download_attachments(&mailbox, &account, uid, std::path::Path::new(&output_dir)).await?;
+            let value = mk
+                .download_attachments(&mailbox, &account, uid, std::path::Path::new(&output_dir))
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        CliCommand::FindAttachments { account, mailbox, offset, limit } => {
+        CliCommand::FindAttachments {
+            account,
+            mailbox,
+            offset,
+            limit,
+        } => {
             let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.find_attachments(&mailbox, &account, offset, limit, None).await?;
+            let value = mk
+                .find_attachments(&mailbox, &account, offset, limit, None)
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        CliCommand::RankSenders { account, mailbox, limit } => {
+        CliCommand::RankSenders {
+            account,
+            mailbox,
+            limit,
+        } => {
             let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.group_by_sender(mailbox.as_deref(), &account, limit, None).await?;
+            let value = mk
+                .group_by_sender(mailbox.as_deref(), &account, limit, None)
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        CliCommand::RankUnsubscribe { account, mailbox, limit } => {
+        CliCommand::RankUnsubscribe {
+            account,
+            mailbox,
+            limit,
+        } => {
             let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.group_by_list(mailbox.as_deref(), &account, limit, None).await?;
+            let value = mk
+                .group_by_list(mailbox.as_deref(), &account, limit, None)
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -1614,7 +1689,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             include_headers,
         } => {
             let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.get_messages(&mailbox, &account, offset, limit, include_content, include_headers).await?;
+            let value = mk
+                .get_messages(
+                    &mailbox,
+                    &account,
+                    offset,
+                    limit,
+                    include_content,
+                    include_headers,
+                )
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -1625,7 +1709,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             include_content,
         } => {
             let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.get_messages_by_uid(&mailbox, &account, &uids, include_content, false).await?;
+            let value = mk
+                .get_messages_by_uid(&mailbox, &account, &uids, include_content, false)
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -1636,7 +1722,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             color,
         } => {
             let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.set_flag_color(&mailbox, &account, uid, color.as_deref()).await?;
+            let value = mk
+                .set_flag_color(&mailbox, &account, uid, color.as_deref())
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -1649,7 +1737,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bcc,
         } => {
             let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.create_draft(&account, &subject, &body, &to, &cc, &bcc).await?;
+            let value = mk
+                .create_draft(&account, &subject, &body, &to, &cc, &bcc)
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -1824,7 +1914,11 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         .append(true)
         .open(&config_path)?;
     file.write_all(section.as_bytes())?;
-    eprintln!("\nWrote account '{}' to {}", account_name, config_path.display());
+    eprintln!(
+        "\nWrote account '{}' to {}",
+        account_name,
+        config_path.display()
+    );
 
     // 6. Store password in keyring if needed
     if need_store_password {

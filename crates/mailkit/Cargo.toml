@@ -26,7 +26,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # HTML to markdown conversion
 fast_html2md = "0.0"
 # HTTP client (for RFC 8058 one-click unsubscribe)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", features = ["json"] }
 # Error handling
 thiserror = "2"
 # Logging

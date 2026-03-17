@@ -16,9 +16,7 @@ pub async fn get_password(account_name: &str, config: &AccountConfig) -> crate::
     // 1. Environment variable override
     let env_key = format!(
         "MAILKIT_PASSWORD_{}",
-        account_name
-            .to_uppercase()
-            .replace(['-', ' '], "_")
+        account_name.to_uppercase().replace(['-', ' '], "_")
     );
     if let Ok(pw) = std::env::var(&env_key) {
         return Ok(pw);
@@ -54,12 +52,7 @@ pub async fn get_password(account_name: &str, config: &AccountConfig) -> crate::
          password.keyring = \"{}\"\n  \
          password.cmd = \"security find-internet-password -s {} -a {} -w\"\n\
          Or store it: mailkit set-password --account {}",
-        account_name,
-        config.username,
-        config.username,
-        config.host,
-        config.username,
-        account_name
+        account_name, config.username, config.username, config.host, config.username, account_name
     )))
 }
 
@@ -75,13 +68,12 @@ pub async fn set_password(
     let mut secret = match config.password {
         Some(ref s @ Secret::Keyring(_)) => s.clone(),
         _ => {
-            let entry =
-                secret::keyring::KeyringEntry::try_new(&config.username).map_err(|e| {
-                    crate::MailkitError::Credential(format!(
-                        "Failed to create keyring entry for '{}': {}",
-                        config.username, e
-                    ))
-                })?;
+            let entry = secret::keyring::KeyringEntry::try_new(&config.username).map_err(|e| {
+                crate::MailkitError::Credential(format!(
+                    "Failed to create keyring entry for '{}': {}",
+                    config.username, e
+                ))
+            })?;
             Secret::new_keyring_entry(entry)
         }
     };

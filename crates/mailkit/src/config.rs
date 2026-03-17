@@ -101,9 +101,10 @@ impl Config {
     /// or the sole account name if only one account is configured.
     pub fn default_account(&self) -> Option<&str> {
         if let Some(ref name) = self.default_account
-            && self.accounts.contains_key(name) {
-                return Some(name);
-            }
+            && self.accounts.contains_key(name)
+        {
+            return Some(name);
+        }
         if self.accounts.len() == 1 {
             return self.accounts.keys().next().map(|s| s.as_str());
         }

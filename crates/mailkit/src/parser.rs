@@ -111,9 +111,9 @@ pub fn parse_rfc822(
 pub fn parse_sender_date(
     raw: &[u8],
 ) -> crate::Result<(String, String, Option<chrono::DateTime<chrono::Utc>>)> {
-    let parsed = MessageParser::default().parse(raw).ok_or_else(|| {
-        crate::MailkitError::Parse("Failed to parse partial headers".to_string())
-    })?;
+    let parsed = MessageParser::default()
+        .parse(raw)
+        .ok_or_else(|| crate::MailkitError::Parse("Failed to parse partial headers".to_string()))?;
 
     let (email, name) = extract_from_parts(parsed.from());
 
@@ -270,7 +270,10 @@ fn extract_attachments(parsed: &mail_parser::Message<'_>) -> Vec<AttachmentInfo>
 
 /// Extract attachment binary data from raw RFC822 bytes.
 /// Returns Vec of (filename, content_type, bytes).
-pub fn extract_attachment_data(raw: &[u8], uid: u32) -> crate::Result<Vec<(String, String, Vec<u8>)>> {
+pub fn extract_attachment_data(
+    raw: &[u8],
+    uid: u32,
+) -> crate::Result<Vec<(String, String, Vec<u8>)>> {
     let parsed = MessageParser::default().parse(raw).ok_or_else(|| {
         crate::MailkitError::Parse(format!("Failed to parse RFC822 message UID {}", uid))
     })?;
@@ -308,9 +311,7 @@ pub fn extract_attachment_data(raw: &[u8], uid: u32) -> crate::Result<Vec<(Strin
 /// Format a mail-parser Address into a single "Name <email>" string (first address).
 fn format_address(addr: Option<&mail_parser::Address<'_>>) -> String {
     match addr {
-        Some(mail_parser::Address::List(list)) if !list.is_empty() => {
-            format_single_addr(&list[0])
-        }
+        Some(mail_parser::Address::List(list)) if !list.is_empty() => format_single_addr(&list[0]),
         Some(mail_parser::Address::Group(groups)) if !groups.is_empty() => {
             if let Some(a) = groups[0].addresses.first() {
                 format_single_addr(a)
@@ -325,9 +326,7 @@ fn format_address(addr: Option<&mail_parser::Address<'_>>) -> String {
 /// Format a mail-parser Address into a list of address strings.
 fn format_address_list(addr: Option<&mail_parser::Address<'_>>) -> Vec<String> {
     match addr {
-        Some(mail_parser::Address::List(list)) => {
-            list.iter().map(format_single_addr).collect()
-        }
+        Some(mail_parser::Address::List(list)) => list.iter().map(format_single_addr).collect(),
         Some(mail_parser::Address::Group(groups)) => groups
             .iter()
             .flat_map(|g| g.addresses.iter())

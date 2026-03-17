@@ -111,10 +111,7 @@ impl Mailkit {
     // -----------------------------------------------------------------
 
     /// List mailboxes, optionally scoped to an account.
-    pub async fn list_mailboxes(
-        &self,
-        account: Option<&str>,
-    ) -> Result<serde_json::Value> {
+    pub async fn list_mailboxes(&self, account: Option<&str>) -> Result<serde_json::Value> {
         let account_names: Vec<String> = if let Some(name) = account {
             if !self.pool.config().accounts.contains_key(name) {
                 return Err(MailkitError::AccountNotFound(name.to_string()));
@@ -127,8 +124,7 @@ impl Mailkit {
         let mut all_mailboxes: Vec<MailboxInfo> = Vec::new();
         for acct_name in &account_names {
             let mut session = self.pool.acquire(acct_name).await?;
-            let mailboxes =
-                imap_client::list_mailboxes(session.session(), acct_name).await?;
+            let mailboxes = imap_client::list_mailboxes(session.session(), acct_name).await?;
             session.release().await;
             all_mailboxes.extend(mailboxes);
         }
@@ -202,9 +198,15 @@ impl Mailkit {
     ) -> Result<serde_json::Value> {
         let mut session = self.pool.acquire(account).await?;
         imap_client::select(session.session(), mailbox).await?;
-        let messages =
-            imap_client::fetch_by_uids(session.session(), uids, mailbox, account, include_content, include_headers)
-                .await?;
+        let messages = imap_client::fetch_by_uids(
+            session.session(),
+            uids,
+            mailbox,
+            account,
+            include_content,
+            include_headers,
+        )
+        .await?;
         session.release().await;
 
         Ok(serde_json::json!({
@@ -275,10 +277,11 @@ impl Mailkit {
         let mut map: HashMap<String, SenderSummary> = HashMap::new();
 
         for mbox in &mailboxes {
-            let sender_dates = match imap_client::fetch_sender_dates(session.session(), mbox, on_progress).await {
-                Ok(data) => data,
-                Err(_) => continue, // skip unselectable mailboxes
-            };
+            let sender_dates =
+                match imap_client::fetch_sender_dates(session.session(), mbox, on_progress).await {
+                    Ok(data) => data,
+                    Err(_) => continue, // skip unselectable mailboxes
+                };
 
             for (email, display_name, date) in sender_dates {
                 if email.is_empty() {
@@ -367,10 +370,11 @@ impl Mailkit {
         let mut map: HashMap<(String, String), ListSummary> = HashMap::new();
 
         for mbox in &mailboxes {
-            let rows = match imap_client::fetch_list_headers(session.session(), mbox, on_progress).await {
-                Ok(data) => data,
-                Err(_) => continue, // skip unselectable mailboxes
-            };
+            let rows =
+                match imap_client::fetch_list_headers(session.session(), mbox, on_progress).await {
+                    Ok(data) => data,
+                    Err(_) => continue, // skip unselectable mailboxes
+                };
 
             for row in rows {
                 let key = (row.sender_email.clone(), row.sender_name.clone());
@@ -400,10 +404,10 @@ impl Mailkit {
                 entry.count += 1;
 
                 // Capture list_id from any message in the group
-                if entry.list_id.is_none() {
-                    if let Some(ref lid) = row.list_id {
-                        entry.list_id = Some(lid.clone());
-                    }
+                if entry.list_id.is_none()
+                    && let Some(ref lid) = row.list_id
+                {
+                    entry.list_id = Some(lid.clone());
                 }
 
                 // Track the newest message — its UID and unsubscribe info are used
@@ -434,8 +438,7 @@ impl Mailkit {
                     }
                     if !row.sender_name.is_empty() {
                         entry.display_name = row.sender_name.clone();
-                        entry.sender =
-                            format!("{} <{}>", entry.display_name, row.sender_email);
+                        entry.sender = format!("{} <{}>", entry.display_name, row.sender_email);
                     }
                 }
 
@@ -457,7 +460,9 @@ impl Mailkit {
         let mut lists: Vec<ListSummary> = map.into_values().collect();
         // One-click senders first, then by message count
         lists.sort_by(|a, b| {
-            b.one_click.cmp(&a.one_click).then_with(|| b.count.cmp(&a.count))
+            b.one_click
+                .cmp(&a.one_click)
+                .then_with(|| b.count.cmp(&a.count))
         });
 
         let unique_lists = lists.len();
@@ -532,7 +537,8 @@ impl Mailkit {
                     session.session(),
                     uid,
                     &color_bits.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                ).await?;
+                )
+                .await?;
 
                 let mut add = vec!["\\Flagged".to_string()];
                 for (i, &bit) in color_bits.iter().enumerate() {
@@ -627,7 +633,8 @@ impl Mailkit {
         on_progress: Option<&ProgressFn>,
     ) -> Result<serde_json::Value> {
         let mut session = self.pool.acquire(account).await?;
-        let uids = imap_client::fetch_attachment_uids(session.session(), mailbox, on_progress).await?;
+        let uids =
+            imap_client::fetch_attachment_uids(session.session(), mailbox, on_progress).await?;
         session.release().await;
 
         let total = uids.len();
@@ -658,9 +665,13 @@ impl Mailkit {
         let trash = self.trash_mailbox(account);
         let mut session = self.pool.acquire(account).await?;
         imap_client::select(session.session(), mailbox).await?;
-        let (deleted, failed) =
-            imap_client::bulk_delete_messages(session.session(), uids, trash.as_deref(), on_progress)
-                .await?;
+        let (deleted, failed) = imap_client::bulk_delete_messages(
+            session.session(),
+            uids,
+            trash.as_deref(),
+            on_progress,
+        )
+        .await?;
         imap_client::sync(session.session()).await?;
         session.release().await;
 
@@ -690,8 +701,7 @@ impl Mailkit {
         imap_client::select(session.session(), mailbox).await?;
 
         // 1. Fetch the exact sender from the target message
-        let (target_email, target_name) =
-            imap_client::fetch_sender(session.session(), uid).await?;
+        let (target_email, target_name) = imap_client::fetch_sender(session.session(), uid).await?;
 
         let sender_display = if target_name.is_empty() {
             target_email.clone()
@@ -841,7 +851,9 @@ impl Mailkit {
         let drafts_name = if let Some(ref d) = acct_config.drafts_mailbox {
             d.clone()
         } else {
-            find_drafts_mailbox(session.session()).await?.unwrap_or_else(|| "Drafts".to_string())
+            find_drafts_mailbox(session.session())
+                .await?
+                .unwrap_or_else(|| "Drafts".to_string())
         };
 
         imap_client::append_draft(session.session(), &drafts_name, &rfc822).await?;
@@ -903,11 +915,10 @@ impl Mailkit {
         session.release().await;
 
         // Parse attachments on a blocking thread (CPU-intensive MIME parsing)
-        let attachments = tokio::task::spawn_blocking(move || {
-            parser::extract_attachment_data(&raw, uid)
-        })
-        .await
-        .map_err(|e| MailkitError::Other(format!("spawn_blocking join error: {}", e)))??;
+        let attachments =
+            tokio::task::spawn_blocking(move || parser::extract_attachment_data(&raw, uid))
+                .await
+                .map_err(|e| MailkitError::Other(format!("spawn_blocking join error: {}", e)))??;
 
         if attachments.is_empty() {
             return Ok(serde_json::json!({
@@ -1016,8 +1027,7 @@ impl Mailkit {
 
                 // Search every mailbox for messages from this sender that
                 // have a List-Unsubscribe-Post header (bulk/marketing mail)
-                let all_mailboxes =
-                    imap_client::list_mailbox_names(session.session()).await?;
+                let all_mailboxes = imap_client::list_mailbox_names(session.session()).await?;
 
                 let mut total_found = 0usize;
                 let mut total_deleted = 0usize;
@@ -1146,17 +1156,17 @@ async fn filter_sender_with_unsub_post(
             let header_str = String::from_utf8_lossy(header_bytes);
 
             // Must have List-Unsubscribe-Post
-            if imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe-Post")
-                .is_none()
+            if imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe-Post").is_none()
             {
                 continue;
             }
 
             // Must match exact sender
-            if let Ok((email, name, _)) = parser::parse_sender_date(header_bytes) {
-                if email == target_email && name == target_name {
-                    exact.push(uid);
-                }
+            if let Ok((email, name, _)) = parser::parse_sender_date(header_bytes)
+                && email == target_email
+                && name == target_name
+            {
+                exact.push(uid);
             }
         }
     }
