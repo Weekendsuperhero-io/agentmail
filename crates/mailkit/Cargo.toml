@@ -2,6 +2,7 @@
 name = "mailkit"
 version = "0.4.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 # IMAP protocol (tokio runtime, no async-std)
