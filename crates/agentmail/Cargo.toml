@@ -1,13 +1,13 @@
 [package]
 name = "agentmail"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "A Rust IMAP client library for email management — read, search, delete, unsubscribe, and manage mailboxes"
 repository = "https://github.com/weekendsuperhero-io/agentmail"
 documentation = "https://docs.rs/agentmail"
 homepage = "https://github.com/weekendsuperhero-io/agentmail"
-readme = "README.md"
+readme = "../../README.md"
 keywords = ["email", "imap", "mail", "mcp", "agent"]
 categories = ["email", "network-programming"]
 authors = ["WeekendSuperhero <hello@weekendsuperhero.io>"]
