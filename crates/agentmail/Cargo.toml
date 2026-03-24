@@ -1,6 +1,6 @@
 [package]
 name = "agentmail"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "A Rust IMAP client library for email management — read, search, delete, unsubscribe, and manage mailboxes"

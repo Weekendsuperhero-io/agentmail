@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agentmail"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-imap",
  "chrono",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "agentmail-app"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agentmail",
  "clap",
