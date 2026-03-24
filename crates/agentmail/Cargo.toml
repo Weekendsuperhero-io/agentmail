@@ -18,41 +18,27 @@ rust-version = "1.94"
 async-imap = { version = "0.11", default-features = false, features = [
   "runtime-tokio"
 ] }
-# Date/time handling
-chrono = { version = "0.4", features = ["serde"] }
-# Directory paths
-dirs = "6"
+chrono.workspace = true
+dirs.workspace = true
 # HTML to markdown conversion
 fast_html2md = "0.0"
-# Async utilities
-futures = "0.3"
-# Fast hash map (SwissTable)
-hashbrown = { version = "0.16", features = ["rayon", "serde"] }
+futures.workspace = true
+hashbrown.workspace = true
 # RFC822 message composition (for drafts)
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 # Email parsing from raw RFC822
 mail-parser = "0.11"
 native-tls = "0.2"
-# HTTP client (for RFC 8058 one-click unsubscribe)
-reqwest = { version = "0.13", features = ["json"] }
-schemars = { version = "1.2", features = ["chrono04"] }
+reqwest.workspace = true
+schemars.workspace = true
 # Credential storage (raw, shell command, or system keyring)
-secret-lib = { version = "1", features = [
-  "command",
-  "derive",
-  "keyring",
-  "rustls",
-  "tokio"
-] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# Error handling
-thiserror = "2"
-# Async runtime
-tokio = { version = "1", features = ["fs", "net", "rt", "sync", "time"] }
+secret-lib = { workspace = true, features = ["command", "derive"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 # TLS for IMAP connections (tokio-native)
 tokio-native-tls = "0.3"
 # Configuration file parsing
 toml = "1.1"
-# Logging
-tracing = "0.1"
+tracing.workspace = true
