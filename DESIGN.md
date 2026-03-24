@@ -2,7 +2,7 @@
 
 ## Overview
 
-Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 20 tools and 5 prompts for reading, searching, composing, organizing, and managing email across multiple accounts.
+Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 21 tools and 6 prompts for reading, searching, composing, organizing, and managing email across multiple accounts.
 
 No Mail.app dependency. Pure IMAP over TLS. Works on macOS, Linux, and Windows.
 
@@ -18,7 +18,7 @@ graph TB
     end
 
     subgraph "agentmail-mcp (in-process)"
-        MCP[AgentMailServer<br/>20 tools, 5 prompts]
+        MCP[AgentMailServer<br/>21 tools, 6 prompts]
         MK[Agentmail Facade]
         POOL[ConnectionPool<br/>3 sessions/account]
         CRED[Credential Resolver]
@@ -90,7 +90,7 @@ agentmail-mcp/
         error.rs       # AgentmailError enum
     agentmail-mcp/      # Binary + library — MCP server + CLI
       src/
-        lib.rs        # AgentMailServer, 20 tools, 5 prompts, serve_on()
+        lib.rs        # AgentMailServer, 21 tools, 6 prompts, serve_on()
         main.rs       # CLI dispatch (clap), account configuration
 ```
 
@@ -149,48 +149,49 @@ flowchart TD
 
 When running in-process, the agent app calls `init_keyring_with_service("agent")` so passwords are stored under the agent's keyring service, not "agentmail". The signed agent app avoids macOS Keychain popups.
 
-## MCP Tools (20)
+## MCP Tools (21)
 
 ### Read Operations (read_only_hint = true)
 
-| Tool                  | Description                                     |
-| --------------------- | ----------------------------------------------- |
-| `list_accounts`       | List configured IMAP accounts                   |
-| `list_mailboxes`      | List mailboxes with message counts              |
-| `list_capabilities`   | Query IMAP server capabilities                  |
-| `check_connection`    | Test IMAP connectivity                          |
-| `get_messages`        | Paginated fetch, newest-first by UID            |
-| `get_messages_by_uid` | Fetch specific messages by UID                  |
-| `search_messages`     | IMAP SEARCH with text/header/flag filters       |
-| `list_flags`          | List all flags in use with counts               |
-| `find_attachments`    | Scan for messages with attachments              |
-| `rank_senders`        | Group senders by message count                  |
-| `rank_unsubscribe`    | Rank mailing lists by volume (List-Unsubscribe) |
+| Tool                  | Description                                                      |
+| --------------------- | ---------------------------------------------------------------- |
+| `list_accounts`       | List configured IMAP accounts                                    |
+| `list_mailboxes`      | List mailboxes with message counts                               |
+| `list_capabilities`   | Query IMAP server capabilities                                   |
+| `check_connection`    | Test IMAP connectivity                                           |
+| `get_messages`        | Paginated fetch, newest-first by UID                             |
+| `search_messages`     | IMAP SEARCH with text/header/flag filters                        |
+| `list_flags`          | List all flags in use with counts; resolves Apple Mail colors    |
+| `find_attachments`    | Scan for messages with attachments                               |
+| `rank_senders`        | Rank senders by message count                                    |
+| `rank_unsubscribe`    | Rank bulk-mail senders by List-Unsubscribe, sorted by one-click  |
+| `rank_list_id`        | Rank mailing lists by List-Id (RFC 2919), groups across senders  |
 
 ### Write Operations
 
-| Tool                   | Description                           |
-| ---------------------- | ------------------------------------- |
-| `delete_messages`      | Delete by UID (up to 500)             |
-| `delete_by_sender`     | Delete all from a sender              |
-| `move_message`         | IMAP MOVE between mailboxes           |
-| `create_mailbox`       | Create new folder                     |
-| `create_draft`         | Compose RFC822 → Drafts folder        |
-| `set_flag_color`       | Apple Mail compatible color flags     |
-| `add_flags`            | Add flags (system + custom keywords)  |
-| `remove_flags`         | Remove flags                          |
-| `unsubscribe_message`  | Extract unsubscribe URL + bulk delete |
-| `download_attachments` | Extract attachments to disk           |
+| Tool                   | Description                                                       |
+| ---------------------- | ----------------------------------------------------------------- |
+| `delete_messages`      | Delete by UID (up to 500)                                         |
+| `delete_by_sender`     | Delete all from a sender, optionally across all mailboxes         |
+| `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes  |
+| `move_message`         | IMAP MOVE between mailboxes                                       |
+| `create_mailbox`       | Create new folder                                                 |
+| `create_draft`         | Compose RFC822 → Drafts folder                                    |
+| `add_flags`            | Add flags and/or Apple Mail color (union semantics)               |
+| `remove_flags`         | Remove flags and/or clear Apple Mail color                        |
+| `unsubscribe_message`  | RFC 8058 one-click unsubscribe + bulk delete matching bulk mail   |
+| `download_attachments` | Extract attachments to disk                                       |
 
-## MCP Prompts (5)
+## MCP Prompts (6)
 
-| Prompt                | Description                               |
-| --------------------- | ----------------------------------------- |
-| `inbox-summary`       | Comprehensive inbox overview              |
-| `cleanup-sender`      | Find & bulk-delete from a sender          |
-| `find-attachments`    | Scan for downloadable attachments         |
-| `compose-email`       | Guided draft composition                  |
-| `unsubscribe-cleanup` | Identify & unsubscribe from mailing lists |
+| Prompt                | Description                                          |
+| --------------------- | ---------------------------------------------------- |
+| `inbox-summary`       | Comprehensive inbox overview                         |
+| `cleanup-sender`      | Find & bulk-delete from a sender                     |
+| `find-attachments`    | Scan for downloadable attachments                    |
+| `compose-email`       | Guided draft composition                             |
+| `unsubscribe-cleanup` | Identify & unsubscribe from mailing lists            |
+| `list-id-cleanup`     | Identify mailing lists by List-Id and bulk-delete    |
 
 ## Provider Defaults
 

@@ -127,7 +127,7 @@ pub struct SearchCriteria {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SenderSummary {
-    /// Combined "Display Name <email>" for direct use in search.
+    /// Combined `"Display Name <email>"` for direct use in search.
     pub sender: String,
     /// Normalized email address (lowercase).
     pub address: String,
@@ -145,7 +145,7 @@ pub struct SenderSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ListSummary {
-    /// Sender display string ("Display Name <email>" or just "email").
+    /// Sender display string (`"Display Name <email>"` or just `"email"`).
     pub sender: String,
     /// Normalized sender email address (lowercase).
     pub address: String,

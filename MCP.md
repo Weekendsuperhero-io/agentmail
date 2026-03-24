@@ -2,7 +2,7 @@
 
 MCP spec: 2025-06-18 | rmcp: 1.2 | Transport: stdio (standalone) or DuplexStream (in-process)
 
-## Tools (20)
+## Tools (21)
 
 ### Discovery & Connection
 
@@ -47,6 +47,7 @@ MCP spec: 2025-06-18 | rmcp: 1.2 | Transport: stdio (standalone) or DuplexStream
 | 8   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only` |
 | 9   | `rank_senders`     | Group by (email, display name) with counts + date ranges. Omit mailbox to scan all.                 | `read_only` |
 | 10  | `rank_unsubscribe` | Rank bulk-mail senders by volume. Returns unsubscribe URLs, sample UIDs.                            | `read_only` |
+| 11  | `rank_list_id`     | Rank mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.          | `read_only` |
 
 #### Output Schemas
 
@@ -112,19 +113,33 @@ Grouped by (email, display name) — same email with different display names are
 ```
 Sorted: one-click senders first, then by count. `sampleMailbox` needed because UIDs are per-mailbox.
 
+**rank_list_id**
+```json
+{ "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueLists",
+  "lists": [{
+    "listId": "list-id.example.com",
+    "displayName": "Example List",
+    "senders": ["noreply@example.com"],
+    "count", "sampleUid", "sampleMailbox?",
+    "oldestDate?", "newestDate?"
+  }] }
+```
+Grouped by List-Id header — same list with different senders are merged into one entry.
+
 ---
 
 ### Write / Mutate
 
 | #   | Tool                   | Description                                                                           | Annotations                 |
 | --- | ---------------------- | ------------------------------------------------------------------------------------- | --------------------------- |
-| 11  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash or expunges.                                | `destructive`, `idempotent` |
-| 12  | `delete_by_sender`     | Delete all from exact sender. `allMailboxes=true` scans entire account.               | `destructive`               |
-| 13  | `move_message`         | IMAP MOVE between mailboxes                                                           |                             |
-| 14  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                |
-| 15  | `create_draft`         | Compose RFC822 to Drafts folder (subject, body, to/cc/bcc)                            |                             |
-| 16  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     |                             |
-| 17  | `unsubscribe_message`  | Extract List-Unsubscribe URL, optionally one-click POST + bulk delete matching sender | `destructive`, `open_world` |
+| 12  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash or expunges.                                | `destructive`, `idempotent` |
+| 13  | `delete_by_sender`     | Delete all from exact sender. `allMailboxes=true` scans entire account.               | `destructive`               |
+| 14  | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes.                     | `destructive`               |
+| 15  | `move_message`         | IMAP MOVE between mailboxes                                                           |                             |
+| 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                |
+| 17  | `create_draft`         | Compose RFC822 to Drafts folder (subject, body, to/cc/bcc)                            |                             |
+| 18  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     |                             |
+| 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail                  | `destructive`, `open_world` |
 
 #### Output Schemas
 
@@ -141,6 +156,16 @@ Sorted: one-click senders first, then by count. `sampleMailbox` needed because U
   "mailboxes?": [{ "mailbox", "found", "deleted", "failed" }] }
 ```
 `mailboxes` present when `allMailboxes=true`.
+
+**delete_list_id**
+```json
+{ "mailbox": "INBOX" | "*", "account",
+  "listId": "list-id.example.com",
+  "found", "deleted", "failed",
+  "mailboxes?": [{ "mailbox", "found", "deleted", "failed" }],
+  "skipped?": ["Trash", "Junk"] }
+```
+`mailboxes` present when scanning all mailboxes. `skipped` lists mailboxes excluded from scan.
 
 **move_message**
 ```json
@@ -182,18 +207,12 @@ Sorted: one-click senders first, then by count. `sampleMailbox` needed because U
 
 ### Flag Management
 
-| #   | Tool             | Description                                                         | Annotations |
-| --- | ---------------- | ------------------------------------------------------------------- | ----------- |
-| 18  | `set_flag_color` | Apple Mail compatible color flags (7 colors). Omit color to unflag. |             |
-| 19  | `add_flags`      | Add flags (union). System (`\Seen`, `\Flagged`) or custom keywords. |             |
-| 20  | `remove_flags`   | Remove specific flags. Others preserved.                            |             |
+| #   | Tool           | Description                                                                          | Annotations |
+| --- | -------------- | ------------------------------------------------------------------------------------ | ----------- |
+| 20  | `add_flags`    | Add flags and/or Apple Mail color (union semantics). Colors: red, orange, yellow, green, blue, purple, gray. |             |
+| 21  | `remove_flags` | Remove specific flags and/or clear Apple Mail color. Others preserved.                |             |
 
 #### Output Schemas
-
-**set_flag_color**
-```json
-{ "mailbox", "account", "uid", "color": "red" | null, "flags": ["\\Flagged", "$MailFlagBit0"] }
-```
 
 **add_flags** / **remove_flags**
 ```json
@@ -203,7 +222,7 @@ Returns the full updated flag set after the operation.
 
 ---
 
-## Prompts (5)
+## Prompts (6)
 
 | #   | Prompt                | Description                                       | Arguments                    |
 | --- | --------------------- | ------------------------------------------------- | ---------------------------- |
@@ -212,6 +231,7 @@ Returns the full updated flag set after the operation.
 | 3   | `find-attachments`    | Scan for downloadable attachments                 | `account`, `mailbox?`        |
 | 4   | `compose-email`       | Guided draft composition                          | `account`, `to?`, `subject?` |
 | 5   | `unsubscribe-cleanup` | Identify high-volume lists, unsubscribe + delete  | `account`                    |
+| 6   | `list-id-cleanup`     | Identify mailing lists by List-Id, bulk-delete    | `account`                    |
 
 ## Annotations Key
 
