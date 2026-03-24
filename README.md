@@ -4,6 +4,8 @@ IMAP email client exposed as both a CLI and an MCP (Model Context Protocol) serv
 
 One binary: `agentmail serve` starts the MCP stdio server, all other subcommands are a direct CLI.
 
+See also: [DESIGN.md](DESIGN.md) for architecture diagrams and design decisions, [MCP.md](MCP.md) for the full MCP tool & prompt reference with output schemas.
+
 ## Requirements
 
 - Rust toolchain (edition 2024)
@@ -249,10 +251,13 @@ agentmail list-capabilities --account gmail
 agentmail set-password --account gmail
 agentmail get-messages --account gmail --mailbox INBOX --limit 10
 agentmail get-messages-by-uid --account gmail --uids 123 456
-agentmail group-by-sender --account gmail --limit 20
+agentmail rank-senders --account gmail --limit 20
+agentmail rank-unsubscribe --account gmail --limit 20
 agentmail find-attachments --account gmail
 agentmail download-attachments --account gmail --uid 123 --output-dir ./downloads
 agentmail list-flags --account gmail
+agentmail add-flags --account gmail --uid 123 --flags "\\Seen" --color red
+agentmail create-draft --account gmail --subject "Hello" --body "Hi there" --to user@example.com
 ```
 
 Full subcommand list: `agentmail --help`
@@ -290,40 +295,44 @@ To pass passwords via environment variables instead of keychain:
 
 ## MCP Tools
 
-17 tools covering account discovery, mailbox management, message reading, search, bulk operations, and composition.
+21 tools covering account discovery, mailbox management, message reading, search, bulk operations, flag management, and composition.
 
-| Tool                   | Description                                                             |
-| ---------------------- | ----------------------------------------------------------------------- |
-| `list_accounts`        | Return configured account names (use this first)                        |
-| `list_mailboxes`       | List mailboxes with message counts (total, unseen, recent)              |
-| `create_mailbox`       | Create a new mailbox (folder) on the server                             |
-| `check_connection`     | Test IMAP connectivity for an account                                   |
-| `list_capabilities`    | List IMAP server capabilities (IDLE, MOVE, etc.)                        |
-| `get_messages`         | Paginated message fetch, newest-first by UID                            |
-| `get_messages_by_uid`  | Fetch specific messages by UID (up to 50 per call)                      |
-| `search_messages`      | IMAP SEARCH with text, header, and status filters                       |
-| `group_by_sender`      | Group messages by sender with counts and date ranges                    |
-| `list_flags`           | List all flags in use across messages with counts                       |
-| `find_attachments`     | Scan for messages with attachments via Content-Type header              |
-| `download_attachments` | Download attachments from a message to disk                             |
-| `delete_messages`      | Delete messages by UID (up to 500 per call, moves to Trash or expunges) |
-| `move_message`         | Move a message between mailboxes via IMAP MOVE                          |
-| `create_draft`         | Compose RFC822 draft and append to Drafts folder                        |
-| `get_message_source`   | Fetch raw RFC822 message source                                         |
-| `unsubscribe_message`  | Extract List-Unsubscribe URL, optionally delete matching list messages  |
+| Tool                   | Description                                                                           |
+| ---------------------- | ------------------------------------------------------------------------------------- |
+| `list_accounts`        | Return configured account names (use this first)                                      |
+| `list_mailboxes`       | List mailboxes with message counts (total, unseen, recent)                            |
+| `create_mailbox`       | Create a new mailbox (folder) on the server                                           |
+| `check_connection`     | Test IMAP connectivity for an account                                                 |
+| `list_capabilities`    | List IMAP server capabilities (IDLE, MOVE, etc.)                                      |
+| `get_messages`         | Paginated message fetch, newest-first by UID                                          |
+| `search_messages`      | IMAP SEARCH with text, header, sender, subject, and status filters                    |
+| `list_flags`           | List all flags in use with counts; resolves Apple Mail color flags                    |
+| `rank_senders`         | Rank senders by message count across one or all mailboxes                             |
+| `rank_unsubscribe`     | Rank bulk-mail senders by List-Unsubscribe presence, sorted by one-click support      |
+| `rank_list_id`         | Rank mailing lists by List-Id header (RFC 2919), groups regardless of sender          |
+| `find_attachments`     | Scan for messages with attachments (multipart/mixed or multipart/related)              |
+| `download_attachments` | Download attachments from a message to disk                                           |
+| `delete_messages`      | Delete messages by UID (up to 500 per call, moves to Trash or expunges)               |
+| `delete_by_sender`     | Delete all messages from a sender identified by UID, optionally across all mailboxes  |
+| `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes                      |
+| `move_message`         | Move a message between mailboxes via IMAP MOVE                                        |
+| `create_draft`         | Compose RFC822 draft and append to Drafts folder                                      |
+| `unsubscribe_message`  | RFC 8058 one-click unsubscribe, optionally delete matching bulk mail across all boxes  |
+| `add_flags`            | Add flags and/or set Apple Mail color on a message (union semantics)                  |
+| `remove_flags`         | Remove flags and/or clear Apple Mail color from a message                             |
 
 ### Key parameters
 
 - `account` is **required** for most tools. Use `list_accounts` to discover valid names.
-- `mailbox` defaults to `INBOX` when omitted.
+- `mailbox` defaults to `INBOX` when omitted. Omit it on `rank_senders`, `rank_unsubscribe`, `rank_list_id`, `list_flags`, and `find_attachments` to scan the entire account (auto-skips Trash, Junk, Spam, Drafts).
 - `limit` defaults to 25, clamped to 1..50.
 - `includeContent` (default false) returns normalized markdown body text, trimmed for context window safety.
 - All reads use `BODY.PEEK` to avoid marking messages as `\Seen`.
-- Long-running operations (`group_by_sender`, `find_attachments`, `list_flags`) support MCP progress notifications.
+- Long-running operations (`rank_senders`, `rank_unsubscribe`, `rank_list_id`, `find_attachments`, `list_flags`, `delete_messages`) support MCP progress notifications.
 
 ## MCP Prompts
 
-5 prompts provide guided conversation starters for common email workflows:
+6 prompts provide guided conversation starters for common email workflows:
 
 | Prompt                | Description                                                                        |
 | --------------------- | ---------------------------------------------------------------------------------- |
@@ -332,26 +341,30 @@ To pass passwords via environment variables instead of keychain:
 | `find-attachments`    | Scan a mailbox for messages with attachments and list for download                 |
 | `compose-email`       | Guided email draft composition                                                     |
 | `unsubscribe-cleanup` | Identify high-volume mailing lists, unsubscribe and bulk-delete                    |
+| `list-id-cleanup`     | Identify mailing lists by List-Id and bulk-delete entire lists                     |
 
 ## Architecture
 
 ```
 agentmail (binary crate: agentmail-mcp)
-  ├── serve              → MCP stdio server (tokio + rmcp)
-  │                        17 tools + 5 prompts, progress notifications
-  ├── list-accounts      → CLI
-  ├── list-mailboxes     → CLI
-  ├── create-mailbox     → CLI
-  ├── check-connection   → CLI
-  ├── list-capabilities  → CLI
-  ├── get-messages       → CLI
-  ├── get-messages-by-uid → CLI
-  ├── group-by-sender    → CLI
-  ├── find-attachments   → CLI
+  ├── serve                → MCP stdio server (tokio + rmcp)
+  │                          21 tools + 6 prompts, progress notifications
+  ├── list-accounts        → CLI
+  ├── list-mailboxes       → CLI
+  ├── create-mailbox       → CLI
+  ├── check-connection     → CLI
+  ├── list-capabilities    → CLI
+  ├── get-messages         → CLI
+  ├── get-messages-by-uid  → CLI
+  ├── rank-senders         → CLI
+  ├── rank-unsubscribe     → CLI
+  ├── find-attachments     → CLI
   ├── download-attachments → CLI
-  ├── list-flags         → CLI
-  ├── set-password       → CLI (keychain store)
-  └── configure          → CLI (interactive account setup)
+  ├── list-flags           → CLI
+  ├── add-flags            → CLI (flags + Apple Mail colors)
+  ├── create-draft         → CLI
+  ├── set-password         → CLI (keychain store)
+  └── configure            → CLI (interactive account setup)
 
 crates/agentmail (library)
   ├── config.rs       → TOML config loading, default account resolution
@@ -361,6 +374,7 @@ crates/agentmail (library)
   ├── parser.rs       → RFC822 → MessageInfo (via mail-parser), attachment extraction
   ├── draft.rs        → RFC822 composition (via lettre)
   ├── content.rs      → HTML→markdown conversion, context window trimming
+  ├── provider.rs     → Email provider presets (Gmail, iCloud, Outlook, Fastmail, Yahoo)
   ├── types.rs        → Shared data structures (MessageInfo, MailboxInfo, etc.)
   ├── error.rs        → Error types
   └── lib.rs          → Public API facade
