@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use mail_parser::{MessageParser, MimeHeaders};
 
