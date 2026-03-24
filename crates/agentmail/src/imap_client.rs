@@ -1005,8 +1005,8 @@ pub async fn fetch_flags(
     let uids_raw = imap_timeout(session.uid_search("ALL")).await?;
     let uids: Vec<u32> = uids_raw.into_iter().collect();
     let total = uids.len() as u64;
-    let mut flag_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut color_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut flag_counts: hashbrown::HashMap<String, u32> = hashbrown::HashMap::new();
+    let mut color_counts: hashbrown::HashMap<String, u32> = hashbrown::HashMap::new();
     let mut completed = 0u64;
 
     for chunk in uids.chunks(1000) {

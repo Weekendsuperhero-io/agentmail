@@ -1,6 +1,6 @@
+use hashbrown::HashMap;
 use secret::Secret;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Top-level configuration file.

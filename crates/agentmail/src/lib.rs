@@ -290,7 +290,7 @@ impl Agentmail {
             None => list_scannable_mailbox_names(session.session()).await?,
         };
 
-        use std::collections::HashMap;
+        use hashbrown::HashMap;
         // Key by (email, display_name) so "Find My <noreply@apple.com>" and
         // "iCloud <noreply@apple.com>" are separate entries.
         let mut map: HashMap<(String, String), SenderSummary> = HashMap::new();
@@ -379,7 +379,7 @@ impl Agentmail {
             None => list_scannable_mailbox_names(session.session()).await?,
         };
 
-        use std::collections::HashMap;
+        use hashbrown::HashMap;
         use types::ListSummary;
 
         // Key by (email, display_name) for exact sender grouping
@@ -712,7 +712,7 @@ impl Agentmail {
             None => list_scannable_mailbox_names(session.session()).await?,
         };
 
-        use std::collections::HashMap;
+        use hashbrown::HashMap;
         let mut total_flags: HashMap<String, u32> = HashMap::new();
         let mut total_colors: HashMap<String, u32> = HashMap::new();
         let mut per_mailbox = Vec::new();

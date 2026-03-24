@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -95,6 +95,7 @@ pub struct MessageInfo {
 
     // All headers (raw original values)
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    #[schemars(with = "std::collections::HashMap<String, Vec<String>>")]
     pub headers: HashMap<String, Vec<String>>,
 }
 
