@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-use crate::MailkitError;
+use crate::AgentmailError;
 use crate::config::{AccountConfig, Config};
 use crate::imap_client::{self, ImapSession};
 
@@ -29,11 +29,29 @@ impl ConnectionPool {
     }
 
     /// Get or create the semaphore for a given account.
+    /// Uses the account's `max_connections` config if set, otherwise the default.
     async fn account_semaphore(&self, account_name: &str) -> Arc<Semaphore> {
         let mut sems = self.semaphores.lock().await;
         sems.entry(account_name.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PER_ACCOUNT)))
+            .or_insert_with(|| {
+                let limit = self
+                    .config
+                    .accounts
+                    .get(account_name)
+                    .and_then(|c| c.max_connections)
+                    .unwrap_or(MAX_CONCURRENT_PER_ACCOUNT);
+                Arc::new(Semaphore::new(limit))
+            })
             .clone()
+    }
+
+    /// Get the max connections limit for an account.
+    fn account_max_connections(&self, account_name: &str) -> usize {
+        self.config
+            .accounts
+            .get(account_name)
+            .and_then(|c| c.max_connections)
+            .unwrap_or(MAX_CONCURRENT_PER_ACCOUNT)
     }
 
     /// Acquire a session for the named account.
@@ -43,14 +61,16 @@ impl ConnectionPool {
             .config
             .accounts
             .get(account_name)
-            .ok_or_else(|| MailkitError::AccountNotFound(account_name.to_string()))?;
+            .ok_or_else(|| AgentmailError::AccountNotFound(account_name.to_string()))?;
+
+        let max_conn = self.account_max_connections(account_name);
 
         // Acquire a concurrency permit (blocks if at cap)
         let sem = self.account_semaphore(account_name).await;
         let permit = sem
             .acquire_owned()
             .await
-            .map_err(|_| MailkitError::Other("concurrency semaphore closed".to_string()))?;
+            .map_err(|_| AgentmailError::Other("concurrency semaphore closed".to_string()))?;
 
         // Pop a candidate session while holding the lock briefly
         let maybe_session = {
@@ -66,6 +86,7 @@ impl ConnectionPool {
                 session: Some(session),
                 account_name: account_name.to_string(),
                 pool: Arc::clone(&self.pools),
+                max_connections: max_conn,
                 _permit: permit,
             });
         }
@@ -79,6 +100,7 @@ impl ConnectionPool {
             session: Some(session),
             account_name: account_name.to_string(),
             pool: Arc::clone(&self.pools),
+            max_connections: max_conn,
             _permit: permit,
         })
     }
@@ -108,6 +130,8 @@ pub struct PooledSession {
     session: Option<ImapSession>,
     account_name: String,
     pool: Arc<Mutex<HashMap<String, Vec<ImapSession>>>>,
+    /// Max idle sessions to keep for this account.
+    max_connections: usize,
     /// Concurrency permit — released on drop to unblock waiting callers.
     _permit: OwnedSemaphorePermit,
 }
@@ -124,7 +148,7 @@ impl PooledSession {
         if let Some(session) = self.session.take() {
             let mut pools = self.pool.lock().await;
             let pool = pools.entry(self.account_name.clone()).or_default();
-            if pool.len() < MAX_CONCURRENT_PER_ACCOUNT {
+            if pool.len() < self.max_connections {
                 pool.push(session);
             }
             // else: drop the session (connection closes)

@@ -7,7 +7,7 @@ use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
 use tracing::debug;
 
-use crate::MailkitError;
+use crate::AgentmailError;
 use crate::config::AccountConfig;
 use crate::error::Result;
 use crate::parser;
@@ -40,8 +40,8 @@ where
 {
     match tokio::time::timeout(IMAP_TIMEOUT, future).await {
         Ok(Ok(val)) => Ok(val),
-        Ok(Err(e)) => Err(MailkitError::Other(e.to_string())),
-        Err(_elapsed) => Err(MailkitError::Other(format!(
+        Ok(Err(e)) => Err(AgentmailError::Other(e.to_string())),
+        Err(_elapsed) => Err(AgentmailError::Other(format!(
             "IMAP operation timed out after {}s",
             IMAP_TIMEOUT.as_secs()
         ))),
@@ -79,7 +79,7 @@ pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSessi
     let tcp = imap_timeout(TcpStream::connect(&addr)).await?;
 
     let connector = native_tls::TlsConnector::new()
-        .map_err(|e| MailkitError::Other(format!("TLS connector error: {}", e)))?;
+        .map_err(|e| AgentmailError::Other(format!("TLS connector error: {}", e)))?;
     let connector = tokio_native_tls::TlsConnector::from(connector);
     let tls = imap_timeout(connector.connect(&config.host, tcp)).await?;
 
@@ -87,9 +87,9 @@ pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSessi
     let login_fut = client.login(&config.username, password);
     let session = match tokio::time::timeout(IMAP_TIMEOUT, login_fut).await {
         Ok(Ok(session)) => session,
-        Ok(Err((err, _client))) => return Err(MailkitError::Imap(err)),
+        Ok(Err((err, _client))) => return Err(AgentmailError::Imap(err)),
         Err(_elapsed) => {
-            return Err(MailkitError::Other(format!(
+            return Err(AgentmailError::Other(format!(
                 "IMAP login timed out after {}s",
                 IMAP_TIMEOUT.as_secs()
             )));
@@ -102,8 +102,8 @@ pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSessi
 pub async fn ping(session: &mut ImapSession) -> Result<()> {
     match tokio::time::timeout(PING_TIMEOUT, session.noop()).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(MailkitError::Imap(e)),
-        Err(_) => Err(MailkitError::Other("IMAP ping timed out".into())),
+        Ok(Err(e)) => Err(AgentmailError::Imap(e)),
+        Err(_) => Err(AgentmailError::Other("IMAP ping timed out".into())),
     }
 }
 
@@ -139,7 +139,7 @@ pub async fn list_mailboxes(
 
     let mut result = Vec::with_capacity(names.len());
     for item in names {
-        let name_ref = item.map_err(MailkitError::Imap)?;
+        let name_ref = item.map_err(AgentmailError::Imap)?;
         let name = name_ref.name().to_string();
         let delimiter = name_ref.delimiter().map(|c| c.to_string());
 
@@ -169,7 +169,7 @@ pub async fn list_mailbox_names(session: &mut ImapSession) -> Result<Vec<String>
 
     let mut result = Vec::with_capacity(names.len());
     for item in names {
-        let name_ref = item.map_err(MailkitError::Imap)?;
+        let name_ref = item.map_err(AgentmailError::Imap)?;
         result.push(name_ref.name().to_string());
     }
     Ok(result)
@@ -314,7 +314,7 @@ pub async fn fetch_sender_dates(
     let mut results = Vec::with_capacity(uids.len());
     let mut completed = 0u64;
 
-    for chunk in uids.chunks(500) {
+    for chunk in uids.chunks(1000) {
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -335,7 +335,7 @@ pub async fn fetch_sender_dates(
         );
 
         for item in fetched {
-            let fetch = item.map_err(MailkitError::Imap)?;
+            let fetch = item.map_err(AgentmailError::Imap)?;
             let header_bytes = fetch.header().unwrap_or(&[]);
 
             match parser::parse_sender_date(header_bytes) {
@@ -369,8 +369,8 @@ pub async fn fetch_sender(session: &mut ImapSession, uid: u32) -> Result<(String
     let fetch = fetched
         .into_iter()
         .next()
-        .ok_or(MailkitError::MessageNotFound(uid))?
-        .map_err(MailkitError::Imap)?;
+        .ok_or(AgentmailError::MessageNotFound(uid))?
+        .map_err(AgentmailError::Imap)?;
 
     let header_bytes = fetch.header().unwrap_or(&[]);
     let (email, name, _date) = parser::parse_sender_date(header_bytes)?;
@@ -384,7 +384,7 @@ pub async fn fetch_senders_batch(
     uids: &[u32],
 ) -> Result<Vec<(u32, String, String)>> {
     let mut results = Vec::new();
-    for chunk in uids.chunks(500) {
+    for chunk in uids.chunks(1000) {
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -396,7 +396,7 @@ pub async fn fetch_senders_batch(
                 .await?;
 
         for item in fetched {
-            let fetch = item.map_err(MailkitError::Imap)?;
+            let fetch = item.map_err(AgentmailError::Imap)?;
             let uid = match fetch.uid {
                 Some(u) => u,
                 None => continue,
@@ -446,7 +446,7 @@ pub async fn fetch_list_headers(
     let mut results = Vec::new();
     let mut completed = 0u64;
 
-    for chunk in uids.chunks(500) {
+    for chunk in uids.chunks(1000) {
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -461,7 +461,7 @@ pub async fn fetch_list_headers(
         .await?;
 
         for item in fetched {
-            let fetch = item.map_err(MailkitError::Imap)?;
+            let fetch = item.map_err(AgentmailError::Imap)?;
             let uid = match fetch.uid {
                 Some(u) => u,
                 None => continue,
@@ -544,7 +544,7 @@ pub async fn fetch_by_uids(
             ),
             Err(e) => debug!(error = %e, "FETCH item error"),
         }
-        let fetch = item.map_err(MailkitError::Imap)?;
+        let fetch = item.map_err(AgentmailError::Imap)?;
         let uid = fetch.uid.unwrap_or(0);
         let size = fetch.size;
         let flags: Vec<String> = fetch.flags().map(|f| flag_to_string(&f)).collect();
@@ -590,7 +590,7 @@ pub async fn fetch_by_uids(
         Ok(msgs)
     })
     .await
-    .map_err(|e| MailkitError::Other(format!("spawn_blocking join error: {}", e)))??;
+    .map_err(|e| AgentmailError::Other(format!("spawn_blocking join error: {}", e)))??;
 
     Ok(messages)
 }
@@ -607,8 +607,8 @@ pub async fn get_flags(session: &mut ImapSession, uid: u32) -> Result<Vec<String
     let fetch = fetched
         .into_iter()
         .next()
-        .ok_or(MailkitError::MessageNotFound(uid))?
-        .map_err(MailkitError::Imap)?;
+        .ok_or(AgentmailError::MessageNotFound(uid))?
+        .map_err(AgentmailError::Imap)?;
     Ok(fetch.flags().map(|f| flag_to_string(&f)).collect())
 }
 
@@ -698,7 +698,7 @@ pub async fn fetch_attachment_uids(
     let mut attachment_uids: Vec<u32> = Vec::new();
     let mut completed = 0u64;
 
-    for chunk in uids.chunks(500) {
+    for chunk in uids.chunks(1000) {
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -712,14 +712,14 @@ pub async fn fetch_attachment_uids(
         .await?;
 
         for item in fetched {
-            let fetch = item.map_err(MailkitError::Imap)?;
+            let fetch = item.map_err(AgentmailError::Imap)?;
             let uid = fetch.uid.unwrap_or(0);
             if uid == 0 {
                 continue;
             }
             let header_bytes = fetch.header().unwrap_or(&[]);
             let header_str = String::from_utf8_lossy(header_bytes).to_lowercase();
-            if header_str.contains("multipart/mixed") {
+            if header_str.contains("multipart/mixed") || header_str.contains("multipart/related") {
                 attachment_uids.push(uid);
             }
         }
@@ -739,50 +739,54 @@ pub async fn fetch_attachment_uids(
 // Delete operations
 // ---------------------------------------------------------------------------
 
+/// Result of bulk deletion: (deleted UIDs, failed UIDs, trash_fallback).
+/// `trash_fallback` is true when trash MOVE failed and we fell back to flag+expunge.
+pub struct BulkDeleteResult {
+    pub deleted: Vec<u32>,
+    pub failed: Vec<u32>,
+    pub trash_fallback: bool,
+}
+
 /// Delete messages by UID, processing in chunks.
+/// If `trash_mailbox` is set, attempts MOVE first; falls back to flag+expunge on failure.
 pub async fn bulk_delete_messages(
     session: &mut ImapSession,
     uids: &[u32],
     trash_mailbox: Option<&str>,
     on_progress: Option<&ProgressFn>,
-) -> Result<(Vec<u32>, Vec<u32>)> {
+) -> Result<BulkDeleteResult> {
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
+    let mut trash_fallback = false;
+    let mut use_trash = trash_mailbox;
     let total = uids.len() as u64;
 
-    for chunk in uids.chunks(100) {
+    for chunk in uids.chunks(500) {
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
             .collect::<Vec<_>>()
             .join(",");
 
-        let result: std::result::Result<(), MailkitError> = if let Some(trash) = trash_mailbox {
-            imap_timeout(session.uid_mv(&uid_set, trash))
+        let result: std::result::Result<(), AgentmailError> = if let Some(trash) = use_trash {
+            let move_result = imap_timeout(session.uid_mv(&uid_set, trash))
                 .await
-                .map(|_| ())
+                .map(|_| ());
+            if move_result.is_err() {
+                // Trash MOVE failed — fall back to flag+expunge for all remaining
+                trash_fallback = true;
+                use_trash = None;
+                flag_and_expunge(session, &uid_set).await
+            } else {
+                move_result
+            }
         } else {
-            imap_timeout(async {
-                let _: Vec<_> = session
-                    .uid_store(&uid_set, "+FLAGS (\\Deleted)")
-                    .await?
-                    .collect::<Vec<_>>()
-                    .await;
-                let _: Vec<_> = session
-                    .uid_expunge(&uid_set)
-                    .await?
-                    .collect::<Vec<_>>()
-                    .await;
-                Ok::<_, async_imap::error::Error>(())
-            })
-            .await
+            flag_and_expunge(session, &uid_set).await
         };
 
         match result {
             Ok(()) => {
                 deleted.extend_from_slice(chunk);
-                // Flush untagged responses (EXPUNGE, EXISTS) so the session
-                // view is consistent before the next chunk.
                 let _ = imap_timeout(session.noop()).await;
             }
             Err(_) => failed.extend_from_slice(chunk),
@@ -793,7 +797,32 @@ pub async fn bulk_delete_messages(
         }
     }
 
-    Ok((deleted, failed))
+    Ok(BulkDeleteResult {
+        deleted,
+        failed,
+        trash_fallback,
+    })
+}
+
+/// Flag messages as deleted and expunge them (permanent delete).
+async fn flag_and_expunge(
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> std::result::Result<(), AgentmailError> {
+    imap_timeout(async {
+        let _: Vec<_> = session
+            .uid_store(uid_set, "+FLAGS (\\Deleted)")
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        let _: Vec<_> = session
+            .uid_expunge(uid_set)
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        Ok::<_, async_imap::error::Error>(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -838,9 +867,9 @@ pub async fn get_message_source(
     let fetch = fetched
         .into_iter()
         .next()
-        .ok_or(MailkitError::MessageNotFound(uid))?
-        .map_err(MailkitError::Imap)?;
-    let body = fetch.body().ok_or(MailkitError::MessageNotFound(uid))?;
+        .ok_or(AgentmailError::MessageNotFound(uid))?
+        .map_err(AgentmailError::Imap)?;
+    let body = fetch.body().ok_or(AgentmailError::MessageNotFound(uid))?;
     Ok(body.to_vec())
 }
 
@@ -873,8 +902,8 @@ pub async fn fetch_unsubscribe_headers(
     let fetch = fetched
         .into_iter()
         .next()
-        .ok_or(MailkitError::MessageNotFound(uid))?
-        .map_err(MailkitError::Imap)?;
+        .ok_or(AgentmailError::MessageNotFound(uid))?
+        .map_err(AgentmailError::Imap)?;
 
     let header_bytes = fetch.header().unwrap_or(&[]);
     let header_str = String::from_utf8_lossy(header_bytes);
@@ -954,23 +983,33 @@ fn build_search_query(criteria: &SearchCriteria) -> String {
 }
 
 /// Fetch all unique flags in use across messages in a mailbox, with counts.
+/// Result of scanning flags in a mailbox: per-flag counts and per-message color resolution.
+pub struct FlagScanResult {
+    pub flags: Vec<(String, u32)>,
+    pub colors: Vec<(String, u32)>,
+}
+
 pub async fn fetch_flags(
     session: &mut ImapSession,
     mailbox: &str,
     on_progress: Option<&ProgressFn>,
-) -> Result<Vec<(String, u32)>> {
+) -> Result<FlagScanResult> {
     let mb = imap_timeout(session.select(mailbox)).await?;
     if mb.exists == 0 {
-        return Ok(Vec::new());
+        return Ok(FlagScanResult {
+            flags: Vec::new(),
+            colors: Vec::new(),
+        });
     }
 
     let uids_raw = imap_timeout(session.uid_search("ALL")).await?;
     let uids: Vec<u32> = uids_raw.into_iter().collect();
     let total = uids.len() as u64;
-    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut flag_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut color_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut completed = 0u64;
 
-    for chunk in uids.chunks(500) {
+    for chunk in uids.chunks(1000) {
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -979,10 +1018,14 @@ pub async fn fetch_flags(
         let fetched = timed_uid_fetch_collect(session, &uid_set, "(FLAGS)").await?;
 
         for item in fetched {
-            let fetch = item.map_err(MailkitError::Imap)?;
-            for flag in fetch.flags() {
-                let name = flag_to_string(&flag);
-                *counts.entry(name).or_insert(0) += 1;
+            let fetch = item.map_err(AgentmailError::Imap)?;
+            let msg_flags: Vec<String> = fetch.flags().map(|f| flag_to_string(&f)).collect();
+            for name in &msg_flags {
+                *flag_counts.entry(name.clone()).or_insert(0) += 1;
+            }
+            // Resolve Apple Mail color from MailFlagBit combinations
+            if let Some(color) = crate::bits_to_color(&msg_flags) {
+                *color_counts.entry(color.to_string()).or_insert(0) += 1;
             }
         }
 
@@ -992,9 +1035,11 @@ pub async fn fetch_flags(
         }
     }
 
-    let mut flags: Vec<(String, u32)> = counts.into_iter().collect();
+    let mut flags: Vec<(String, u32)> = flag_counts.into_iter().collect();
     flags.sort_by(|a, b| b.1.cmp(&a.1));
-    Ok(flags)
+    let mut colors: Vec<(String, u32)> = color_counts.into_iter().collect();
+    colors.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(FlagScanResult { flags, colors })
 }
 
 /// Escape a string for use in IMAP quoted strings.

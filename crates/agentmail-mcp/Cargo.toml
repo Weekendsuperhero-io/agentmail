@@ -1,0 +1,42 @@
+[package]
+name = "agentmail-app"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "MCP server and CLI for agentmail — connects AI agents to email via IMAP"
+repository = "https://github.com/weekendsuperhero-io/agentmail"
+documentation = "https://docs.rs/agentmail-app"
+homepage = "https://github.com/weekendsuperhero-io/agentmail"
+readme = "../../README.md"
+keywords = ["email", "imap", "mcp", "agent", "cli"]
+categories = ["command-line-utilities", "email"]
+authors = ["WeekendSuperhero <hello@weekendsuperhero.io>"]
+rust-version = "1.94"
+
+[lib]
+name = "agentmail_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentmail"
+path = "src/main.rs"
+
+[dependencies]
+agentmail = { path = "../agentmail" }
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "1.2", default-features = true, features = [
+  "transport-async-rw",
+  "transport-worker",
+] }
+schemars = "1.2"
+secret-lib = { version = "1", features = ["keyring", "rustls", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+  "io-std",
+  "macros",
+  "rt",
+  "rt-multi-thread"
+] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

@@ -29,6 +29,54 @@ pub struct AccountConfig {
     pub trash_mailbox: Option<String>,
     /// Drafts mailbox name override (default: auto-detect or "Drafts").
     pub drafts_mailbox: Option<String>,
+    /// Max concurrent IMAP connections for this account (default: 3).
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+}
+
+impl AccountConfig {
+    /// Create an account config programmatically (for in-process use).
+    /// Password is resolved via keyring using the username.
+    pub fn new(host: impl Into<String>, username: impl Into<String>) -> Self {
+        let username = username.into();
+        let password = secret::keyring::KeyringEntry::try_new(&username)
+            .ok()
+            .map(Secret::new_keyring_entry);
+        Self {
+            host: host.into(),
+            port: 993,
+            username,
+            password,
+            tls: true,
+            trash_mailbox: None,
+            drafts_mailbox: None,
+            max_connections: None,
+        }
+    }
+
+    /// Set the IMAP port.
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Set trash mailbox name.
+    pub fn with_trash(mut self, mailbox: impl Into<String>) -> Self {
+        self.trash_mailbox = Some(mailbox.into());
+        self
+    }
+
+    /// Set drafts mailbox name.
+    pub fn with_drafts(mut self, mailbox: impl Into<String>) -> Self {
+        self.drafts_mailbox = Some(mailbox.into());
+        self
+    }
+
+    /// Set max concurrent IMAP connections.
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_connections = Some(n);
+        self
+    }
 }
 
 fn default_port() -> u16 {
@@ -66,7 +114,7 @@ where
 }
 
 impl Config {
-    /// Load config from the default path or `MAILKIT_CONFIG` env override.
+    /// Load config from the default path or `AGENTMAIL_CONFIG` env override.
     pub fn load() -> crate::Result<Self> {
         let path = Self::default_path();
         Self::load_from(&path)
@@ -75,7 +123,7 @@ impl Config {
     /// Load from a specific path.
     pub fn load_from(path: &std::path::Path) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
-            crate::MailkitError::Config(format!(
+            crate::AgentmailError::Config(format!(
                 "Failed to read config file '{}': {}. \
                  Create it with your IMAP account settings. See README for format.",
                 path.display(),
@@ -83,14 +131,14 @@ impl Config {
             ))
         })?;
         let config: Config = toml::from_str(&content).map_err(|e| {
-            crate::MailkitError::Config(format!(
+            crate::AgentmailError::Config(format!(
                 "Failed to parse config file '{}': {}",
                 path.display(),
                 e
             ))
         })?;
         if config.accounts.is_empty() {
-            return Err(crate::MailkitError::Config(
+            return Err(crate::AgentmailError::Config(
                 "No accounts configured. Add at least one [accounts.<name>] section.".into(),
             ));
         }
@@ -111,14 +159,31 @@ impl Config {
         None
     }
 
-    /// Default config path: `$MAILKIT_CONFIG` or `~/.config/mailkit/config.toml`.
+    /// Build config from a list of account configs (no file).
+    /// Used by in-process MCP when accounts come from the host app.
+    pub fn from_accounts(accounts: Vec<(String, AccountConfig)>) -> Self {
+        Self {
+            default_account: None,
+            accounts: accounts.into_iter().collect(),
+        }
+    }
+
+    /// Build an empty config with no accounts.
+    pub fn empty() -> Self {
+        Self {
+            default_account: None,
+            accounts: HashMap::new(),
+        }
+    }
+
+    /// Default config path: `$AGENTMAIL_CONFIG` or `~/.config/agentmail/config.toml`.
     pub fn default_path() -> PathBuf {
-        if let Ok(p) = std::env::var("MAILKIT_CONFIG") {
+        if let Ok(p) = std::env::var("AGENTMAIL_CONFIG") {
             return PathBuf::from(p);
         }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("mailkit")
+            .join("agentmail")
             .join("config.toml")
     }
 }

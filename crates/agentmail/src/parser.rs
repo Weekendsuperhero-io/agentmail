@@ -17,7 +17,7 @@ pub fn parse_rfc822(
     include_headers: bool,
 ) -> crate::Result<MessageInfo> {
     let parsed = MessageParser::default().parse(raw).ok_or_else(|| {
-        crate::MailkitError::Parse(format!("Failed to parse RFC822 message UID {}", uid))
+        crate::AgentmailError::Parse(format!("Failed to parse RFC822 message UID {}", uid))
     })?;
 
     let subject = parsed.subject().unwrap_or("").to_string();
@@ -111,9 +111,9 @@ pub fn parse_rfc822(
 pub fn parse_sender_date(
     raw: &[u8],
 ) -> crate::Result<(String, String, Option<chrono::DateTime<chrono::Utc>>)> {
-    let parsed = MessageParser::default()
-        .parse(raw)
-        .ok_or_else(|| crate::MailkitError::Parse("Failed to parse partial headers".to_string()))?;
+    let parsed = MessageParser::default().parse(raw).ok_or_else(|| {
+        crate::AgentmailError::Parse("Failed to parse partial headers".to_string())
+    })?;
 
     let (email, name) = extract_from_parts(parsed.from());
 
@@ -275,7 +275,7 @@ pub fn extract_attachment_data(
     uid: u32,
 ) -> crate::Result<Vec<(String, String, Vec<u8>)>> {
     let parsed = MessageParser::default().parse(raw).ok_or_else(|| {
-        crate::MailkitError::Parse(format!("Failed to parse RFC822 message UID {}", uid))
+        crate::AgentmailError::Parse(format!("Failed to parse RFC822 message UID {}", uid))
     })?;
 
     let mut results = Vec::new();

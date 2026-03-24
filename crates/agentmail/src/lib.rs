@@ -6,21 +6,24 @@ pub mod draft;
 pub mod error;
 pub mod imap_client;
 pub mod parser;
+pub mod provider;
 pub mod types;
 
-pub use config::Config;
+pub use config::{AccountConfig, Config};
 pub use connection::ConnectionPool;
-pub use error::{MailkitError, Result};
+pub use credentials::init_keyring_with_service;
+pub use error::{AgentmailError, Result};
 pub use imap_client::ProgressFn;
+pub use provider::MailProvider;
 pub use types::*;
 
 /// High-level facade for IMAP operations.
 /// Owns the connection pool and configuration.
-pub struct Mailkit {
+pub struct Agentmail {
     pool: ConnectionPool,
 }
 
-impl Mailkit {
+impl Agentmail {
     /// Create from an existing config.
     pub fn new(config: Config) -> Self {
         Self {
@@ -53,8 +56,8 @@ impl Mailkit {
     // Account & connection
     // -----------------------------------------------------------------
 
-    /// List accounts as JSON.
-    pub async fn list_accounts(&self) -> Result<serde_json::Value> {
+    /// List configured accounts.
+    pub async fn list_accounts(&self) -> Result<ListAccountsResponse> {
         let config = self.pool.config();
         let default = config.default_account();
 
@@ -70,7 +73,7 @@ impl Mailkit {
             .collect();
         accounts.sort_by(|a, b| a.name.cmp(&b.name));
 
-        Ok(serde_json::json!({ "accounts": accounts }))
+        Ok(ListAccountsResponse { accounts })
     }
 
     /// Check IMAP connectivity for an account.
@@ -95,15 +98,15 @@ impl Mailkit {
     }
 
     /// List IMAP capabilities for an account.
-    pub async fn list_capabilities(&self, account: &str) -> Result<serde_json::Value> {
+    pub async fn list_capabilities(&self, account: &str) -> Result<ListCapabilitiesResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = imap_client::list_capabilities(session.session()).await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "account": account,
-            "capabilities": caps,
-        }))
+        Ok(ListCapabilitiesResponse {
+            account: account.to_string(),
+            capabilities: caps,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -111,25 +114,25 @@ impl Mailkit {
     // -----------------------------------------------------------------
 
     /// List mailboxes, optionally scoped to an account.
-    pub async fn list_mailboxes(&self, account: Option<&str>) -> Result<serde_json::Value> {
+    pub async fn list_mailboxes(&self, account: Option<&str>) -> Result<ListMailboxesResponse> {
         let account_names: Vec<String> = if let Some(name) = account {
             if !self.pool.config().accounts.contains_key(name) {
-                return Err(MailkitError::AccountNotFound(name.to_string()));
+                return Err(AgentmailError::AccountNotFound(name.to_string()));
             }
             vec![name.to_string()]
         } else {
             self.pool.account_names()
         };
 
-        let mut all_mailboxes: Vec<MailboxInfo> = Vec::new();
+        let mut mailboxes: Vec<MailboxInfo> = Vec::new();
         for acct_name in &account_names {
             let mut session = self.pool.acquire(acct_name).await?;
-            let mailboxes = imap_client::list_mailboxes(session.session(), acct_name).await?;
+            let mboxes = imap_client::list_mailboxes(session.session(), acct_name).await?;
             session.release().await;
-            all_mailboxes.extend(mailboxes);
+            mailboxes.extend(mboxes);
         }
 
-        Ok(serde_json::json!({ "mailboxes": all_mailboxes }))
+        Ok(ListMailboxesResponse { mailboxes })
     }
 
     /// Create a new mailbox on the server.
@@ -137,17 +140,31 @@ impl Mailkit {
         &self,
         account: &str,
         mailbox_name: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<CreateMailboxResponse> {
         let mut session = self.pool.acquire(account).await?;
+
+        // Check if mailbox already exists (make CREATE idempotent)
+        let names = imap_client::list_mailbox_names(session.session()).await?;
+        if names.iter().any(|n| n.eq_ignore_ascii_case(mailbox_name)) {
+            session.release().await;
+            return Ok(CreateMailboxResponse {
+                account: account.to_string(),
+                mailbox: mailbox_name.to_string(),
+                created: false,
+                already_exists: true,
+            });
+        }
+
         imap_client::create_mailbox(session.session(), mailbox_name).await?;
         imap_client::sync(session.session()).await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "account": account,
-            "mailbox": mailbox_name,
-            "created": true,
-        }))
+        Ok(CreateMailboxResponse {
+            account: account.to_string(),
+            mailbox: mailbox_name.to_string(),
+            created: true,
+            already_exists: false,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -163,7 +180,7 @@ impl Mailkit {
         limit: usize,
         include_content: bool,
         include_headers: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<GetMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
         let (messages, total) = imap_client::fetch_messages(
             session.session(),
@@ -177,14 +194,14 @@ impl Mailkit {
         .await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "offset": offset,
-            "limit": limit,
-            "total": total,
-            "messages": messages,
-        }))
+        Ok(GetMessagesResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            offset,
+            limit,
+            total: total as usize,
+            messages,
+        })
     }
 
     /// Fetch specific messages by UID.
@@ -195,7 +212,7 @@ impl Mailkit {
         uids: &[u32],
         include_content: bool,
         include_headers: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<GetMessagesByUidResponse> {
         let mut session = self.pool.acquire(account).await?;
         imap_client::select(session.session(), mailbox).await?;
         let messages = imap_client::fetch_by_uids(
@@ -209,11 +226,11 @@ impl Mailkit {
         .await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "messages": messages,
-        }))
+        Ok(GetMessagesByUidResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            messages,
+        })
     }
 
     /// Search messages using IMAP criteria.
@@ -226,7 +243,7 @@ impl Mailkit {
         limit: usize,
         include_content: bool,
         include_headers: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<SearchMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
         let (messages, total) = imap_client::search_messages(
             session.session(),
@@ -241,14 +258,14 @@ impl Mailkit {
         .await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "offset": offset,
-            "limit": limit,
-            "totalMatches": total,
-            "messages": messages,
-        }))
+        Ok(SearchMessagesResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            offset,
+            limit,
+            total_matches: total as usize,
+            messages,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -265,16 +282,18 @@ impl Mailkit {
         account: &str,
         limit: Option<usize>,
         on_progress: Option<&ProgressFn>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<RankSendersResponse> {
         let mut session = self.pool.acquire(account).await?;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
-            None => imap_client::list_mailbox_names(session.session()).await?,
+            None => list_scannable_mailbox_names(session.session()).await?,
         };
 
         use std::collections::HashMap;
-        let mut map: HashMap<String, SenderSummary> = HashMap::new();
+        // Key by (email, display_name) so "Find My <noreply@apple.com>" and
+        // "iCloud <noreply@apple.com>" are separate entries.
+        let mut map: HashMap<(String, String), SenderSummary> = HashMap::new();
 
         for mbox in &mailboxes {
             let sender_dates =
@@ -287,7 +306,8 @@ impl Mailkit {
                 if email.is_empty() {
                     continue;
                 }
-                let entry = map.entry(email.clone()).or_insert_with(|| SenderSummary {
+                let key = (email.clone(), display_name.clone());
+                let entry = map.entry(key).or_insert_with(|| SenderSummary {
                     sender: String::new(),
                     address: email,
                     display_name: display_name.clone(),
@@ -297,10 +317,6 @@ impl Mailkit {
                 });
 
                 entry.count += 1;
-
-                if !display_name.is_empty() {
-                    entry.display_name = display_name;
-                }
 
                 if let Some(d) = date {
                     entry.oldest_date = Some(match entry.oldest_date {
@@ -328,18 +344,18 @@ impl Mailkit {
         senders.sort_by(|a, b| b.count.cmp(&a.count));
 
         let unique_senders = senders.len();
+        let total_messages = senders.iter().map(|s| s.count).sum::<u32>();
         if let Some(n) = limit {
             senders.truncate(n);
         }
 
-        let mailbox_label = mailbox.unwrap_or("*");
-        Ok(serde_json::json!({
-            "mailbox": mailbox_label,
-            "account": account,
-            "totalMessages": senders.iter().map(|s| s.count).sum::<u32>(),
-            "uniqueSenders": unique_senders,
-            "senders": senders,
-        }))
+        Ok(RankSendersResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            total_messages,
+            unique_senders,
+            senders,
+        })
     }
 
     /// Group mailing-list messages by sender.
@@ -355,12 +371,12 @@ impl Mailkit {
         account: &str,
         limit: Option<usize>,
         on_progress: Option<&ProgressFn>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<RankUnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
-            None => imap_client::list_mailbox_names(session.session()).await?,
+            None => list_scannable_mailbox_names(session.session()).await?,
         };
 
         use std::collections::HashMap;
@@ -392,7 +408,6 @@ impl Mailkit {
                         unsubscribe_url: None,
                         list_unsubscribe_post: None,
                         one_click: false,
-                        list_id: None,
                         sample_uid: row.uid,
                         sample_mailbox: Some(mbox.clone()),
                         count: 0,
@@ -402,13 +417,6 @@ impl Mailkit {
                 });
 
                 entry.count += 1;
-
-                // Capture list_id from any message in the group
-                if entry.list_id.is_none()
-                    && let Some(ref lid) = row.list_id
-                {
-                    entry.list_id = Some(lid.clone());
-                }
 
                 // Track the newest message — its UID and unsubscribe info are used
                 let is_newer = match row.date {
@@ -433,9 +441,6 @@ impl Mailkit {
                         .as_deref()
                         .map(|v| v.contains("List-Unsubscribe=One-Click"))
                         .unwrap_or(false);
-                    if let Some(ref lid) = row.list_id {
-                        entry.list_id = Some(lid.clone());
-                    }
                     if !row.sender_name.is_empty() {
                         entry.display_name = row.sender_name.clone();
                         entry.sender = format!("{} <{}>", entry.display_name, row.sender_email);
@@ -471,151 +476,400 @@ impl Mailkit {
             lists.truncate(n);
         }
 
-        let mailbox_label = mailbox.unwrap_or("*");
-        Ok(serde_json::json!({
-            "mailbox": mailbox_label,
-            "account": account,
-            "totalMessages": total_messages,
-            "uniqueLists": unique_lists,
-            "lists": lists,
-        }))
+        Ok(RankUnsubscribeResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            total_messages,
+            unique_lists,
+            lists,
+        })
+    }
+
+    /// Group messages by List-Id header (RFC 2919).
+    ///
+    /// Groups all messages from the same mailing list regardless of sender.
+    /// When `mailbox` is `None`, scans all mailboxes (excluding trash/junk/drafts).
+    pub async fn group_by_list_id(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        limit: Option<usize>,
+        on_progress: Option<&ProgressFn>,
+    ) -> Result<RankListIdResponse> {
+        let mut session = self.pool.acquire(account).await?;
+
+        let mailboxes = match mailbox {
+            Some(mbox) => vec![mbox.to_string()],
+            None => list_scannable_mailbox_names(session.session()).await?,
+        };
+
+        use std::collections::{HashMap, HashSet};
+
+        struct ListIdEntry {
+            display_name: String,
+            senders: HashSet<String>,
+            count: u32,
+            sample_uid: u32,
+            sample_mailbox: Option<String>,
+            oldest_date: Option<chrono::DateTime<chrono::Utc>>,
+            newest_date: Option<chrono::DateTime<chrono::Utc>>,
+        }
+
+        let mut map: HashMap<String, ListIdEntry> = HashMap::new();
+
+        for mbox in &mailboxes {
+            let rows =
+                match imap_client::fetch_list_headers(session.session(), mbox, on_progress).await {
+                    Ok(data) => data,
+                    Err(_) => continue,
+                };
+
+            for row in rows {
+                let list_id = match row.list_id {
+                    Some(ref id) if !id.is_empty() => id.clone(),
+                    _ => continue, // Skip messages without List-Id
+                };
+
+                let entry = map.entry(list_id.clone()).or_insert_with(|| {
+                    let display = extract_list_id_display(&list_id);
+                    ListIdEntry {
+                        display_name: display,
+                        senders: HashSet::new(),
+                        count: 0,
+                        sample_uid: row.uid,
+                        sample_mailbox: Some(mbox.clone()),
+                        oldest_date: None,
+                        newest_date: None,
+                    }
+                });
+
+                entry.count += 1;
+                if !row.sender_email.is_empty() {
+                    entry.senders.insert(row.sender_email.clone());
+                }
+
+                let is_newer = match row.date {
+                    Some(d) => entry.newest_date.map(|e| d > e).unwrap_or(true),
+                    None => entry.newest_date.is_none(),
+                };
+                if is_newer {
+                    entry.sample_uid = row.uid;
+                    entry.sample_mailbox = Some(mbox.clone());
+                }
+
+                if let Some(d) = row.date {
+                    entry.oldest_date = Some(match entry.oldest_date {
+                        Some(existing) => existing.min(d),
+                        None => d,
+                    });
+                    entry.newest_date = Some(match entry.newest_date {
+                        Some(existing) => existing.max(d),
+                        None => d,
+                    });
+                }
+            }
+        }
+
+        session.release().await;
+
+        let mut lists: Vec<ListIdSummary> = map
+            .into_iter()
+            .map(|(list_id, entry)| {
+                let mut senders: Vec<String> = entry.senders.into_iter().collect();
+                senders.sort();
+                ListIdSummary {
+                    list_id,
+                    display_name: entry.display_name,
+                    senders,
+                    count: entry.count,
+                    sample_uid: entry.sample_uid,
+                    sample_mailbox: entry.sample_mailbox,
+                    oldest_date: entry.oldest_date,
+                    newest_date: entry.newest_date,
+                }
+            })
+            .collect();
+        lists.sort_by(|a, b| b.count.cmp(&a.count));
+
+        let unique_lists = lists.len();
+        let total_messages = lists.iter().map(|l| l.count).sum::<u32>();
+        if let Some(n) = limit {
+            lists.truncate(n);
+        }
+
+        Ok(RankListIdResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            total_messages,
+            unique_lists,
+            lists,
+        })
+    }
+
+    /// Delete all messages with a specific List-Id across mailboxes.
+    pub async fn delete_list_id(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        list_id: &str,
+        on_progress: Option<&ProgressFn>,
+    ) -> Result<DeleteListIdResponse> {
+        let mut session = self.pool.acquire(account).await?;
+        let trash = self.resolve_trash_mailbox(session.session(), account).await;
+
+        let mailboxes = match mailbox {
+            Some(mbox) => vec![mbox.to_string()],
+            None => list_scannable_mailbox_names(session.session()).await?,
+        };
+
+        let mut total_found = 0usize;
+        let mut total_deleted = 0usize;
+        let mut total_failed = 0usize;
+        let mut per_mailbox = Vec::new();
+        let mut skipped = Vec::new();
+
+        for mbox in &mailboxes {
+            if imap_client::select(session.session(), mbox).await.is_err() {
+                skipped.push(mbox.clone());
+                continue;
+            }
+
+            // Server-side SEARCH HEADER List-Id
+            let criteria = SearchCriteria {
+                header: Some(("List-Id".to_string(), list_id.to_string())),
+                deleted: Some(false),
+                ..Default::default()
+            };
+            let query = imap_client::build_search_query_pub(&criteria);
+            let uids = match imap_client::search_uids(session.session(), &query).await {
+                Ok(u) => u,
+                Err(_) => {
+                    skipped.push(mbox.clone());
+                    continue;
+                }
+            };
+
+            if uids.is_empty() {
+                continue;
+            }
+
+            let found = uids.len();
+            let result = imap_client::bulk_delete_messages(
+                session.session(),
+                &uids,
+                trash.as_deref(),
+                on_progress,
+            )
+            .await?;
+            imap_client::sync(session.session()).await?;
+
+            total_found += found;
+            total_deleted += result.deleted.len();
+            total_failed += result.failed.len();
+
+            if found > 0 {
+                per_mailbox.push(PerMailboxDeleteResult {
+                    mailbox: mbox.clone(),
+                    found,
+                    deleted: result.deleted.len(),
+                    failed: result.failed.len(),
+                });
+            }
+        }
+
+        session.release().await;
+
+        Ok(DeleteListIdResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            list_id: list_id.to_string(),
+            found: total_found,
+            deleted: total_deleted,
+            failed: total_failed,
+            mailboxes: per_mailbox,
+            skipped,
+        })
     }
 
     // -----------------------------------------------------------------
     // Flags
     // -----------------------------------------------------------------
 
-    /// List all flags actually in use across messages in a mailbox, with counts.
+    /// List all flags actually in use across messages, with counts.
+    ///
+    /// When `mailbox` is `None`, scans all mailboxes in the account.
+    /// Resolves Apple Mail `$MailFlagBit*` combinations to color names per-message.
     pub async fn list_flags(
         &self,
-        mailbox: &str,
+        mailbox: Option<&str>,
         account: &str,
         on_progress: Option<&ProgressFn>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ListFlagsResponse> {
         let mut session = self.pool.acquire(account).await?;
-        let flags = imap_client::fetch_flags(session.session(), mailbox, on_progress).await?;
-        session.release().await;
 
-        let flag_list: Vec<serde_json::Value> = flags
-            .iter()
-            .map(|(name, count)| serde_json::json!({ "flag": name, "count": count }))
-            .collect();
+        let mailboxes = match mailbox {
+            Some(mbox) => vec![mbox.to_string()],
+            None => list_scannable_mailbox_names(session.session()).await?,
+        };
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "totalFlags": flag_list.len(),
-            "flags": flag_list,
-        }))
-    }
+        use std::collections::HashMap;
+        let mut total_flags: HashMap<String, u32> = HashMap::new();
+        let mut total_colors: HashMap<String, u32> = HashMap::new();
+        let mut per_mailbox = Vec::new();
 
-    /// Set a colored flag on a message (Apple Mail / RFC draft-eggert-mailflagcolors).
-    /// Uses union semantics: existing flags are preserved, only color bits + \Flagged are added/changed.
-    /// Pass `color = None` to remove the flag entirely (clears \Flagged and all color bits).
-    pub async fn set_flag_color(
-        &self,
-        mailbox: &str,
-        account: &str,
-        uid: u32,
-        color: Option<&str>,
-    ) -> Result<serde_json::Value> {
-        let mut session = self.pool.acquire(account).await?;
-        imap_client::select(session.session(), mailbox).await?;
+        for mbox in &mailboxes {
+            let scan = match imap_client::fetch_flags(session.session(), mbox, on_progress).await {
+                Ok(s) => s,
+                Err(_) => continue, // skip unselectable mailboxes
+            };
 
-        let color_bits = ["$MailFlagBit0", "$MailFlagBit1", "$MailFlagBit2"];
-
-        match color {
-            Some(color_name) => {
-                let bits = color_to_bits(color_name)
-                    .ok_or_else(|| MailkitError::Other(format!(
-                        "Unknown flag color '{}'. Valid colors: red, orange, yellow, green, blue, purple, gray",
-                        color_name
-                    )))?;
-
-                // Remove old color bits first, then add new ones + \Flagged
-                imap_client::remove_flags(
-                    session.session(),
-                    uid,
-                    &color_bits.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                )
-                .await?;
-
-                let mut add = vec!["\\Flagged".to_string()];
-                for (i, &bit) in color_bits.iter().enumerate() {
-                    if bits[i] {
-                        add.push(bit.to_string());
-                    }
-                }
-                imap_client::add_flags(session.session(), uid, &add).await?;
+            if !scan.flags.is_empty() {
+                let mbox_flags: Vec<FlagCount> = scan
+                    .flags
+                    .iter()
+                    .map(|(name, count)| FlagCount {
+                        flag: name.clone(),
+                        count: *count,
+                    })
+                    .collect();
+                per_mailbox.push(MailboxFlagBreakdown {
+                    mailbox: mbox.clone(),
+                    total_flags: mbox_flags.len(),
+                    flags: mbox_flags,
+                });
             }
-            None => {
-                // Unflag: remove \Flagged and all color bits
-                let mut remove: Vec<String> = vec!["\\Flagged".to_string()];
-                remove.extend(color_bits.iter().map(|s| s.to_string()));
-                imap_client::remove_flags(session.session(), uid, &remove).await?;
+
+            for (name, count) in &scan.flags {
+                *total_flags.entry(name.clone()).or_insert(0) += count;
+            }
+            for (color, count) in &scan.colors {
+                *total_colors.entry(color.clone()).or_insert(0) += count;
             }
         }
 
-        imap_client::sync(session.session()).await?;
-
-        // Read back the updated flags
-        let updated_flags = imap_client::get_flags(session.session(), uid).await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "uid": uid,
-            "color": color,
-            "flags": updated_flags,
-        }))
+        let mut flag_list: Vec<(String, u32)> = total_flags.into_iter().collect();
+        flag_list.sort_by(|a, b| b.1.cmp(&a.1));
+        let flags: Vec<FlagCount> = flag_list
+            .into_iter()
+            .map(|(flag, count)| FlagCount { flag, count })
+            .collect();
+
+        let mut color_list: Vec<(String, u32)> = total_colors.into_iter().collect();
+        color_list.sort_by(|a, b| b.1.cmp(&a.1));
+        let colors: Vec<ColorCount> = color_list
+            .into_iter()
+            .map(|(color, count)| ColorCount { color, count })
+            .collect();
+
+        Ok(ListFlagsResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            total_flags: flags.len(),
+            flags,
+            colors,
+            per_mailbox,
+        })
     }
 
-    /// Update flags on a message with union semantics: adds the specified flags
-    /// without removing any existing flags.
+    /// Add flags and/or set a color on a message.
+    /// Flags use union semantics (+FLAGS). Color replaces any existing color.
     pub async fn add_flags(
         &self,
         mailbox: &str,
         account: &str,
         uid: u32,
         flags: &[String],
-    ) -> Result<serde_json::Value> {
+        color: Option<&str>,
+    ) -> Result<UpdateFlagsResponse> {
         let mut session = self.pool.acquire(account).await?;
         imap_client::select(session.session(), mailbox).await?;
-        imap_client::add_flags(session.session(), uid, flags).await?;
+
+        // Set color if requested (clear old bits, set new ones)
+        if let Some(color_name) = color {
+            let bits = color_to_bits(color_name).ok_or_else(|| {
+                AgentmailError::Other(format!(
+                    "Unknown flag color '{}'. Valid: red, orange, yellow, green, blue, purple, gray",
+                    color_name
+                ))
+            })?;
+            let color_bits = ["$MailFlagBit0", "$MailFlagBit1", "$MailFlagBit2"];
+            imap_client::remove_flags(
+                session.session(),
+                uid,
+                &color_bits.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .await?;
+            let mut add = vec!["\\Flagged".to_string()];
+            for (i, &bit) in color_bits.iter().enumerate() {
+                if bits[i] {
+                    add.push(bit.to_string());
+                }
+            }
+            imap_client::add_flags(session.session(), uid, &add).await?;
+        }
+
+        // Add regular flags
+        if !flags.is_empty() {
+            imap_client::add_flags(session.session(), uid, flags).await?;
+        }
+
         imap_client::sync(session.session()).await?;
         let updated_flags = imap_client::get_flags(session.session(), uid).await?;
+        let resolved_color = bits_to_color(&updated_flags).map(|c| c.to_string());
         session.release().await;
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "uid": uid,
-            "flags": updated_flags,
-        }))
+        Ok(UpdateFlagsResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            uid,
+            flags: updated_flags,
+            color: resolved_color,
+        })
     }
 
-    /// Remove specific flags from a message.
+    /// Remove flags and/or clear color from a message.
+    /// Flags use difference semantics (-FLAGS). `remove_color` clears \Flagged + all color bits.
     pub async fn remove_flags(
         &self,
         mailbox: &str,
         account: &str,
         uid: u32,
         flags: &[String],
-    ) -> Result<serde_json::Value> {
+        remove_color: bool,
+    ) -> Result<UpdateFlagsResponse> {
         let mut session = self.pool.acquire(account).await?;
         imap_client::select(session.session(), mailbox).await?;
-        imap_client::remove_flags(session.session(), uid, flags).await?;
+
+        // Remove color if requested
+        if remove_color {
+            let mut remove = vec!["\\Flagged".to_string()];
+            remove.extend(
+                ["$MailFlagBit0", "$MailFlagBit1", "$MailFlagBit2"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+            imap_client::remove_flags(session.session(), uid, &remove).await?;
+        }
+
+        // Remove regular flags
+        if !flags.is_empty() {
+            imap_client::remove_flags(session.session(), uid, flags).await?;
+        }
+
         imap_client::sync(session.session()).await?;
         let updated_flags = imap_client::get_flags(session.session(), uid).await?;
+        let resolved_color = bits_to_color(&updated_flags).map(|c| c.to_string());
         session.release().await;
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "uid": uid,
-            "flags": updated_flags,
-        }))
+        Ok(UpdateFlagsResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            uid,
+            flags: updated_flags,
+            color: resolved_color,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -624,30 +878,65 @@ impl Mailkit {
 
     /// Find messages with attachments via Content-Type header scan.
     /// Returns UIDs and total count; use get_messages_by_uid to fetch details.
+    ///
+    /// When `mailbox` is `None`, scans all mailboxes in the account and
+    /// includes a per-mailbox breakdown in the output.
     pub async fn find_attachments(
         &self,
-        mailbox: &str,
+        mailbox: Option<&str>,
         account: &str,
         offset: usize,
         limit: usize,
         on_progress: Option<&ProgressFn>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<FindAttachmentsResponse> {
         let mut session = self.pool.acquire(account).await?;
-        let uids =
-            imap_client::fetch_attachment_uids(session.session(), mailbox, on_progress).await?;
+
+        let mailboxes = match mailbox {
+            Some(mbox) => vec![mbox.to_string()],
+            None => list_scannable_mailbox_names(session.session()).await?,
+        };
+
+        let mut all_uids: Vec<u32> = Vec::new();
+        let mut per_mailbox = Vec::new();
+
+        for mbox in &mailboxes {
+            let uids = match imap_client::fetch_attachment_uids(
+                session.session(),
+                mbox,
+                on_progress,
+            )
+            .await
+            {
+                Ok(u) => u,
+                Err(_) => continue, // skip unselectable mailboxes
+            };
+
+            if !uids.is_empty() {
+                per_mailbox.push(MailboxAttachmentCount {
+                    mailbox: mbox.clone(),
+                    count: uids.len(),
+                });
+                all_uids.extend(uids);
+            }
+        }
+
         session.release().await;
 
-        let total = uids.len();
-        let page: Vec<u32> = uids.into_iter().skip(offset).take(limit).collect();
+        // Sort newest-first (highest UID first) across all mailboxes
+        all_uids.sort_unstable_by(|a, b| b.cmp(a));
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "uids": page,
-        }))
+        let total = all_uids.len();
+        let page: Vec<u32> = all_uids.into_iter().skip(offset).take(limit).collect();
+
+        Ok(FindAttachmentsResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            total,
+            offset,
+            limit,
+            uids: page,
+            per_mailbox,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -661,11 +950,11 @@ impl Mailkit {
         account: &str,
         uids: &[u32],
         on_progress: Option<&ProgressFn>,
-    ) -> Result<serde_json::Value> {
-        let trash = self.trash_mailbox(account);
+    ) -> Result<DeleteMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
+        let trash = self.resolve_trash_mailbox(session.session(), account).await;
         imap_client::select(session.session(), mailbox).await?;
-        let (deleted, failed) = imap_client::bulk_delete_messages(
+        let result = imap_client::bulk_delete_messages(
             session.session(),
             uids,
             trash.as_deref(),
@@ -675,12 +964,13 @@ impl Mailkit {
         imap_client::sync(session.session()).await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "deleted": deleted.len(),
-            "failed": failed.len(),
-        }))
+        Ok(DeleteMessagesResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            deleted: result.deleted.len(),
+            failed: result.failed.len(),
+            trash_fallback: result.trash_fallback,
+        })
     }
 
     /// Delete all messages from an exact sender identified by UID.
@@ -695,9 +985,9 @@ impl Mailkit {
         uid: u32,
         all_mailboxes: bool,
         on_progress: Option<&ProgressFn>,
-    ) -> Result<serde_json::Value> {
-        let trash = self.trash_mailbox(account);
+    ) -> Result<DeleteBySenderResponse> {
         let mut session = self.pool.acquire(account).await?;
+        let trash = self.resolve_trash_mailbox(session.session(), account).await;
         imap_client::select(session.session(), mailbox).await?;
 
         // 1. Fetch the exact sender from the target message
@@ -710,7 +1000,7 @@ impl Mailkit {
         };
 
         let search_mailboxes = if all_mailboxes {
-            imap_client::list_mailbox_names(session.session()).await?
+            list_scannable_mailbox_names(session.session()).await?
         } else {
             vec![mailbox.to_string()]
         };
@@ -719,9 +1009,11 @@ impl Mailkit {
         let mut total_deleted = 0usize;
         let mut total_failed = 0usize;
         let mut per_mailbox = Vec::new();
+        let mut skipped = Vec::new();
 
         for mbox in &search_mailboxes {
             if imap_client::select(session.session(), mbox).await.is_err() {
+                skipped.push(mbox.clone());
                 continue;
             }
 
@@ -734,7 +1026,10 @@ impl Mailkit {
             let query = imap_client::build_search_query_pub(&criteria);
             let candidate_uids = match imap_client::search_uids(session.session(), &query).await {
                 Ok(uids) => uids,
-                Err(_) => continue,
+                Err(_) => {
+                    skipped.push(mbox.clone());
+                    continue;
+                }
             };
 
             if candidate_uids.is_empty() {
@@ -755,7 +1050,7 @@ impl Mailkit {
             }
 
             let found = exact_uids.len();
-            let (deleted, failed) = imap_client::bulk_delete_messages(
+            let result = imap_client::bulk_delete_messages(
                 session.session(),
                 &exact_uids,
                 trash.as_deref(),
@@ -765,35 +1060,35 @@ impl Mailkit {
             imap_client::sync(session.session()).await?;
 
             total_found += found;
-            total_deleted += deleted.len();
-            total_failed += failed.len();
+            total_deleted += result.deleted.len();
+            total_failed += result.failed.len();
 
             if found > 0 {
-                per_mailbox.push(serde_json::json!({
-                    "mailbox": mbox,
-                    "found": found,
-                    "deleted": deleted.len(),
-                    "failed": failed.len(),
-                }));
+                per_mailbox.push(PerMailboxDeleteResult {
+                    mailbox: mbox.clone(),
+                    found,
+                    deleted: result.deleted.len(),
+                    failed: result.failed.len(),
+                });
             }
         }
 
         session.release().await;
 
-        let mut result = serde_json::json!({
-            "mailbox": if all_mailboxes { "*" } else { mailbox },
-            "account": account,
-            "sender": sender_display,
-            "found": total_found,
-            "deleted": total_deleted,
-            "failed": total_failed,
-        });
-
-        if all_mailboxes {
-            result["mailboxes"] = serde_json::json!(per_mailbox);
-        }
-
-        Ok(result)
+        Ok(DeleteBySenderResponse {
+            mailbox: if all_mailboxes {
+                "*".to_string()
+            } else {
+                mailbox.to_string()
+            },
+            account: account.to_string(),
+            sender: sender_display,
+            found: total_found,
+            deleted: total_deleted,
+            failed: total_failed,
+            mailboxes: per_mailbox,
+            skipped,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -807,20 +1102,31 @@ impl Mailkit {
         account: &str,
         uid: u32,
         destination: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<MoveMessageResponse> {
         let mut session = self.pool.acquire(account).await?;
+
+        // Validate destination mailbox exists
+        let names = imap_client::list_mailbox_names(session.session()).await?;
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(destination)) {
+            session.release().await;
+            return Err(AgentmailError::Other(format!(
+                "Destination mailbox '{}' does not exist",
+                destination
+            )));
+        }
+
         imap_client::select(session.session(), mailbox).await?;
         imap_client::move_message(session.session(), uid, destination).await?;
         imap_client::sync(session.session()).await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "uid": uid,
-            "destination": destination,
-            "moved": true,
-        }))
+        Ok(MoveMessageResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            uid,
+            destination: destination.to_string(),
+            moved: true,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -836,11 +1142,11 @@ impl Mailkit {
         to: &[String],
         cc: &[String],
         bcc: &[String],
-    ) -> Result<serde_json::Value> {
+    ) -> Result<CreateDraftResponse> {
         let acct_config = self
             .pool
             .account_config(account)
-            .ok_or_else(|| MailkitError::AccountNotFound(account.to_string()))?;
+            .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
         let from = &acct_config.username;
 
         let rfc822 = draft::compose_draft(subject, body, to, cc, bcc, Some(from))?;
@@ -860,17 +1166,17 @@ impl Mailkit {
         imap_client::sync(session.session()).await?;
         session.release().await;
 
-        Ok(serde_json::json!({
-            "created": true,
-            "account": account,
-            "draftsMailbox": drafts_name,
-            "subject": subject,
-            "recipients": {
-                "to": to,
-                "cc": cc,
-                "bcc": bcc,
+        Ok(CreateDraftResponse {
+            created: true,
+            account: account.to_string(),
+            drafts_mailbox: drafts_name,
+            subject: subject.to_string(),
+            recipients: DraftRecipients {
+                to: to.to_vec(),
+                cc: cc.to_vec(),
+                bcc: bcc.to_vec(),
             },
-        }))
+        })
     }
 
     // -----------------------------------------------------------------
@@ -883,18 +1189,18 @@ impl Mailkit {
         mailbox: &str,
         account: &str,
         uid: u32,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<GetMessageSourceResponse> {
         let mut session = self.pool.acquire(account).await?;
         let raw = imap_client::get_message_source(session.session(), mailbox, uid).await?;
         session.release().await;
 
         let source = String::from_utf8_lossy(&raw).to_string();
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "uid": uid,
-            "source": source,
-        }))
+        Ok(GetMessageSourceResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            uid,
+            source,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -902,14 +1208,14 @@ impl Mailkit {
     // -----------------------------------------------------------------
 
     /// Download attachments from a message to a directory.
-    /// Files are named `{uid}_{original_name}`.
+    /// Files are named `{uid}_{index}_{original_name}`.
     pub async fn download_attachments(
         &self,
         mailbox: &str,
         account: &str,
         uid: u32,
         output_dir: &std::path::Path,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<DownloadAttachmentsResponse> {
         let mut session = self.pool.acquire(account).await?;
         let raw = imap_client::get_message_source(session.session(), mailbox, uid).await?;
         session.release().await;
@@ -918,54 +1224,52 @@ impl Mailkit {
         let attachments =
             tokio::task::spawn_blocking(move || parser::extract_attachment_data(&raw, uid))
                 .await
-                .map_err(|e| MailkitError::Other(format!("spawn_blocking join error: {}", e)))??;
+                .map_err(|e| {
+                    AgentmailError::Other(format!("spawn_blocking join error: {}", e))
+                })??;
 
         if attachments.is_empty() {
-            return Ok(serde_json::json!({
-                "mailbox": mailbox,
-                "account": account,
-                "uid": uid,
-                "downloaded": [],
-            }));
+            return Ok(DownloadAttachmentsResponse {
+                mailbox: mailbox.to_string(),
+                account: account.to_string(),
+                uid,
+                downloaded: Vec::new(),
+            });
         }
 
-        // Write files on a blocking thread (filesystem I/O)
+        // Write files using async I/O
         let output_dir = output_dir.to_path_buf();
-        let downloaded = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>> {
-            std::fs::create_dir_all(&output_dir).map_err(|e| {
-                MailkitError::Other(format!(
-                    "Failed to create directory '{}': {}",
-                    output_dir.display(),
-                    e
-                ))
+        tokio::fs::create_dir_all(&output_dir).await.map_err(|e| {
+            AgentmailError::Other(format!(
+                "Failed to create directory '{}': {}",
+                output_dir.display(),
+                e
+            ))
+        })?;
+
+        let mut downloaded = Vec::new();
+        for (index, (name, content_type, bytes)) in attachments.iter().enumerate() {
+            let filename = format!("{}_{}_{}", uid, index, sanitize_filename(name));
+            let path = output_dir.join(&filename);
+            tokio::fs::write(&path, bytes).await.map_err(|e| {
+                AgentmailError::Other(format!("Failed to write '{}': {}", path.display(), e))
             })?;
 
-            let mut results = Vec::new();
-            for (name, content_type, bytes) in &attachments {
-                let filename = format!("{}_{}", uid, sanitize_filename(name));
-                let path = output_dir.join(&filename);
-                std::fs::write(&path, bytes).map_err(|e| {
-                    MailkitError::Other(format!("Failed to write '{}': {}", path.display(), e))
-                })?;
+            downloaded.push(DownloadedFile {
+                index,
+                filename,
+                path: path.display().to_string(),
+                content_type: content_type.clone(),
+                size: bytes.len(),
+            });
+        }
 
-                results.push(serde_json::json!({
-                    "filename": filename,
-                    "path": path.display().to_string(),
-                    "contentType": content_type,
-                    "size": bytes.len(),
-                }));
-            }
-            Ok(results)
+        Ok(DownloadAttachmentsResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            uid,
+            downloaded,
         })
-        .await
-        .map_err(|e| MailkitError::Other(format!("spawn_blocking join error: {}", e)))??;
-
-        Ok(serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "uid": uid,
-            "downloaded": downloaded,
-        }))
     }
 
     // -----------------------------------------------------------------
@@ -985,10 +1289,9 @@ impl Mailkit {
         uid: u32,
         delete_matching: bool,
         on_progress: Option<&ProgressFn>,
-    ) -> Result<serde_json::Value> {
-        let trash = self.trash_mailbox(account);
-
+    ) -> Result<UnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
+        let trash = self.resolve_trash_mailbox(session.session(), account).await;
 
         // Fetch unsubscribe + list-id headers from the target message
         let headers =
@@ -996,23 +1299,31 @@ impl Mailkit {
 
         let has_unsubscribe = headers.list_unsubscribe.is_some();
 
-        let mut result = serde_json::json!({
-            "mailbox": mailbox,
-            "account": account,
-            "uid": uid,
-            "listUnsubscribe": headers.list_unsubscribe,
-            "listUnsubscribePost": headers.list_unsubscribe_post,
-            "listId": headers.list_id,
-        });
+        let mut response = UnsubscribeResponse {
+            mailbox: mailbox.to_string(),
+            account: account.to_string(),
+            uid,
+            list_unsubscribe: headers.list_unsubscribe.clone(),
+            list_unsubscribe_post: headers.list_unsubscribe_post.clone(),
+            list_id: headers.list_id.clone(),
+            pathway: None,
+            unsubscribed: UnsubscribeResult {
+                success: false,
+                method: None,
+                url: None,
+                http_status: None,
+                reason: None,
+            },
+            matching_messages: None,
+        };
 
         if has_unsubscribe {
-            let unsub_result = attempt_one_click_unsubscribe(
+            response.unsubscribed = attempt_one_click_unsubscribe(
                 headers.list_unsubscribe.as_deref(),
                 headers.list_unsubscribe_post.as_deref(),
             )
             .await;
-            result["unsubscribed"] = serde_json::json!(unsub_result);
-            result["pathway"] = serde_json::json!("list-unsubscribe");
+            response.pathway = Some("list-unsubscribe".to_string());
 
             if delete_matching {
                 // Get the exact sender of the target message
@@ -1026,16 +1337,18 @@ impl Mailkit {
                 };
 
                 // Search every mailbox for messages from this sender that
-                // have a List-Unsubscribe-Post header (bulk/marketing mail)
-                let all_mailboxes = imap_client::list_mailbox_names(session.session()).await?;
+                // have a List-Unsubscribe header (bulk/marketing mail)
+                let all_mailboxes = list_scannable_mailbox_names(session.session()).await?;
 
                 let mut total_found = 0usize;
                 let mut total_deleted = 0usize;
                 let mut total_failed = 0usize;
                 let mut per_mailbox = Vec::new();
+                let mut skipped = Vec::new();
 
                 for mbox in &all_mailboxes {
                     if imap_client::select(session.session(), mbox).await.is_err() {
+                        skipped.push(mbox.clone());
                         continue;
                     }
 
@@ -1046,13 +1359,19 @@ impl Mailkit {
                     };
                     let query = imap_client::build_search_query_pub(&criteria);
                     let candidate_uids =
-                        imap_client::search_uids(session.session(), &query).await?;
+                        match imap_client::search_uids(session.session(), &query).await {
+                            Ok(uids) => uids,
+                            Err(_) => {
+                                skipped.push(mbox.clone());
+                                continue;
+                            }
+                        };
 
                     if candidate_uids.is_empty() {
                         continue;
                     }
 
-                    let exact_uids = filter_sender_with_unsub_post(
+                    let exact_uids = filter_sender_bulk_mail(
                         session.session(),
                         &candidate_uids,
                         &target_email,
@@ -1065,7 +1384,7 @@ impl Mailkit {
                     }
 
                     let found = exact_uids.len();
-                    let (deleted, failed) = imap_client::bulk_delete_messages(
+                    let result = imap_client::bulk_delete_messages(
                         session.session(),
                         &exact_uids,
                         trash.as_deref(),
@@ -1075,47 +1394,63 @@ impl Mailkit {
                     imap_client::sync(session.session()).await?;
 
                     total_found += found;
-                    total_deleted += deleted.len();
-                    total_failed += failed.len();
+                    total_deleted += result.deleted.len();
+                    total_failed += result.failed.len();
 
                     if found > 0 {
-                        per_mailbox.push(serde_json::json!({
-                            "mailbox": mbox,
-                            "found": found,
-                            "deleted": deleted.len(),
-                            "failed": failed.len(),
-                        }));
+                        per_mailbox.push(PerMailboxDeleteResult {
+                            mailbox: mbox.clone(),
+                            found,
+                            deleted: result.deleted.len(),
+                            failed: result.failed.len(),
+                        });
                     }
                 }
 
-                result["matchingMessages"] = serde_json::json!({
-                    "matchedBy": "sender+list-unsubscribe-post",
-                    "sender": sender_display,
-                    "found": total_found,
-                    "deleted": total_deleted,
-                    "failed": total_failed,
-                    "mailboxes": per_mailbox,
+                response.matching_messages = Some(MatchingMessagesResult {
+                    matched_by: "sender+list-unsubscribe".to_string(),
+                    sender: sender_display,
+                    found: total_found,
+                    deleted: total_deleted,
+                    failed: total_failed,
+                    mailboxes: per_mailbox,
+                    skipped,
                 });
             }
         } else {
-            result["unsubscribed"] = serde_json::json!({
-                "success": false,
-                "reason": "Message has no List-Unsubscribe header.",
-            });
+            response.unsubscribed = UnsubscribeResult {
+                success: false,
+                method: None,
+                url: None,
+                http_status: None,
+                reason: Some("Message has no List-Unsubscribe header.".to_string()),
+            };
         }
 
         session.release().await;
-        Ok(result)
+        Ok(response)
     }
 
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------
 
-    fn trash_mailbox(&self, account: &str) -> Option<String> {
+    fn configured_trash(&self, account: &str) -> Option<String> {
         self.pool
             .account_config(account)
             .and_then(|c| c.trash_mailbox.clone())
+    }
+
+    /// Resolve trash mailbox: config override, then auto-detect.
+    async fn resolve_trash_mailbox(
+        &self,
+        session: &mut imap_client::ImapSession,
+        account: &str,
+    ) -> Option<String> {
+        if let Some(configured) = self.configured_trash(account) {
+            return Some(configured);
+        }
+        find_trash_mailbox(session).await.ok().flatten()
     }
 }
 
@@ -1123,16 +1458,17 @@ impl Mailkit {
 // Utility functions
 // ---------------------------------------------------------------------------
 
-/// From a set of candidate UIDs, fetch FROM + List-Unsubscribe-Post headers and
-/// return only those that match the exact sender AND have a List-Unsubscribe-Post header.
-async fn filter_sender_with_unsub_post(
+/// From a set of candidate UIDs, fetch FROM + List-Unsubscribe/Post headers and
+/// return only those that match the exact sender AND have either List-Unsubscribe
+/// or List-Unsubscribe-Post (i.e. bulk/marketing mail).
+async fn filter_sender_bulk_mail(
     session: &mut imap_client::ImapSession,
     candidate_uids: &[u32],
     target_email: &str,
     target_name: &str,
 ) -> Result<Vec<u32>> {
     let mut exact = Vec::new();
-    for chunk in candidate_uids.chunks(500) {
+    for chunk in candidate_uids.chunks(1000) {
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -1142,12 +1478,12 @@ async fn filter_sender_with_unsub_post(
         let fetched = imap_client::timed_uid_fetch_collect_pub(
             session,
             &uid_set,
-            "(UID BODY.PEEK[HEADER.FIELDS (FROM List-Unsubscribe-Post)])",
+            "(UID BODY.PEEK[HEADER.FIELDS (FROM List-Unsubscribe List-Unsubscribe-Post)])",
         )
         .await?;
 
         for item in fetched {
-            let fetch = item.map_err(MailkitError::Imap)?;
+            let fetch = item.map_err(AgentmailError::Imap)?;
             let uid = match fetch.uid {
                 Some(u) => u,
                 None => continue,
@@ -1155,9 +1491,13 @@ async fn filter_sender_with_unsub_post(
             let header_bytes = fetch.header().unwrap_or(&[]);
             let header_str = String::from_utf8_lossy(header_bytes);
 
-            // Must have List-Unsubscribe-Post
-            if imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe-Post").is_none()
-            {
+            // Must have List-Unsubscribe OR List-Unsubscribe-Post
+            let has_unsub =
+                imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe").is_some();
+            let has_unsub_post =
+                imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe-Post")
+                    .is_some();
+            if !has_unsub && !has_unsub_post {
                 continue;
             }
 
@@ -1191,43 +1531,42 @@ fn extract_https_unsubscribe_url(header: &str) -> Option<String> {
 
 /// Attempt RFC 8058 one-click unsubscribe.
 ///
-/// Returns a JSON-friendly status object:
-/// - `{ "success": true, "method": "one-click", "url": "..." }` on success
-/// - `{ "success": false, "reason": "..." }` on failure or when not supported
+/// Attempt RFC 8058 one-click unsubscribe.
 async fn attempt_one_click_unsubscribe(
     list_unsubscribe: Option<&str>,
     list_unsubscribe_post: Option<&str>,
-) -> serde_json::Value {
+) -> UnsubscribeResult {
+    let fail = |reason: &str| UnsubscribeResult {
+        success: false,
+        method: None,
+        url: None,
+        http_status: None,
+        reason: Some(reason.to_string()),
+    };
+
     // RFC 8058 requires both List-Unsubscribe (with https URL) and
     // List-Unsubscribe-Post: List-Unsubscribe=One-Click
     let post_value = match list_unsubscribe_post {
         Some(v) if v.contains("List-Unsubscribe=One-Click") => v,
         _ => {
-            return serde_json::json!({
-                "success": false,
-                "reason": "No List-Unsubscribe-Post header with One-Click support. Manual unsubscribe may be required via the List-Unsubscribe URL.",
-            });
+            return fail(
+                "No List-Unsubscribe-Post header with One-Click support. Manual unsubscribe may be required via the List-Unsubscribe URL.",
+            );
         }
     };
     let _ = post_value;
 
     let unsub_header = match list_unsubscribe {
         Some(h) => h,
-        None => {
-            return serde_json::json!({
-                "success": false,
-                "reason": "No List-Unsubscribe header found.",
-            });
-        }
+        None => return fail("No List-Unsubscribe header found."),
     };
 
     let url = match extract_https_unsubscribe_url(unsub_header) {
         Some(u) => u,
         None => {
-            return serde_json::json!({
-                "success": false,
-                "reason": "No HTTPS URL found in List-Unsubscribe header. Only mailto: links are present.",
-            });
+            return fail(
+                "No HTTPS URL found in List-Unsubscribe header. Only mailto: links are present.",
+            );
         }
     };
 
@@ -1237,12 +1576,7 @@ async fn attempt_one_click_unsubscribe(
         .build();
     let client = match client {
         Ok(c) => c,
-        Err(e) => {
-            return serde_json::json!({
-                "success": false,
-                "reason": format!("Failed to create HTTP client: {e}"),
-            });
-        }
+        Err(e) => return fail(&format!("Failed to create HTTP client: {e}")),
     };
 
     match client
@@ -1255,28 +1589,30 @@ async fn attempt_one_click_unsubscribe(
         Ok(resp) => {
             let status = resp.status().as_u16();
             if resp.status().is_success() || resp.status().is_redirection() {
-                serde_json::json!({
-                    "success": true,
-                    "method": "one-click",
-                    "url": url,
-                    "httpStatus": status,
-                })
+                UnsubscribeResult {
+                    success: true,
+                    method: Some("one-click".to_string()),
+                    url: Some(url),
+                    http_status: Some(status),
+                    reason: None,
+                }
             } else {
-                serde_json::json!({
-                    "success": false,
-                    "reason": format!("Unsubscribe endpoint returned HTTP {status}"),
-                    "url": url,
-                    "httpStatus": status,
-                })
+                UnsubscribeResult {
+                    success: false,
+                    method: None,
+                    url: Some(url),
+                    http_status: Some(status),
+                    reason: Some(format!("Unsubscribe endpoint returned HTTP {status}")),
+                }
             }
         }
-        Err(e) => {
-            serde_json::json!({
-                "success": false,
-                "reason": format!("HTTP request failed: {e}"),
-                "url": url,
-            })
-        }
+        Err(e) => UnsubscribeResult {
+            success: false,
+            method: None,
+            url: Some(url),
+            http_status: None,
+            reason: Some(format!("HTTP request failed: {e}")),
+        },
     }
 }
 
@@ -1284,6 +1620,30 @@ async fn attempt_one_click_unsubscribe(
 pub fn clamp_usize(val: Option<u64>, default: usize, min: usize, max: usize) -> usize {
     let v = val.map(|v| v as usize).unwrap_or(default);
     v.max(min).min(max)
+}
+
+/// Auto-detect the Trash mailbox by scanning LIST results.
+async fn find_trash_mailbox(session: &mut imap_client::ImapSession) -> Result<Option<String>> {
+    let names = imap_client::list_mailbox_names(session).await?;
+    let candidates = [
+        "Trash",
+        "[Gmail]/Trash",
+        "INBOX.Trash",
+        "Deleted Messages",
+        "Deleted",
+    ];
+    for candidate in &candidates {
+        if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(candidate)) {
+            return Ok(Some(name.clone()));
+        }
+    }
+    if let Some(name) = names
+        .iter()
+        .find(|n| n.to_lowercase().contains("trash") || n.to_lowercase().contains("deleted"))
+    {
+        return Ok(Some(name.clone()));
+    }
+    Ok(None)
 }
 
 /// Auto-detect the Drafts mailbox by scanning LIST results.
@@ -1301,6 +1661,69 @@ async fn find_drafts_mailbox(session: &mut imap_client::ImapSession) -> Result<O
         return Ok(Some(name.clone()));
     }
     Ok(None)
+}
+
+/// List mailbox names suitable for scanning — excludes Trash, Junk, Spam, and Drafts.
+/// These mailboxes contain deleted/spam/incomplete messages that skew scan results.
+async fn list_scannable_mailbox_names(
+    session: &mut imap_client::ImapSession,
+) -> Result<Vec<String>> {
+    let all = imap_client::list_mailbox_names(session).await?;
+
+    // Exact names to skip (case-insensitive)
+    let skip_exact: &[&str] = &[
+        "Trash",
+        "Junk",
+        "Spam",
+        "Drafts",
+        "[Gmail]/Trash",
+        "[Gmail]/Spam",
+        "[Gmail]/Drafts",
+        "INBOX.Trash",
+        "INBOX.Junk",
+        "INBOX.Drafts",
+        "Deleted Messages",
+        "Deleted",
+    ];
+
+    Ok(all
+        .into_iter()
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            // Skip exact matches
+            if skip_exact.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+                return false;
+            }
+            // Skip any mailbox containing junk/spam/trash/deleted/draft
+            if lower.contains("junk")
+                || lower.contains("spam")
+                || lower.contains("trash")
+                || lower.contains("deleted")
+                || lower.contains("draft")
+            {
+                return false;
+            }
+            true
+        })
+        .collect())
+}
+
+/// Extract the display name from a List-Id header value.
+/// Format: `Cool List <cool.example.com>` → "Cool List"
+/// If no display name, returns the identifier: `<cool.example.com>` → "cool.example.com"
+fn extract_list_id_display(list_id: &str) -> String {
+    let trimmed = list_id.trim();
+    if let Some(bracket_start) = trimmed.find('<') {
+        let before = trimmed[..bracket_start].trim();
+        if !before.is_empty() {
+            return before.to_string();
+        }
+        // No display name — extract the identifier from angle brackets
+        if let Some(bracket_end) = trimmed.find('>') {
+            return trimmed[bracket_start + 1..bracket_end].to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Sanitize a filename: replace path separators and control chars with underscores.

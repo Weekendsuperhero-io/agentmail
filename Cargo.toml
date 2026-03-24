@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/mailkit", "crates/mailkit-mcp"]
+members = ["crates/agentmail", "crates/agentmail-mcp"]

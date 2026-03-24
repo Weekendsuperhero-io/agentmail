@@ -1,14 +1,23 @@
-use clap::{Parser, Subcommand};
+use agentmail::{
+    ConnectionStatus, CreateDraftResponse, CreateMailboxResponse, DeleteBySenderResponse,
+    DeleteListIdResponse, DeleteMessagesResponse, DownloadAttachmentsResponse,
+    FindAttachmentsResponse, GetMessagesResponse, ListAccountsResponse, ListCapabilitiesResponse,
+    ListFlagsResponse, ListMailboxesResponse, MoveMessageResponse, RankListIdResponse,
+    RankSendersResponse, RankUnsubscribeResponse, SearchMessagesResponse, UnsubscribeResponse,
+    UpdateFlagsResponse,
+};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::{
-        router::prompt::PromptRouter, router::tool::ToolRouter, wrapper::Parameters,
+        router::prompt::PromptRouter,
+        router::tool::ToolRouter,
+        wrapper::{Json, Parameters},
     },
     model::{
-        CallToolResult, ClientJsonRpcMessage, ClientNotification, ClientRequest, Content,
-        GetPromptRequestParams, GetPromptResult, InitializedNotification, JsonRpcMessage,
-        ListPromptsResult, Meta, PaginatedRequestParams, ProgressNotificationParam, PromptMessage,
-        PromptMessageRole, ProtocolVersion, ServerCapabilities, ServerInfo, ServerResult,
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, GetPromptRequestParams,
+        GetPromptResult, InitializedNotification, JsonRpcMessage, ListPromptsResult, Meta,
+        PaginatedRequestParams, ProgressNotificationParam, PromptMessage, PromptMessageRole,
+        ProtocolVersion, ServerCapabilities, ServerInfo, ServerResult,
     },
     prompt, prompt_handler, prompt_router,
     service::RequestContext,
@@ -23,13 +32,9 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-fn tool_success(value: Value) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::structured(value))
-}
-
-fn tool_error(message: impl Into<String>) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::error(vec![Content::text(message.into())]))
-}
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
 
 fn default_true() -> bool {
     true
@@ -41,7 +46,7 @@ fn default_false() -> bool {
 
 /// Build an optional progress callback from MCP meta + peer.
 /// Returns `None` if the client didn't provide a progress token.
-fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> Option<mailkit::ProgressFn> {
+fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> Option<agentmail::ProgressFn> {
     let token = meta.get_progress_token()?.clone();
     let peer = peer.clone();
     Some(Arc::new(move |completed: u64, total: u64| {
@@ -168,7 +173,7 @@ struct SearchMessagesArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for listing flags in use.")]
 struct ListFlagsArgs {
-    #[schemars(description = "Mailbox to scan. Defaults to INBOX.")]
+    #[schemars(description = "Mailbox to scan. Omit to scan all mailboxes in the account.")]
     mailbox: Option<String>,
     #[schemars(description = "Account name (required).")]
     account: String,
@@ -215,7 +220,7 @@ struct DeleteBySenderArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for finding messages with attachments.")]
 struct FindAttachmentsArgs {
-    #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
+    #[schemars(description = "Mailbox name. Omit to scan all mailboxes in the account.")]
     mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
@@ -321,6 +326,34 @@ struct RankUnsubscribeArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(description = "Arguments for ranking mailing lists by List-Id header.")]
+struct RankListIdArgs {
+    #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
+    mailbox: Option<String>,
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    account: String,
+    #[schemars(description = "Maximum number of lists to return. If omitted, returns all lists.")]
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(description = "Arguments for deleting all messages with a specific List-Id.")]
+struct DeleteListIdArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    account: String,
+    #[schemars(description = "The List-Id header value to match (from rank_list_id).")]
+    list_id: String,
+    #[schemars(description = "Mailbox to search. Omit to search all mailboxes.")]
+    mailbox: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for creating a new mailbox on the server.")]
 struct CreateMailboxArgs {
     #[schemars(
@@ -352,27 +385,7 @@ struct DownloadAttachmentsArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(
-    description = "Arguments for setting a colored flag on a message (Apple Mail compatible)."
-)]
-struct SetFlagColorArgs {
-    #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
-    mailbox: Option<String>,
-    #[schemars(
-        description = "Account name (required). Use list_accounts to discover valid names."
-    )]
-    account: String,
-    #[schemars(description = "IMAP UID of the message to flag.")]
-    uid: u32,
-    #[schemars(
-        description = "Color name: red, orange, yellow, green, blue, purple, gray. Omit or set to null to remove the flag."
-    )]
-    color: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-#[schemars(
-    description = "Arguments for adding flags to a message (union — existing flags are preserved)."
+    description = "Arguments for adding flags and/or setting an Apple Mail color on a message."
 )]
 struct AddFlagsArgs {
     #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
@@ -383,15 +396,22 @@ struct AddFlagsArgs {
     account: String,
     #[schemars(description = "IMAP UID of the message.")]
     uid: u32,
+    #[serde(default)]
     #[schemars(
-        description = "Flags to add. System flags use backslash prefix (e.g. \"\\\\Seen\", \"\\\\Flagged\"). Custom keywords are plain strings (e.g. \"$MailFlagBit0\")."
+        description = "Flags to add. System flags use backslash prefix (e.g. \"\\\\Seen\", \"\\\\Flagged\"). Custom keywords are plain strings. Cannot include \\\\Deleted or \\\\Recent."
     )]
     flags: Vec<String>,
+    #[schemars(
+        description = "Apple Mail color to set (case-insensitive): red, orange, yellow, green, blue, purple, gray. Sets \\\\Flagged + $MailFlagBit keywords. Replaces any existing color."
+    )]
+    color: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[schemars(description = "Arguments for removing flags from a message.")]
+#[schemars(
+    description = "Arguments for removing flags and/or clearing Apple Mail color from a message."
+)]
 struct RemoveFlagsArgs {
     #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
     mailbox: Option<String>,
@@ -401,10 +421,16 @@ struct RemoveFlagsArgs {
     account: String,
     #[schemars(description = "IMAP UID of the message.")]
     uid: u32,
+    #[serde(default)]
     #[schemars(
-        description = "Flags to remove. System flags use backslash prefix (e.g. \"\\\\Seen\", \"\\\\Flagged\"). Custom keywords are plain strings."
+        description = "Flags to remove. System flags use backslash prefix (e.g. \"\\\\Seen\"). Cannot include \\\\Deleted or \\\\Recent."
     )]
     flags: Vec<String>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "If true, removes the Apple Mail color flag (\\\\Flagged + all $MailFlagBit keywords). Defaults to false."
+    )]
+    color: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,12 +480,19 @@ struct UnsubscribeCleanupArgs {
     account: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ListIdCleanupArgs {
+    #[schemars(description = "Account name.")]
+    account: String,
+}
+
 // ---------------------------------------------------------------------------
 // CompatStdioWorker — handles JSON-RPC stdio transport with init patching
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-enum CompatTransportError {
+pub enum CompatTransportError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Join(tokio::task::JoinError),
@@ -569,7 +602,7 @@ fn parse_client_message(raw: &str) -> Result<ClientJsonRpcMessage, CompatTranspo
 }
 
 #[derive(Clone, Default)]
-struct CompatStdioWorker;
+pub struct CompatStdioWorker;
 
 impl Worker for CompatStdioWorker {
     type Error = CompatTransportError;
@@ -699,19 +732,19 @@ impl Worker for CompatStdioWorker {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct MailKitServer {
+pub struct AgentMailServer {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
-    mailkit: Arc<mailkit::Mailkit>,
+    agentmail: Arc<agentmail::Agentmail>,
 }
 
 #[tool_router]
-impl MailKitServer {
-    fn new(mailkit: mailkit::Mailkit) -> Self {
+impl AgentMailServer {
+    pub fn new(agentmail: agentmail::Agentmail) -> Self {
         Self {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
-            mailkit: Arc::new(mailkit),
+            agentmail: Arc::new(agentmail),
         }
     }
 
@@ -723,10 +756,10 @@ impl MailKitServer {
     async fn list_accounts_tool(
         &self,
         Parameters(_args): Parameters<ListAccountsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.mailkit.list_accounts().await {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+    ) -> Result<Json<ListAccountsResponse>, McpError> {
+        match self.agentmail.list_accounts().await {
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -738,11 +771,11 @@ impl MailKitServer {
     async fn list_mailboxes_tool(
         &self,
         Parameters(args): Parameters<ListMailboxesArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<ListMailboxesResponse>, McpError> {
         let account = args.account.filter(|s| !s.trim().is_empty());
-        match self.mailkit.list_mailboxes(account.as_deref()).await {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+        match self.agentmail.list_mailboxes(account.as_deref()).await {
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -758,17 +791,17 @@ impl MailKitServer {
     async fn create_mailbox_tool(
         &self,
         Parameters(args): Parameters<CreateMailboxArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<CreateMailboxResponse>, McpError> {
         if args.mailbox_name.trim().is_empty() {
-            return tool_error("mailbox_name is required");
+            return Err(McpError::internal_error("mailbox_name is required", None));
         }
         match self
-            .mailkit
+            .agentmail
             .create_mailbox(&args.account, &args.mailbox_name)
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -780,10 +813,10 @@ impl MailKitServer {
     async fn check_connection_tool(
         &self,
         Parameters(args): Parameters<CheckConnectionArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.mailkit.check_connection(&args.account).await {
-            Ok(status) => tool_success(serde_json::to_value(status).unwrap_or_default()),
-            Err(e) => tool_error(e.to_string()),
+    ) -> Result<Json<ConnectionStatus>, McpError> {
+        match self.agentmail.check_connection(&args.account).await {
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -795,10 +828,10 @@ impl MailKitServer {
     async fn list_capabilities_tool(
         &self,
         Parameters(args): Parameters<ListCapabilitiesArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.mailkit.list_capabilities(&args.account).await {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+    ) -> Result<Json<ListCapabilitiesResponse>, McpError> {
+        match self.agentmail.list_capabilities(&args.account).await {
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -810,13 +843,13 @@ impl MailKitServer {
     async fn get_messages_tool(
         &self,
         Parameters(args): Parameters<GetMessagesArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<GetMessagesResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
-        let offset = mailkit::clamp_usize(args.offset, 0, 0, 1_000_000);
-        let limit = mailkit::clamp_usize(args.limit, 25, 1, 50);
+        let offset = agentmail::clamp_usize(args.offset, 0, 0, 1_000_000);
+        let limit = agentmail::clamp_usize(args.limit, 25, 1, 50);
 
         match self
-            .mailkit
+            .agentmail
             .get_messages(
                 &mailbox,
                 &args.account,
@@ -827,8 +860,8 @@ impl MailKitServer {
             )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -840,12 +873,12 @@ impl MailKitServer {
     async fn search_messages_tool(
         &self,
         Parameters(args): Parameters<SearchMessagesArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<SearchMessagesResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
-        let offset = mailkit::clamp_usize(args.offset, 0, 0, 1_000_000);
-        let limit = mailkit::clamp_usize(args.limit, 25, 1, 50);
+        let offset = agentmail::clamp_usize(args.offset, 0, 0, 1_000_000);
+        let limit = agentmail::clamp_usize(args.limit, 25, 1, 50);
 
-        let criteria = mailkit::SearchCriteria {
+        let criteria = agentmail::SearchCriteria {
             text: args.query,
             from: args.sender_contains,
             subject: args.subject_contains,
@@ -861,7 +894,7 @@ impl MailKitServer {
         };
 
         match self
-            .mailkit
+            .agentmail
             .search_messages(
                 &mailbox,
                 &args.account,
@@ -873,14 +906,14 @@ impl MailKitServer {
             )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
         name = "list_flags",
-        description = "List all IMAP flags in use across messages in a mailbox with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Scans all messages. Useful for understanding mailbox state.",
+        description = "List all IMAP flags in use with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Omit mailbox to scan the entire account across all mailboxes. Resolves Apple Mail $MailFlagBit color flags to color names (red, orange, yellow, green, blue, purple, gray).",
         annotations(read_only_hint = true)
     )]
     async fn list_flags_tool(
@@ -888,16 +921,15 @@ impl MailKitServer {
         meta: Meta,
         client: Peer<RoleServer>,
         Parameters(args): Parameters<ListFlagsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.as_deref().unwrap_or("INBOX");
+    ) -> Result<Json<ListFlagsResponse>, McpError> {
         let progress = make_progress_fn(&meta, &client);
         match self
-            .mailkit
-            .list_flags(mailbox, &args.account, progress.as_ref())
+            .agentmail
+            .list_flags(args.mailbox.as_deref(), &args.account, progress.as_ref())
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -911,29 +943,35 @@ impl MailKitServer {
         meta: Meta,
         client: Peer<RoleServer>,
         Parameters(args): Parameters<DeleteMessagesArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<DeleteMessagesResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         if args.uids.is_empty() {
-            return tool_error("uids must contain at least one UID");
+            return Err(McpError::internal_error(
+                "uids must contain at least one UID",
+                None,
+            ));
         }
         if args.uids.len() > 500 {
-            return tool_error("uids supports up to 500 UIDs per call");
+            return Err(McpError::internal_error(
+                "uids supports up to 500 UIDs per call",
+                None,
+            ));
         }
 
         let progress = make_progress_fn(&meta, &client);
         match self
-            .mailkit
+            .agentmail
             .delete_messages(&mailbox, &args.account, &args.uids, progress.as_ref())
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
         name = "delete_by_sender",
-        description = "Delete all messages from an exact sender. Takes a UID to identify the sender — extracts the full From header (display name + email) and deletes every message with an identical sender. 'Dutch Bros Coffee <member@rewards.dutchbros.com>' and 'member@rewards.dutchbros.com' are treated as different senders. Set allMailboxes=true to search and delete across the entire account. Ideal for bulk cleanup after rank_senders.",
+        description = "Delete all messages from an exact sender. Takes a UID to identify the sender — extracts the full From header (display name + email) and deletes every message with an identical sender. Set allMailboxes=true to search and delete across the entire account. Ideal for bulk cleanup after rank_senders. For mailing list cleanup, use unsubscribe_message instead — it attempts one-click unsubscribe and only deletes bulk mail.",
         annotations(destructive_hint = true)
     )]
     async fn delete_by_sender_tool(
@@ -941,12 +979,12 @@ impl MailKitServer {
         meta: Meta,
         client: Peer<RoleServer>,
         Parameters(args): Parameters<DeleteBySenderArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<DeleteBySenderResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
 
         let progress = make_progress_fn(&meta, &client);
         match self
-            .mailkit
+            .agentmail
             .delete_by_sender(
                 &mailbox,
                 &args.account,
@@ -956,14 +994,14 @@ impl MailKitServer {
             )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
         name = "find_attachments",
-        description = "Scan a mailbox for messages that have attachments. Returns paginated UIDs (newest-first) and total count. Use download_attachments with a specific UID to save files to disk.",
+        description = "Scan for messages with attachments (multipart/mixed or multipart/related). Returns paginated UIDs (newest-first) and total count. Omit mailbox to scan the entire account with a per-mailbox breakdown. Use download_attachments with a specific UID to save files to disk.",
         annotations(read_only_hint = true)
     )]
     async fn find_attachments_tool(
@@ -971,19 +1009,24 @@ impl MailKitServer {
         meta: Meta,
         client: Peer<RoleServer>,
         Parameters(args): Parameters<FindAttachmentsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
-        let offset = mailkit::clamp_usize(args.offset, 0, 0, 100_000);
-        let limit = mailkit::clamp_usize(args.limit, 25, 1, 100);
+    ) -> Result<Json<FindAttachmentsResponse>, McpError> {
+        let offset = agentmail::clamp_usize(args.offset, 0, 0, 100_000);
+        let limit = agentmail::clamp_usize(args.limit, 25, 1, 100);
         let progress = make_progress_fn(&meta, &client);
 
         match self
-            .mailkit
-            .find_attachments(&mailbox, &args.account, offset, limit, progress.as_ref())
+            .agentmail
+            .find_attachments(
+                args.mailbox.as_deref(),
+                &args.account,
+                offset,
+                limit,
+                progress.as_ref(),
+            )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -999,7 +1042,7 @@ impl MailKitServer {
     async fn download_attachments_tool(
         &self,
         Parameters(args): Parameters<DownloadAttachmentsArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<DownloadAttachmentsResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         let output_dir = args
             .output_dir
@@ -1007,12 +1050,12 @@ impl MailKitServer {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
 
         match self
-            .mailkit
+            .agentmail
             .download_attachments(&mailbox, &args.account, args.uid, &output_dir)
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -1024,9 +1067,15 @@ impl MailKitServer {
     async fn create_draft_tool(
         &self,
         Parameters(args): Parameters<CreateDraftArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<CreateDraftResponse>, McpError> {
+        if args.to.is_empty() && args.cc.is_empty() && args.bcc.is_empty() {
+            return Err(McpError::internal_error(
+                "At least one recipient (to, cc, or bcc) is required",
+                None,
+            ));
+        }
         match self
-            .mailkit
+            .agentmail
             .create_draft(
                 &args.account,
                 args.subject.trim(),
@@ -1037,8 +1086,8 @@ impl MailKitServer {
             )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -1050,21 +1099,21 @@ impl MailKitServer {
     async fn move_message_tool(
         &self,
         Parameters(args): Parameters<MoveMessageArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<MoveMessageResponse>, McpError> {
         if args.mailbox.trim().is_empty() {
-            return tool_error("mailbox is required");
+            return Err(McpError::internal_error("mailbox is required", None));
         }
         if args.destination.trim().is_empty() {
-            return tool_error("destination is required");
+            return Err(McpError::internal_error("destination is required", None));
         }
 
         match self
-            .mailkit
+            .agentmail
             .move_message(&args.mailbox, &args.account, args.uid, &args.destination)
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -1078,12 +1127,12 @@ impl MailKitServer {
         meta: Meta,
         client: Peer<RoleServer>,
         Parameters(args): Parameters<UnsubscribeMessageArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<UnsubscribeResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         let progress = make_progress_fn(&meta, &client);
 
         match self
-            .mailkit
+            .agentmail
             .unsubscribe_message(
                 &mailbox,
                 &args.account,
@@ -1093,14 +1142,14 @@ impl MailKitServer {
             )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
         name = "rank_senders",
-        description = "Rank all senders by message count. Omit mailbox to scan the entire account across all mailboxes. Returns each unique sender with message count, display name, and date range (oldest/newest). Sorted by message count descending. Efficient: fetches only FROM+DATE headers using BODY.PEEK.",
+        description = "Rank all senders by message count. Omit mailbox to scan the entire account across all mailboxes. Groups by (email, display name) — 'Find My <noreply@apple.com>' and 'iCloud <noreply@apple.com>' are separate entries. Sorted by message count descending. Efficient: fetches only FROM+DATE headers using BODY.PEEK.",
         annotations(read_only_hint = true)
     )]
     async fn rank_senders_tool(
@@ -1108,12 +1157,12 @@ impl MailKitServer {
         meta: Meta,
         client: Peer<RoleServer>,
         Parameters(args): Parameters<RankSendersArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<RankSendersResponse>, McpError> {
         let limit = args.limit.map(|v| v as usize);
         let progress = make_progress_fn(&meta, &client);
 
         match self
-            .mailkit
+            .agentmail
             .group_by_sender(
                 args.mailbox.as_deref(),
                 &args.account,
@@ -1122,14 +1171,14 @@ impl MailKitServer {
             )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
         name = "rank_unsubscribe",
-        description = "Rank bulk-mail senders by message count. Omit mailbox to scan the entire account. Includes messages with either List-Unsubscribe or List-Unsubscribe-Post. Grouped by sender (From), sorted by one-click support first then by count. The unsubscribe URL is taken from the newest message per sender. Deletion via unsubscribe_message matches by exact sender + List-Unsubscribe-Post. Returns count, unsubscribe URL, List-Unsubscribe-Post, List-Id, sample UID + mailbox.",
+        description = "Rank bulk-mail senders by message count. Omit mailbox to scan the entire account. Includes messages with either List-Unsubscribe or List-Unsubscribe-Post. Grouped by sender (From), sorted by one-click support first then by count. To clean up a sender, pass the sampleUid and sampleMailbox to unsubscribe_message (not delete_by_sender). Returns count, unsubscribe URL, one-click flag, sample UID + mailbox.",
         annotations(read_only_hint = true)
     )]
     async fn rank_unsubscribe_tool(
@@ -1137,12 +1186,12 @@ impl MailKitServer {
         meta: Meta,
         client: Peer<RoleServer>,
         Parameters(args): Parameters<RankUnsubscribeArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<RankUnsubscribeResponse>, McpError> {
         let limit = args.limit.map(|v| v as usize);
         let progress = make_progress_fn(&meta, &client);
 
         match self
-            .mailkit
+            .agentmail
             .group_by_list(
                 args.mailbox.as_deref(),
                 &args.account,
@@ -1151,80 +1200,160 @@ impl MailKitServer {
             )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
-        name = "set_flag_color",
-        description = "Set or remove a colored flag on a message (Apple Mail compatible). Colors: red, orange, yellow, green, blue, purple, gray. Sets \\Flagged plus $MailFlagBit0-2 keywords per RFC draft-eggert-mailflagcolors. Existing non-flag keywords are preserved (union semantics). Omit color to unflag.",
-        annotations(read_only_hint = false, destructive_hint = false)
+        name = "rank_list_id",
+        description = "Rank mailing lists by List-Id header (RFC 2919). Groups all messages from the same mailing list regardless of sender address — useful for lists like GitHub notifications where multiple senders share one List-Id. Omit mailbox to scan the entire account. Use delete_list_id to remove all messages from a list.",
+        annotations(read_only_hint = true)
     )]
-    async fn set_flag_color_tool(
+    async fn rank_list_id_tool(
         &self,
-        Parameters(args): Parameters<SetFlagColorArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
+        meta: Meta,
+        client: Peer<RoleServer>,
+        Parameters(args): Parameters<RankListIdArgs>,
+    ) -> Result<Json<RankListIdResponse>, McpError> {
+        let limit = args.limit.map(|v| v as usize);
+        let progress = make_progress_fn(&meta, &client);
+
         match self
-            .mailkit
-            .set_flag_color(&mailbox, &args.account, args.uid, args.color.as_deref())
+            .agentmail
+            .group_by_list_id(
+                args.mailbox.as_deref(),
+                &args.account,
+                limit,
+                progress.as_ref(),
+            )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    #[tool(
+        name = "delete_list_id",
+        description = "Delete all messages with a specific List-Id across all mailboxes. Identifies the list by its List-Id header value (from rank_list_id). Deletes ALL messages from that mailing list regardless of sender address. Omit mailbox to search the entire account.",
+        annotations(destructive_hint = true)
+    )]
+    async fn delete_list_id_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        Parameters(args): Parameters<DeleteListIdArgs>,
+    ) -> Result<Json<DeleteListIdResponse>, McpError> {
+        let progress = make_progress_fn(&meta, &client);
+        match self
+            .agentmail
+            .delete_list_id(
+                args.mailbox.as_deref(),
+                &args.account,
+                &args.list_id,
+                progress.as_ref(),
+            )
+            .await
+        {
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
         name = "add_flags",
-        description = "Add flags to a message using union semantics — existing flags are preserved. Use for system flags (\\Seen, \\Flagged, \\Answered) or custom keywords.",
+        description = "Add flags and/or set an Apple Mail color on a message. Flags use union semantics — existing flags are preserved. Use color for Apple Mail colored flags (red, orange, yellow, green, blue, purple, gray). Cannot set \\Deleted (use delete_messages) or \\Recent (read-only).",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn add_flags_tool(
         &self,
         Parameters(args): Parameters<AddFlagsArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<UpdateFlagsResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
-        if args.flags.is_empty() {
-            return tool_error("At least one flag is required");
+        if args.flags.is_empty() && args.color.is_none() {
+            return Err(McpError::internal_error(
+                "At least one flag or a color is required",
+                None,
+            ));
+        }
+        // Guard dangerous flags
+        for flag in &args.flags {
+            let lower = flag.to_lowercase();
+            if lower == "\\deleted" {
+                return Err(McpError::internal_error(
+                    "Cannot set \\Deleted via add_flags — use delete_messages instead",
+                    None,
+                ));
+            }
+            if lower == "\\recent" {
+                return Err(McpError::internal_error(
+                    "Cannot set \\Recent — it is a read-only server flag",
+                    None,
+                ));
+            }
         }
         match self
-            .mailkit
-            .add_flags(&mailbox, &args.account, args.uid, &args.flags)
+            .agentmail
+            .add_flags(
+                &mailbox,
+                &args.account,
+                args.uid,
+                &args.flags,
+                args.color.as_deref(),
+            )
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
         name = "remove_flags",
-        description = "Remove specific flags from a message. Use for system flags (\\Seen, \\Flagged) or custom keywords. Only the specified flags are removed; all others are preserved.",
+        description = "Remove flags and/or clear Apple Mail color from a message. Only specified flags are removed; all others preserved. Set color=true to remove the colored flag (\\Flagged + all $MailFlagBit keywords). Cannot remove \\Deleted (use delete_messages) or \\Recent (read-only).",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn remove_flags_tool(
         &self,
         Parameters(args): Parameters<RemoveFlagsArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<UpdateFlagsResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
-        if args.flags.is_empty() {
-            return tool_error("At least one flag is required");
+        if args.flags.is_empty() && !args.color {
+            return Err(McpError::internal_error(
+                "At least one flag or color=true is required",
+                None,
+            ));
+        }
+        // Guard dangerous flags
+        for flag in &args.flags {
+            let lower = flag.to_lowercase();
+            if lower == "\\deleted" {
+                return Err(McpError::internal_error(
+                    "Cannot remove \\Deleted via remove_flags — use delete_messages instead",
+                    None,
+                ));
+            }
+            if lower == "\\recent" {
+                return Err(McpError::internal_error(
+                    "Cannot remove \\Recent — it is a read-only server flag",
+                    None,
+                ));
+            }
         }
         match self
-            .mailkit
-            .remove_flags(&mailbox, &args.account, args.uid, &args.flags)
+            .agentmail
+            .remove_flags(&mailbox, &args.account, args.uid, &args.flags, args.color)
             .await
         {
-            Ok(value) => tool_success(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(data) => Ok(Json(data)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 }
 
 #[prompt_router]
-impl MailKitServer {
+impl AgentMailServer {
     #[prompt(
         name = "inbox-summary",
         description = "Get a comprehensive overview of your inbox: mailbox structure, unread counts, top senders by volume, and recent messages."
@@ -1332,9 +1461,34 @@ impl MailKitServer {
                  The unsubscribe URL comes from the newest message per sender. \
                  Step 2: Present me with the ranked list so I can pick which ones to clean up. \
                  Step 3: For each one I approve, call unsubscribe_message with the sample UID and mailbox, \
-                 and delete_matching=true. Deletion matches by exact sender name + List-Unsubscribe-Post \
-                 header to ensure only bulk mail is removed. The unsubscribe POST is best-effort — \
-                 if it fails, the messages are still deleted across all mailboxes.",
+                 and delete_matching=true. Deletion matches by exact sender + either List-Unsubscribe \
+                 or List-Unsubscribe-Post header to ensure only bulk mail is removed. The unsubscribe \
+                 POST is best-effort — if it fails, the messages are still deleted across all mailboxes.",
+                params.0.account
+            ),
+        )]
+    }
+
+    #[prompt(
+        name = "list-id-cleanup",
+        description = "Identify mailing lists by List-Id and bulk-delete entire lists."
+    )]
+    async fn list_id_cleanup_prompt(
+        &self,
+        params: Parameters<ListIdCleanupArgs>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Help me clean up mailing lists in account \"{}\". \
+                 Step 1: Use rank_list_id (omit mailbox to scan the entire account) to get a ranked list \
+                 of mailing lists grouped by their List-Id header. This groups all messages from the same \
+                 mailing list regardless of sender — useful for lists like GitHub notifications where \
+                 multiple senders share one List-Id. \
+                 Step 2: Present me with the ranked list so I can see which lists have the most messages. \
+                 Show the list name, message count, and the unique senders for each. \
+                 Step 3: For each list I approve, call delete_list_id with the list_id value to remove \
+                 all messages from that mailing list across all mailboxes.",
                 params.0.account
             ),
         )]
@@ -1343,7 +1497,7 @@ impl MailKitServer {
 
 #[tool_handler]
 #[prompt_handler]
-impl ServerHandler for MailKitServer {
+impl ServerHandler for AgentMailServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -1353,606 +1507,78 @@ impl ServerHandler for MailKitServer {
         )
         .with_protocol_version(ProtocolVersion::V_2025_06_18)
         .with_instructions(
-            "MailKit is a full-featured IMAP email client. \
+            "AgentMail is a full-featured IMAP email client. \
              Start with list_accounts to discover configured accounts. \
              Use list_mailboxes to see folder structure and message counts. \
              Read messages with get_messages (paginated, newest-first) or search_messages (with filters). \
              Use search_messages to find specific messages by sender, subject, or content. \
-             Manage email: delete_messages, delete_by_sender, move_message, create_draft, create_mailbox, unsubscribe_message. \
-             rank_senders and rank_unsubscribe accept an optional mailbox — omit it to scan the entire account across all mailboxes. \
-             rank_unsubscribe includes messages with either List-Unsubscribe or List-Unsubscribe-Post, grouped by sender. \
-             rank_unsubscribe uses the newest message's URL per sender for the most valid one-click unsubscribe. \
+             Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, create_draft, create_mailbox, unsubscribe_message. \
+             rank_senders, rank_unsubscribe, rank_list_id, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
+             All-mailbox scans automatically skip Trash, Junk, Spam, and Drafts. \
+             Two cleanup workflows: (1) rank_senders → delete_by_sender for unwanted personal senders, (2) rank_unsubscribe → unsubscribe_message for mailing lists. \
+             Never use delete_by_sender for mailing list cleanup — it deletes ALL messages from a sender including non-bulk ones. \
+             rank_list_id groups by List-Id header (RFC 2919) — all messages from the same mailing list regardless of sender. Use delete_list_id to remove an entire list. \
+             rank_senders groups by (email, display name) — same email with different display names are separate entries. \
              rank_unsubscribe returns sample UIDs + mailboxes that can be passed directly to unsubscribe_message. \
-             delete_by_sender supports allMailboxes=true to delete a sender's messages across all mailboxes. \
-             unsubscribe_message deletes by matching sender + List-Unsubscribe-Post header when delete_matching=true; the unsubscribe POST is best-effort and never blocks deletion. \
-             find_attachments scans for messages with attachments; download_attachments saves them to disk. \
+             unsubscribe_message deletes by matching sender + either unsubscribe header when delete_matching=true; the unsubscribe POST is best-effort and never blocks deletion. \
+             list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
+             find_attachments detects multipart/mixed and multipart/related; download_attachments saves them to disk. \
              All reads use BODY.PEEK to avoid marking messages as read.",
         )
     }
 }
 
 // ---------------------------------------------------------------------------
-// CLI
+// Public API — serve functions
 // ---------------------------------------------------------------------------
 
-#[derive(Parser)]
-#[command(name = "mailkit", about = "IMAP email client and MCP server")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<CliCommand>,
+/// Serve the MCP server over an arbitrary `AsyncRead + AsyncWrite` transport.
+///
+/// This is intended for in-process callers (e.g. the Tauri host) that provide
+/// a `DuplexStream` or similar transport instead of stdio.
+pub async fn serve_on<T>(
+    transport: T,
+    mk: agentmail::Agentmail,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let server = AgentMailServer::new(mk);
+    let service = server.serve(transport).await.inspect_err(|e| {
+        eprintln!("agentmail: server error: {}", e);
+    })?;
+    service.waiting().await?;
+    Ok(())
 }
 
-#[derive(Subcommand)]
-enum CliCommand {
-    /// Start the MCP server (JSON-RPC over stdio)
-    Serve,
-    /// List configured accounts
-    ListAccounts,
-    /// List mailboxes for an account
-    ListMailboxes {
-        #[arg(long)]
-        account: Option<String>,
-    },
-    /// Create a new mailbox on the server
-    CreateMailbox {
-        #[arg(long)]
-        account: String,
-        #[arg(long)]
-        name: String,
-    },
-    /// Check IMAP connection for an account
-    CheckConnection {
-        #[arg(long)]
-        account: String,
-    },
-    /// List IMAP server capabilities for an account
-    ListCapabilities {
-        #[arg(long)]
-        account: String,
-    },
-    /// Store a password in the system keychain for an account
-    SetPassword {
-        #[arg(long)]
-        account: String,
-    },
-    /// Interactively configure a new IMAP account
-    Configure {
-        /// Provider preset: gmail, icloud, outlook, fastmail, or omit for custom
-        provider: Option<String>,
-    },
-    /// List all flags in use across messages in a mailbox
-    ListFlags {
-        #[arg(long)]
-        account: String,
-        #[arg(long, default_value = "INBOX")]
-        mailbox: String,
-    },
-    /// Rank senders by message count (omit --mailbox to scan all mailboxes)
-    RankSenders {
-        #[arg(long)]
-        account: String,
-        #[arg(long)]
-        mailbox: Option<String>,
-        #[arg(long)]
-        limit: Option<usize>,
-    },
-    /// Rank bulk-mail senders by List-Unsubscribe-Post presence, then count (omit --mailbox to scan all)
-    RankUnsubscribe {
-        #[arg(long)]
-        account: String,
-        #[arg(long)]
-        mailbox: Option<String>,
-        #[arg(long)]
-        limit: Option<usize>,
-    },
-    /// Find messages with attachments
-    FindAttachments {
-        #[arg(long)]
-        account: String,
-        #[arg(long, default_value = "INBOX")]
-        mailbox: String,
-        #[arg(long, default_value = "0")]
-        offset: usize,
-        #[arg(long, default_value = "25")]
-        limit: usize,
-    },
-    /// Download attachments from a message
-    DownloadAttachments {
-        #[arg(long)]
-        account: String,
-        #[arg(long, default_value = "INBOX")]
-        mailbox: String,
-        #[arg(long)]
-        uid: u32,
-        #[arg(long, default_value = ".")]
-        output_dir: String,
-    },
-    /// Fetch messages from a mailbox (for testing)
-    GetMessages {
-        #[arg(long)]
-        account: String,
-        #[arg(long, default_value = "INBOX")]
-        mailbox: String,
-        #[arg(long, default_value = "0")]
-        offset: usize,
-        #[arg(long, default_value = "10")]
-        limit: usize,
-        /// Include normalized markdown body content
-        #[arg(long)]
-        include_content: bool,
-        /// Include the full raw headers map
-        #[arg(long)]
-        include_headers: bool,
-    },
-    /// Fetch specific messages by UID
-    GetMessagesByUid {
-        #[arg(long)]
-        account: String,
-        #[arg(long, default_value = "INBOX")]
-        mailbox: String,
-        #[arg(long, num_args = 1..)]
-        uids: Vec<u32>,
-        #[arg(long, default_value = "false")]
-        include_content: bool,
-    },
-    /// Set a colored flag on a message (Apple Mail compatible)
-    SetFlagColor {
-        #[arg(long)]
-        account: String,
-        #[arg(long, default_value = "INBOX")]
-        mailbox: String,
-        #[arg(long)]
-        uid: u32,
-        /// Color: red, orange, yellow, green, blue, purple, gray. Omit to unflag.
-        #[arg(long)]
-        color: Option<String>,
-    },
-    /// Create a draft email
-    CreateDraft {
-        #[arg(long)]
-        account: String,
-        #[arg(long)]
-        subject: String,
-        #[arg(long)]
-        body: String,
-        #[arg(long, num_args = 1..)]
-        to: Vec<String>,
-        #[arg(long, num_args = 0..)]
-        cc: Vec<String>,
-        #[arg(long, num_args = 0..)]
-        bcc: Vec<String>,
-    },
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing — logs to stderr so MCP JSON-RPC on stdout is unaffected.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
-
-    mailkit::credentials::init_keyring();
-    let cli = Cli::parse();
-
-    match cli.command.unwrap_or(CliCommand::Serve) {
-        CliCommand::Serve => {
-            let mk = mailkit::Mailkit::from_default_config().map_err(|e| {
-                eprintln!("mailkit: failed to load config: {}", e);
-                e
-            })?;
-
-            // Pre-warm: validate credentials and open one connection per account.
-            // This surfaces keychain dialogs or credential errors at startup,
-            // before the MCP server accepts tool calls.
-            for account in mk.account_names() {
-                match mk.check_connection(&account).await {
-                    Ok(status) if status.connected => {
-                        eprintln!("mailkit: {} connected", account);
-                    }
-                    Ok(status) => {
-                        eprintln!(
-                            "mailkit: {} connection failed: {}",
-                            account,
-                            status.error.as_deref().unwrap_or("unknown")
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("mailkit: {} credential error: {}", account, e);
-                    }
-                }
+/// Serve the MCP server over stdio using the `CompatStdioWorker` transport.
+///
+/// This is the entry point for the standalone `agentmail serve` binary.
+pub async fn serve_stdio(mk: agentmail::Agentmail) -> Result<(), Box<dyn std::error::Error>> {
+    // Pre-warm: validate credentials and open one connection per account.
+    for account in mk.account_names() {
+        match mk.check_connection(&account).await {
+            Ok(status) if status.connected => {
+                eprintln!("agentmail: {} connected", account);
             }
-
-            let server = MailKitServer::new(mk);
-            let worker = CompatStdioWorker;
-            let service = server.serve(worker).await.inspect_err(|e| {
-                eprintln!("mailkit: server error: {}", e);
-            })?;
-            service.waiting().await?;
-            Ok(())
-        }
-        CliCommand::ListAccounts => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.list_accounts().await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::ListMailboxes { account } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.list_mailboxes(account.as_deref()).await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::CreateMailbox { account, name } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.create_mailbox(&account, &name).await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::CheckConnection { account } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let status = mk.check_connection(&account).await?;
-            println!("{}", serde_json::to_string_pretty(&status)?);
-            Ok(())
-        }
-        CliCommand::ListCapabilities { account } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.list_capabilities(&account).await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::SetPassword { account } => {
-            let config = mailkit::Config::load()?;
-            let acct_config = config
-                .accounts
-                .get(&account)
-                .ok_or_else(|| format!("Account '{}' not found in config", account))?;
-
-            eprint!(
-                "Enter password for {} ({}): ",
-                account, acct_config.username
-            );
-            let mut password = String::new();
-            std::io::stdin().read_line(&mut password)?;
-            let password = password.trim();
-
-            mailkit::credentials::set_password(&account, acct_config, password).await?;
-            eprintln!("Password stored successfully.");
-            Ok(())
-        }
-        CliCommand::Configure { provider } => configure_account(provider.as_deref()).await,
-        CliCommand::ListFlags { account, mailbox } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk.list_flags(&mailbox, &account, None).await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::DownloadAttachments {
-            account,
-            mailbox,
-            uid,
-            output_dir,
-        } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk
-                .download_attachments(&mailbox, &account, uid, std::path::Path::new(&output_dir))
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::FindAttachments {
-            account,
-            mailbox,
-            offset,
-            limit,
-        } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk
-                .find_attachments(&mailbox, &account, offset, limit, None)
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::RankSenders {
-            account,
-            mailbox,
-            limit,
-        } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk
-                .group_by_sender(mailbox.as_deref(), &account, limit, None)
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::RankUnsubscribe {
-            account,
-            mailbox,
-            limit,
-        } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk
-                .group_by_list(mailbox.as_deref(), &account, limit, None)
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::GetMessages {
-            account,
-            mailbox,
-            offset,
-            limit,
-            include_content,
-            include_headers,
-        } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk
-                .get_messages(
-                    &mailbox,
-                    &account,
-                    offset,
-                    limit,
-                    include_content,
-                    include_headers,
-                )
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::GetMessagesByUid {
-            account,
-            mailbox,
-            uids,
-            include_content,
-        } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk
-                .get_messages_by_uid(&mailbox, &account, &uids, include_content, false)
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::SetFlagColor {
-            account,
-            mailbox,
-            uid,
-            color,
-        } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk
-                .set_flag_color(&mailbox, &account, uid, color.as_deref())
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        CliCommand::CreateDraft {
-            account,
-            subject,
-            body,
-            to,
-            cc,
-            bcc,
-        } => {
-            let mk = mailkit::Mailkit::from_default_config()?;
-            let value = mk
-                .create_draft(&account, &subject, &body, &to, &cc, &bcc)
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Interactive account configuration
-// ---------------------------------------------------------------------------
-
-fn prompt(label: &str) -> Result<String, Box<dyn std::error::Error>> {
-    eprint!("{}", label);
-    let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
-    Ok(buf.trim().to_string())
-}
-
-fn prompt_default(label: &str, default: &str) -> Result<String, Box<dyn std::error::Error>> {
-    eprint!("{} [{}]: ", label, default);
-    let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
-    let val = buf.trim();
-    if val.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(val.to_string())
-    }
-}
-
-struct ProviderPreset {
-    host: &'static str,
-    port: u16,
-    username_hint: &'static str,
-}
-
-fn provider_preset(name: &str) -> Option<ProviderPreset> {
-    match name {
-        "gmail" => Some(ProviderPreset {
-            host: "imap.gmail.com",
-            port: 993,
-            username_hint: "you@gmail.com",
-        }),
-        "icloud" => Some(ProviderPreset {
-            host: "imap.mail.me.com",
-            port: 993,
-            username_hint: "your iCloud username (not full email)",
-        }),
-        "outlook" | "hotmail" | "live" => Some(ProviderPreset {
-            host: "outlook.office365.com",
-            port: 993,
-            username_hint: "you@outlook.com",
-        }),
-        "fastmail" => Some(ProviderPreset {
-            host: "imap.fastmail.com",
-            port: 993,
-            username_hint: "you@fastmail.com",
-        }),
-        "yahoo" => Some(ProviderPreset {
-            host: "imap.mail.yahoo.com",
-            port: 993,
-            username_hint: "you@yahoo.com",
-        }),
-        _ => None,
-    }
-}
-
-async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("mailkit account setup\n");
-
-    // 1. Resolve provider
-    let provider_name = match provider {
-        Some(p) => p.to_lowercase(),
-        None => {
-            let val = prompt("Provider (gmail, icloud, outlook, fastmail, yahoo, custom): ")?;
-            val.to_lowercase()
-        }
-    };
-    let preset = provider_preset(&provider_name);
-
-    // 2. Account name
-    let default_name = if preset.is_some() {
-        provider_name.clone()
-    } else {
-        String::new()
-    };
-    let account_name = if default_name.is_empty() {
-        prompt("Account name: ")?
-    } else {
-        prompt_default("Account name", &default_name)?
-    };
-    if account_name.is_empty() {
-        return Err("Account name cannot be empty".into());
-    }
-
-    // 3. Host / port / username
-    let (host, port, username) = if let Some(ref p) = preset {
-        let host = prompt_default("IMAP host", p.host)?;
-        let port_str = prompt_default("IMAP port", &p.port.to_string())?;
-        let port: u16 = port_str.parse().unwrap_or(p.port);
-        eprintln!("  (hint: {})", p.username_hint);
-        let username = prompt("Username: ")?;
-        (host, port, username)
-    } else {
-        let host = prompt("IMAP host: ")?;
-        let port_str = prompt_default("IMAP port", "993")?;
-        let port: u16 = port_str.parse().unwrap_or(993);
-        let username = prompt("Username: ")?;
-        (host, port, username)
-    };
-    if host.is_empty() || username.is_empty() {
-        return Err("Host and username are required".into());
-    }
-
-    // 4. Password method
-    eprintln!("\nPassword storage:");
-    eprintln!("  1. keyring  - Store in system keychain (recommended)");
-    eprintln!("  2. command  - Read from a shell command at runtime");
-    eprintln!("  3. raw      - Store in config file (not recommended)");
-    let method = prompt_default("Method", "keyring")?;
-
-    let (password_toml, need_store_password) = match method.as_str() {
-        "command" | "cmd" | "2" => {
-            let default_cmd = format!(
-                "security find-internet-password -s {} -a {} -w",
-                host, username
-            );
-            eprintln!("  (hint: use the default to read Apple Mail's stored password)");
-            let cmd = prompt_default("Command", &default_cmd)?;
-            (format!("password.cmd = {:?}", cmd), false)
-        }
-        "raw" | "3" => {
-            let pw = prompt("Password: ")?;
-            (format!("password.raw = {:?}", pw), false)
-        }
-        _ => {
-            // keyring (default)
-            (format!("password.keyring = {:?}", username), true)
-        }
-    };
-
-    // 5. Write config file
-    let config_path = mailkit::Config::default_path();
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Check if account already exists
-    if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        let key = format!("[accounts.{}]", account_name);
-        if content.contains(&key) {
-            return Err(format!(
-                "Account '{}' already exists in {}. Edit the file directly to modify it.",
-                account_name,
-                config_path.display()
-            )
-            .into());
+            Ok(status) => {
+                eprintln!(
+                    "agentmail: {} connection failed: {}",
+                    account,
+                    status.error.as_deref().unwrap_or("unknown")
+                );
+            }
+            Err(e) => {
+                eprintln!("agentmail: {} credential error: {}", account, e);
+            }
         }
     }
 
-    let mut section = format!("\n[accounts.{}]\n", account_name);
-    section.push_str(&format!("host = {:?}\n", host));
-    if port != 993 {
-        section.push_str(&format!("port = {}\n", port));
-    }
-    section.push_str(&format!("username = {:?}\n", username));
-    section.push_str(&format!("{}\n", password_toml));
-
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config_path)?;
-    file.write_all(section.as_bytes())?;
-    eprintln!(
-        "\nWrote account '{}' to {}",
-        account_name,
-        config_path.display()
-    );
-
-    // 6. Store password in keyring if needed
-    if need_store_password {
-        eprint!("Enter password for {} ({}): ", account_name, username);
-        let mut pw = String::new();
-        std::io::stdin().read_line(&mut pw)?;
-        let pw = pw.trim();
-
-        let entry =
-            secret::keyring::KeyringEntry::try_new(&username).map_err(|e| format!("{}", e))?;
-        let mut secret = secret::Secret::new_keyring_entry(entry);
-        secret
-            .set(pw)
-            .await
-            .map_err(|e| format!("Failed to store password: {}", e))?;
-        eprintln!("Password stored in system keychain.");
-    }
-
-    // 7. Test connection
-    let test = prompt_default("\nTest connection?", "y")?;
-    if test.starts_with('y') || test.starts_with('Y') {
-        eprintln!("Connecting to {}:{}...", host, port);
-        let config = mailkit::Config::load()?;
-        let mk = mailkit::Mailkit::new(config);
-        let status = mk.check_connection(&account_name).await?;
-        if status.connected {
-            eprintln!("Connected successfully!");
-        } else {
-            eprintln!(
-                "Connection failed: {}",
-                status.error.as_deref().unwrap_or("unknown error")
-            );
-        }
-    }
-
+    let server = AgentMailServer::new(mk);
+    let worker = CompatStdioWorker;
+    let service = server.serve(worker).await.inspect_err(|e| {
+        eprintln!("agentmail: server error: {}", e);
+    })?;
+    service.waiting().await?;
     Ok(())
 }

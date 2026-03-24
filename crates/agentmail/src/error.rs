@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum MailkitError {
+pub enum AgentmailError {
     #[error("IMAP error: {0}")]
     Imap(#[from] async_imap::error::Error),
 
@@ -39,4 +39,4 @@ pub enum MailkitError {
     Other(String),
 }
 
-pub type Result<T> = std::result::Result<T, MailkitError>;
+pub type Result<T> = std::result::Result<T, AgentmailError>;
