@@ -15,20 +15,18 @@ rust-version = "1.94"
 
 [dependencies]
 # IMAP protocol (tokio runtime, no async-std)
-async-imap = { version = "0.11", default-features = false, features = [
-  "runtime-tokio"
-] }
+async-imap = { workspace = true, features = ["runtime-tokio"] }
 chrono.workspace = true
 dirs.workspace = true
 # HTML to markdown conversion
-fast_html2md = "0.0"
+fast_html2md = { workspace = true }
 futures.workspace = true
 hashbrown.workspace = true
 # RFC822 message composition (for drafts)
-lettre = { version = "0.11", default-features = false, features = ["builder"] }
+lettre = { workspace = true, features = ["builder"] }
 # Email parsing from raw RFC822
-mail-parser = "0.11"
-native-tls = "0.2"
+mail-parser = { workspace = true }
+native-tls = { workspace = true }
 reqwest.workspace = true
 schemars.workspace = true
 # Credential storage (raw, shell command, or system keyring)
@@ -38,7 +36,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 # TLS for IMAP connections (tokio-native)
-tokio-native-tls = "0.3"
+tokio-native-tls = { workspace = true }
 # Configuration file parsing
-toml = "1.1"
+toml = { workspace = true }
 tracing.workspace = true
