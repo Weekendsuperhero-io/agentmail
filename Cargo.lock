@@ -25,6 +25,7 @@ version = "0.1.5"
 dependencies = [
  "async-imap",
  "chrono",
+ "clap",
  "dirs",
  "fast_html2md",
  "futures",
@@ -33,6 +34,7 @@ dependencies = [
  "mail-parser",
  "native-tls",
  "reqwest",
+ "rmcp",
  "schemars",
  "secret-lib",
  "serde",
@@ -42,20 +44,6 @@ dependencies = [
  "tokio-native-tls",
  "toml",
  "tracing",
-]
-
-[[package]]
-name = "agentmail-app"
-version = "0.1.5"
-dependencies = [
- "agentmail",
- "clap",
- "rmcp",
- "schemars",
- "secret-lib",
- "serde",
- "serde_json",
- "tokio",
  "tracing-subscriber",
  "uuid",
 ]
