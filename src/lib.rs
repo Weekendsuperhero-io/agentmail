@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod draft;
 pub mod error;
 pub mod imap_client;
+pub mod mcp;
 pub mod parser;
 pub mod provider;
 pub mod types;

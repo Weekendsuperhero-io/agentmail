@@ -40,3 +40,6 @@ tokio-native-tls = { workspace = true }
 # Configuration file parsing
 toml = { workspace = true }
 tracing.workspace = true
+
+[lints]
+workspace = true
