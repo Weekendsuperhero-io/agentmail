@@ -299,7 +299,7 @@ impl Agentmail {
             let sender_dates =
                 match imap_client::fetch_sender_dates(session.session(), mbox, on_progress).await {
                     Ok(data) => data,
-                    Err(_) => continue, // skip unselectable mailboxes
+                    Err(e) => { tracing::warn!("Skipping mailbox '{}': {}", mbox, e); continue; }
                 };
 
             for (email, display_name, date) in sender_dates {
@@ -389,7 +389,7 @@ impl Agentmail {
             let rows =
                 match imap_client::fetch_list_headers(session.session(), mbox, on_progress).await {
                     Ok(data) => data,
-                    Err(_) => continue, // skip unselectable mailboxes
+                    Err(e) => { tracing::warn!("Skipping mailbox '{}': {}", mbox, e); continue; }
                 };
 
             for row in rows {
@@ -720,7 +720,7 @@ impl Agentmail {
         for mbox in &mailboxes {
             let scan = match imap_client::fetch_flags(session.session(), mbox, on_progress).await {
                 Ok(s) => s,
-                Err(_) => continue, // skip unselectable mailboxes
+                Err(e) => { tracing::warn!("Skipping mailbox '{}': {}", mbox, e); continue; }
             };
 
             if !scan.flags.is_empty() {
@@ -908,7 +908,7 @@ impl Agentmail {
             .await
             {
                 Ok(u) => u,
-                Err(_) => continue, // skip unselectable mailboxes
+                Err(e) => { tracing::warn!("Skipping mailbox '{}': {}", mbox, e); continue; }
             };
 
             if !uids.is_empty() {
@@ -1679,6 +1679,7 @@ async fn list_scannable_mailbox_names(
         "[Gmail]/Trash",
         "[Gmail]/Spam",
         "[Gmail]/Drafts",
+        "[Gmail]/All Mail",  // superset of all folders — scanning it double-counts everything
         "INBOX.Trash",
         "INBOX.Junk",
         "INBOX.Drafts",
@@ -1686,12 +1687,13 @@ async fn list_scannable_mailbox_names(
         "Deleted",
     ];
 
-    Ok(all
+    let result: Vec<String> = all
         .into_iter()
         .filter(|name| {
             let lower = name.to_lowercase();
             // Skip exact matches
             if skip_exact.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+                tracing::debug!("Skipping mailbox (exact match): {}", name);
                 return false;
             }
             // Skip any mailbox containing junk/spam/trash/deleted/draft
@@ -1700,12 +1702,17 @@ async fn list_scannable_mailbox_names(
                 || lower.contains("trash")
                 || lower.contains("deleted")
                 || lower.contains("draft")
+                || lower.contains("all mail")
             {
+                tracing::debug!("Skipping mailbox (keyword match): {}", name);
                 return false;
             }
             true
         })
-        .collect())
+        .collect();
+
+    tracing::info!("Scannable mailboxes: {:?}", result);
+    Ok(result)
 }
 
 /// Extract the display name from a List-Id header value.

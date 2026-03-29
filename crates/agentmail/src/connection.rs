@@ -1,16 +1,27 @@
 use hashbrown::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::AgentmailError;
 use crate::config::{AccountConfig, Config};
 use crate::imap_client::{self, ImapSession};
 
+/// Sessions idle longer than this are discarded without pinging.
+/// Gmail drops idle IMAP connections after ~10 minutes.
+const MAX_IDLE_SECS: u64 = 120;
+
+/// An idle session with the time it was returned to the pool.
+struct IdleSession {
+    session: ImapSession,
+    returned_at: Instant,
+}
+
 /// Connection pool managing IMAP sessions across accounts.
 pub struct ConnectionPool {
     config: Config,
     /// Per-account pool of idle sessions.
-    pools: Arc<Mutex<HashMap<String, Vec<ImapSession>>>>,
+    pools: Arc<Mutex<HashMap<String, Vec<IdleSession>>>>,
     /// Per-account semaphores to cap concurrent IMAP operations.
     semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
 }
@@ -73,24 +84,32 @@ impl ConnectionPool {
             .map_err(|_| AgentmailError::Other("concurrency semaphore closed".to_string()))?;
 
         // Pop a candidate session while holding the lock briefly
-        let maybe_session = {
+        let maybe_idle = {
             let mut pools = self.pools.lock().await;
             pools.get_mut(account_name).and_then(|pool| pool.pop())
         }; // lock released here — before any network I/O
 
         // Validate the candidate outside the lock
-        if let Some(mut session) = maybe_session
-            && imap_client::ping(&mut session).await.is_ok()
-        {
-            return Ok(PooledSession {
-                session: Some(session),
-                account_name: account_name.to_string(),
-                pool: Arc::clone(&self.pools),
-                max_connections: max_conn,
-                _permit: permit,
-            });
+        if let Some(idle) = maybe_idle {
+            let age = idle.returned_at.elapsed().as_secs();
+            if age < MAX_IDLE_SECS {
+                // Recent enough — ping to verify it's alive
+                let mut session = idle.session;
+                if imap_client::ping(&mut session).await.is_ok() {
+                    return Ok(PooledSession {
+                        session: Some(session),
+                        account_name: account_name.to_string(),
+                        pool: Arc::clone(&self.pools),
+                        max_connections: max_conn,
+                        _permit: permit,
+                    });
+                }
+                tracing::debug!("Pooled IMAP session for {} failed ping, creating fresh", account_name);
+            } else {
+                tracing::debug!("Discarding IMAP session for {} (idle {}s > {}s)", account_name, age, MAX_IDLE_SECS);
+            }
         }
-        // Session was stale (or absent), drop it and create fresh
+        // Session was stale, too old, or absent — create fresh
 
         // Create new connection
         let password = crate::credentials::get_password(account_name, account_config).await?;
@@ -103,6 +122,54 @@ impl ConnectionPool {
             max_connections: max_conn,
             _permit: permit,
         })
+    }
+
+    /// Run an operation with automatic retry on connection failure.
+    /// If the operation fails with an IMAP/IO/timeout error, acquires a fresh
+    /// session and retries once. This handles idle-timeout disconnects transparently.
+    pub async fn with_retry<F, Fut, T>(
+        &self,
+        account_name: &str,
+        op: F,
+    ) -> crate::Result<T>
+    where
+        F: Fn(PooledSession) -> Fut + Send,
+        Fut: std::future::Future<Output = (PooledSession, crate::Result<T>)> + Send,
+    {
+        let session = self.acquire(account_name).await?;
+        let (session, result) = op(session).await;
+        match result {
+            Ok(val) => {
+                session.release().await;
+                Ok(val)
+            }
+            Err(ref e) if Self::is_connection_error(e) => {
+                tracing::warn!("IMAP operation failed ({}), retrying with fresh session", e);
+                drop(session); // drop the stale session
+                let retry_session = self.acquire(account_name).await?;
+                let (retry_session, retry_result) = op(retry_session).await;
+                if retry_result.is_ok() {
+                    retry_session.release().await;
+                } else {
+                    drop(retry_session);
+                }
+                retry_result
+            }
+            Err(e) => {
+                drop(session);
+                Err(e)
+            }
+        }
+    }
+
+    /// Check if an error likely indicates a dead/stale IMAP connection.
+    fn is_connection_error(e: &crate::AgentmailError) -> bool {
+        matches!(
+            e,
+            crate::AgentmailError::Imap(_)
+                | crate::AgentmailError::Io(_)
+                | crate::AgentmailError::NotConnected
+        ) || matches!(e, crate::AgentmailError::Other(msg) if msg.contains("timed out"))
     }
 
     /// List all configured account names.
@@ -129,7 +196,7 @@ impl ConnectionPool {
 pub struct PooledSession {
     session: Option<ImapSession>,
     account_name: String,
-    pool: Arc<Mutex<HashMap<String, Vec<ImapSession>>>>,
+    pool: Arc<Mutex<HashMap<String, Vec<IdleSession>>>>,
     /// Max idle sessions to keep for this account.
     max_connections: usize,
     /// Concurrency permit — released on drop to unblock waiting callers.
@@ -149,7 +216,10 @@ impl PooledSession {
             let mut pools = self.pool.lock().await;
             let pool = pools.entry(self.account_name.clone()).or_default();
             if pool.len() < self.max_connections {
-                pool.push(session);
+                pool.push(IdleSession {
+                    session,
+                    returned_at: Instant::now(),
+                });
             }
             // else: drop the session (connection closes)
         }
