@@ -2,16 +2,15 @@
 name = "agentmail"
 version = "0.1.5"
 edition = "2024"
-license = "Apache-2.0"
+rust-version = "1.94"
 description = "A Rust IMAP client library for email management — read, search, delete, unsubscribe, and manage mailboxes"
-repository = "https://github.com/weekendsuperhero-io/agentmail"
 documentation = "https://docs.rs/agentmail"
-homepage = "https://github.com/weekendsuperhero-io/agentmail"
 readme = "../../README.md"
+homepage = "https://github.com/weekendsuperhero-io/agentmail"
+repository = "https://github.com/weekendsuperhero-io/agentmail"
+license = "Apache-2.0"
 keywords = ["agent", "email", "imap", "mail", "mcp"]
 categories = ["email", "network-programming"]
-authors = ["WeekendSuperhero <hello@weekendsuperhero.io>"]
-rust-version = "1.94"
 
 [dependencies]
 # IMAP protocol (tokio runtime, no async-std)
