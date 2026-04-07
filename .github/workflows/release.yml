@@ -95,6 +95,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-release-cargo-
 
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 

@@ -70,6 +70,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.94
 
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Build documentation
         run: cargo doc --no-deps --all-features
         env:
