@@ -8,14 +8,15 @@ pub mod imap_client;
 pub mod mcp;
 pub mod parser;
 pub mod provider;
+pub mod secret;
 pub mod types;
 
 pub use config::{AccountConfig, Config};
 pub use connection::ConnectionPool;
-pub use credentials::init_keyring_with_service;
 pub use error::{AgentmailError, Result};
 pub use imap_client::ProgressFn;
 pub use provider::MailProvider;
+pub use secret::init_service_name;
 pub use types::*;
 
 /// High-level facade for IMAP operations.

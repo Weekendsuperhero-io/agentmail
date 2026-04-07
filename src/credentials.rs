@@ -1,25 +1,12 @@
 use crate::config::AccountConfig;
-use secret::Secret;
-
-/// Initialize the keyring backend with the default "agentmail" service name.
-/// Call once at startup before any password operations.
-pub fn init_keyring() {
-    init_keyring_with_service("agentmail");
-}
-
-/// Initialize the keyring backend with a custom service name.
-/// Use this when embedding agentmail in another app (e.g. agent) so credentials
-/// are stored under the host app's keyring service, not "agentmail".
-pub fn init_keyring_with_service(name: &'static str) {
-    secret::keyring::set_global_service_name(name);
-}
+use crate::secret::Secret;
 
 /// Retrieve the password for an IMAP account.
 ///
 /// Lookup order:
 /// 1. Environment variable `AGENTMAIL_PASSWORD_{ACCOUNT_NAME}` (override for CI/Docker)
 /// 2. `password` field in config (Secret: raw, command, or keyring)
-/// 3. Default keyring entry under "agentmail" service with username as key (backward compat)
+/// 3. Default keyring entry with username as key (backward compat)
 pub async fn get_password(account_name: &str, config: &AccountConfig) -> crate::Result<String> {
     // 1. Environment variable override
     let env_key = format!(
@@ -43,13 +30,7 @@ pub async fn get_password(account_name: &str, config: &AccountConfig) -> crate::
 
     // 3. Default keyring fallback (backward compat: handles passwords stored via set-password
     //    before the config had a password field)
-    let default_entry = secret::keyring::KeyringEntry::try_new(&config.username).map_err(|e| {
-        crate::AgentmailError::Credential(format!(
-            "Failed to create default keyring entry for '{}': {}",
-            config.username, e
-        ))
-    })?;
-    let default_secret = Secret::new_keyring_entry(default_entry);
+    let default_secret = Secret::new_keyring(format!("mail.{}", config.username));
     if let Ok(pw) = default_secret.get().await {
         return Ok(pw);
     }
@@ -67,7 +48,7 @@ pub async fn get_password(account_name: &str, config: &AccountConfig) -> crate::
 /// Store a password for an account in the system keyring.
 ///
 /// If the config has a Keyring secret, stores into that entry.
-/// Otherwise, stores under the default "agentmail" service with the username as key.
+/// Otherwise, stores under the default service with the username as key.
 pub async fn set_password(
     account_name: &str,
     config: &AccountConfig,
@@ -75,15 +56,7 @@ pub async fn set_password(
 ) -> crate::Result<()> {
     let mut secret = match config.password {
         Some(ref s @ Secret::Keyring(_)) => s.clone(),
-        _ => {
-            let entry = secret::keyring::KeyringEntry::try_new(&config.username).map_err(|e| {
-                crate::AgentmailError::Credential(format!(
-                    "Failed to create keyring entry for '{}': {}",
-                    config.username, e
-                ))
-            })?;
-            Secret::new_keyring_entry(entry)
-        }
+        _ => Secret::new_keyring(format!("mail.{}", config.username)),
     };
 
     secret.set(password).await.map_err(|e| {

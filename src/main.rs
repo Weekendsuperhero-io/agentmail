@@ -167,7 +167,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    agentmail::credentials::init_keyring();
+    agentmail::secret::init_service_name("agentmail");
+    // Initialize platform keyring store for standalone mode
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(store) = apple_native_keyring_store::keychain::Store::new() {
+            keyring_core::set_default_store(store);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(store) = windows_native_keyring_store::Store::new() {
+            keyring_core::set_default_store(store);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(store) = dbus_secret_service_keyring_store::Store::new() {
+            keyring_core::set_default_store(store);
+        }
+    }
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(CliCommand::Serve) {
@@ -481,7 +500,7 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         }
         _ => {
             // keyring (default)
-            (format!("password.keyring = {:?}", username), true)
+            (format!("password.keyring = \"mail.{}\"", username), true)
         }
     };
 
@@ -532,9 +551,7 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         std::io::stdin().read_line(&mut pw)?;
         let pw = pw.trim();
 
-        let entry =
-            secret::keyring::KeyringEntry::try_new(&username).map_err(|e| format!("{}", e))?;
-        let mut secret = secret::Secret::new_keyring_entry(entry);
+        let mut secret = agentmail::secret::Secret::new_keyring(format!("mail.{}", username));
         secret
             .set(pw)
             .await

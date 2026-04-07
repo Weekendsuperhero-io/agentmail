@@ -1,6 +1,7 @@
 use hashbrown::HashMap;
-use secret::Secret;
 use serde::Deserialize;
+
+use crate::secret::Secret;
 use std::path::PathBuf;
 
 /// Top-level configuration file.
@@ -39,9 +40,7 @@ impl AccountConfig {
     /// Password is resolved via keyring using the username.
     pub fn new(host: impl Into<String>, username: impl Into<String>) -> Self {
         let username = username.into();
-        let password = secret::keyring::KeyringEntry::try_new(&username)
-            .ok()
-            .map(Secret::new_keyring_entry);
+        let password = Some(Secret::new_keyring(format!("mail.{}", username)));
         Self {
             host: host.into(),
             port: 993,
