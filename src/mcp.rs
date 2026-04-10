@@ -44,6 +44,33 @@ fn default_false() -> bool {
     false
 }
 
+fn mask_prefix_for_log(value: &str) -> String {
+    let char_count = value.chars().count();
+    if char_count <= 1 {
+        return "***".to_string();
+    }
+
+    let visible_len = 3_usize.min(char_count - 1);
+    let visible: String = value.chars().take(visible_len).collect();
+    format!("{visible}***")
+}
+
+fn account_log_hint(account: &str) -> String {
+    let account = account.trim();
+    if account.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    if let Some((local, domain)) = account.rsplit_once('@')
+        && !local.is_empty()
+        && !domain.is_empty()
+    {
+        return format!("{}@{}", mask_prefix_for_log(local), domain);
+    }
+
+    mask_prefix_for_log(account)
+}
+
 /// Build an optional progress callback from MCP meta + peer.
 /// Returns `None` if the client didn't provide a progress token.
 fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> Option<crate::ProgressFn> {
@@ -1557,19 +1584,20 @@ where
 pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error::Error>> {
     // Pre-warm: validate credentials and open one connection per account.
     for account in mk.account_names() {
+        let account_hint = account_log_hint(&account);
         match mk.check_connection(&account).await {
             Ok(status) if status.connected => {
-                eprintln!("agentmail: {} connected", account);
+                eprintln!("agentmail: {} connected", account_hint);
             }
             Ok(status) => {
                 eprintln!(
                     "agentmail: {} connection failed: {}",
-                    account,
+                    account_hint,
                     status.error.as_deref().unwrap_or("unknown")
                 );
             }
             Err(e) => {
-                eprintln!("agentmail: {} credential error: {}", account, e);
+                eprintln!("agentmail: {} credential error: {}", account_hint, e);
             }
         }
     }

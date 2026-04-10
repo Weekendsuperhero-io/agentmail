@@ -11,8 +11,9 @@ jobs:
     with:
       validate-runs-on: ubuntu-latest
       rust-cache-provider: github
+      build-linux-packages: "libdbus-1-dev pkg-config"
       validate-linux-packages: "libdbus-1-dev pkg-config"
-      # Optional override if binary cannot be inferred from Cargo.toml
+      publish-linux-packages: "libdbus-1-dev pkg-config"
       # binary-name: agentmail
       binary-matrix-json: >-
         [
