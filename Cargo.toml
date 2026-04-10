@@ -32,7 +32,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 fast_html2md = "0.0"
 futures = "0.3"
-hashbrown = { version = "0.16", features = ["rayon", "serde"] }
+hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 mail-parser = "0.11"
 native-tls = "0.2"
