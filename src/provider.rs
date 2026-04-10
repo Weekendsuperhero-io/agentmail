@@ -1,5 +1,5 @@
 use crate::config::AccountConfig;
-use secret::Secret;
+use crate::secret::Secret;
 
 /// Supported mail providers with pre-configured IMAP defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,9 +93,7 @@ impl MailProvider {
     /// Build an AccountConfig with this provider's defaults.
     /// Password is resolved via keyring using the username at connection time.
     pub fn default_config(&self, username: &str) -> AccountConfig {
-        let password = secret::keyring::KeyringEntry::try_new(username)
-            .ok()
-            .map(Secret::new_keyring_entry);
+        let password = Some(Secret::new_keyring(format!("mail.{}", username)));
 
         AccountConfig {
             host: self.host().to_string(),
