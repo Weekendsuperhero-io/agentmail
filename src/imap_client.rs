@@ -127,10 +127,31 @@ pub async fn list_capabilities(session: &mut ImapSession) -> Result<Vec<String>>
 // ---------------------------------------------------------------------------
 
 /// List all mailboxes for an account. Uses LIST + STATUS per mailbox.
+/// Map an RFC 6154 special-use `NameAttribute` to a role string.
+fn role_from_attributes(attrs: &[async_imap::types::NameAttribute<'_>]) -> Option<String> {
+    use async_imap::types::NameAttribute;
+    for attr in attrs {
+        let role = match attr {
+            NameAttribute::All => "all",
+            NameAttribute::Archive => "archive",
+            NameAttribute::Drafts => "drafts",
+            NameAttribute::Flagged => "flagged",
+            NameAttribute::Junk => "junk",
+            NameAttribute::Sent => "sent",
+            NameAttribute::Trash => "trash",
+            _ => continue,
+        };
+        return Some(role.to_string());
+    }
+    None
+}
+
 pub async fn list_mailboxes(
     session: &mut ImapSession,
     account_name: &str,
 ) -> Result<Vec<MailboxInfo>> {
+    use async_imap::types::NameAttribute;
+
     let names: Vec<_> = imap_timeout(async {
         let stream = session.list(Some(""), Some("*")).await?;
         Ok::<_, async_imap::error::Error>(stream.collect::<Vec<_>>().await)
@@ -142,25 +163,48 @@ pub async fn list_mailboxes(
         let name_ref = item.map_err(AgentmailError::Imap)?;
         let name = name_ref.name().to_string();
         let delimiter = name_ref.delimiter().map(|c| c.to_string());
+        let attrs = name_ref.attributes();
 
-        // Get counts via STATUS
-        let status = imap_timeout(session.status(&name, "(MESSAGES UNSEEN RECENT)")).await?;
+        let no_select = attrs.contains(&NameAttribute::NoSelect);
+        let no_inferiors = attrs.contains(&NameAttribute::NoInferiors);
+        let role = role_from_attributes(attrs);
+
+        // NoSelect mailboxes can't be SELECTed — skip the STATUS call.
+        let (total, unseen, recent) = if no_select {
+            (0, 0, 0)
+        } else {
+            let status = imap_timeout(session.status(&name, "(MESSAGES UNSEEN RECENT)")).await?;
+            (status.exists, status.unseen.unwrap_or(0), status.recent)
+        };
 
         result.push(MailboxInfo {
             name: name.clone(),
             account: account_name.to_string(),
-            total_messages: status.exists,
-            unseen_messages: status.unseen.unwrap_or(0),
-            recent_messages: status.recent,
+            total_messages: total,
+            unseen_messages: unseen,
+            recent_messages: recent,
             delimiter,
             path: name,
+            no_select,
+            no_inferiors,
+            role,
         });
     }
     Ok(result)
 }
 
-/// List all mailbox names (without STATUS calls — much faster than list_mailboxes).
-pub async fn list_mailbox_names(session: &mut ImapSession) -> Result<Vec<String>> {
+/// Lightweight mailbox entry: name + key attributes (no STATUS calls).
+pub struct MailboxEntry {
+    pub name: String,
+    pub no_select: bool,
+    pub role: Option<String>,
+}
+
+/// List all mailboxes with key attributes (without STATUS calls — much faster
+/// than `list_mailboxes`).
+pub async fn list_mailbox_entries(session: &mut ImapSession) -> Result<Vec<MailboxEntry>> {
+    use async_imap::types::NameAttribute;
+
     let names: Vec<_> = imap_timeout(async {
         let stream = session.list(Some(""), Some("*")).await?;
         Ok::<_, async_imap::error::Error>(stream.collect::<Vec<_>>().await)
@@ -170,9 +214,24 @@ pub async fn list_mailbox_names(session: &mut ImapSession) -> Result<Vec<String>
     let mut result = Vec::with_capacity(names.len());
     for item in names {
         let name_ref = item.map_err(AgentmailError::Imap)?;
-        result.push(name_ref.name().to_string());
+        let attrs = name_ref.attributes();
+        result.push(MailboxEntry {
+            name: name_ref.name().to_string(),
+            no_select: attrs.contains(&NameAttribute::NoSelect),
+            role: role_from_attributes(attrs),
+        });
     }
     Ok(result)
+}
+
+/// List all selectable mailbox names (without STATUS calls).
+pub async fn list_mailbox_names(session: &mut ImapSession) -> Result<Vec<String>> {
+    let entries = list_mailbox_entries(session).await?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| !e.no_select)
+        .map(|e| e.name)
+        .collect())
 }
 
 /// Create a new mailbox on the server.

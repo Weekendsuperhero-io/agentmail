@@ -2,6 +2,8 @@
 
 IMAP email client exposed as both a CLI and an MCP (Model Context Protocol) server, built with Rust.
 
+MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-03-26 and 2024-11-05) | rmcp 1.4
+
 One binary: `agentmail serve` starts the MCP stdio server, all other subcommands are a direct CLI.
 
 See also: [DESIGN.md](DESIGN.md) for architecture diagrams and design decisions, [MCP.md](MCP.md) for the full MCP tool & prompt reference with output schemas.
@@ -9,7 +11,7 @@ See also: [DESIGN.md](DESIGN.md) for architecture diagrams and design decisions,
 ## Requirements
 
 - Rust toolchain (edition 2024)
-- An IMAP-enabled email account (Gmail, Outlook, Fastmail, self-hosted, etc.)
+- An IMAP-enabled email account (Gmail, iCloud, Yahoo, Fastmail, self-hosted, etc.)
 
 ## Build
 
@@ -72,23 +74,22 @@ password.cmd = "security find-internet-password -s imap.mail.me.com -a johnapple
 host = "imap.company.com"
 username = "you@company.com"
 password.cmd = "op read op://Work/Email/password"
-trash_mailbox = "Trash"
-drafts_mailbox = "Drafts"
 ```
 
 All accounts are available simultaneously — the MCP tools and CLI commands accept an `account` parameter to select which one to operate on.
 
 ### Account config reference
 
-| Field            | Type   | Default                  | Description                                         |
-| ---------------- | ------ | ------------------------ | --------------------------------------------------- |
-| `host`           | string | **required**             | IMAP server hostname                                |
-| `port`           | u16    | `993`                    | IMAP port                                           |
-| `username`       | string | **required**             | Login username / email                              |
-| `password`       | Secret | —                        | Password source (see [Passwords](#passwords) below) |
-| `tls`            | bool   | `true`                   | Use TLS                                             |
-| `trash_mailbox`  | string | auto-detect / `"Trash"`  | Trash folder name override                          |
-| `drafts_mailbox` | string | auto-detect / `"Drafts"` | Drafts folder name override                         |
+| Field             | Type   | Default      | Description                                         |
+| ----------------- | ------ | ------------ | --------------------------------------------------- |
+| `host`            | string | **required** | IMAP server hostname                                |
+| `port`            | u16    | `993`        | IMAP port                                           |
+| `username`        | string | **required** | Login username / email                              |
+| `password`        | Secret | —            | Password source (see [Passwords](#passwords) below) |
+| `tls`             | bool   | `true`       | Use TLS                                             |
+| `max_connections` | usize  | `3`          | Max concurrent IMAP connections for this account    |
+
+Trash and drafts mailboxes are auto-detected at runtime via RFC 6154 special-use attributes (`\Trash`, `\Drafts`), with string-matching fallback for servers that don't support RFC 6154.
 
 ### Passwords
 
@@ -295,12 +296,12 @@ To pass passwords via environment variables instead of keychain:
 
 ## MCP Tools
 
-21 tools covering account discovery, mailbox management, message reading, search, bulk operations, flag management, and composition.
+21 tools covering account discovery, mailbox management, message reading, search, bulk operations, flag management, and composition. 9 long-running tools support optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/tasks) (SEP-1686) for async fire-and-forget execution.
 
 | Tool                   | Description                                                                           |
 | ---------------------- | ------------------------------------------------------------------------------------- |
 | `list_accounts`        | Return configured account names (use this first)                                      |
-| `list_mailboxes`       | List mailboxes with message counts (total, unseen, recent)                            |
+| `list_mailboxes`       | List mailboxes with counts, attributes, and RFC 6154 special-use roles                |
 | `create_mailbox`       | Create a new mailbox (folder) on the server                                           |
 | `check_connection`     | Test IMAP connectivity for an account                                                 |
 | `list_capabilities`    | List IMAP server capabilities (IDLE, MOVE, etc.)                                      |
@@ -328,7 +329,8 @@ To pass passwords via environment variables instead of keychain:
 - `limit` defaults to 25, clamped to 1..50.
 - `includeContent` (default false) returns normalized markdown body text, trimmed for context window safety.
 - All reads use `BODY.PEEK` to avoid marking messages as `\Seen`.
-- Long-running operations (`rank_senders`, `rank_unsubscribe`, `rank_list_id`, `find_attachments`, `list_flags`, `delete_messages`) support MCP progress notifications.
+- Long-running operations (`rank_senders`, `rank_unsubscribe`, `rank_list_id`, `find_attachments`, `list_flags`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`) support MCP progress notifications and optional task-based invocation.
+- Destructive tasks targeting the same account are automatically serialized to prevent IMAP state conflicts.
 
 ## MCP Prompts
 
@@ -347,8 +349,8 @@ To pass passwords via environment variables instead of keychain:
 
 ```
 agentmail (binary crate: agentmail-mcp)
-  ├── serve                → MCP stdio server (tokio + rmcp)
-  │                          21 tools + 6 prompts, progress notifications
+  ├── serve                → MCP stdio server (tokio + rmcp 1.4)
+  │                          21 tools + 6 prompts, tasks, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
   ├── create-mailbox       → CLI
@@ -366,21 +368,23 @@ agentmail (binary crate: agentmail-mcp)
   ├── set-password         → CLI (keychain store)
   └── configure            → CLI (interactive account setup)
 
-crates/agentmail (library)
+src/ (library + binary)
+  ├── lib.rs          → Public API facade (25+ async methods)
+  ├── main.rs         → CLI dispatch (clap), account configuration
+  ├── mcp.rs          → MCP server: 21 tools, 6 prompts, task manager, serve_on()/serve_stdio()
   ├── config.rs       → TOML config loading, default account resolution
-  ├── credentials.rs  → Password resolution (env → secret-lib → keyring fallback)
-  ├── connection.rs   → IMAP connection pool (3 idle sessions/account)
+  ├── credentials.rs  → Password resolution (env → config secret → default keyring)
+  ├── connection.rs   → IMAP connection pool (default 3 sessions/account, configurable)
   ├── imap_client.rs  → IMAP operations (fetch, search, delete, move, create, sync)
   ├── parser.rs       → RFC822 → MessageInfo (via mail-parser), attachment extraction
   ├── draft.rs        → RFC822 composition (via lettre)
   ├── content.rs      → HTML→markdown conversion, context window trimming
-  ├── provider.rs     → Email provider presets (Gmail, iCloud, Outlook, Fastmail, Yahoo)
+  ├── provider.rs     → Email provider presets (Gmail, iCloud, Yahoo, Fastmail)
   ├── types.rs        → Shared data structures (MessageInfo, MailboxInfo, etc.)
-  ├── error.rs        → Error types
-  └── lib.rs          → Public API facade
+  └── error.rs        → Error types
 ```
 
-**Connection pooling:** Each account maintains up to 3 idle IMAP sessions. Sessions are validated with NOOP before reuse and replaced when stale. Credentials are resolved on-demand when a new connection is needed.
+**Connection pooling:** Each account maintains up to 3 idle IMAP sessions (configurable via `max_connections`). Sessions are validated with NOOP before reuse and replaced when stale. Credentials are resolved on-demand when a new connection is needed.
 
 **Post-mutation sync:** All mutating operations (delete, move, create draft, create mailbox) issue a NOOP after the operation to flush pending server-side state before releasing the session back to the pool.
 

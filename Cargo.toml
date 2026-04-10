@@ -36,8 +36,9 @@ hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 mail-parser = "0.11"
 native-tls = "0.2"
+parking_lot = "0.12"
 reqwest = { version = "0.13", features = ["json"] }
-rmcp = { version = "1.4", features = ["transport-async-rw", "transport-worker"] }
+rmcp = { version = "1.4", features = ["transport-io"] }
 schemars = { version = "1.2", features = ["chrono04"] }
 keyring-core = "0.7"
 serde = { version = "1", features = ["derive"] }

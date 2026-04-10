@@ -6,31 +6,25 @@ use crate::{
     RankSendersResponse, RankUnsubscribeResponse, SearchMessagesResponse, UnsubscribeResponse,
     UpdateFlagsResponse,
 };
+use hashbrown::HashMap;
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
-    handler::server::{
-        router::prompt::PromptRouter,
-        router::tool::ToolRouter,
-        wrapper::{Json, Parameters},
-    },
+    handler::server::wrapper::{Json, Parameters},
     model::{
-        ClientJsonRpcMessage, ClientNotification, ClientRequest, GetPromptRequestParams,
-        GetPromptResult, InitializedNotification, JsonRpcMessage, ListPromptsResult, Meta,
-        PaginatedRequestParams, ProgressNotificationParam, PromptMessage, PromptMessageRole,
-        ProtocolVersion, ServerCapabilities, ServerInfo, ServerResult,
+        CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
+        CreateTaskResult, GetPromptRequestParams, GetPromptResult, GetTaskInfoParams,
+        GetTaskPayloadResult, GetTaskResult, GetTaskResultParams, ListPromptsResult,
+        ListTasksResult, Meta, PaginatedRequestParams, ProgressNotificationParam, PromptMessage,
+        PromptMessageRole, ServerCapabilities, ServerInfo, Task, TaskStatus,
     },
     prompt, prompt_handler, prompt_router,
     service::RequestContext,
     tool, tool_handler, tool_router,
-    transport::worker::{Worker, WorkerContext, WorkerQuitReason},
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
-use std::collections::VecDeque;
-use std::fmt;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::task::JoinHandle;
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -42,6 +36,10 @@ fn default_true() -> bool {
 
 fn default_false() -> bool {
     false
+}
+
+fn utc_now_iso8601() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn mask_prefix_for_log(value: &str) -> String {
@@ -515,241 +513,91 @@ struct ListIdCleanupArgs {
 }
 
 // ---------------------------------------------------------------------------
-// CompatStdioWorker — handles JSON-RPC stdio transport with init patching
+// Task Manager
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-pub enum CompatTransportError {
-    Io(std::io::Error),
-    Json(serde_json::Error),
-    Join(tokio::task::JoinError),
-    Closed,
+/// Tools whose `annotations.destructive_hint` is `true`.
+/// Destructive tasks targeting the same account are serialized — each waits for
+/// the previous destructive task to finish before starting.
+const DESTRUCTIVE_TOOLS: &[&str] = &[
+    "delete_messages",
+    "delete_by_sender",
+    "delete_list_id",
+    "unsubscribe_message",
+];
+
+/// Try to extract the `account` field from a tool call's JSON arguments.
+fn extract_account(args: &Option<serde_json::Map<String, serde_json::Value>>) -> Option<String> {
+    args.as_ref()?.get("account")?.as_str().map(String::from)
 }
 
-impl fmt::Display for CompatTransportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CompatTransportError::Io(err) => write!(f, "io error: {}", err),
-            CompatTransportError::Json(err) => write!(f, "json error: {}", err),
-            CompatTransportError::Join(err) => write!(f, "join error: {}", err),
-            CompatTransportError::Closed => write!(f, "transport closed"),
-        }
-    }
+struct ManagedTask {
+    meta: Task,
+    result: Arc<parking_lot::Mutex<Option<Result<CallToolResult, McpError>>>>,
+    handle: JoinHandle<()>,
 }
 
-impl std::error::Error for CompatTransportError {}
-
-impl From<std::io::Error> for CompatTransportError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
+struct TaskManager {
+    tasks: HashMap<String, ManagedTask>,
+    /// Per-account async mutex that serializes destructive tasks.
+    /// These must be `tokio::sync::Mutex` because the guard is held across
+    /// the entire `call_tool().await` execution.
+    /// Non-destructive tasks bypass these locks entirely.
+    destructive_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
-impl From<serde_json::Error> for CompatTransportError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
-    }
-}
-
-fn merge_client_info_defaults(obj: &mut Map<String, Value>) {
-    if !obj.contains_key("name") {
-        obj.insert("name".to_string(), Value::String("inspector".to_string()));
-    }
-    if !obj.contains_key("version") {
-        obj.insert("version".to_string(), Value::String("0".to_string()));
-    }
-}
-
-fn patch_initialize_value(raw: &str) -> Result<Option<Value>, CompatTransportError> {
-    let mut value: Value = serde_json::from_str(raw)?;
-    let method = value
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if method != "initialize" {
-        return Ok(None);
-    }
-
-    let root = match value.as_object_mut() {
-        Some(obj) => obj,
-        None => return Ok(None),
-    };
-
-    let params = root
-        .entry("params".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let params_obj = match params.as_object_mut() {
-        Some(obj) => obj,
-        None => return Ok(None),
-    };
-
-    if !params_obj.contains_key("protocolVersion") {
-        params_obj.insert(
-            "protocolVersion".to_string(),
-            Value::String("2025-06-18".to_string()),
-        );
-    }
-
-    if !params_obj.contains_key("capabilities") {
-        params_obj.insert("capabilities".to_string(), Value::Object(Map::new()));
-    }
-
-    match params_obj.get_mut("clientInfo") {
-        Some(client_info) => {
-            if let Some(client_obj) = client_info.as_object_mut() {
-                merge_client_info_defaults(client_obj);
-            } else {
-                params_obj.insert(
-                    "clientInfo".to_string(),
-                    json!({"name":"inspector","version":"0"}),
-                );
-            }
-        }
-        None => {
-            params_obj.insert(
-                "clientInfo".to_string(),
-                json!({"name":"inspector","version":"0"}),
-            );
+impl TaskManager {
+    fn new() -> Self {
+        Self {
+            tasks: HashMap::new(),
+            destructive_locks: HashMap::new(),
         }
     }
 
-    Ok(Some(value))
-}
-
-fn parse_client_message(raw: &str) -> Result<ClientJsonRpcMessage, CompatTransportError> {
-    let value: Value = serde_json::from_str(raw)?;
-    if let Some(method) = value.get("method").and_then(Value::as_str)
-        && method == "initialize"
-    {
-        let patched = patch_initialize_value(raw)?.unwrap_or(value);
-        return serde_json::from_value::<ClientJsonRpcMessage>(patched)
-            .map_err(CompatTransportError::Json);
-    }
-    serde_json::from_value::<ClientJsonRpcMessage>(value).map_err(CompatTransportError::Json)
-}
-
-#[derive(Clone, Default)]
-pub struct CompatStdioWorker;
-
-impl Worker for CompatStdioWorker {
-    type Error = CompatTransportError;
-    type Role = RoleServer;
-
-    fn err_closed() -> Self::Error {
-        CompatTransportError::Closed
+    /// Get or create the destructive-task serialization lock for an account.
+    fn destructive_lock(&mut self, account: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.destructive_locks
+            .entry(account.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
-    fn err_join(e: tokio::task::JoinError) -> Self::Error {
-        CompatTransportError::Join(e)
-    }
-
-    async fn run(
-        self,
-        mut context: WorkerContext<Self>,
-    ) -> Result<(), WorkerQuitReason<Self::Error>> {
-        let mut reader = BufReader::new(tokio::io::stdin());
-        let mut stdout = tokio::io::stdout();
-        let mut line = String::new();
-        let mut should_inject_initialized = false;
-        let mut hold_inbound_until_initialized = false;
-        let mut pending_after_init: VecDeque<ClientJsonRpcMessage> = VecDeque::new();
-        let cancel_token = context.cancellation_token.clone();
-
-        loop {
-            if !hold_inbound_until_initialized
-                && let Some(next_msg) = pending_after_init.pop_front()
-            {
-                context.send_to_handler(next_msg).await?;
-                continue;
+    /// Check if a specific task's spawned future has finished and update its
+    /// metadata accordingly.
+    fn refresh_status(&mut self, task_id: &str) {
+        if let Some(managed) = self.tasks.get_mut(task_id) {
+            if managed.meta.status != TaskStatus::Working {
+                return;
             }
-
-            if should_inject_initialized {
-                let notif = ClientNotification::InitializedNotification(InitializedNotification {
-                    method: Default::default(),
-                    extensions: Default::default(),
-                });
-                context
-                    .send_to_handler(JsonRpcMessage::notification(notif))
-                    .await?;
-                should_inject_initialized = false;
-                hold_inbound_until_initialized = false;
-                continue;
-            }
-
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    return Err(WorkerQuitReason::Cancelled);
-                }
-                send_req = context.recv_from_handler() => {
-                    let send_req = send_req?;
-                    let json_line = serde_json::to_string(&send_req.message).map_err(|e| {
-                        WorkerQuitReason::fatal(
-                            CompatTransportError::Json(e),
-                            "serializing outbound message",
-                        )
-                    })?;
-                    stdout.write_all(json_line.as_bytes()).await.map_err(|e| {
-                        WorkerQuitReason::fatal(
-                            CompatTransportError::Io(e),
-                            "writing outbound message",
-                        )
-                    })?;
-                    stdout.write_all(b"\n").await.map_err(|e| {
-                        WorkerQuitReason::fatal(
-                            CompatTransportError::Io(e),
-                            "writing outbound newline",
-                        )
-                    })?;
-                    stdout.flush().await.map_err(|e| {
-                        WorkerQuitReason::fatal(
-                            CompatTransportError::Io(e),
-                            "flushing outbound message",
-                        )
-                    })?;
-
-                    if let JsonRpcMessage::Response(resp) = &send_req.message
-                        && matches!(resp.result, ServerResult::InitializeResult(_)) {
-                            should_inject_initialized = true;
+            if managed.handle.is_finished() {
+                let now = utc_now_iso8601();
+                // Try to determine if it succeeded or failed by checking the
+                // result slot synchronously.
+                let status = match managed.result.try_lock() {
+                    Some(guard) => match guard.as_ref() {
+                        Some(Ok(_)) => TaskStatus::Completed,
+                        Some(Err(_)) => TaskStatus::Failed,
+                        None => {
+                            // Handle finished but no result written → aborted/panicked
+                            TaskStatus::Failed
                         }
-
-                    let _ = send_req.responder.send(Ok(()));
-                }
-                read_result = reader.read_line(&mut line) => {
-                    let read = read_result.map_err(|e| {
-                        WorkerQuitReason::fatal(
-                            CompatTransportError::Io(e),
-                            "reading inbound line",
-                        )
-                    })?;
-                    if read == 0 {
-                        return Err(WorkerQuitReason::TransportClosed);
+                    },
+                    None => {
+                        // Lock contention — treat as still completing
+                        return;
                     }
-
-                    let raw = line.trim().to_string();
-                    line.clear();
-                    if raw.is_empty() {
-                        continue;
-                    }
-
-                    let inbound = parse_client_message(&raw).map_err(WorkerQuitReason::fatal_context("parsing inbound message"))?;
-                    let is_initialize_request = matches!(
-                        &inbound,
-                        JsonRpcMessage::Request(req) if matches!(req.request, ClientRequest::InitializeRequest(_))
-                    );
-
-                    if is_initialize_request {
-                        hold_inbound_until_initialized = true;
-                        context.send_to_handler(inbound).await?;
-                        continue;
-                    }
-
-                    if hold_inbound_until_initialized {
-                        pending_after_init.push_back(inbound);
-                    } else {
-                        context.send_to_handler(inbound).await?;
-                    }
-                }
+                };
+                managed.meta.status = status;
+                managed.meta.last_updated_at = now;
             }
+        }
+    }
+
+    /// Refresh the status of all tracked tasks.
+    fn refresh_all(&mut self) {
+        let ids: Vec<String> = self.tasks.keys().cloned().collect();
+        for id in ids {
+            self.refresh_status(&id);
         }
     }
 }
@@ -760,18 +608,16 @@ impl Worker for CompatStdioWorker {
 
 #[derive(Clone)]
 pub struct AgentMailServer {
-    tool_router: ToolRouter<Self>,
-    prompt_router: PromptRouter<Self>,
     agentmail: Arc<crate::Agentmail>,
+    task_manager: Arc<parking_lot::Mutex<TaskManager>>,
 }
 
 #[tool_router]
 impl AgentMailServer {
     pub fn new(agentmail: crate::Agentmail) -> Self {
         Self {
-            tool_router: Self::tool_router(),
-            prompt_router: Self::prompt_router(),
             agentmail: Arc::new(agentmail),
+            task_manager: Arc::new(parking_lot::Mutex::new(TaskManager::new())),
         }
     }
 
@@ -941,7 +787,8 @@ impl AgentMailServer {
     #[tool(
         name = "list_flags",
         description = "List all IMAP flags in use with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Omit mailbox to scan the entire account across all mailboxes. Resolves Apple Mail $MailFlagBit color flags to color names (red, orange, yellow, green, blue, purple, gray).",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        execution(task_support = "optional")
     )]
     async fn list_flags_tool(
         &self,
@@ -963,7 +810,8 @@ impl AgentMailServer {
     #[tool(
         name = "delete_messages",
         description = "Delete one or more messages by UID. Moves to Trash if configured, otherwise flags \\Deleted and expunges. Supports up to 500 UIDs per call.",
-        annotations(destructive_hint = true, idempotent_hint = true)
+        annotations(destructive_hint = true, idempotent_hint = true),
+        execution(task_support = "optional")
     )]
     async fn delete_messages_tool(
         &self,
@@ -999,7 +847,8 @@ impl AgentMailServer {
     #[tool(
         name = "delete_by_sender",
         description = "Delete all messages from an exact sender. Takes a UID to identify the sender — extracts the full From header (display name + email) and deletes every message with an identical sender. Set allMailboxes=true to search and delete across the entire account. Ideal for bulk cleanup after rank_senders. For mailing list cleanup, use unsubscribe_message instead — it attempts one-click unsubscribe and only deletes bulk mail.",
-        annotations(destructive_hint = true)
+        annotations(destructive_hint = true),
+        execution(task_support = "optional")
     )]
     async fn delete_by_sender_tool(
         &self,
@@ -1029,7 +878,8 @@ impl AgentMailServer {
     #[tool(
         name = "find_attachments",
         description = "Scan for messages with attachments (multipart/mixed or multipart/related). Returns paginated UIDs (newest-first) and total count. Omit mailbox to scan the entire account with a per-mailbox breakdown. Use download_attachments with a specific UID to save files to disk.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        execution(task_support = "optional")
     )]
     async fn find_attachments_tool(
         &self,
@@ -1064,7 +914,8 @@ impl AgentMailServer {
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
-        )
+        ),
+        execution(task_support = "optional")
     )]
     async fn download_attachments_tool(
         &self,
@@ -1177,7 +1028,8 @@ impl AgentMailServer {
     #[tool(
         name = "rank_senders",
         description = "Rank all senders by message count. Omit mailbox to scan the entire account across all mailboxes. Groups by (email, display name) — 'Find My <noreply@apple.com>' and 'iCloud <noreply@apple.com>' are separate entries. Sorted by message count descending. Efficient: fetches only FROM+DATE headers using BODY.PEEK.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        execution(task_support = "optional")
     )]
     async fn rank_senders_tool(
         &self,
@@ -1206,7 +1058,8 @@ impl AgentMailServer {
     #[tool(
         name = "rank_unsubscribe",
         description = "Rank bulk-mail senders by message count. Omit mailbox to scan the entire account. Includes messages with either List-Unsubscribe or List-Unsubscribe-Post. Grouped by sender (From), sorted by one-click support first then by count. To clean up a sender, pass the sampleUid and sampleMailbox to unsubscribe_message (not delete_by_sender). Returns count, unsubscribe URL, one-click flag, sample UID + mailbox.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        execution(task_support = "optional")
     )]
     async fn rank_unsubscribe_tool(
         &self,
@@ -1235,7 +1088,8 @@ impl AgentMailServer {
     #[tool(
         name = "rank_list_id",
         description = "Rank mailing lists by List-Id header (RFC 2919). Groups all messages from the same mailing list regardless of sender address — useful for lists like GitHub notifications where multiple senders share one List-Id. Omit mailbox to scan the entire account. Use delete_list_id to remove all messages from a list.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true),
+        execution(task_support = "optional")
     )]
     async fn rank_list_id_tool(
         &self,
@@ -1264,7 +1118,8 @@ impl AgentMailServer {
     #[tool(
         name = "delete_list_id",
         description = "Delete all messages with a specific List-Id across all mailboxes. Identifies the list by its List-Id header value (from rank_list_id). Deletes ALL messages from that mailing list regardless of sender address. Omit mailbox to search the entire account.",
-        annotations(destructive_hint = true)
+        annotations(destructive_hint = true),
+        execution(task_support = "optional")
     )]
     async fn delete_list_id_tool(
         &self,
@@ -1530,9 +1385,9 @@ impl ServerHandler for AgentMailServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
+                .enable_tasks()
                 .build(),
         )
-        .with_protocol_version(ProtocolVersion::V_2025_06_18)
         .with_instructions(
             "AgentMail is a full-featured IMAP email client. \
              Start with list_accounts to discover configured accounts. \
@@ -1552,6 +1407,138 @@ impl ServerHandler for AgentMailServer {
              find_attachments detects multipart/mixed and multipart/related; download_attachments saves them to disk. \
              All reads use BODY.PEEK to avoid marking messages as read.",
         )
+    }
+
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CreateTaskResult, McpError> {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let now = utc_now_iso8601();
+
+        let is_destructive = DESTRUCTIVE_TOOLS.contains(&request.name.as_ref());
+        let destructive_lock = if is_destructive {
+            let account = extract_account(&request.arguments).ok_or_else(|| {
+                McpError::invalid_params(
+                    "destructive tools require an 'account' argument for task queuing",
+                    None,
+                )
+            })?;
+            Some(self.task_manager.lock().destructive_lock(&account))
+        } else {
+            None
+        };
+
+        let result_slot: Arc<parking_lot::Mutex<Option<Result<CallToolResult, McpError>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+
+        let server = self.clone();
+        let slot = Arc::clone(&result_slot);
+        let handle = tokio::spawn(async move {
+            // If destructive, acquire the per-account lock first.
+            // This serializes destructive tasks — the task waits here until
+            // any previously-enqueued destructive task on the same account
+            // finishes.
+            let _guard = match destructive_lock {
+                Some(ref lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let result = server.call_tool(request, context).await;
+            *slot.lock() = Some(result);
+        });
+
+        let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
+            .with_poll_interval(2000);
+
+        let managed = ManagedTask {
+            meta: task.clone(),
+            result: result_slot,
+            handle,
+        };
+
+        self.task_manager.lock().tasks.insert(task_id, managed);
+
+        Ok(CreateTaskResult::new(task))
+    }
+
+    async fn list_tasks(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListTasksResult, McpError> {
+        let mut mgr = self.task_manager.lock();
+        mgr.refresh_all();
+        let tasks: Vec<Task> = mgr.tasks.values().map(|m| m.meta.clone()).collect();
+        Ok(ListTasksResult::new(tasks))
+    }
+
+    async fn get_task_info(
+        &self,
+        request: GetTaskInfoParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        let mut mgr = self.task_manager.lock();
+        mgr.refresh_status(&request.task_id);
+        let managed = mgr.tasks.get(&request.task_id).ok_or_else(|| {
+            McpError::invalid_params(format!("unknown task: {}", request.task_id), None)
+        })?;
+        Ok(GetTaskResult {
+            meta: None,
+            task: managed.meta.clone(),
+        })
+    }
+
+    async fn get_task_result(
+        &self,
+        request: GetTaskResultParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskPayloadResult, McpError> {
+        let mut mgr = self.task_manager.lock();
+        mgr.refresh_status(&request.task_id);
+        let managed = mgr.tasks.get(&request.task_id).ok_or_else(|| {
+            McpError::invalid_params(format!("unknown task: {}", request.task_id), None)
+        })?;
+        match managed.meta.status {
+            TaskStatus::Working => Err(McpError::invalid_params("task is still running", None)),
+            TaskStatus::Cancelled => Err(McpError::invalid_params("task was cancelled", None)),
+            _ => {
+                // Take the result out of the slot.
+                let result = managed.result.try_lock().and_then(|mut guard| guard.take());
+                match result {
+                    Some(Ok(call_result)) => {
+                        let value = serde_json::to_value(call_result)
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        Ok(GetTaskPayloadResult::new(value))
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err(McpError::internal_error(
+                        "task result already consumed",
+                        None,
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CancelTaskResult, McpError> {
+        let mut mgr = self.task_manager.lock();
+        let managed = mgr.tasks.get_mut(&request.task_id).ok_or_else(|| {
+            McpError::invalid_params(format!("unknown task: {}", request.task_id), None)
+        })?;
+        if managed.meta.status == TaskStatus::Working {
+            managed.handle.abort();
+            managed.meta.status = TaskStatus::Cancelled;
+            managed.meta.last_updated_at = utc_now_iso8601();
+        }
+        Ok(CancelTaskResult {
+            meta: None,
+            task: managed.meta.clone(),
+        })
     }
 }
 
@@ -1578,7 +1565,7 @@ where
     Ok(())
 }
 
-/// Serve the MCP server over stdio using the `CompatStdioWorker` transport.
+/// Serve the MCP server over stdio.
 ///
 /// This is the entry point for the standalone `agentmail serve` binary.
 pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error::Error>> {
@@ -1603,10 +1590,12 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
     }
 
     let server = AgentMailServer::new(mk);
-    let worker = CompatStdioWorker;
-    let service = server.serve(worker).await.inspect_err(|e| {
-        eprintln!("agentmail: server error: {}", e);
-    })?;
+    let service = server
+        .serve(rmcp::transport::io::stdio())
+        .await
+        .inspect_err(|e| {
+            eprintln!("agentmail: server error: {}", e);
+        })?;
     service.waiting().await?;
     Ok(())
 }
