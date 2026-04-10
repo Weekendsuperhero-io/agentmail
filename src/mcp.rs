@@ -61,11 +61,10 @@ fn account_log_hint(account: &str) -> String {
         return "<empty>".to_string();
     }
 
-    if let Some((local, domain)) = account.rsplit_once('@') {
-        if !local.is_empty() && !domain.is_empty() {
+    if let Some((local, domain)) = account.rsplit_once('@')
+        && !local.is_empty() && !domain.is_empty() {
             return format!("{}@{}", mask_prefix_for_log(local), domain);
         }
-    }
 
     mask_prefix_for_log(account)
 }
