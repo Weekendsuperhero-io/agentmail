@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **MCP tasks** — added task management to support background execution and polling of long-running tools.
+- **Mailbox roles** — added `role_from_attributes` to parse RFC 6154 roles with fallback logic for older servers.
+- **Tool synchronization** — added async mutexes to serialize destructive tool executions per-account.
+
+### Changed
+- **Mailbox detection** — replaced hardcoded mailbox names with auto-detection using RFC 6154 special-use attributes (`Trash`, `Drafts`).
+- **MCP transport** — replaced custom `CompatStdioWorker` with the standard `rmcp` stdio transport.
+- **Mailbox info** — updated `MailboxInfo` to expose `no_select`, `no_inferiors`, and `role`.
+- **Tool configurations** — updated all applicable tools to include `task_support = "optional"`.
+
+### Removed
+- **Account configuration** — removed explicit `trash_mailbox` and `drafts_mailbox` settings from `AccountConfig`.
+- **Mail providers** — removed the `Outlook` provider from `MailProvider`.
+
+### Added
 - **AgentMail MCP server** — added initial MailKit MCP server with 21 tools and 6 prompts for AI assistant email integration.
 - **IMAP client** — added a complete implementation with connection pooling, multi-provider support, and HTML to Markdown conversion.
 - **CI/CD workflows** — added reusable workflows for PR descriptions, changelogs, cross-platform binary builds, and GitHub Releases.
