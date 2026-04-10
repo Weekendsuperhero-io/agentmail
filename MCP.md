@@ -1,6 +1,8 @@
 # Agentmail MCP — Tool & Prompt Reference
 
-MCP spec: 2025-06-18 | rmcp: 1.2 | Transport: stdio (standalone) or DuplexStream (in-process)
+MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-03-26 and 2024-11-05) | rmcp: 1.4 | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
+
+**Supported capabilities:** tools, prompts, tasks (SEP-1686), progress notifications
 
 ## Tools (21)
 
@@ -9,7 +11,7 @@ MCP spec: 2025-06-18 | rmcp: 1.2 | Transport: stdio (standalone) or DuplexStream
 | #   | Tool                | Description                                      | Annotations |
 | --- | ------------------- | ------------------------------------------------ | ----------- |
 | 1   | `list_accounts`     | Return configured IMAP account names             | `read_only` |
-| 2   | `list_mailboxes`    | List all folders with total/unseen/recent counts | `read_only` |
+| 2   | `list_mailboxes`    | List all folders with counts, attributes, and RFC 6154 roles | `read_only` |
 | 3   | `check_connection`  | Test IMAP connectivity and auth for an account   | `read_only` |
 | 4   | `list_capabilities` | Query IMAP extensions (IDLE, MOVE, CONDSTORE)    | `read_only` |
 
@@ -22,8 +24,10 @@ MCP spec: 2025-06-18 | rmcp: 1.2 | Transport: stdio (standalone) or DuplexStream
 
 **list_mailboxes** → `ListMailboxesResponse`
 ```json
-{ "mailboxes": [{ "name", "account", "totalMessages", "unseenMessages", "recentMessages", "delimiter?", "path" }] }
+{ "mailboxes": [{ "name", "account", "totalMessages", "unseenMessages", "recentMessages", "delimiter?", "path",
+    "noSelect?": bool, "noInferiors?": bool, "role?": "trash"|"junk"|"drafts"|"sent"|"archive"|"all"|"flagged" }] }
 ```
+`noSelect` (RFC 3501): mailbox is a virtual container — cannot be selected, searched, or deleted from. `noInferiors`: no child mailboxes exist or can be created. `role` (RFC 6154): server-declared special-use purpose. Omitted for ordinary user mailboxes.
 
 **check_connection** → `ConnectionStatus`
 ```json
@@ -39,15 +43,15 @@ MCP spec: 2025-06-18 | rmcp: 1.2 | Transport: stdio (standalone) or DuplexStream
 
 ### Read Messages
 
-| #   | Tool               | Description                                                                                         | Annotations |
-| --- | ------------------ | --------------------------------------------------------------------------------------------------- | ----------- |
-| 5   | `get_messages`     | Paginated fetch, newest-first. Optional body + headers. Default: INBOX, offset=0, limit=25 (max 50) | `read_only` |
-| 6   | `search_messages`  | IMAP SEARCH: sender, subject, to, full-text, read/flagged/deleted, header key/value. Paginated.     | `read_only` |
-| 7   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only` |
-| 8   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only` |
-| 9   | `rank_senders`     | Group by (email, display name) with counts + date ranges. Omit mailbox to scan all.                 | `read_only` |
-| 10  | `rank_unsubscribe` | Rank bulk-mail senders by volume. Returns unsubscribe URLs, sample UIDs.                            | `read_only` |
-| 11  | `rank_list_id`     | Rank mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.          | `read_only` |
+| #   | Tool               | Description                                                                                         | Annotations            |
+| --- | ------------------ | --------------------------------------------------------------------------------------------------- | ---------------------- |
+| 5   | `get_messages`     | Paginated fetch, newest-first. Optional body + headers. Default: INBOX, offset=0, limit=25 (max 50) | `read_only`            |
+| 6   | `search_messages`  | IMAP SEARCH: sender, subject, to, full-text, read/flagged/deleted, header key/value. Paginated.     | `read_only`            |
+| 7   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only`, `taskable` |
+| 8   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only`, `taskable` |
+| 9   | `rank_senders`     | Group by (email, display name) with counts + date ranges. Omit mailbox to scan all.                 | `read_only`, `taskable` |
+| 10  | `rank_unsubscribe` | Rank bulk-mail senders by volume. Returns unsubscribe URLs, sample UIDs.                            | `read_only`, `taskable` |
+| 11  | `rank_list_id`     | Rank mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.          | `read_only`, `taskable` |
 
 #### Output Schemas
 
@@ -130,16 +134,16 @@ Grouped by List-Id header — same list with different senders are merged into o
 
 ### Write / Mutate
 
-| #   | Tool                   | Description                                                                           | Annotations                 |
-| --- | ---------------------- | ------------------------------------------------------------------------------------- | --------------------------- |
-| 12  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash or expunges.                                | `destructive`, `idempotent` |
-| 13  | `delete_by_sender`     | Delete all from exact sender. `allMailboxes=true` scans entire account.               | `destructive`               |
-| 14  | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes.                     | `destructive`               |
-| 15  | `move_message`         | IMAP MOVE between mailboxes                                                           |                             |
-| 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                |
-| 17  | `create_draft`         | Compose RFC822 to Drafts folder (subject, body, to/cc/bcc)                            |                             |
-| 18  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     |                             |
-| 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail                  | `destructive`, `open_world` |
+| #   | Tool                   | Description                                                                           | Annotations                              |
+| --- | ---------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------- |
+| 12  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash or expunges.                                | `destructive`, `idempotent`, `taskable`   |
+| 13  | `delete_by_sender`     | Delete all from exact sender. `allMailboxes=true` scans entire account.               | `destructive`, `taskable`                 |
+| 14  | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes.                     | `destructive`, `taskable`                 |
+| 15  | `move_message`         | IMAP MOVE between mailboxes                                                           |                                          |
+| 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
+| 17  | `create_draft`         | Compose RFC822 to Drafts folder (subject, body, to/cc/bcc)                            |                                          |
+| 18  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     | `taskable`                               |
+| 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail                  | `destructive`, `open_world`              |
 
 #### Output Schemas
 
@@ -233,6 +237,16 @@ Returns the full updated flag set after the operation.
 | 5   | `unsubscribe-cleanup` | Identify high-volume lists, unsubscribe + delete  | `account`                    |
 | 6   | `list-id-cleanup`     | Identify mailing lists by List-Id, bulk-delete    | `account`                    |
 
+## Task Support (SEP-1686)
+
+9 long-running tools support `execution.taskSupport = "optional"` — clients can invoke them normally (synchronous with progress notifications) or as background tasks (enqueue, poll, retrieve result).
+
+**Taskable tools:** `list_flags`, `find_attachments`, `rank_senders`, `rank_unsubscribe`, `rank_list_id`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`
+
+**Destructive task serialization:** Destructive tasks (`delete_messages`, `delete_by_sender`, `delete_list_id`, `unsubscribe_message`) targeting the same account are serialized — each waits for the previous destructive task to finish before starting. Non-destructive tasks run concurrently without restriction.
+
+**Task lifecycle:** `tasks/list`, `tasks/get`, `tasks/getResult`, `tasks/cancel`
+
 ## Annotations Key
 
 | Annotation    | Meaning                                                        |
@@ -241,3 +255,4 @@ Returns the full updated flag set after the operation.
 | `destructive` | Permanently deletes or modifies messages                       |
 | `idempotent`  | Safe to call multiple times with same arguments                |
 | `open_world`  | Makes external HTTP requests (e.g. one-click unsubscribe POST) |
+| `taskable`    | Supports `execution.taskSupport = "optional"` (SEP-1686)       |

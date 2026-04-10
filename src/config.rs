@@ -26,10 +26,6 @@ pub struct AccountConfig {
     pub password: Option<Secret>,
     #[serde(default = "default_tls")]
     pub tls: bool,
-    /// Trash mailbox name override (default: auto-detect or "Trash").
-    pub trash_mailbox: Option<String>,
-    /// Drafts mailbox name override (default: auto-detect or "Drafts").
-    pub drafts_mailbox: Option<String>,
     /// Max concurrent IMAP connections for this account (default: 3).
     #[serde(default)]
     pub max_connections: Option<usize>,
@@ -47,8 +43,6 @@ impl AccountConfig {
             username,
             password,
             tls: true,
-            trash_mailbox: None,
-            drafts_mailbox: None,
             max_connections: None,
         }
     }
@@ -56,18 +50,6 @@ impl AccountConfig {
     /// Set the IMAP port.
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
-        self
-    }
-
-    /// Set trash mailbox name.
-    pub fn with_trash(mut self, mailbox: impl Into<String>) -> Self {
-        self.trash_mailbox = Some(mailbox.into());
-        self
-    }
-
-    /// Set drafts mailbox name.
-    pub fn with_drafts(mut self, mailbox: impl Into<String>) -> Self {
-        self.drafts_mailbox = Some(mailbox.into());
         self
     }
 

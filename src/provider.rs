@@ -6,7 +6,6 @@ use crate::secret::Secret;
 pub enum MailProvider {
     Gmail,
     ICloud,
-    Outlook,
     Yahoo,
     Fastmail,
     Custom,
@@ -18,7 +17,6 @@ impl MailProvider {
         &[
             ("Gmail", MailProvider::Gmail),
             ("iCloud", MailProvider::ICloud),
-            ("Outlook", MailProvider::Outlook),
             ("Yahoo", MailProvider::Yahoo),
             ("Fastmail", MailProvider::Fastmail),
             ("Custom", MailProvider::Custom),
@@ -30,9 +28,6 @@ impl MailProvider {
         match name.to_lowercase().as_str() {
             "gmail" | "google" => Some(MailProvider::Gmail),
             "icloud" | "apple" => Some(MailProvider::ICloud),
-            "outlook" | "microsoft" | "office365" | "hotmail" | "live" => {
-                Some(MailProvider::Outlook)
-            }
             "yahoo" => Some(MailProvider::Yahoo),
             "fastmail" => Some(MailProvider::Fastmail),
             "custom" => Some(MailProvider::Custom),
@@ -45,7 +40,6 @@ impl MailProvider {
         match self {
             MailProvider::Gmail => "Gmail",
             MailProvider::ICloud => "iCloud",
-            MailProvider::Outlook => "Outlook",
             MailProvider::Yahoo => "Yahoo",
             MailProvider::Fastmail => "Fastmail",
             MailProvider::Custom => "Custom",
@@ -57,7 +51,6 @@ impl MailProvider {
         match self {
             MailProvider::Gmail => "imap.gmail.com",
             MailProvider::ICloud => "imap.mail.me.com",
-            MailProvider::Outlook => "outlook.office365.com",
             MailProvider::Yahoo => "imap.mail.yahoo.com",
             MailProvider::Fastmail => "imap.fastmail.com",
             MailProvider::Custom => "",
@@ -69,29 +62,9 @@ impl MailProvider {
         993
     }
 
-    /// Trash mailbox name for this provider.
-    pub fn trash_mailbox(&self) -> &'static str {
-        match self {
-            MailProvider::Gmail => "[Gmail]/Trash",
-            MailProvider::ICloud => "Deleted Messages",
-            MailProvider::Outlook => "Deleted",
-            MailProvider::Yahoo => "Trash",
-            MailProvider::Fastmail => "Trash",
-            MailProvider::Custom => "Trash",
-        }
-    }
-
-    /// Drafts mailbox name for this provider.
-    pub fn drafts_mailbox(&self) -> &'static str {
-        match self {
-            MailProvider::Gmail => "[Gmail]/Drafts",
-            MailProvider::Yahoo => "Draft",
-            _ => "Drafts",
-        }
-    }
-
     /// Build an AccountConfig with this provider's defaults.
     /// Password is resolved via keyring using the username at connection time.
+    /// Trash and drafts mailboxes are auto-detected via RFC 6154 roles at runtime.
     pub fn default_config(&self, username: &str) -> AccountConfig {
         let password = Some(Secret::new_keyring(format!("mail.{}", username)));
 
@@ -101,8 +74,6 @@ impl MailProvider {
             username: username.to_string(),
             password,
             tls: true,
-            trash_mailbox: Some(self.trash_mailbox().to_string()),
-            drafts_mailbox: Some(self.drafts_mailbox().to_string()),
             max_connections: None,
         }
     }

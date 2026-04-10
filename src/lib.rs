@@ -617,7 +617,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
     ) -> Result<DeleteListIdResponse> {
         let mut session = self.pool.acquire(account).await?;
-        let trash = self.resolve_trash_mailbox(session.session(), account).await;
+        let trash = self.resolve_trash_mailbox(session.session()).await;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
@@ -954,7 +954,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
     ) -> Result<DeleteMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
-        let trash = self.resolve_trash_mailbox(session.session(), account).await;
+        let trash = self.resolve_trash_mailbox(session.session()).await;
         imap_client::select(session.session(), mailbox).await?;
         let result = imap_client::bulk_delete_messages(
             session.session(),
@@ -989,7 +989,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
     ) -> Result<DeleteBySenderResponse> {
         let mut session = self.pool.acquire(account).await?;
-        let trash = self.resolve_trash_mailbox(session.session(), account).await;
+        let trash = self.resolve_trash_mailbox(session.session()).await;
         imap_client::select(session.session(), mailbox).await?;
 
         // 1. Fetch the exact sender from the target message
@@ -1155,14 +1155,9 @@ impl Agentmail {
 
         let mut session = self.pool.acquire(account).await?;
 
-        // Determine the drafts mailbox: explicit config, or auto-detect
-        let drafts_name = if let Some(ref d) = acct_config.drafts_mailbox {
-            d.clone()
-        } else {
-            find_drafts_mailbox(session.session())
-                .await?
-                .unwrap_or_else(|| "Drafts".to_string())
-        };
+        let drafts_name = find_drafts_mailbox(session.session())
+            .await?
+            .unwrap_or_else(|| "Drafts".to_string());
 
         imap_client::append_draft(session.session(), &drafts_name, &rfc822).await?;
         imap_client::sync(session.session()).await?;
@@ -1293,7 +1288,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
     ) -> Result<UnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
-        let trash = self.resolve_trash_mailbox(session.session(), account).await;
+        let trash = self.resolve_trash_mailbox(session.session()).await;
 
         // Fetch unsubscribe + list-id headers from the target message
         let headers =
@@ -1437,21 +1432,11 @@ impl Agentmail {
     // Internal helpers
     // -----------------------------------------------------------------
 
-    fn configured_trash(&self, account: &str) -> Option<String> {
-        self.pool
-            .account_config(account)
-            .and_then(|c| c.trash_mailbox.clone())
-    }
-
-    /// Resolve trash mailbox: config override, then auto-detect.
+    /// Auto-detect the trash mailbox via RFC 6154 role, with string fallback.
     async fn resolve_trash_mailbox(
         &self,
         session: &mut imap_client::ImapSession,
-        account: &str,
     ) -> Option<String> {
-        if let Some(configured) = self.configured_trash(account) {
-            return Some(configured);
-        }
         find_trash_mailbox(session).await.ok().flatten()
     }
 }
@@ -1625,42 +1610,55 @@ pub fn clamp_usize(val: Option<u64>, default: usize, min: usize, max: usize) -> 
 }
 
 /// Auto-detect the Trash mailbox by scanning LIST results.
+/// Auto-detect the Trash mailbox via RFC 6154 `\Trash` role, with string fallback.
 async fn find_trash_mailbox(session: &mut imap_client::ImapSession) -> Result<Option<String>> {
-    let names = imap_client::list_mailbox_names(session).await?;
-    let candidates = [
+    let entries = imap_client::list_mailbox_entries(session).await?;
+
+    // Prefer RFC 6154 \Trash role.
+    if let Some(entry) = entries.iter().find(|e| e.role.as_deref() == Some("trash")) {
+        return Ok(Some(entry.name.clone()));
+    }
+
+    // Fallback: string matching for servers without RFC 6154 support.
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    for candidate in [
         "Trash",
         "[Gmail]/Trash",
         "INBOX.Trash",
         "Deleted Messages",
         "Deleted",
-    ];
-    for candidate in &candidates {
+    ] {
         if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(candidate)) {
-            return Ok(Some(name.clone()));
+            return Ok(Some(name.to_string()));
         }
     }
     if let Some(name) = names
         .iter()
         .find(|n| n.to_lowercase().contains("trash") || n.to_lowercase().contains("deleted"))
     {
-        return Ok(Some(name.clone()));
+        return Ok(Some(name.to_string()));
     }
     Ok(None)
 }
 
-/// Auto-detect the Drafts mailbox by scanning LIST results.
-/// Checks common names: "Drafts", "[Gmail]/Drafts", "INBOX.Drafts".
+/// Auto-detect the Drafts mailbox via RFC 6154 `\Drafts` role, with string fallback.
 async fn find_drafts_mailbox(session: &mut imap_client::ImapSession) -> Result<Option<String>> {
-    let names = imap_client::list_mailbox_names(session).await?;
-    let candidates = ["Drafts", "[Gmail]/Drafts", "INBOX.Drafts"];
-    for candidate in &candidates {
+    let entries = imap_client::list_mailbox_entries(session).await?;
+
+    // Prefer RFC 6154 \Drafts role.
+    if let Some(entry) = entries.iter().find(|e| e.role.as_deref() == Some("drafts")) {
+        return Ok(Some(entry.name.clone()));
+    }
+
+    // Fallback: string matching for servers without RFC 6154 support.
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    for candidate in ["Drafts", "[Gmail]/Drafts", "INBOX.Drafts"] {
         if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(candidate)) {
-            return Ok(Some(name.clone()));
+            return Ok(Some(name.to_string()));
         }
     }
-    // Fallback: look for any mailbox containing "draft" (case-insensitive)
     if let Some(name) = names.iter().find(|n| n.to_lowercase().contains("draft")) {
-        return Ok(Some(name.clone()));
+        return Ok(Some(name.to_string()));
     }
     Ok(None)
 }
@@ -1670,43 +1668,43 @@ async fn find_drafts_mailbox(session: &mut imap_client::ImapSession) -> Result<O
 async fn list_scannable_mailbox_names(
     session: &mut imap_client::ImapSession,
 ) -> Result<Vec<String>> {
-    let all = imap_client::list_mailbox_names(session).await?;
+    let entries = imap_client::list_mailbox_entries(session).await?;
 
-    // Exact names to skip (case-insensitive)
-    let skip_exact: &[&str] = &[
-        "Trash",
-        "Junk",
-        "Spam",
-        "Drafts",
-        "[Gmail]/Trash",
-        "[Gmail]/Spam",
-        "[Gmail]/Drafts",
-        "INBOX.Trash",
-        "INBOX.Junk",
-        "INBOX.Drafts",
-        "Deleted Messages",
-        "Deleted",
-    ];
+    /// Roles that should be skipped during whole-account scans.
+    const SKIP_ROLES: &[&str] = &["trash", "junk", "drafts", "all"];
 
-    Ok(all
+    Ok(entries
         .into_iter()
-        .filter(|name| {
-            let lower = name.to_lowercase();
-            // Skip exact matches
-            if skip_exact.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+        .filter(|entry| {
+            // Skip non-selectable mailboxes (\NoSelect).
+            if entry.no_select {
                 return false;
             }
-            // Skip any mailbox containing junk/spam/trash/deleted/draft
-            if lower.contains("junk")
-                || lower.contains("spam")
-                || lower.contains("trash")
-                || lower.contains("deleted")
-                || lower.contains("draft")
+
+            // Skip mailboxes with a skip-listed RFC 6154 role.
+            if let Some(ref role) = entry.role
+                && SKIP_ROLES.contains(&role.as_str())
             {
                 return false;
             }
+
+            // Fallback: string-based filtering for servers that don't send
+            // RFC 6154 special-use attributes.
+            if entry.role.is_none() {
+                let lower = entry.name.to_lowercase();
+                if lower.contains("junk")
+                    || lower.contains("spam")
+                    || lower.contains("trash")
+                    || lower.contains("deleted")
+                    || lower.contains("draft")
+                {
+                    return false;
+                }
+            }
+
             true
         })
+        .map(|entry| entry.name)
         .collect())
 }
 

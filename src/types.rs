@@ -29,6 +29,16 @@ pub struct MailboxInfo {
     pub delimiter: Option<String>,
     /// Full IMAP path including hierarchy
     pub path: String,
+    /// `true` when the mailbox cannot be SELECTed (virtual container only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_select: bool,
+    /// `true` when no child mailboxes exist or can be created.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_inferiors: bool,
+    /// RFC 6154 special-use role: "all", "archive", "drafts", "flagged",
+    /// "junk", "sent", or "trash". `None` for ordinary user mailboxes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Metadata for a MIME attachment part (no binary content).

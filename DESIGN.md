@@ -4,6 +4,8 @@
 
 Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 21 tools and 6 prompts for reading, searching, composing, organizing, and managing email across multiple accounts.
 
+MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-03-26 and 2024-11-05) | rmcp 1.4
+
 No Mail.app dependency. Pure IMAP over TLS. Works on macOS, Linux, and Windows.
 
 ## Architecture
@@ -18,7 +20,7 @@ graph TB
     end
 
     subgraph "agentmail-mcp (in-process)"
-        MCP[AgentMailServer<br/>21 tools, 6 prompts]
+        MCP[AgentMailServer<br/>21 tools, 6 prompts, tasks]
         MK[Agentmail Facade]
         POOL[ConnectionPool<br/>3 sessions/account]
         CRED[Credential Resolver]
@@ -27,7 +29,7 @@ graph TB
     subgraph "IMAP Servers"
         GMAIL[imap.gmail.com]
         ICLOUD[imap.mail.me.com]
-        OUTLOOK[outlook.office365.com]
+        CUSTOM[Custom IMAP]
     end
 
     UI -->|add account| DB
@@ -42,7 +44,7 @@ graph TB
     CRED -->|3. keyring| KR
     POOL <-->|TLS| GMAIL
     POOL <-->|TLS| ICLOUD
-    POOL <-->|TLS| OUTLOOK
+    POOL <-->|TLS| CUSTOM
 ```
 
 ## Two Operating Modes
@@ -73,25 +75,22 @@ graph LR
 ## Crate Structure
 
 ```
-agentmail-mcp/
-  crates/
-    agentmail/          # Library — IMAP client, no MCP dependency
-      src/
-        lib.rs        # Agentmail facade (25+ async methods)
-        imap_client.rs # Raw IMAP operations (SELECT, FETCH, SEARCH, STORE)
-        connection.rs  # Per-account session pool + semaphore concurrency
-        config.rs      # AccountConfig, Config (file + programmatic)
-        credentials.rs # Password resolution: env → config → keyring
-        provider.rs    # MailProvider enum (Gmail, iCloud, Outlook, etc.)
-        parser.rs      # RFC822 parsing via mail-parser
-        content.rs     # HTML → Markdown, truncation, cleanup
-        draft.rs       # RFC822 composition via lettre
-        types.rs       # MessageInfo, MailboxInfo, SearchCriteria, etc.
-        error.rs       # AgentmailError enum
-    agentmail-mcp/      # Binary + library — MCP server + CLI
-      src/
-        lib.rs        # AgentMailServer, 21 tools, 6 prompts, serve_on()
-        main.rs       # CLI dispatch (clap), account configuration
+agentmail/
+  src/
+    lib.rs          # Agentmail facade (25+ async methods)
+    main.rs         # CLI dispatch (clap), account configuration
+    mcp.rs          # AgentMailServer, 21 tools, 6 prompts, task manager, serve_on()/serve_stdio()
+    imap_client.rs  # Raw IMAP operations (SELECT, FETCH, SEARCH, STORE)
+    connection.rs   # Per-account session pool + semaphore concurrency
+    config.rs       # AccountConfig, Config (file + programmatic)
+    credentials.rs  # Password resolution: env → config secret → default keyring
+    secret.rs       # Secret resolution (raw / cmd / keyring)
+    provider.rs     # MailProvider enum (Gmail, iCloud, Yahoo, Fastmail)
+    parser.rs       # RFC822 parsing via mail-parser
+    content.rs      # HTML → Markdown, truncation, cleanup
+    draft.rs        # RFC822 composition via lettre
+    types.rs        # MessageInfo, MailboxInfo, SearchCriteria, etc.
+    error.rs        # AgentmailError enum
 ```
 
 ## Connection Pool
@@ -129,7 +128,7 @@ sequenceDiagram
     Pool->>Sem: release permit
 ```
 
-- Max 3 concurrent IMAP operations per account (well within provider limits)
+- Default 3 concurrent IMAP operations per account (configurable via `max_connections`), well within provider limits
 - Sessions validated with NOOP before reuse
 - Stale sessions dropped, fresh ones created on demand
 - `PooledSession` auto-releases semaphore permit on drop
@@ -156,7 +155,7 @@ When running in-process, the agent app calls `init_keyring_with_service("agent")
 | Tool                  | Description                                                      |
 | --------------------- | ---------------------------------------------------------------- |
 | `list_accounts`       | List configured IMAP accounts                                    |
-| `list_mailboxes`      | List mailboxes with message counts                               |
+| `list_mailboxes`      | List mailboxes with counts, attributes (noSelect, noInferiors), and RFC 6154 roles |
 | `list_capabilities`   | Query IMAP server capabilities                                   |
 | `check_connection`    | Test IMAP connectivity                                           |
 | `get_messages`        | Paginated fetch, newest-first by UID                             |
@@ -195,15 +194,14 @@ When running in-process, the agent app calls `init_keyring_with_service("agent")
 
 ## Provider Defaults
 
-The `MailProvider` enum provides sensible IMAP defaults per provider. Users only need to enter their email and app password.
+The `MailProvider` enum provides sensible IMAP defaults per provider. Users only need to enter their email and app password. Trash and drafts mailboxes are auto-detected at runtime via RFC 6154 special-use attributes (`\Trash`, `\Drafts`), with string-matching fallback for servers that don't support RFC 6154.
 
-| Provider | Host                    | Trash              | Drafts           |
-| -------- | ----------------------- | ------------------ | ---------------- |
-| Gmail    | `imap.gmail.com`        | `[Gmail]/Trash`    | `[Gmail]/Drafts` |
-| iCloud   | `imap.mail.me.com`      | `Deleted Messages` | `Drafts`         |
-| Outlook  | `outlook.office365.com` | `Deleted`          | `Drafts`         |
-| Yahoo    | `imap.mail.yahoo.com`   | `Trash`            | `Draft`          |
-| Fastmail | `imap.fastmail.com`     | `Trash`            | `Drafts`         |
+| Provider | Host                    |
+| -------- | ----------------------- |
+| Gmail    | `imap.gmail.com`        |
+| iCloud   | `imap.mail.me.com`      |
+| Yahoo    | `imap.mail.yahoo.com`   |
+| Fastmail | `imap.fastmail.com`     |
 
 ## Content Processing
 
@@ -224,5 +222,7 @@ Email content flows through a pipeline:
 - **App passwords over OAuth** — simpler for users, no client ID registration needed
 - **Config file for standalone, runtime injection for in-process** — same library code, different config sources
 - **Passwords in OS keyring, never in DB** — proper security, no key management burden
+- **Mailbox attributes** — RFC 6154 special-use roles (trash, junk, drafts, sent, archive, all, flagged) and RFC 3501 flags (noSelect, noInferiors) surfaced from IMAP LIST. Scan-all operations use roles to skip Trash/Junk/Drafts with string-matching fallback for servers without RFC 6154 support
 - **Tool annotations** — `read_only_hint`, `destructive_hint`, `idempotent_hint` per MCP 2025-06-18 spec
 - **Progress notifications** — long operations (rank_senders, find_attachments) report progress to MCP client
+- **Task support (SEP-1686)** — 9 long-running tools support optional async task invocation (enqueue, poll, cancel). Destructive tasks targeting the same account are serialized to prevent IMAP state conflicts
