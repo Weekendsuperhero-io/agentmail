@@ -168,25 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     agentmail::secret::init_service_name("agentmail");
-    // Initialize platform keyring store for standalone mode
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(store) = apple_native_keyring_store::keychain::Store::new() {
-            keyring_core::set_default_store(store);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(store) = windows_native_keyring_store::Store::new() {
-            keyring_core::set_default_store(store);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(store) = dbus_secret_service_keyring_store::Store::new() {
-            keyring_core::set_default_store(store);
-        }
-    }
+    init_platform_keyring();
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(CliCommand::Serve) {
@@ -366,6 +348,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform keyring initialization
+// ---------------------------------------------------------------------------
+
+/// Install the platform-appropriate keyring store as the default for `keyring_core`.
+///
+/// On macOS, prefers the data-protection keychain (which doesn't depend on a default
+/// keychain pointer and works in headless launchd contexts). Probes it with a no-op
+/// read; if the binary lacks the entitlement (typical for unsigned `cargo install`
+/// builds), falls back to the legacy file-based keychain. Surfaces failures via
+/// `tracing` so the cause is visible instead of silently swallowed.
+fn init_platform_keyring() {
+    #[cfg(target_os = "macos")]
+    {
+        let protected = apple_native_keyring_store::protected::Store::new()
+            .expect("protected::Store::new is documented infallible");
+        keyring_core::set_default_store(protected);
+
+        // Probe: try to read a sentinel entry. NoEntry means the store works
+        // (entry just doesn't exist). MissingEntitlement / PlatformFailure means
+        // we need to fall back to the file-based keychain.
+        let probe = keyring_core::Entry::new("agentmail.probe.startup", "probe");
+        let probe_ok = match probe {
+            Ok(entry) => match entry.get_password() {
+                Ok(_) => true,
+                Err(keyring_core::error::Error::NoEntry) => true,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let entitlement_issue = msg.contains("-34018")
+                        || msg.to_lowercase().contains("missing entitlement");
+                    if entitlement_issue {
+                        tracing::debug!(
+                            "keychain: data-protection unavailable (missing entitlement); \
+                             falling back to file-based keychain"
+                        );
+                        false
+                    } else {
+                        // Some other error — keep data-protection, surface details
+                        // on the next real call.
+                        tracing::debug!(
+                            "keychain: data-protection probe returned {e}; keeping it active"
+                        );
+                        true
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::warn!("keychain: Entry probe failed unexpectedly: {e}");
+                false
+            }
+        };
+
+        if !probe_ok {
+            match apple_native_keyring_store::keychain::Store::new() {
+                Ok(store) => {
+                    keyring_core::set_default_store(store);
+                    tracing::debug!("keychain: using file-based backend");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "keychain: no backend available (file-based failed: {e}). \
+                         Password operations will fail. \
+                         Set AGENTMAIL_PASSWORD_<ACCOUNT> to bypass the keychain."
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        match windows_native_keyring_store::Store::new() {
+            Ok(store) => keyring_core::set_default_store(store),
+            Err(e) => tracing::warn!(
+                "keychain: Windows credential store unavailable: {e}. \
+                 Set AGENTMAIL_PASSWORD_<ACCOUNT> to bypass."
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match dbus_secret_service_keyring_store::Store::new() {
+            Ok(store) => keyring_core::set_default_store(store),
+            Err(e) => tracing::warn!(
+                "keychain: D-Bus secret service unavailable: {e}. \
+                 Set AGENTMAIL_PASSWORD_<ACCOUNT> to bypass."
+            ),
         }
     }
 }

@@ -343,7 +343,7 @@ impl Agentmail {
                 format!("{} <{}>", s.display_name, s.address)
             };
         }
-        senders.sort_by(|a, b| b.count.cmp(&a.count));
+        senders.sort_by_key(|b| std::cmp::Reverse(b.count));
 
         let unique_senders = senders.len();
         let total_messages = senders.iter().map(|s| s.count).sum::<u32>();
@@ -591,7 +591,7 @@ impl Agentmail {
                 }
             })
             .collect();
-        lists.sort_by(|a, b| b.count.cmp(&a.count));
+        lists.sort_by_key(|b| std::cmp::Reverse(b.count));
 
         let unique_lists = lists.len();
         let total_messages = lists.iter().map(|l| l.count).sum::<u32>();
@@ -752,14 +752,14 @@ impl Agentmail {
         session.release().await;
 
         let mut flag_list: Vec<(String, u32)> = total_flags.into_iter().collect();
-        flag_list.sort_by(|a, b| b.1.cmp(&a.1));
+        flag_list.sort_by_key(|b| std::cmp::Reverse(b.1));
         let flags: Vec<FlagCount> = flag_list
             .into_iter()
             .map(|(flag, count)| FlagCount { flag, count })
             .collect();
 
         let mut color_list: Vec<(String, u32)> = total_colors.into_iter().collect();
-        color_list.sort_by(|a, b| b.1.cmp(&a.1));
+        color_list.sort_by_key(|b| std::cmp::Reverse(b.1));
         let colors: Vec<ColorCount> = color_list
             .into_iter()
             .map(|(color, count)| ColorCount { color, count })

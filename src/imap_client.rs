@@ -1095,9 +1095,9 @@ pub async fn fetch_flags(
     }
 
     let mut flags: Vec<(String, u32)> = flag_counts.into_iter().collect();
-    flags.sort_by(|a, b| b.1.cmp(&a.1));
+    flags.sort_by_key(|b| std::cmp::Reverse(b.1));
     let mut colors: Vec<(String, u32)> = color_counts.into_iter().collect();
-    colors.sort_by(|a, b| b.1.cmp(&a.1));
+    colors.sort_by_key(|b| std::cmp::Reverse(b.1));
     Ok(FlagScanResult { flags, colors })
 }
 
