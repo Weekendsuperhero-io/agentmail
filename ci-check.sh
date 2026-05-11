@@ -28,6 +28,12 @@ echo "==> Building..."
 cargo build --all-features
 
 echo "==> Running tests..."
-cargo test --all-features
+if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo nextest run --all-features --profile ci
+else
+    echo "    cargo-nextest not installed; falling back to 'cargo test'."
+    echo "    Install with: cargo install cargo-nextest --locked"
+    cargo test --all-features
+fi
 
 echo "==> All checks passed."
