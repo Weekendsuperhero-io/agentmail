@@ -1145,6 +1145,12 @@ impl Agentmail {
         cc: &[String],
         bcc: &[String],
     ) -> Result<CreateDraftResponse> {
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(AgentmailError::Other(
+                "At least one recipient (to, cc, or bcc) is required".to_string(),
+            ));
+        }
+
         let acct_config = self
             .pool
             .account_config(account)
@@ -1158,6 +1164,11 @@ impl Agentmail {
         let drafts_name = find_drafts_mailbox(session.session())
             .await?
             .unwrap_or_else(|| "Drafts".to_string());
+
+        // Best-effort: create the drafts mailbox if it doesn't exist yet.
+        // Many servers auto-create it, but some (Dovecot, etc.) require explicit CREATE first.
+        // Ignore "already exists" errors; the APPEND below will surface real problems.
+        let _ = imap_client::create_mailbox(session.session(), &drafts_name).await;
 
         imap_client::append_draft(session.session(), &drafts_name, &rfc822).await?;
         imap_client::sync(session.session()).await?;

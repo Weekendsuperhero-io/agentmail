@@ -141,7 +141,7 @@ Grouped by List-Id header — same list with different senders are merged into o
 | 14  | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes.                     | `destructive`, `taskable`                 |
 | 15  | `move_message`         | IMAP MOVE between mailboxes                                                           |                                          |
 | 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
-| 17  | `create_draft`         | Compose RFC822 to Drafts folder (subject, body, to/cc/bcc)                            |                                          |
+| 17  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing) |                                          |
 | 18  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     | `taskable`                               |
 | 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail                  | `destructive`, `open_world`              |
 

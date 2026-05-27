@@ -939,7 +939,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "create_draft",
-        description = "Create and save a draft email. Composes an RFC822 message and appends it to the account's Drafts folder. Requires subject, body, and at least one recipient (to, cc, or bcc).",
+        description = "Create and save a draft email. Composes an RFC822 message and appends it to the account's Drafts folder (creating the Drafts mailbox if necessary). Requires at least one recipient (to, cc, or bcc). Subject and body are optional.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn create_draft_tool(

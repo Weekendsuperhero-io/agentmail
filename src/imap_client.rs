@@ -905,7 +905,7 @@ pub async fn append_draft(
     drafts_mailbox: &str,
     rfc822_message: &[u8],
 ) -> Result<()> {
-    imap_timeout(session.append(drafts_mailbox, Some("\\Draft"), None, rfc822_message)).await?;
+    imap_timeout(session.append(drafts_mailbox, Some(r"(\Draft)"), None, rfc822_message)).await?;
     Ok(())
 }
 
