@@ -75,3 +75,7 @@ redundant_closure_for_method_calls = "allow"
 semicolon_if_nothing_returned = "warn"
 trivially_copy_pass_by_ref = "warn"
 unnested_or_patterns = "warn"
+
+[dev-dependencies]
+proptest = "1"
+mail-parser = "0.11"

@@ -460,6 +460,14 @@ pub struct DraftRecipients {
     pub bcc: Vec<String>,
 }
 
+/// Attachment data for creating drafts (internal; bytes already loaded).
+#[derive(Debug, Clone)]
+pub struct DraftAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
 /// Response for create_draft.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -469,6 +477,8 @@ pub struct CreateDraftResponse {
     pub drafts_mailbox: String,
     pub subject: String,
     pub recipients: DraftRecipients,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 /// A downloaded attachment file.

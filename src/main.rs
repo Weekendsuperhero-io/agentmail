@@ -344,7 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .create_draft(&account, &subject, &body, &to, &cc, &bcc)
+                .create_draft(&account, &subject, &body, &to, &cc, &bcc, &[])
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())

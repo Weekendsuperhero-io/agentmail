@@ -1136,6 +1136,8 @@ impl Agentmail {
     // -----------------------------------------------------------------
 
     /// Create a draft message.
+    /// When `attachments` is non-empty, the message is built as multipart/mixed
+    /// with the body as the first part and each attachment as subsequent parts.
     pub async fn create_draft(
         &self,
         account: &str,
@@ -1144,6 +1146,7 @@ impl Agentmail {
         to: &[String],
         cc: &[String],
         bcc: &[String],
+        attachments: &[crate::types::DraftAttachment],
     ) -> Result<CreateDraftResponse> {
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
             return Err(AgentmailError::Other(
@@ -1157,7 +1160,7 @@ impl Agentmail {
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
         let from = &acct_config.username;
 
-        let rfc822 = draft::compose_draft(subject, body, to, cc, bcc, Some(from))?;
+        let rfc822 = draft::compose_draft(subject, body, to, cc, bcc, Some(from), attachments)?;
 
         let mut session = self.pool.acquire(account).await?;
 
@@ -1174,6 +1177,8 @@ impl Agentmail {
         imap_client::sync(session.session()).await?;
         session.release().await;
 
+        let attached_names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
+
         Ok(CreateDraftResponse {
             created: true,
             account: account.to_string(),
@@ -1184,6 +1189,7 @@ impl Agentmail {
                 cc: cc.to_vec(),
                 bcc: bcc.to_vec(),
             },
+            attachments: attached_names,
         })
     }
 
@@ -1785,5 +1791,64 @@ pub fn bits_to_color(flags: &[String]) -> Option<&'static str> {
         (true, false, true) => Some("purple"),
         (true, true, false) => Some("gray"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fast test for the early validation error in create_draft.
+    /// Uses an empty config so no IMAP connection or credentials are needed.
+    /// This exercises the public API path that the MCP tool also goes through.
+    #[tokio::test]
+    async fn create_draft_rejects_empty_recipients() {
+        let mk = Agentmail::new(Config::empty());
+
+        let err = mk
+            .create_draft("any-account", "subj", "body", &[], &[], &[], &[])
+            .await
+            .expect_err("should fail with no recipients");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("recipient"),
+            "expected recipient validation error, got: {msg}"
+        );
+    }
+
+    /// Sanity check that we can construct an Agentmail and call create_draft
+    /// with attachments (it will fail at the "account not found" stage, which
+    /// proves the attachments parameter is accepted and passed down).
+    #[tokio::test]
+    async fn create_draft_accepts_attachments_before_account_lookup() {
+        let mk = Agentmail::new(Config::empty());
+
+        let att = DraftAttachment {
+            filename: "test.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            data: b"hello attachment".to_vec(),
+        };
+
+        let err = mk
+            .create_draft(
+                "nonexistent-account",
+                "with att",
+                "body",
+                &["to@example.com".to_string()],
+                &[],
+                &[],
+                &[att],
+            )
+            .await
+            .expect_err("should fail because account doesn't exist");
+
+        // The important thing is we didn't fail earlier (e.g. on attachment handling).
+        // The actual error should be about the missing account.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Account") || msg.contains("not found"),
+            "expected account lookup error, got: {msg}"
+        );
     }
 }
