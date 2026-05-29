@@ -294,10 +294,14 @@ struct DraftAttachmentArg {
     #[schemars(description = "Local filesystem path to the file to attach (required).")]
     path: String,
     #[serde(default)]
-    #[schemars(description = "Override filename to show in the email. Defaults to the file's basename.")]
+    #[schemars(
+        description = "Override filename to show in the email. Defaults to the file's basename."
+    )]
     filename: Option<String>,
     #[serde(default)]
-    #[schemars(description = "MIME content type (e.g. 'application/pdf'). Inferred from extension when omitted.")]
+    #[schemars(
+        description = "MIME content type (e.g. 'application/pdf'). Inferred from extension when omitted."
+    )]
     content_type: Option<String>,
 }
 
@@ -1026,7 +1030,12 @@ impl AgentMailServer {
                 Ok(d) => d,
                 Err(e) => {
                     return Err(McpError::internal_error(
-                        format!("Failed to read attachment #{} at '{}': {}", i + 1, a.path, e),
+                        format!(
+                            "Failed to read attachment #{} at '{}': {}",
+                            i + 1,
+                            a.path,
+                            e
+                        ),
                         None,
                     ));
                 }

@@ -51,9 +51,8 @@ pub fn compose_draft(
     } else {
         let mut mixed = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
         for att in attachments {
-            let ct = ContentType::parse(&att.content_type).unwrap_or_else(|_| {
-                ContentType::parse("application/octet-stream").unwrap()
-            });
+            let ct = ContentType::parse(&att.content_type)
+                .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
             let part = Attachment::new(att.filename.clone()).body(att.data.clone(), ct);
             mixed = mixed.singlepart(part);
         }
@@ -144,7 +143,10 @@ mod tests {
         let pdf_part = msg
             .attachments()
             .find(|p| p.attachment_name() == Some("report.pdf"));
-        assert!(pdf_part.is_some(), "could not locate the PDF attachment part");
+        assert!(
+            pdf_part.is_some(),
+            "could not locate the PDF attachment part"
+        );
     }
 
     #[test]
@@ -201,7 +203,10 @@ mod tests {
         .unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains("Invalid email address"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("Invalid email address"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -212,7 +217,16 @@ mod tests {
             data: b"data".to_vec(),
         };
 
-        let raw = compose_draft("s", "b", &["a@b.c".to_string()], &[], &[], Some("sender@example.com"), &[att]).unwrap();
+        let raw = compose_draft(
+            "s",
+            "b",
+            &["a@b.c".to_string()],
+            &[],
+            &[],
+            Some("sender@example.com"),
+            &[att],
+        )
+        .unwrap();
         let msg = parse(&raw);
         assert!(msg.is_content_type("multipart", "mixed"));
 
@@ -222,5 +236,4 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["weird.xyz123"]);
     }
-
 }
