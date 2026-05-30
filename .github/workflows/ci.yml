@@ -15,3 +15,7 @@ jobs:
       docs-os: ubuntu-latest
       linux-packages: "libdbus-1-dev pkg-config"
       build-matrix-json: "[]"
+      # Run nextest when available (preferred runner + .config/nextest.toml).
+      # Falls back to `cargo test` if nextest is unavailable or on Windows.
+      # This still runs all tests including tests/proptest_draft.rs.
+      test-command: cargo nextest run --all-features --profile ci || cargo test --all-features

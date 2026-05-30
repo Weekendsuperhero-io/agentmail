@@ -11,12 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP tasks** — added task management to support background execution and polling of long-running tools.
 - **Mailbox roles** — added `role_from_attributes` to parse RFC 6154 roles with fallback logic for older servers.
 - **Tool synchronization** — added async mutexes to serialize destructive tool executions per-account.
+- **Keychain tests** — added unit tests for `Secret` (Raw/Command paths plus a keyring roundtrip via `keyring_core::mock::Store`) and for the macOS error-code classifier (-25307, -25308, -34018).
 
 ### Changed
 - **Mailbox detection** — replaced hardcoded mailbox names with auto-detection using RFC 6154 special-use attributes (`Trash`, `Drafts`).
 - **MCP transport** — replaced custom `CompatStdioWorker` with the standard `rmcp` stdio transport.
 - **Mailbox info** — updated `MailboxInfo` to expose `no_select`, `no_inferiors`, and `role`.
 - **Tool configurations** — updated all applicable tools to include `task_support = "optional"`.
+- **rmcp** — bumped to 1.6 (adds 2025-11-25 protocol support; Origin validation, session store, and other HTTP-only features are not used since agentmail is stdio-only).
+- **macOS keychain** — prefer the data-protection keychain backend, falling back to the legacy file-based keychain when the binary lacks the entitlement. Improves reliability in headless/launchd contexts.
+- **Tests** — switched `ci-check.sh` to `cargo nextest run` (with a `cargo test` fallback) and added a `.config/nextest.toml`.
+
+### Fixed
+- **Keychain errors** — surface `errSecNoDefaultKeychain` (-25307), `errSecInteractionNotAllowed` (-25308), and `errSecMissingEntitlement` (-34018) as typed `SecretError` variants with remediation hints, instead of opaque string failures.
+- **Keychain init logging** — stopped silently swallowing platform-store initialization failures; they now log via `tracing::warn!`.
 
 ### Removed
 - **Account configuration** — removed explicit `trash_mailbox` and `drafts_mailbox` settings from `AccountConfig`.

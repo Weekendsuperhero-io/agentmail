@@ -141,7 +141,7 @@ Grouped by List-Id header — same list with different senders are merged into o
 | 14  | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes.                     | `destructive`, `taskable`                 |
 | 15  | `move_message`         | IMAP MOVE between mailboxes                                                           |                                          |
 | 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
-| 17  | `create_draft`         | Compose RFC822 to Drafts folder (subject, body, to/cc/bcc)                            |                                          |
+| 17  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. |                                          |
 | 18  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     | `taskable`                               |
 | 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail                  | `destructive`, `open_world`              |
 
@@ -184,8 +184,10 @@ Grouped by List-Id header — same list with different senders are merged into o
 **create_draft**
 ```json
 { "created": true, "account", "draftsMailbox",
-  "subject", "recipients": { "to": [], "cc": [], "bcc": [] } }
+  "subject", "recipients": { "to": [], "cc": [], "bcc": [] },
+  "attachments?": ["report.pdf", "photo.jpg"] }
 ```
+`attachments` lists the filenames that were successfully attached (empty when none provided).
 
 **download_attachments**
 ```json
@@ -233,7 +235,7 @@ Returns the full updated flag set after the operation.
 | 1   | `inbox-summary`       | Full inbox overview: folders, top senders, unread | `account`                    |
 | 2   | `cleanup-sender`      | Find & bulk-delete from a specific sender         | `account`, `sender`          |
 | 3   | `find-attachments`    | Scan for downloadable attachments                 | `account`, `mailbox?`        |
-| 4   | `compose-email`       | Guided draft composition                          | `account`, `to?`, `subject?` |
+| 4   | `compose-email`       | Guided draft composition (supports attachments via create_draft) | `account`, `to?`, `subject?` |
 | 5   | `unsubscribe-cleanup` | Identify high-volume lists, unsubscribe + delete  | `account`                    |
 | 6   | `list-id-cleanup`     | Identify mailing lists by List-Id, bulk-delete    | `account`                    |
 

@@ -1,6 +1,6 @@
 use crate::{
     ConnectionStatus, CreateDraftResponse, CreateMailboxResponse, DeleteBySenderResponse,
-    DeleteListIdResponse, DeleteMessagesResponse, DownloadAttachmentsResponse,
+    DeleteListIdResponse, DeleteMessagesResponse, DownloadAttachmentsResponse, DraftAttachment,
     FindAttachmentsResponse, GetMessagesResponse, ListAccountsResponse, ListCapabilitiesResponse,
     ListFlagsResponse, ListMailboxesResponse, MoveMessageResponse, RankListIdResponse,
     RankSendersResponse, RankUnsubscribeResponse, SearchMessagesResponse, UnsubscribeResponse,
@@ -280,6 +280,29 @@ struct CreateDraftArgs {
     #[serde(default)]
     #[schemars(description = "Bcc recipient email addresses.")]
     bcc: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Attachments to include. Each entry requires a local filesystem 'path'. 'filename' and 'contentType' are optional and will be inferred when omitted."
+    )]
+    attachments: Vec<DraftAttachmentArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(description = "Attachment to attach to a draft.")]
+struct DraftAttachmentArg {
+    #[schemars(description = "Local filesystem path to the file to attach (required).")]
+    path: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Override filename to show in the email. Defaults to the file's basename."
+    )]
+    filename: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "MIME content type (e.g. 'application/pdf'). Inferred from extension when omitted."
+    )]
+    content_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -529,6 +552,53 @@ const DESTRUCTIVE_TOOLS: &[&str] = &[
 /// Try to extract the `account` field from a tool call's JSON arguments.
 fn extract_account(args: &Option<serde_json::Map<String, serde_json::Value>>) -> Option<String> {
     args.as_ref()?.get("account")?.as_str().map(String::from)
+}
+
+/// Guess a MIME type from a filename extension. Falls back to application/octet-stream.
+fn guess_content_type(filename: &str) -> String {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" | "heif" => "image/heic",
+        "svg" => "image/svg+xml",
+        "txt" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "html" | "htm" => "text/html",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "rtf" => "application/rtf",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "wav" => "audio/wav",
+        "ics" => "text/calendar",
+        "vcf" => "text/vcard",
+        "eml" => "message/rfc822",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 struct ManagedTask {
@@ -939,7 +1009,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "create_draft",
-        description = "Create and save a draft email. Composes an RFC822 message and appends it to the account's Drafts folder. Requires subject, body, and at least one recipient (to, cc, or bcc).",
+        description = "Create and save a draft email. Composes an RFC822 message and appends it to the account's Drafts folder (creating the Drafts mailbox if necessary). Requires at least one recipient (to, cc, or bcc). Subject and body are optional. Supports optional attachments via local file paths.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn create_draft_tool(
@@ -952,6 +1022,45 @@ impl AgentMailServer {
                 None,
             ));
         }
+
+        // Load attachments (best-effort per file; surface first error clearly)
+        let mut loaded: Vec<DraftAttachment> = Vec::with_capacity(args.attachments.len());
+        for (i, a) in args.attachments.iter().enumerate() {
+            let data = match tokio::fs::read(&a.path).await {
+                Ok(d) => d,
+                Err(e) => {
+                    return Err(McpError::internal_error(
+                        format!(
+                            "Failed to read attachment #{} at '{}': {}",
+                            i + 1,
+                            a.path,
+                            e
+                        ),
+                        None,
+                    ));
+                }
+            };
+            let filename = a
+                .filename
+                .clone()
+                .or_else(|| {
+                    std::path::Path::new(&a.path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| format!("attachment-{}", i + 1));
+            let content_type = a
+                .content_type
+                .clone()
+                .unwrap_or_else(|| guess_content_type(&filename));
+            loaded.push(DraftAttachment {
+                filename,
+                content_type,
+                data,
+            });
+        }
+
         match self
             .agentmail
             .create_draft(
@@ -961,6 +1070,7 @@ impl AgentMailServer {
                 &args.to,
                 &args.cc,
                 &args.bcc,
+                &loaded,
             )
             .await
         {
@@ -1317,7 +1427,7 @@ impl AgentMailServer {
         }
         instructions.push_str(
             " Ask me what I want to say, help me write the body, then use create_draft \
-             to save it. Show me a preview of the draft before saving.",
+             (with optional attachments) to save it. Show me a preview of the draft before saving.",
         );
         vec![PromptMessage::new_text(
             PromptMessageRole::User,
@@ -1394,7 +1504,7 @@ impl ServerHandler for AgentMailServer {
              Use list_mailboxes to see folder structure and message counts. \
              Read messages with get_messages (paginated, newest-first) or search_messages (with filters). \
              Use search_messages to find specific messages by sender, subject, or content. \
-             Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, create_draft, create_mailbox, unsubscribe_message. \
+             Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
              rank_senders, rank_unsubscribe, rank_list_id, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
              All-mailbox scans automatically skip Trash, Junk, Spam, and Drafts. \
              Two cleanup workflows: (1) rank_senders → delete_by_sender for unwanted personal senders, (2) rank_unsubscribe → unsubscribe_message for mailing lists. \

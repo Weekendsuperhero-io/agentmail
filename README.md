@@ -2,7 +2,7 @@
 
 IMAP email client exposed as both a CLI and an MCP (Model Context Protocol) server, built with Rust.
 
-MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-03-26 and 2024-11-05) | rmcp 1.4
+MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-11-25, 2025-03-26, and 2024-11-05) | rmcp 1.6
 
 One binary: `agentmail serve` starts the MCP stdio server, all other subcommands are a direct CLI.
 
@@ -349,7 +349,7 @@ To pass passwords via environment variables instead of keychain:
 
 ```
 agentmail (binary crate: agentmail-mcp)
-  ├── serve                → MCP stdio server (tokio + rmcp 1.4)
+  ├── serve                → MCP stdio server (tokio + rmcp 1.6)
   │                          21 tools + 6 prompts, tasks, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
