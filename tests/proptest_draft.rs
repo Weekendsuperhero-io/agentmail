@@ -251,7 +251,7 @@ proptest! {
         let result = compose_draft(
             "bad addr test",
             "body",
-            &[bad_addr.clone()],
+            std::slice::from_ref(&bad_addr),
             &[],
             &[],
             None,
