@@ -15,15 +15,7 @@ jobs:
       docs-os: ubuntu-latest
       linux-packages: "libdbus-1-dev pkg-config"
       build-matrix-json: "[]"
-      # Explicitly install cargo-nextest (best-effort via official get.nexte.st installer)
-      # so GitHub CI uses the project's preferred runner + .config/nextest.toml
-      # (same as ./ci-check.sh). Install is attempted only if not already present
-      # (mainly helps on Linux/macOS). Falls back to `cargo test` if nextest is
-      # unavailable or on Windows — this still runs all tests including the
-      # dedicated proptest file in tests/proptest_draft.rs.
-      test-command: |
-        if ! command -v cargo-nextest >/dev/null 2>&1; then
-          curl --proto '=https' --tlsv1.2 -LsSf https://get.nexte.st/latest/cargo-nextest \
-            | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin" 2>/dev/null || true
-        fi
-        cargo nextest run --all-features --profile ci || cargo test --all-features
+      # Run nextest when available (preferred runner + .config/nextest.toml).
+      # Falls back to `cargo test` if nextest is unavailable or on Windows.
+      # This still runs all tests including tests/proptest_draft.rs.
+      test-command: cargo nextest run --all-features --profile ci || cargo test --all-features
