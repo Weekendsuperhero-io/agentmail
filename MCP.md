@@ -1,3 +1,7 @@
+---
+created: 2026-05-29T19:20
+updated: 2026-05-29T19:20
+---
 # Agentmail MCP — Tool & Prompt Reference
 
 MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-03-26 and 2024-11-05) | rmcp: 1.4 | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)

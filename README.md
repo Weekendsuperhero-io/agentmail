@@ -1,3 +1,7 @@
+---
+created: 2026-05-29T19:20
+updated: 2026-05-29T19:20
+---
 # agentmail
 
 IMAP email client exposed as both a CLI and an MCP (Model Context Protocol) server, built with Rust.
