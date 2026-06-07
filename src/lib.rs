@@ -101,9 +101,10 @@ impl Agentmail {
 
     /// List IMAP capabilities for an account.
     pub async fn list_capabilities(&self, account: &str) -> Result<ListCapabilitiesResponse> {
-        let mut session = self.pool.acquire(account).await?;
-        let caps = imap_client::list_capabilities(session.session()).await?;
-        session.release().await;
+        let caps = self
+            .pool
+            .with_session_retry(account, async |s| imap_client::list_capabilities(s).await)
+            .await?;
 
         Ok(ListCapabilitiesResponse {
             account: account.to_string(),
@@ -128,9 +129,13 @@ impl Agentmail {
 
         let mut mailboxes: Vec<MailboxInfo> = Vec::new();
         for acct_name in &account_names {
-            let mut session = self.pool.acquire(acct_name).await?;
-            let mboxes = imap_client::list_mailboxes(session.session(), acct_name).await?;
-            session.release().await;
+            let acct = acct_name.clone();
+            let mboxes = self
+                .pool
+                .with_session_retry(acct_name, async move |s| {
+                    imap_client::list_mailboxes(s, &acct).await
+                })
+                .await?;
             mailboxes.extend(mboxes);
         }
 
@@ -183,18 +188,22 @@ impl Agentmail {
         include_content: bool,
         include_headers: bool,
     ) -> Result<GetMessagesResponse> {
-        let mut session = self.pool.acquire(account).await?;
-        let (messages, total) = imap_client::fetch_messages(
-            session.session(),
-            mailbox,
-            account,
-            offset,
-            limit,
-            include_content,
-            include_headers,
-        )
-        .await?;
-        session.release().await;
+        let (mailbox_s, account_s) = (mailbox.to_string(), account.to_string());
+        let (messages, total) = self
+            .pool
+            .with_session_retry(account, async move |s| {
+                imap_client::fetch_messages(
+                    s,
+                    &mailbox_s,
+                    &account_s,
+                    offset,
+                    limit,
+                    include_content,
+                    include_headers,
+                )
+                .await
+            })
+            .await?;
 
         Ok(GetMessagesResponse {
             mailbox: mailbox.to_string(),
@@ -215,18 +224,23 @@ impl Agentmail {
         include_content: bool,
         include_headers: bool,
     ) -> Result<GetMessagesByUidResponse> {
-        let mut session = self.pool.acquire(account).await?;
-        imap_client::select(session.session(), mailbox).await?;
-        let messages = imap_client::fetch_by_uids(
-            session.session(),
-            uids,
-            mailbox,
-            account,
-            include_content,
-            include_headers,
-        )
-        .await?;
-        session.release().await;
+        let (mailbox_s, account_s, uids_v) =
+            (mailbox.to_string(), account.to_string(), uids.to_vec());
+        let messages = self
+            .pool
+            .with_session_retry(account, async move |s| {
+                imap_client::select(s, &mailbox_s).await?;
+                imap_client::fetch_by_uids(
+                    s,
+                    &uids_v,
+                    &mailbox_s,
+                    &account_s,
+                    include_content,
+                    include_headers,
+                )
+                .await
+            })
+            .await?;
 
         Ok(GetMessagesByUidResponse {
             mailbox: mailbox.to_string(),
@@ -246,19 +260,24 @@ impl Agentmail {
         include_content: bool,
         include_headers: bool,
     ) -> Result<SearchMessagesResponse> {
-        let mut session = self.pool.acquire(account).await?;
-        let (messages, total) = imap_client::search_messages(
-            session.session(),
-            mailbox,
-            account,
-            criteria,
-            offset,
-            limit,
-            include_content,
-            include_headers,
-        )
-        .await?;
-        session.release().await;
+        let (mailbox_s, account_s, criteria_c) =
+            (mailbox.to_string(), account.to_string(), criteria.clone());
+        let (messages, total) = self
+            .pool
+            .with_session_retry(account, async move |s| {
+                imap_client::search_messages(
+                    s,
+                    &mailbox_s,
+                    &account_s,
+                    &criteria_c,
+                    offset,
+                    limit,
+                    include_content,
+                    include_headers,
+                )
+                .await
+            })
+            .await?;
 
         Ok(SearchMessagesResponse {
             mailbox: mailbox.to_string(),
