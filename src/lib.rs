@@ -741,11 +741,14 @@ impl Agentmail {
                 });
             }
 
+            // entry_ref: per-mailbox aggregation over a tiny distinct flag/color
+            // set — almost always a hit. Allocate the owned key only on insert.
+            // See PERF-entry-ref.md.
             for (name, count) in &scan.flags {
-                *total_flags.entry(name.clone()).or_insert(0) += count;
+                *total_flags.entry_ref(name.as_str()).or_insert(0) += count;
             }
             for (color, count) in &scan.colors {
-                *total_colors.entry(color.clone()).or_insert(0) += count;
+                *total_colors.entry_ref(color.as_str()).or_insert(0) += count;
             }
         }
 

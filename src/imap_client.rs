@@ -1080,11 +1080,15 @@ pub async fn fetch_flags(
             let fetch = item.map_err(AgentmailError::Imap)?;
             let msg_flags: Vec<String> = fetch.flags().map(|f| flag_to_string(&f)).collect();
             for name in &msg_flags {
-                *flag_counts.entry(name.clone()).or_insert(0) += 1;
+                // entry_ref: allocate the owned `String` key only on first sight
+                // of a flag — the distinct flag set is tiny, so this loop (once
+                // per email) is almost always a hit. See PERF-entry-ref.md.
+                *flag_counts.entry_ref(name.as_str()).or_insert(0) += 1;
             }
             // Resolve Apple Mail color from MailFlagBit combinations
             if let Some(color) = crate::bits_to_color(&msg_flags) {
-                *color_counts.entry(color.to_string()).or_insert(0) += 1;
+                // `color` is already a borrowed `&str` — pass it directly.
+                *color_counts.entry_ref(color).or_insert(0) += 1;
             }
         }
 
