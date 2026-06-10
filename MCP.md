@@ -6,7 +6,7 @@ updated: 2026-05-29T19:20
 
 MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK) | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
 
-**Supported capabilities:** tools, prompts, tasks (SEP-1686), progress notifications
+**Supported capabilities:** tools, prompts, resources, completions, tasks (SEP-1686), progress notifications, request cancellation
 
 ## Tools (21)
 
@@ -107,7 +107,7 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
     "count", "oldestDate?", "newestDate?"
   }] }
 ```
-Grouped by (email, display name) — same email with different display names are separate entries.
+Grouped by (email, display name) — same email with different display names are separate entries. `limit` defaults to 100 on all three rank tools; set it higher to return more.
 
 **rank_unsubscribe**
 ```json
@@ -252,6 +252,35 @@ Returns the full updated flag set after the operation.
 **Destructive task serialization:** Destructive tasks (`delete_messages`, `delete_by_sender`, `delete_list_id`, `unsubscribe_message`) targeting the same account are serialized — each waits for the previous destructive task to finish before starting. Non-destructive tasks run concurrently without restriction.
 
 **Task lifecycle:** `tasks/list`, `tasks/get`, `tasks/getResult`, `tasks/cancel`
+
+**Cancellation:** `tasks/cancel` aborts the task's future at its next await point. For direct (non-task) calls, `notifications/cancelled` stops long scans cooperatively at the next mailbox or fetch-chunk boundary; transport shutdown triggers the same path.
+
+## Resources (2 templates)
+
+Single messages are addressable as resources. `resources/list` is intentionally empty — discovery is template-based (`resources/templates/list`), since mailboxes hold thousands of messages.
+
+| URI template                               | MIME type        | Content                                       |
+| ------------------------------------------ | ---------------- | --------------------------------------------- |
+| `email://{account}/{mailbox}/{uid}`        | `text/markdown`  | Message rendered as markdown (headers + body) |
+| `email://{account}/{mailbox}/{uid}/source` | `message/rfc822` | Raw RFC822 source with all headers and MIME   |
+
+`account` and `mailbox` are percent-encoded URI segments; a `/` inside a mailbox name must be encoded as `%2F` (e.g. `email://work/Archive%2F2024/1234`). The markdown body is the same normalized, length-capped content `get_messages` returns with `includeContent=true`.
+
+**Error codes for `resources/read`:**
+
+| Code     | Meaning                                                    |
+| -------- | ---------------------------------------------------------- |
+| `-32602` | Malformed URI, unknown account                             |
+| `-32002` | UID does not exist in the mailbox (resource not found)     |
+| `-32603` | Transport/IMAP failure (including unselectable mailboxes)  |
+
+## Completions
+
+`completion/complete` is supported for prompt arguments and the `email://` resource-template variables:
+
+- `account` — instant, from configured account names, prefix-filtered.
+- `mailbox` — IMAP LIST scoped to the `account` from the completion context (falls back to the default account); for resource templates the values are returned percent-encoded, ready for substitution. Failures yield an empty list, never an error.
+- Other arguments (`uid`, `sender`, `to`, `subject`) are not enumerable and return no values.
 
 ## Annotations Key
 

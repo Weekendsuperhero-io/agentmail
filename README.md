@@ -338,10 +338,11 @@ Opens a web UI to exercise all 21 tools, 6 prompts, and task calls interactively
 
 - `account` is **required** for most tools. Use `list_accounts` to discover valid names.
 - `mailbox` defaults to `INBOX` when omitted. Omit it on `rank_senders`, `rank_unsubscribe`, `rank_list_id`, `list_flags`, and `find_attachments` to scan the entire account (auto-skips Trash, Junk, Spam, Drafts).
-- `limit` defaults to 25, clamped to 1..50.
+- `limit` defaults to 25, clamped to 1..50. On `rank_senders`, `rank_unsubscribe`, and `rank_list_id` it defaults to 100 — set it higher to return more.
 - `includeContent` (default false) returns normalized markdown body text, trimmed for context window safety.
 - All reads use `BODY.PEEK` to avoid marking messages as `\Seen`.
 - Long-running operations (`rank_senders`, `rank_unsubscribe`, `rank_list_id`, `find_attachments`, `list_flags`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`) support MCP progress notifications and optional task-based invocation.
+- Cancelling a request (`notifications/cancelled`) stops long scans cooperatively at the next mailbox or fetch-chunk boundary.
 - Destructive tasks targeting the same account are automatically serialized to prevent IMAP state conflicts.
 
 ## MCP Prompts
@@ -356,6 +357,24 @@ Opens a web UI to exercise all 21 tools, 6 prompts, and task calls interactively
 | `compose-email`       | Guided email draft composition                                                     |
 | `unsubscribe-cleanup` | Identify high-volume mailing lists, unsubscribe and bulk-delete                    |
 | `list-id-cleanup`     | Identify mailing lists by List-Id and bulk-delete entire lists                     |
+
+## MCP Resources
+
+Single messages are addressable as resources — the read-one-message primitive that complements the paginated tools:
+
+| URI template                                  | MIME type         | Content                                          |
+| --------------------------------------------- | ----------------- | ------------------------------------------------ |
+| `email://{account}/{mailbox}/{uid}`           | `text/markdown`   | Message rendered as markdown (headers + body)    |
+| `email://{account}/{mailbox}/{uid}/source`    | `message/rfc822`  | Raw RFC822 source with all headers and MIME      |
+
+Encoding rules: `account` and `mailbox` are percent-encoded URI segments — a `/` inside a mailbox name (hierarchy delimiter) must be encoded as `%2F`, e.g. `email://work/Archive%2F2024/1234`. Get UIDs from `get_messages`, `search_messages`, or the `rank_*` tools. `resources/list` is intentionally empty: discovery is template-based, since mailboxes hold thousands of messages.
+
+## MCP Completions
+
+Argument autocompletion (`completion/complete`) is supported for the prompts and the `email://` resource templates:
+
+- `account` — completes instantly from configured account names.
+- `mailbox` — runs an IMAP LIST scoped to the account from the completion context (or the default account); network failures return an empty list rather than an error.
 
 ## Architecture
 
