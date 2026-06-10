@@ -37,6 +37,7 @@ dependencies = [
  "mail-parser",
  "native-tls",
  "parking_lot",
+ "percent-encoding",
  "proptest",
  "reqwest",
  "rmcp",

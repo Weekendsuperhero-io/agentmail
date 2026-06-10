@@ -2,6 +2,7 @@
 
 mod args;
 mod prompts;
+mod resources;
 mod tasks;
 mod tools_read;
 mod tools_write;
@@ -12,10 +13,12 @@ use rmcp::{
     handler::server::router::tool::ToolRouter,
     model::{
         CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
-        CreateTaskResult, GetPromptRequestParams, GetPromptResult, GetTaskInfoParams,
-        GetTaskPayloadResult, GetTaskResult, GetTaskResultParams, Implementation,
-        ListPromptsResult, ListTasksResult, Meta, PaginatedRequestParams,
-        ProgressNotificationParam, ServerCapabilities, ServerInfo, Task, TaskStatus,
+        CompleteRequestParams, CompleteResult, CreateTaskResult, GetPromptRequestParams,
+        GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult,
+        GetTaskResultParams, Implementation, ListPromptsResult, ListResourceTemplatesResult,
+        ListTasksResult, Meta, PaginatedRequestParams, ProgressNotificationParam,
+        ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo, Task,
+        TaskStatus,
     },
     prompt_handler,
     service::RequestContext,
@@ -125,7 +128,7 @@ impl AgentMailServer {
         }
     }
 
-    /// Combined tool router — referenced by `#[tool_handler]`\'s default
+    /// Combined tool router — referenced by `#[tool_handler]`'s default
     /// `Self::tool_router()` expression and by the regression tests.
     fn tool_router() -> ToolRouter<Self> {
         Self::read_tools_router() + Self::write_tools_router()
@@ -140,6 +143,8 @@ impl ServerHandler for AgentMailServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
+                .enable_resources()
+                .enable_completions()
                 .enable_tasks()
                 .build(),
         )
@@ -163,8 +168,35 @@ impl ServerHandler for AgentMailServer {
              unsubscribe_message deletes by matching sender + either unsubscribe header when delete_matching=true; the unsubscribe POST is best-effort and never blocks deletion. \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
              find_attachments detects multipart/mixed and multipart/related; download_attachments saves them to disk. \
+             Single messages are also readable as resources: email://{account}/{mailbox}/{uid} (markdown) and email://{account}/{mailbox}/{uid}/source (raw RFC822); percent-encode account and mailbox, encoding '/' in mailbox names as %2F. \
              All reads use BODY.PEEK to avoid marking messages as read.",
         )
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult::with_all_items(
+            resources::email_resource_templates(),
+        ))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        self.read_email_resource(&request.uri).await
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, McpError> {
+        self.handle_complete(request).await
     }
 
     async fn enqueue_task(

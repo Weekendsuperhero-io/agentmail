@@ -125,7 +125,7 @@ async fn initialize_reports_capabilities_and_identity() {
     let caps = init["capabilities"]
         .as_object()
         .expect("capabilities object");
-    for cap in ["tools", "prompts", "tasks"] {
+    for cap in ["tools", "prompts", "resources", "completions", "tasks"] {
         assert!(
             caps.contains_key(cap),
             "missing `{cap}` capability: {caps:?}"
@@ -241,6 +241,160 @@ async fn invalid_params_yields_32602() {
         Some(-32602),
         "empty uids should be rejected as invalid params: {resp:#}"
     );
+}
+
+#[tokio::test]
+async fn resources_templates_list_two_email_templates() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("resources/templates/list", json!({})).await;
+    let templates = resp["result"]["resourceTemplates"]
+        .as_array()
+        .expect("resourceTemplates array");
+    assert_eq!(templates.len(), 2, "template count drifted: {templates:#?}");
+
+    let body = &templates[0];
+    assert_eq!(
+        body["uriTemplate"].as_str(),
+        Some("email://{account}/{mailbox}/{uid}")
+    );
+    assert_eq!(body["mimeType"].as_str(), Some("text/markdown"));
+
+    let source = &templates[1];
+    assert_eq!(
+        source["uriTemplate"].as_str(),
+        Some("email://{account}/{mailbox}/{uid}/source")
+    );
+    assert_eq!(source["mimeType"].as_str(), Some("message/rfc822"));
+}
+
+#[tokio::test]
+async fn resources_list_is_empty() {
+    // Discovery is template-only; this also pins that resources/list is
+    // served (not method_not_found) now that the capability is advertised.
+    let mut client = McpClient::start().await;
+    let resp = client.request("resources/list", json!({})).await;
+    assert!(
+        resp.get("error").is_none(),
+        "resources/list failed: {resp:#}"
+    );
+    let resources = resp["result"]["resources"]
+        .as_array()
+        .expect("resources array");
+    assert!(resources.is_empty(), "expected empty list: {resources:#?}");
+}
+
+#[tokio::test]
+async fn resources_read_malformed_uri_is_32602() {
+    let mut client = McpClient::start().await;
+    for uri in ["email://dummy/INBOX", "notemail://x/y/1"] {
+        let resp = client.request("resources/read", json!({"uri": uri})).await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "malformed uri `{uri}` should be invalid params: {resp:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resources_read_unknown_account_is_32602() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request("resources/read", json!({"uri": "email://ghost/INBOX/1"}))
+        .await;
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown account should be invalid params: {resp:#}"
+    );
+}
+
+#[tokio::test]
+async fn resources_read_decodes_mailbox_and_fails_at_connect() {
+    // Proves the percent-decode path executes end-to-end: the URI parses
+    // (Archive%2F2024 → Archive/2024), the account resolves, and the failure
+    // happens at the IMAP connect to imap.invalid (NXDOMAIN per RFC 6761,
+    // fails in milliseconds) → internal error, not invalid params.
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "resources/read",
+            json!({"uri": "email://dummy/Archive%2F2024/7"}),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32603),
+        "decoded read should fail at connect: {resp:#}"
+    );
+}
+
+#[tokio::test]
+async fn completion_for_prompt_account_returns_dummy() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "completion/complete",
+            json!({
+                "ref": {"type": "ref/prompt", "name": "inbox-summary"},
+                "argument": {"name": "account", "value": "d"}
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["result"]["completion"]["values"],
+        json!(["dummy"]),
+        "prefix 'd' should complete to dummy: {resp:#}"
+    );
+
+    let resp = client
+        .request(
+            "completion/complete",
+            json!({
+                "ref": {"type": "ref/prompt", "name": "inbox-summary"},
+                "argument": {"name": "account", "value": "z"}
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["completion"]["values"], json!([]));
+}
+
+#[tokio::test]
+async fn completion_for_resource_template_account() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "completion/complete",
+            json!({
+                "ref": {"type": "ref/resource", "uri": "email://{account}/{mailbox}/{uid}"},
+                "argument": {"name": "account", "value": ""}
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["result"]["completion"]["values"],
+        json!(["dummy"]),
+        "resource template account completion: {resp:#}"
+    );
+}
+
+#[tokio::test]
+async fn completion_mailbox_swallows_network_errors() {
+    // Mailbox completion needs an IMAP LIST, which fails against
+    // imap.invalid — the completion must still succeed with no values.
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "completion/complete",
+            json!({
+                "ref": {"type": "ref/prompt", "name": "find-attachments"},
+                "argument": {"name": "mailbox", "value": ""},
+                "context": {"arguments": {"account": "dummy"}}
+            }),
+        )
+        .await;
+    assert!(resp.get("error").is_none(), "must not error: {resp:#}");
+    assert_eq!(resp["result"]["completion"]["values"], json!([]));
 }
 
 #[tokio::test]
