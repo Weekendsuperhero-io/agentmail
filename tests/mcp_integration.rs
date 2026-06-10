@@ -244,6 +244,26 @@ async fn invalid_params_yields_32602() {
 }
 
 #[tokio::test]
+async fn rank_limit_documents_default_of_100() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in ["rank_senders", "rank_unsubscribe", "rank_list_id"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("tool `{name}` missing"));
+        let desc = tool["inputSchema"]["properties"]["limit"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            desc.contains("Defaults to 100"),
+            "`{name}` limit description should document the default: {desc}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn prompts_list_has_6_prompts() {
     let mut client = McpClient::start().await;
     let resp = client.request("prompts/list", json!({})).await;

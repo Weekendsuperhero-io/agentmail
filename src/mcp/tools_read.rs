@@ -225,7 +225,7 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         Parameters(args): Parameters<RankSendersArgs>,
     ) -> Result<Json<RankSendersResponse>, McpError> {
-        let limit = args.limit.map(|v| v as usize);
+        let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
 
         match self
@@ -255,7 +255,7 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         Parameters(args): Parameters<RankUnsubscribeArgs>,
     ) -> Result<Json<RankUnsubscribeResponse>, McpError> {
-        let limit = args.limit.map(|v| v as usize);
+        let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
 
         match self
@@ -285,7 +285,7 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         Parameters(args): Parameters<RankListIdArgs>,
     ) -> Result<Json<RankListIdResponse>, McpError> {
-        let limit = args.limit.map(|v| v as usize);
+        let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
 
         match self

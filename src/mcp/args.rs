@@ -276,7 +276,7 @@ pub(super) struct RankSendersArgs {
     )]
     pub(super) account: String,
     #[schemars(
-        description = "Maximum number of senders to return. If omitted, returns all senders."
+        description = "Maximum number of senders to return. Defaults to 100; set higher to return more."
     )]
     pub(super) limit: Option<u64>,
 }
@@ -291,7 +291,9 @@ pub(super) struct RankUnsubscribeArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "Maximum number of lists to return. If omitted, returns all lists.")]
+    #[schemars(
+        description = "Maximum number of lists to return. Defaults to 100; set higher to return more."
+    )]
     pub(super) limit: Option<u64>,
 }
 
@@ -305,7 +307,9 @@ pub(super) struct RankListIdArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "Maximum number of lists to return. If omitted, returns all lists.")]
+    #[schemars(
+        description = "Maximum number of lists to return. Defaults to 100; set higher to return more."
+    )]
     pub(super) limit: Option<u64>,
 }
 
