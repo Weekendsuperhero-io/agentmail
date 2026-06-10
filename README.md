@@ -6,7 +6,7 @@ updated: 2026-05-29T19:20
 
 IMAP email client exposed as both a CLI and an MCP (Model Context Protocol) server, built with Rust.
 
-MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-11-25, 2025-03-26, and 2024-11-05) | rmcp 1.6
+MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK)
 
 One binary: `agentmail serve` starts the MCP stdio server, all other subcommands are a direct CLI.
 
@@ -298,9 +298,17 @@ To pass passwords via environment variables instead of keychain:
 }
 ```
 
+### Debugging with MCP Inspector
+
+```bash
+npx @modelcontextprotocol/inspector /path/to/agentmail serve
+```
+
+Opens a web UI to exercise all 21 tools, 6 prompts, and task calls interactively.
+
 ## MCP Tools
 
-21 tools covering account discovery, mailbox management, message reading, search, bulk operations, flag management, and composition. 9 long-running tools support optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/tasks) (SEP-1686) for async fire-and-forget execution.
+21 tools covering account discovery, mailbox management, message reading, search, bulk operations, flag management, and composition. 9 long-running tools support optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/tasks) (SEP-1686) for async fire-and-forget execution.
 
 | Tool                   | Description                                                                           |
 | ---------------------- | ------------------------------------------------------------------------------------- |
@@ -353,7 +361,7 @@ To pass passwords via environment variables instead of keychain:
 
 ```
 agentmail (binary crate: agentmail-mcp)
-  ├── serve                → MCP stdio server (tokio + rmcp 1.6)
+  ├── serve                → MCP stdio server (tokio + rmcp)
   │                          21 tools + 6 prompts, tasks, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI

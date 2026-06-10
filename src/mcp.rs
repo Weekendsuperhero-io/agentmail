@@ -13,9 +13,10 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
         CreateTaskResult, GetPromptRequestParams, GetPromptResult, GetTaskInfoParams,
-        GetTaskPayloadResult, GetTaskResult, GetTaskResultParams, ListPromptsResult,
-        ListTasksResult, Meta, PaginatedRequestParams, ProgressNotificationParam, PromptMessage,
-        PromptMessageRole, ServerCapabilities, ServerInfo, Task, TaskStatus,
+        GetTaskPayloadResult, GetTaskResult, GetTaskResultParams, Implementation,
+        ListPromptsResult, ListTasksResult, Meta, PaginatedRequestParams,
+        ProgressNotificationParam, PromptMessage, PromptMessageRole, ServerCapabilities,
+        ServerInfo, Task, TaskStatus,
     },
     prompt, prompt_handler, prompt_router,
     service::RequestContext,
@@ -86,6 +87,28 @@ fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> Option<crate::Progr
                 .await;
         });
     }))
+}
+
+/// Map a library error to an MCP error code. Model-actionable failures
+/// (bad account/mailbox/message selectors, config and credential problems)
+/// map to `invalid_params` so the caller can correct its input; transport
+/// and server failures map to `internal_error`.
+fn to_mcp_error(e: &crate::AgentmailError) -> McpError {
+    use crate::AgentmailError as E;
+    match e {
+        E::AccountNotFound(_)
+        | E::MailboxNotFound(_)
+        | E::MessageNotFound(_)
+        | E::Config(_)
+        | E::Credential(_) => McpError::invalid_params(e.to_string(), None),
+        E::Imap(_)
+        | E::Tls(_)
+        | E::Io(_)
+        | E::Parse(_)
+        | E::NotConnected
+        | E::PoolExhausted
+        | E::Other(_) => McpError::internal_error(e.to_string(), None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +312,7 @@ struct CreateDraftArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[schemars(description = "Attachment to attach to a draft.")]
+#[schemars(inline, description = "Attachment to attach to a draft.")]
 struct DraftAttachmentArg {
     #[schemars(description = "Local filesystem path to the file to attach (required).")]
     path: String,
@@ -694,7 +717,11 @@ impl AgentMailServer {
     #[tool(
         name = "list_accounts",
         description = "Return configured IMAP account names. Use this first to discover valid account selectors.",
-        annotations(read_only_hint = true)
+        annotations(
+            title = "List Accounts",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_accounts_tool(
         &self,
@@ -702,14 +729,14 @@ impl AgentMailServer {
     ) -> Result<Json<ListAccountsResponse>, McpError> {
         match self.agentmail.list_accounts().await {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "list_mailboxes",
         description = "List all mailboxes (folders) with message counts: total, unseen, and recent. Shows the full folder tree. Optionally filter to a single account.",
-        annotations(read_only_hint = true)
+        annotations(title = "List Mailboxes", read_only_hint = true)
     )]
     async fn list_mailboxes_tool(
         &self,
@@ -718,7 +745,7 @@ impl AgentMailServer {
         let account = args.account.filter(|s| !s.trim().is_empty());
         match self.agentmail.list_mailboxes(account.as_deref()).await {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
@@ -726,6 +753,7 @@ impl AgentMailServer {
         name = "create_mailbox",
         description = "Create a new mailbox (folder) on the IMAP server. Use delimiter (usually '/') for nested mailboxes.",
         annotations(
+            title = "Create Mailbox",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
@@ -736,7 +764,7 @@ impl AgentMailServer {
         Parameters(args): Parameters<CreateMailboxArgs>,
     ) -> Result<Json<CreateMailboxResponse>, McpError> {
         if args.mailbox_name.trim().is_empty() {
-            return Err(McpError::internal_error("mailbox_name is required", None));
+            return Err(McpError::invalid_params("mailbox_name is required", None));
         }
         match self
             .agentmail
@@ -744,14 +772,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "check_connection",
         description = "Test IMAP connectivity for an account. Connects, authenticates, and reports status.",
-        annotations(read_only_hint = true)
+        annotations(title = "Check Connection", read_only_hint = true)
     )]
     async fn check_connection_tool(
         &self,
@@ -759,14 +787,14 @@ impl AgentMailServer {
     ) -> Result<Json<ConnectionStatus>, McpError> {
         match self.agentmail.check_connection(&args.account).await {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "list_capabilities",
         description = "List IMAP server capabilities for an account. Shows supported extensions like IDLE, MOVE, CONDSTORE, etc.",
-        annotations(read_only_hint = true)
+        annotations(title = "List IMAP Capabilities", read_only_hint = true)
     )]
     async fn list_capabilities_tool(
         &self,
@@ -774,14 +802,14 @@ impl AgentMailServer {
     ) -> Result<Json<ListCapabilitiesResponse>, McpError> {
         match self.agentmail.list_capabilities(&args.account).await {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "get_messages",
         description = "Fetch a paginated list of messages from a mailbox, newest-first. Returns metadata (subject, from, date, flags, UID) by default. Set include_content=true to also get the message body as markdown. Set include_headers=true for the full raw headers map. Defaults: mailbox=INBOX, offset=0, limit=25 (max 50).",
-        annotations(read_only_hint = true)
+        annotations(title = "Get Messages", read_only_hint = true)
     )]
     async fn get_messages_tool(
         &self,
@@ -804,14 +832,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "search_messages",
         description = "Search messages with filters: sender_contains, subject_contains, to_contains, query (full-text), read, flagged, and header key/value. Returns paginated results newest-first. Content excluded by default — set include_content=true to get message bodies. Set include_headers=true for the full raw headers map.",
-        annotations(read_only_hint = true)
+        annotations(title = "Search Messages", read_only_hint = true)
     )]
     async fn search_messages_tool(
         &self,
@@ -850,14 +878,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "list_flags",
         description = "List all IMAP flags in use with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Omit mailbox to scan the entire account across all mailboxes. Resolves Apple Mail $MailFlagBit color flags to color names (red, orange, yellow, green, blue, purple, gray).",
-        annotations(read_only_hint = true),
+        annotations(title = "List Flags", read_only_hint = true),
         execution(task_support = "optional")
     )]
     async fn list_flags_tool(
@@ -873,14 +901,18 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "delete_messages",
         description = "Delete one or more messages by UID. Moves to Trash if configured, otherwise flags \\Deleted and expunges. Supports up to 500 UIDs per call.",
-        annotations(destructive_hint = true, idempotent_hint = true),
+        annotations(
+            title = "Delete Messages",
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
         execution(task_support = "optional")
     )]
     async fn delete_messages_tool(
@@ -891,13 +923,13 @@ impl AgentMailServer {
     ) -> Result<Json<DeleteMessagesResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         if args.uids.is_empty() {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "uids must contain at least one UID",
                 None,
             ));
         }
         if args.uids.len() > 500 {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "uids supports up to 500 UIDs per call",
                 None,
             ));
@@ -910,14 +942,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "delete_by_sender",
         description = "Delete all messages from an exact sender. Takes a UID to identify the sender — extracts the full From header (display name + email) and deletes every message with an identical sender. Set allMailboxes=true to search and delete across the entire account. Ideal for bulk cleanup after rank_senders. For mailing list cleanup, use unsubscribe_message instead — it attempts one-click unsubscribe and only deletes bulk mail.",
-        annotations(destructive_hint = true),
+        annotations(title = "Delete by Sender", destructive_hint = true),
         execution(task_support = "optional")
     )]
     async fn delete_by_sender_tool(
@@ -941,14 +973,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "find_attachments",
         description = "Scan for messages with attachments (multipart/mixed or multipart/related). Returns paginated UIDs (newest-first) and total count. Omit mailbox to scan the entire account with a per-mailbox breakdown. Use download_attachments with a specific UID to save files to disk.",
-        annotations(read_only_hint = true),
+        annotations(title = "Find Attachments", read_only_hint = true),
         execution(task_support = "optional")
     )]
     async fn find_attachments_tool(
@@ -973,7 +1005,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
@@ -981,6 +1013,7 @@ impl AgentMailServer {
         name = "download_attachments",
         description = "Download all attachments from a message to disk. Files are saved as {uid}_{originalname}. Returns file paths, content types, and sizes.",
         annotations(
+            title = "Download Attachments",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
@@ -1003,21 +1036,25 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "create_draft",
         description = "Create and save a draft email. Composes an RFC822 message and appends it to the account's Drafts folder (creating the Drafts mailbox if necessary). Requires at least one recipient (to, cc, or bcc). Subject and body are optional. Supports optional attachments via local file paths.",
-        annotations(read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Create Draft",
+            read_only_hint = false,
+            destructive_hint = false
+        )
     )]
     async fn create_draft_tool(
         &self,
         Parameters(args): Parameters<CreateDraftArgs>,
     ) -> Result<Json<CreateDraftResponse>, McpError> {
         if args.to.is_empty() && args.cc.is_empty() && args.bcc.is_empty() {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "At least one recipient (to, cc, or bcc) is required",
                 None,
             ));
@@ -1029,7 +1066,7 @@ impl AgentMailServer {
             let data = match tokio::fs::read(&a.path).await {
                 Ok(d) => d,
                 Err(e) => {
-                    return Err(McpError::internal_error(
+                    return Err(McpError::invalid_params(
                         format!(
                             "Failed to read attachment #{} at '{}': {}",
                             i + 1,
@@ -1075,24 +1112,28 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "move_message",
         description = "Move a single message from one mailbox to another by UID. Uses IMAP MOVE command. Requires source mailbox, destination mailbox, and the message UID.",
-        annotations(read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Move Message",
+            read_only_hint = false,
+            destructive_hint = false
+        )
     )]
     async fn move_message_tool(
         &self,
         Parameters(args): Parameters<MoveMessageArgs>,
     ) -> Result<Json<MoveMessageResponse>, McpError> {
         if args.mailbox.trim().is_empty() {
-            return Err(McpError::internal_error("mailbox is required", None));
+            return Err(McpError::invalid_params("mailbox is required", None));
         }
         if args.destination.trim().is_empty() {
-            return Err(McpError::internal_error("destination is required", None));
+            return Err(McpError::invalid_params("destination is required", None));
         }
 
         match self
@@ -1101,14 +1142,18 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "unsubscribe_message",
         description = "Unsubscribe from a mailing list and delete matching messages across ALL mailboxes. Requires the message to have a List-Unsubscribe header. Attempts RFC 8058 one-click unsubscribe POST (best-effort — if it fails, messages are still deleted). When delete_matching is true, searches every mailbox for messages from the exact sender that have a List-Unsubscribe-Post header and deletes them. This ensures only bulk/marketing mail is removed, not legitimate messages from the same sender.",
-        annotations(destructive_hint = true, open_world_hint = true)
+        annotations(
+            title = "Unsubscribe from Mailing List",
+            destructive_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn unsubscribe_message_tool(
         &self,
@@ -1131,14 +1176,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "rank_senders",
         description = "Rank all senders by message count. Omit mailbox to scan the entire account across all mailboxes. Groups by (email, display name) — 'Find My <noreply@apple.com>' and 'iCloud <noreply@apple.com>' are separate entries. Sorted by message count descending. Efficient: fetches only FROM+DATE headers using BODY.PEEK.",
-        annotations(read_only_hint = true),
+        annotations(title = "Rank Senders", read_only_hint = true),
         execution(task_support = "optional")
     )]
     async fn rank_senders_tool(
@@ -1161,14 +1206,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "rank_unsubscribe",
         description = "Rank bulk-mail senders by message count. Omit mailbox to scan the entire account. Includes messages with either List-Unsubscribe or List-Unsubscribe-Post. Grouped by sender (From), sorted by one-click support first then by count. To clean up a sender, pass the sampleUid and sampleMailbox to unsubscribe_message (not delete_by_sender). Returns count, unsubscribe URL, one-click flag, sample UID + mailbox.",
-        annotations(read_only_hint = true),
+        annotations(title = "Rank Bulk-Mail Senders", read_only_hint = true),
         execution(task_support = "optional")
     )]
     async fn rank_unsubscribe_tool(
@@ -1191,14 +1236,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "rank_list_id",
         description = "Rank mailing lists by List-Id header (RFC 2919). Groups all messages from the same mailing list regardless of sender address — useful for lists like GitHub notifications where multiple senders share one List-Id. Omit mailbox to scan the entire account. Use delete_list_id to remove all messages from a list.",
-        annotations(read_only_hint = true),
+        annotations(title = "Rank Mailing Lists by List-Id", read_only_hint = true),
         execution(task_support = "optional")
     )]
     async fn rank_list_id_tool(
@@ -1221,14 +1266,14 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "delete_list_id",
         description = "Delete all messages with a specific List-Id across all mailboxes. Identifies the list by its List-Id header value (from rank_list_id). Deletes ALL messages from that mailing list regardless of sender address. Omit mailbox to search the entire account.",
-        annotations(destructive_hint = true),
+        annotations(title = "Delete Mailing List by List-Id", destructive_hint = true),
         execution(task_support = "optional")
     )]
     async fn delete_list_id_tool(
@@ -1249,14 +1294,19 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "add_flags",
         description = "Add flags and/or set an Apple Mail color on a message. Flags use union semantics — existing flags are preserved. Use color for Apple Mail colored flags (red, orange, yellow, green, blue, purple, gray). Cannot set \\Deleted (use delete_messages) or \\Recent (read-only).",
-        annotations(read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Add Flags / Set Color",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn add_flags_tool(
         &self,
@@ -1264,7 +1314,7 @@ impl AgentMailServer {
     ) -> Result<Json<UpdateFlagsResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         if args.flags.is_empty() && args.color.is_none() {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "At least one flag or a color is required",
                 None,
             ));
@@ -1273,13 +1323,13 @@ impl AgentMailServer {
         for flag in &args.flags {
             let lower = flag.to_lowercase();
             if lower == "\\deleted" {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "Cannot set \\Deleted via add_flags — use delete_messages instead",
                     None,
                 ));
             }
             if lower == "\\recent" {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "Cannot set \\Recent — it is a read-only server flag",
                     None,
                 ));
@@ -1297,14 +1347,19 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "remove_flags",
         description = "Remove flags and/or clear Apple Mail color from a message. Only specified flags are removed; all others preserved. Set color=true to remove the colored flag (\\Flagged + all $MailFlagBit keywords). Cannot remove \\Deleted (use delete_messages) or \\Recent (read-only).",
-        annotations(read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Remove Flags / Clear Color",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn remove_flags_tool(
         &self,
@@ -1312,7 +1367,7 @@ impl AgentMailServer {
     ) -> Result<Json<UpdateFlagsResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         if args.flags.is_empty() && !args.color {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "At least one flag or color=true is required",
                 None,
             ));
@@ -1321,13 +1376,13 @@ impl AgentMailServer {
         for flag in &args.flags {
             let lower = flag.to_lowercase();
             if lower == "\\deleted" {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "Cannot remove \\Deleted via remove_flags — use delete_messages instead",
                     None,
                 ));
             }
             if lower == "\\recent" {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "Cannot remove \\Recent — it is a read-only server flag",
                     None,
                 ));
@@ -1339,7 +1394,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => Ok(Json(data)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(to_mcp_error(&e)),
         }
     }
 }
@@ -1498,6 +1553,9 @@ impl ServerHandler for AgentMailServer {
                 .enable_tasks()
                 .build(),
         )
+        // Without this the server announces itself as "rmcp" — rmcp's
+        // Implementation::from_build_env() bakes in its own crate name.
+        .with_server_info(Implementation::new("agentmail", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "AgentMail is a full-featured IMAP email client. \
              Start with list_accounts to discover configured accounts. \
@@ -1708,4 +1766,95 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
         })?;
     service.waiting().await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walk a schema JSON tree asserting no `$ref`/`$defs` keys — several MCP
+    /// hosts (Gemini CLI, n8n, some gateways) reject or drop referenced
+    /// schemas, so every nested type must carry `#[schemars(inline)]`.
+    fn assert_no_refs(value: &serde_json::Value, path: &str, tool: &str, side: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    assert!(
+                        k != "$ref" && k != "$defs",
+                        "tool `{tool}` {side} schema has `{k}` at {path} — \
+                         add #[schemars(inline)] to the nested type"
+                    );
+                    assert_no_refs(v, &format!("{path}/{k}"), tool, side);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    assert_no_refs(v, &format!("{path}/{i}"), tool, side);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn tool_schemas_are_ref_free() {
+        let tools = AgentMailServer::tool_router().list_all();
+        assert_eq!(
+            tools.len(),
+            21,
+            "tool count drifted — update docs and tests"
+        );
+        for tool in &tools {
+            let input = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+            assert_no_refs(&input, "#", &tool.name, "input");
+            let output = tool
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool `{}` lost its output schema", tool.name));
+            let output = serde_json::to_value(output.as_ref()).unwrap();
+            assert_no_refs(&output, "#", &tool.name, "output");
+        }
+    }
+
+    #[test]
+    fn every_tool_has_title_and_description() {
+        for tool in AgentMailServer::tool_router().list_all() {
+            assert!(
+                tool.description.as_deref().is_some_and(|d| !d.is_empty()),
+                "tool `{}` has no description",
+                tool.name
+            );
+            let title = tool
+                .annotations
+                .as_ref()
+                .and_then(|a| a.title.as_deref())
+                .unwrap_or_default();
+            assert!(
+                !title.is_empty(),
+                "tool `{}` has no annotations.title",
+                tool.name
+            );
+        }
+    }
+
+    /// `DESTRUCTIVE_TOOLS` gates task serialization and must stay in sync with
+    /// the per-tool annotations (MCP default: destructive unless read-only).
+    #[test]
+    fn destructive_tools_const_matches_annotations() {
+        for tool in AgentMailServer::tool_router().list_all() {
+            let destructive = tool.annotations.as_ref().is_none_or(|a| {
+                !a.read_only_hint.unwrap_or(false) && a.destructive_hint.unwrap_or(true)
+            });
+            assert_eq!(
+                DESTRUCTIVE_TOOLS.contains(&tool.name.as_ref()),
+                destructive,
+                "DESTRUCTIVE_TOOLS drifted for `{}` — update the const or the annotations",
+                tool.name
+            );
+        }
+    }
 }

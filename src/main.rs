@@ -159,8 +159,10 @@ enum CliCommand {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing — logs to stderr so MCP JSON-RPC on stdout is unaffected.
+    // ANSI only when stderr is a terminal: MCP hosts capture stderr to log files.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),

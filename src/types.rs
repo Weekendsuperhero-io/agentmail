@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// A configured IMAP account.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct AccountInfo {
     pub name: String,
     pub host: String,
@@ -18,6 +19,7 @@ pub struct AccountInfo {
 /// A mailbox on the server with message counts.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MailboxInfo {
     pub name: String,
     pub account: String,
@@ -44,6 +46,7 @@ pub struct MailboxInfo {
 /// Metadata for a MIME attachment part (no binary content).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct AttachmentInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -56,6 +59,7 @@ pub struct AttachmentInfo {
 /// A parsed email message.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MessageInfo {
     /// IMAP UID (unique within mailbox + UIDVALIDITY epoch)
     pub uid: u32,
@@ -137,6 +141,7 @@ pub struct SearchCriteria {
 /// Summary of messages from a single sender address.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct SenderSummary {
     /// Combined `"Display Name <email>"` for direct use in search.
     pub sender: String,
@@ -155,6 +160,7 @@ pub struct SenderSummary {
 /// Summary of mailing list messages grouped by sender.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct ListSummary {
     /// Sender display string (`"Display Name <email>"` or just `"email"`).
     pub sender: String,
@@ -267,6 +273,7 @@ pub struct ListFlagsResponse {
 /// A flag name with its count.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct FlagCount {
     pub flag: String,
     pub count: u32,
@@ -275,6 +282,7 @@ pub struct FlagCount {
 /// A resolved Apple Mail color with its count.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct ColorCount {
     pub color: String,
     pub count: u32,
@@ -283,6 +291,7 @@ pub struct ColorCount {
 /// Per-mailbox flag breakdown.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MailboxFlagBreakdown {
     pub mailbox: String,
     pub total_flags: usize,
@@ -306,6 +315,7 @@ pub struct FindAttachmentsResponse {
 /// Per-mailbox attachment count.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MailboxAttachmentCount {
     pub mailbox: String,
     pub count: usize,
@@ -336,6 +346,7 @@ pub struct RankUnsubscribeResponse {
 /// Summary of messages grouped by List-Id (RFC 2919).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct ListIdSummary {
     /// The List-Id header value (grouping key).
     pub list_id: String,
@@ -404,6 +415,7 @@ pub struct DeleteMessagesResponse {
 /// Per-mailbox deletion result (shared by delete_by_sender and unsubscribe_message).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct PerMailboxDeleteResult {
     pub mailbox: String,
     pub found: usize,
@@ -454,6 +466,7 @@ pub struct CreateMailboxResponse {
 /// Recipients for a draft email.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct DraftRecipients {
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -484,6 +497,7 @@ pub struct CreateDraftResponse {
 /// A downloaded attachment file.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct DownloadedFile {
     pub index: usize,
     pub filename: String,
@@ -515,6 +529,7 @@ pub struct GetMessageSourceResponse {
 /// Result of a one-click unsubscribe attempt.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct UnsubscribeResult {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -530,6 +545,7 @@ pub struct UnsubscribeResult {
 /// Bulk deletion results from unsubscribe_message.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MatchingMessagesResult {
     pub matched_by: String,
     pub sender: String,

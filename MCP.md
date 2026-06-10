@@ -4,7 +4,7 @@ updated: 2026-05-29T19:20
 ---
 # Agentmail MCP — Tool & Prompt Reference
 
-MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-03-26 and 2024-11-05) | rmcp: 1.4 | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
+MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK) | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
 
 **Supported capabilities:** tools, prompts, tasks (SEP-1686), progress notifications
 
@@ -219,8 +219,8 @@ Grouped by List-Id header — same list with different senders are merged into o
 
 | #   | Tool           | Description                                                                          | Annotations |
 | --- | -------------- | ------------------------------------------------------------------------------------ | ----------- |
-| 20  | `add_flags`    | Add flags and/or Apple Mail color (union semantics). Colors: red, orange, yellow, green, blue, purple, gray. |             |
-| 21  | `remove_flags` | Remove specific flags and/or clear Apple Mail color. Others preserved.                |             |
+| 20  | `add_flags`    | Add flags and/or Apple Mail color (union semantics). Colors: red, orange, yellow, green, blue, purple, gray. | `idempotent` |
+| 21  | `remove_flags` | Remove specific flags and/or clear Apple Mail color. Others preserved.                | `idempotent` |
 
 #### Output Schemas
 
