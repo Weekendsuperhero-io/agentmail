@@ -233,7 +233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CliCommand::Configure { provider } => configure_account(provider.as_deref()).await,
         CliCommand::ListFlags { account, mailbox } => {
             let mk = agentmail::Agentmail::from_default_config()?;
-            let value = mk.list_flags(mailbox.as_deref(), &account, None).await?;
+            let value = mk
+                .list_flags(mailbox.as_deref(), &account, None, None)
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -258,7 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .find_attachments(mailbox.as_deref(), &account, offset, limit, None)
+                .find_attachments(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -270,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .group_by_sender(mailbox.as_deref(), &account, limit, None)
+                .group_by_sender(mailbox.as_deref(), &account, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -282,7 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .group_by_list(mailbox.as_deref(), &account, limit, None)
+                .group_by_list(mailbox.as_deref(), &account, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())

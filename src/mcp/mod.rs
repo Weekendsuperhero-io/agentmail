@@ -77,6 +77,14 @@ fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> Option<crate::Progr
     }))
 }
 
+/// Build a `CancelFn` from the request's cancellation token. Fires when the
+/// client sends `notifications/cancelled` for this request, or on transport
+/// shutdown (the token is a child of the serve-loop token). Long scans check
+/// it at mailbox and fetch-chunk boundaries.
+fn make_cancel_fn(ct: tokio_util::sync::CancellationToken) -> crate::CancelFn {
+    Arc::new(move || ct.is_cancelled())
+}
+
 /// Map a library error to an MCP error code. Model-actionable failures
 /// (bad account/mailbox/message selectors, config and credential problems)
 /// map to `invalid_params` so the caller can correct its input; transport
@@ -194,6 +202,13 @@ impl ServerHandler for AgentMailServer {
                 Some(ref lock) => Some(lock.lock().await),
                 None => None,
             };
+            // Cancellation: `tasks/cancel` → JoinHandle::abort() is the
+            // effective cancel path for task-based execution (rmcp keeps the
+            // original request's cancellation token alive after the
+            // CreateTaskResult response, but spec-compliant clients never
+            // cancel an already-responded request id). The cooperative
+            // CancelFn threaded through `context.ct` serves direct tools/call
+            // requests and transport shutdown.
             let result = server.call_tool(request, context).await;
             *slot.lock() = Some(result);
         });
@@ -438,5 +453,17 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn cancel_fn_reflects_token_state() {
+        let ct = tokio_util::sync::CancellationToken::new();
+        let cancel = make_cancel_fn(ct.clone());
+        assert!(!cancel());
+        assert!(crate::imap_client::check_cancel(Some(&cancel)).is_ok());
+        ct.cancel();
+        assert!(cancel());
+        let err = crate::imap_client::check_cancel(Some(&cancel)).unwrap_err();
+        assert_eq!(err.to_string(), "cancelled by client");
     }
 }

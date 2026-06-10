@@ -14,7 +14,7 @@ pub mod types;
 pub use config::{AccountConfig, Config};
 pub use connection::ConnectionPool;
 pub use error::{AgentmailError, Result};
-pub use imap_client::ProgressFn;
+pub use imap_client::{CancelFn, ProgressFn};
 pub use provider::MailProvider;
 pub use secret::init_service_name;
 pub use types::*;
@@ -303,6 +303,7 @@ impl Agentmail {
         account: &str,
         limit: Option<usize>,
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<RankSendersResponse> {
         let mut session = self.pool.acquire(account).await?;
 
@@ -317,8 +318,11 @@ impl Agentmail {
         let mut map: HashMap<(String, String), SenderSummary> = HashMap::new();
 
         for mbox in &mailboxes {
+            imap_client::check_cancel(cancel)?;
             let sender_dates =
-                match imap_client::fetch_sender_dates(session.session(), mbox, on_progress).await {
+                match imap_client::fetch_sender_dates(session.session(), mbox, on_progress, cancel)
+                    .await
+                {
                     Ok(data) => data,
                     Err(_) => continue, // skip unselectable mailboxes
                 };
@@ -352,6 +356,7 @@ impl Agentmail {
             }
         }
 
+        imap_client::check_cancel(cancel)?;
         session.release().await;
 
         let mut senders: Vec<SenderSummary> = map.into_values().collect();
@@ -392,6 +397,7 @@ impl Agentmail {
         account: &str,
         limit: Option<usize>,
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<RankUnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
 
@@ -407,8 +413,11 @@ impl Agentmail {
         let mut map: HashMap<(String, String), ListSummary> = HashMap::new();
 
         for mbox in &mailboxes {
+            imap_client::check_cancel(cancel)?;
             let rows =
-                match imap_client::fetch_list_headers(session.session(), mbox, on_progress).await {
+                match imap_client::fetch_list_headers(session.session(), mbox, on_progress, cancel)
+                    .await
+                {
                     Ok(data) => data,
                     Err(_) => continue, // skip unselectable mailboxes
                 };
@@ -481,6 +490,7 @@ impl Agentmail {
             }
         }
 
+        imap_client::check_cancel(cancel)?;
         session.release().await;
 
         let mut lists: Vec<ListSummary> = map.into_values().collect();
@@ -516,6 +526,7 @@ impl Agentmail {
         account: &str,
         limit: Option<usize>,
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<RankListIdResponse> {
         let mut session = self.pool.acquire(account).await?;
 
@@ -539,8 +550,11 @@ impl Agentmail {
         let mut map: HashMap<String, ListIdEntry> = HashMap::new();
 
         for mbox in &mailboxes {
+            imap_client::check_cancel(cancel)?;
             let rows =
-                match imap_client::fetch_list_headers(session.session(), mbox, on_progress).await {
+                match imap_client::fetch_list_headers(session.session(), mbox, on_progress, cancel)
+                    .await
+                {
                     Ok(data) => data,
                     Err(_) => continue,
                 };
@@ -591,6 +605,7 @@ impl Agentmail {
             }
         }
 
+        imap_client::check_cancel(cancel)?;
         session.release().await;
 
         let mut lists: Vec<ListIdSummary> = map
@@ -634,6 +649,7 @@ impl Agentmail {
         account: &str,
         list_id: &str,
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<DeleteListIdResponse> {
         let mut session = self.pool.acquire(account).await?;
         let trash = self.resolve_trash_mailbox(session.session()).await;
@@ -650,6 +666,7 @@ impl Agentmail {
         let mut skipped = Vec::new();
 
         for mbox in &mailboxes {
+            imap_client::check_cancel(cancel)?;
             if imap_client::select(session.session(), mbox).await.is_err() {
                 skipped.push(mbox.clone());
                 continue;
@@ -680,6 +697,7 @@ impl Agentmail {
                 &uids,
                 trash.as_deref(),
                 on_progress,
+                cancel,
             )
             .await?;
             imap_client::sync(session.session()).await?;
@@ -725,6 +743,7 @@ impl Agentmail {
         mailbox: Option<&str>,
         account: &str,
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<ListFlagsResponse> {
         let mut session = self.pool.acquire(account).await?;
 
@@ -739,7 +758,10 @@ impl Agentmail {
         let mut per_mailbox = Vec::new();
 
         for mbox in &mailboxes {
-            let scan = match imap_client::fetch_flags(session.session(), mbox, on_progress).await {
+            imap_client::check_cancel(cancel)?;
+            let scan = match imap_client::fetch_flags(session.session(), mbox, on_progress, cancel)
+                .await
+            {
                 Ok(s) => s,
                 Err(_) => continue, // skip unselectable mailboxes
             };
@@ -771,6 +793,7 @@ impl Agentmail {
             }
         }
 
+        imap_client::check_cancel(cancel)?;
         session.release().await;
 
         let mut flag_list: Vec<(String, u32)> = total_flags.into_iter().collect();
@@ -912,6 +935,7 @@ impl Agentmail {
         offset: usize,
         limit: usize,
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<FindAttachmentsResponse> {
         let mut session = self.pool.acquire(account).await?;
 
@@ -924,10 +948,12 @@ impl Agentmail {
         let mut per_mailbox = Vec::new();
 
         for mbox in &mailboxes {
+            imap_client::check_cancel(cancel)?;
             let uids = match imap_client::fetch_attachment_uids(
                 session.session(),
                 mbox,
                 on_progress,
+                cancel,
             )
             .await
             {
@@ -944,6 +970,7 @@ impl Agentmail {
             }
         }
 
+        imap_client::check_cancel(cancel)?;
         session.release().await;
 
         // Sort newest-first (highest UID first) across all mailboxes
@@ -974,6 +1001,7 @@ impl Agentmail {
         account: &str,
         uids: &[u32],
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<DeleteMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
         let trash = self.resolve_trash_mailbox(session.session()).await;
@@ -983,6 +1011,7 @@ impl Agentmail {
             uids,
             trash.as_deref(),
             on_progress,
+            cancel,
         )
         .await?;
         imap_client::sync(session.session()).await?;
@@ -1009,6 +1038,7 @@ impl Agentmail {
         uid: u32,
         all_mailboxes: bool,
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<DeleteBySenderResponse> {
         let mut session = self.pool.acquire(account).await?;
         let trash = self.resolve_trash_mailbox(session.session()).await;
@@ -1036,6 +1066,7 @@ impl Agentmail {
         let mut skipped = Vec::new();
 
         for mbox in &search_mailboxes {
+            imap_client::check_cancel(cancel)?;
             if imap_client::select(session.session(), mbox).await.is_err() {
                 skipped.push(mbox.clone());
                 continue;
@@ -1062,7 +1093,8 @@ impl Agentmail {
 
             // Fetch FROM for all candidates and filter for exact match
             let candidates =
-                imap_client::fetch_senders_batch(session.session(), &candidate_uids).await?;
+                imap_client::fetch_senders_batch(session.session(), &candidate_uids, cancel)
+                    .await?;
             let exact_uids: Vec<u32> = candidates
                 .into_iter()
                 .filter(|(_uid, email, name)| email == &target_email && name == &target_name)
@@ -1079,6 +1111,7 @@ impl Agentmail {
                 &exact_uids,
                 trash.as_deref(),
                 on_progress,
+                cancel,
             )
             .await?;
             imap_client::sync(session.session()).await?;
@@ -1325,6 +1358,7 @@ impl Agentmail {
         uid: u32,
         delete_matching: bool,
         on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
     ) -> Result<UnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
         let trash = self.resolve_trash_mailbox(session.session()).await;
@@ -1383,6 +1417,7 @@ impl Agentmail {
                 let mut skipped = Vec::new();
 
                 for mbox in &all_mailboxes {
+                    imap_client::check_cancel(cancel)?;
                     if imap_client::select(session.session(), mbox).await.is_err() {
                         skipped.push(mbox.clone());
                         continue;
@@ -1412,6 +1447,7 @@ impl Agentmail {
                         &candidate_uids,
                         &target_email,
                         &target_name,
+                        cancel,
                     )
                     .await?;
 
@@ -1425,6 +1461,7 @@ impl Agentmail {
                         &exact_uids,
                         trash.as_deref(),
                         on_progress,
+                        cancel,
                     )
                     .await?;
                     imap_client::sync(session.session()).await?;
@@ -1492,9 +1529,11 @@ async fn filter_sender_bulk_mail(
     candidate_uids: &[u32],
     target_email: &str,
     target_name: &str,
+    cancel: Option<&CancelFn>,
 ) -> Result<Vec<u32>> {
     let mut exact = Vec::new();
     for chunk in candidate_uids.chunks(1000) {
+        imap_client::check_cancel(cancel)?;
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())

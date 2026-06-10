@@ -2,7 +2,7 @@
 
 use super::AgentMailServer;
 use super::args::*;
-use super::{make_progress_fn, to_mcp_error};
+use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
 use crate::{
     ConnectionStatus, FindAttachmentsResponse, GetMessagesResponse, ListAccountsResponse,
     ListCapabilitiesResponse, ListFlagsResponse, ListMailboxesResponse, RankListIdResponse,
@@ -14,6 +14,7 @@ use rmcp::{
     model::Meta,
     tool, tool_router,
 };
+use tokio_util::sync::CancellationToken;
 
 #[tool_router(router = read_tools_router, vis = "pub(super)")]
 impl AgentMailServer {
@@ -168,12 +169,19 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<ListFlagsArgs>,
     ) -> Result<Json<ListFlagsResponse>, McpError> {
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
         match self
             .agentmail
-            .list_flags(args.mailbox.as_deref(), &args.account, progress.as_ref())
+            .list_flags(
+                args.mailbox.as_deref(),
+                &args.account,
+                progress.as_ref(),
+                Some(&cancel),
+            )
             .await
         {
             Ok(data) => Ok(Json(data)),
@@ -191,11 +199,13 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<FindAttachmentsArgs>,
     ) -> Result<Json<FindAttachmentsResponse>, McpError> {
         let offset = crate::clamp_usize(args.offset, 0, 0, 100_000);
         let limit = crate::clamp_usize(args.limit, 25, 1, 100);
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
@@ -205,6 +215,7 @@ impl AgentMailServer {
                 offset,
                 limit,
                 progress.as_ref(),
+                Some(&cancel),
             )
             .await
         {
@@ -223,10 +234,12 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<RankSendersArgs>,
     ) -> Result<Json<RankSendersResponse>, McpError> {
         let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
@@ -235,6 +248,7 @@ impl AgentMailServer {
                 &args.account,
                 limit,
                 progress.as_ref(),
+                Some(&cancel),
             )
             .await
         {
@@ -253,10 +267,12 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<RankUnsubscribeArgs>,
     ) -> Result<Json<RankUnsubscribeResponse>, McpError> {
         let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
@@ -265,6 +281,7 @@ impl AgentMailServer {
                 &args.account,
                 limit,
                 progress.as_ref(),
+                Some(&cancel),
             )
             .await
         {
@@ -283,10 +300,12 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<RankListIdArgs>,
     ) -> Result<Json<RankListIdResponse>, McpError> {
         let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
@@ -295,6 +314,7 @@ impl AgentMailServer {
                 &args.account,
                 limit,
                 progress.as_ref(),
+                Some(&cancel),
             )
             .await
         {

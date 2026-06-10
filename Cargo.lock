@@ -46,6 +46,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-native-tls",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",

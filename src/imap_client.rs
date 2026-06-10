@@ -19,6 +19,19 @@ pub type ImapSession = Session<TlsStream<TcpStream>>;
 /// Callback for reporting progress: `(completed, total)`.
 pub type ProgressFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
+/// Callback for cooperative cancellation: returns `true` once the caller
+/// should abandon the operation. Kept as a plain `Fn` so the core library
+/// stays free of tokio_util / MCP types.
+pub type CancelFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Bail out with `AgentmailError::Other("cancelled by client")` when cancelled.
+pub(crate) fn check_cancel(cancel: Option<&CancelFn>) -> Result<()> {
+    if cancel.is_some_and(|c| c()) {
+        return Err(AgentmailError::Other("cancelled by client".to_string()));
+    }
+    Ok(())
+}
+
 /// Type alias for raw fetch items: `(uid, size, flags, body_bytes)`.
 type RawFetchItems = Vec<(u32, Option<u32>, Vec<String>, Vec<u8>)>;
 
@@ -353,6 +366,7 @@ pub async fn fetch_sender_dates(
     session: &mut ImapSession,
     mailbox: &str,
     on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
 ) -> Result<Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)>> {
     let mb = imap_timeout(session.select(mailbox)).await?;
 
@@ -374,6 +388,7 @@ pub async fn fetch_sender_dates(
     let mut completed = 0u64;
 
     for chunk in uids.chunks(1000) {
+        check_cancel(cancel)?;
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -441,9 +456,11 @@ pub async fn fetch_sender(session: &mut ImapSession, uid: u32) -> Result<(String
 pub async fn fetch_senders_batch(
     session: &mut ImapSession,
     uids: &[u32],
+    cancel: Option<&CancelFn>,
 ) -> Result<Vec<(u32, String, String)>> {
     let mut results = Vec::new();
     for chunk in uids.chunks(1000) {
+        check_cancel(cancel)?;
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -487,6 +504,7 @@ pub async fn fetch_list_headers(
     session: &mut ImapSession,
     mailbox: &str,
     on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
 ) -> Result<Vec<ListHeaderRow>> {
     let mb = imap_timeout(session.select(mailbox)).await?;
 
@@ -506,6 +524,7 @@ pub async fn fetch_list_headers(
     let mut completed = 0u64;
 
     for chunk in uids.chunks(1000) {
+        check_cancel(cancel)?;
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -745,6 +764,7 @@ pub async fn fetch_attachment_uids(
     session: &mut ImapSession,
     mailbox: &str,
     on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
 ) -> Result<Vec<u32>> {
     let mb = imap_timeout(session.select(mailbox)).await?;
     if mb.exists == 0 {
@@ -758,6 +778,7 @@ pub async fn fetch_attachment_uids(
     let mut completed = 0u64;
 
     for chunk in uids.chunks(1000) {
+        check_cancel(cancel)?;
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -813,6 +834,7 @@ pub async fn bulk_delete_messages(
     uids: &[u32],
     trash_mailbox: Option<&str>,
     on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
 ) -> Result<BulkDeleteResult> {
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
@@ -821,6 +843,7 @@ pub async fn bulk_delete_messages(
     let total = uids.len() as u64;
 
     for chunk in uids.chunks(500) {
+        check_cancel(cancel)?;
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())
@@ -1052,6 +1075,7 @@ pub async fn fetch_flags(
     session: &mut ImapSession,
     mailbox: &str,
     on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
 ) -> Result<FlagScanResult> {
     let mb = imap_timeout(session.select(mailbox)).await?;
     if mb.exists == 0 {
@@ -1069,6 +1093,7 @@ pub async fn fetch_flags(
     let mut completed = 0u64;
 
     for chunk in uids.chunks(1000) {
+        check_cancel(cancel)?;
         let uid_set: String = chunk
             .iter()
             .map(|u| u.to_string())

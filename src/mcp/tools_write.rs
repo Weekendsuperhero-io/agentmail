@@ -2,7 +2,7 @@
 
 use super::AgentMailServer;
 use super::args::*;
-use super::{make_progress_fn, to_mcp_error};
+use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
 use crate::{
     CreateDraftResponse, CreateMailboxResponse, DeleteBySenderResponse, DeleteListIdResponse,
     DeleteMessagesResponse, DownloadAttachmentsResponse, DraftAttachment, MoveMessageResponse,
@@ -14,6 +14,7 @@ use rmcp::{
     model::Meta,
     tool, tool_router,
 };
+use tokio_util::sync::CancellationToken;
 
 #[tool_router(router = write_tools_router, vis = "pub(super)")]
 impl AgentMailServer {
@@ -58,6 +59,7 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<DeleteMessagesArgs>,
     ) -> Result<Json<DeleteMessagesResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
@@ -75,9 +77,16 @@ impl AgentMailServer {
         }
 
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
         match self
             .agentmail
-            .delete_messages(&mailbox, &args.account, &args.uids, progress.as_ref())
+            .delete_messages(
+                &mailbox,
+                &args.account,
+                &args.uids,
+                progress.as_ref(),
+                Some(&cancel),
+            )
             .await
         {
             Ok(data) => Ok(Json(data)),
@@ -95,11 +104,13 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<DeleteBySenderArgs>,
     ) -> Result<Json<DeleteBySenderResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
 
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
         match self
             .agentmail
             .delete_by_sender(
@@ -108,6 +119,7 @@ impl AgentMailServer {
                 args.uid,
                 args.all_mailboxes,
                 progress.as_ref(),
+                Some(&cancel),
             )
             .await
         {
@@ -266,10 +278,12 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<UnsubscribeMessageArgs>,
     ) -> Result<Json<UnsubscribeResponse>, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
@@ -279,6 +293,7 @@ impl AgentMailServer {
                 args.uid,
                 args.delete_matching,
                 progress.as_ref(),
+                Some(&cancel),
             )
             .await
         {
@@ -297,9 +312,11 @@ impl AgentMailServer {
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
+        ct: CancellationToken,
         Parameters(args): Parameters<DeleteListIdArgs>,
     ) -> Result<Json<DeleteListIdResponse>, McpError> {
         let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
         match self
             .agentmail
             .delete_list_id(
@@ -307,6 +324,7 @@ impl AgentMailServer {
                 &args.account,
                 &args.list_id,
                 progress.as_ref(),
+                Some(&cancel),
             )
             .await
         {
