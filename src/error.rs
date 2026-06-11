@@ -29,6 +29,9 @@ pub enum AgentmailError {
     #[error("Message not found: UID {0}")]
     MessageNotFound(u32),
 
+    #[error("invalid search query: {0}")]
+    InvalidSearch(String),
+
     #[error("Not connected")]
     NotConnected,
 

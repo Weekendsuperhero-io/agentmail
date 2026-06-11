@@ -678,7 +678,7 @@ impl Agentmail {
                 deleted: Some(false),
                 ..Default::default()
             };
-            let query = imap_client::build_search_query_pub(&criteria);
+            let query = imap_client::build_search_query_pub(&criteria)?;
             let uids = match imap_client::search_uids(session.session(), &query).await {
                 Ok(u) => u,
                 Err(_) => {
@@ -1078,7 +1078,7 @@ impl Agentmail {
                 deleted: Some(false),
                 ..Default::default()
             };
-            let query = imap_client::build_search_query_pub(&criteria);
+            let query = imap_client::build_search_query_pub(&criteria)?;
             let candidate_uids = match imap_client::search_uids(session.session(), &query).await {
                 Ok(uids) => uids,
                 Err(_) => {
@@ -1428,7 +1428,7 @@ impl Agentmail {
                         deleted: Some(false),
                         ..Default::default()
                     };
-                    let query = imap_client::build_search_query_pub(&criteria);
+                    let query = imap_client::build_search_query_pub(&criteria)?;
                     let candidate_uids =
                         match imap_client::search_uids(session.session(), &query).await {
                             Ok(uids) => uids,

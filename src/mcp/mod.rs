@@ -98,6 +98,7 @@ fn to_mcp_error(e: &crate::AgentmailError) -> McpError {
         E::AccountNotFound(_)
         | E::MailboxNotFound(_)
         | E::MessageNotFound(_)
+        | E::InvalidSearch(_)
         | E::Config(_)
         | E::Credential(_) => McpError::invalid_params(e.to_string(), None),
         E::Imap(_)

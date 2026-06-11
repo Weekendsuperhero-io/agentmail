@@ -326,9 +326,8 @@ pub async fn search_messages(
 ) -> Result<(Vec<MessageInfo>, u32)> {
     imap_timeout(session.select(mailbox)).await?;
 
-    let query = build_search_query(criteria);
-    let uids_raw = imap_timeout(session.uid_search(&query)).await?;
-    let mut uids: Vec<u32> = uids_raw.into_iter().collect();
+    let query = build_search_query(criteria)?;
+    let mut uids = run_uid_search(session, &query).await?;
     uids.sort_unstable_by(|a, b| b.cmp(a));
     let total_matches = uids.len() as u32;
 
@@ -353,15 +352,14 @@ pub async fn search_messages(
 }
 
 /// Build an IMAP SEARCH query string from SearchCriteria (public wrapper).
-pub fn build_search_query_pub(criteria: &SearchCriteria) -> String {
+pub fn build_search_query_pub(criteria: &SearchCriteria) -> Result<String> {
     build_search_query(criteria)
 }
 
 /// Run a UID SEARCH with a raw query string. Returns matching UIDs.
 /// Caller must have already selected the mailbox.
 pub async fn search_uids(session: &mut ImapSession, query: &str) -> Result<Vec<u32>> {
-    let uids = imap_timeout(session.uid_search(query)).await?;
-    Ok(uids.into_iter().collect())
+    run_uid_search(session, query).await
 }
 
 /// Fetch only FROM and DATE headers for all messages in a mailbox.
@@ -1007,34 +1005,61 @@ pub async fn search_by_header(
     header_name: &str,
     header_value: &str,
 ) -> Result<Vec<u32>> {
-    let query = format!(
-        "HEADER \"{}\" \"{}\"",
-        escape_imap_string(header_name),
-        escape_imap_string(header_value)
-    );
-    let uids = imap_timeout(session.uid_search(&query)).await?;
-    Ok(uids.into_iter().collect())
+    let mut query = format!("HEADER {} {}", quoted(header_name)?, quoted(header_value)?);
+    if !header_name.is_ascii() || !header_value.is_ascii() {
+        query = format!("CHARSET UTF-8 {query}");
+    }
+    run_uid_search(session, &query).await
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Quote a string for use in an IMAP SEARCH command.
+///
+/// Rejects CR/LF outright: async-imap writes command bytes to the wire
+/// unvalidated, so an embedded CRLF would inject a second IMAP command.
+fn quoted(s: &str) -> Result<String> {
+    if s.contains('\r') || s.contains('\n') {
+        return Err(AgentmailError::InvalidSearch(
+            "search text must not contain CR or LF characters".to_string(),
+        ));
+    }
+    Ok(format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
 /// Build an IMAP SEARCH query string from SearchCriteria.
-fn build_search_query(criteria: &SearchCriteria) -> String {
+///
+/// Non-ASCII text gets a `CHARSET UTF-8` prefix with UTF-8 bytes inside
+/// quoted strings. Strictly RFC 3501 wants literals for 8-bit data, but
+/// async-imap cannot send command literals; UTF-8-in-quoted is accepted by
+/// Gmail, Dovecot, Courier, iCloud, and Outlook, and IMAP4rev2 requires it.
+/// Servers that refuse reply with NO [BADCHARSET], mapped to a clear error
+/// in `run_uid_search`.
+fn build_search_query(criteria: &SearchCriteria) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
+    let mut ascii_only = true;
+    let mut push_text = |key: &str, value: &str, parts: &mut Vec<String>| -> Result<()> {
+        ascii_only &= value.is_ascii();
+        parts.push(format!("{key} {}", quoted(value)?));
+        Ok(())
+    };
 
     if let Some(ref text) = criteria.text {
-        parts.push(format!("TEXT \"{}\"", escape_imap_string(text)));
+        push_text("TEXT", text, &mut parts)?;
     }
     if let Some(ref from) = criteria.from {
-        parts.push(format!("FROM \"{}\"", escape_imap_string(from)));
+        push_text("FROM", from, &mut parts)?;
     }
     if let Some(ref subject) = criteria.subject {
-        parts.push(format!("SUBJECT \"{}\"", escape_imap_string(subject)));
+        push_text("SUBJECT", subject, &mut parts)?;
     }
     if let Some(ref to) = criteria.to {
-        parts.push(format!("TO \"{}\"", escape_imap_string(to)));
+        push_text("TO", to, &mut parts)?;
     }
     if let Some(seen) = criteria.seen {
         parts.push(if seen { "SEEN".into() } else { "UNSEEN".into() });
@@ -1054,17 +1079,36 @@ fn build_search_query(criteria: &SearchCriteria) -> String {
         });
     }
     if let Some((ref key, ref value)) = criteria.header {
-        parts.push(format!(
-            "HEADER \"{}\" \"{}\"",
-            escape_imap_string(key),
-            escape_imap_string(value)
-        ));
+        ascii_only &= key.is_ascii() && value.is_ascii();
+        parts.push(format!("HEADER {} {}", quoted(key)?, quoted(value)?));
     }
 
     if parts.is_empty() {
-        "ALL".to_string()
+        Ok("ALL".to_string())
+    } else if ascii_only {
+        Ok(parts.join(" "))
     } else {
-        parts.join(" ")
+        Ok(format!("CHARSET UTF-8 {}", parts.join(" ")))
+    }
+}
+
+/// Run a UID SEARCH, mapping server rejections of the query itself to
+/// `InvalidSearch` so callers see an actionable error instead of a generic
+/// IMAP failure.
+async fn run_uid_search(session: &mut ImapSession, query: &str) -> Result<Vec<u32>> {
+    match imap_timeout(session.uid_search(query)).await {
+        Ok(uids) => Ok(uids.into_iter().collect()),
+        Err(AgentmailError::Imap(async_imap::error::Error::Bad(s))) => Err(
+            AgentmailError::InvalidSearch(format!("server rejected SEARCH: {s}")),
+        ),
+        Err(AgentmailError::Imap(async_imap::error::Error::No(s)))
+            if s.to_uppercase().contains("BADCHARSET") =>
+        {
+            Err(AgentmailError::InvalidSearch(format!(
+                "server does not support UTF-8 SEARCH: {s}"
+            )))
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1134,11 +1178,6 @@ pub async fn fetch_flags(
     Ok(FlagScanResult { flags, colors })
 }
 
-/// Escape a string for use in IMAP quoted strings.
-fn escape_imap_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 /// Convert an async-imap Flag to its string representation.
 fn flag_to_string(flag: &async_imap::types::Flag<'_>) -> String {
     match flag {
@@ -1180,4 +1219,84 @@ fn extract_header_value(headers: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn criteria_text(text: &str) -> SearchCriteria {
+        SearchCriteria {
+            text: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ascii_query_has_no_charset_prefix() {
+        let q = build_search_query(&criteria_text("hello world")).unwrap();
+        assert_eq!(q, "TEXT \"hello world\"");
+    }
+
+    #[test]
+    fn non_ascii_query_gets_utf8_charset_prefix() {
+        let q = build_search_query(&criteria_text("café")).unwrap();
+        assert_eq!(q, "CHARSET UTF-8 TEXT \"café\"");
+    }
+
+    #[test]
+    fn non_ascii_in_any_field_triggers_charset() {
+        let criteria = SearchCriteria {
+            from: Some("björn@example.com".to_string()),
+            seen: Some(false),
+            ..Default::default()
+        };
+        let q = build_search_query(&criteria).unwrap();
+        assert_eq!(q, "CHARSET UTF-8 FROM \"björn@example.com\" UNSEEN");
+    }
+
+    #[test]
+    fn quotes_and_backslashes_are_escaped() {
+        let q = build_search_query(&criteria_text(r#"say "hi" \now"#)).unwrap();
+        assert_eq!(q, r#"TEXT "say \"hi\" \\now""#);
+    }
+
+    #[test]
+    fn crlf_in_search_text_is_rejected() {
+        for bad in ["x\r\nA1 EXPUNGE", "line1\nline2", "cr\rhere"] {
+            let err = build_search_query(&criteria_text(bad)).unwrap_err();
+            assert!(
+                matches!(err, AgentmailError::InvalidSearch(_)),
+                "expected InvalidSearch for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_criteria_searches_all() {
+        let q = build_search_query(&SearchCriteria::default()).unwrap();
+        assert_eq!(q, "ALL");
+    }
+
+    #[test]
+    fn header_pair_is_quoted() {
+        let criteria = SearchCriteria {
+            header: Some(("List-Id".to_string(), "news.example.com".to_string())),
+            ..Default::default()
+        };
+        let q = build_search_query(&criteria).unwrap();
+        assert_eq!(q, "HEADER \"List-Id\" \"news.example.com\"");
+    }
+
+    #[test]
+    fn flag_criteria_compose() {
+        let criteria = SearchCriteria {
+            seen: Some(true),
+            flagged: Some(false),
+            deleted: Some(false),
+            ..Default::default()
+        };
+        let q = build_search_query(&criteria).unwrap();
+        assert_eq!(q, "SEEN UNFLAGGED UNDELETED");
+    }
 }
