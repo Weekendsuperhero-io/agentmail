@@ -392,11 +392,25 @@ pub struct DeleteListIdResponse {
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// True when the caller requested a permanent delete (Trash bypassed).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub permanent: bool,
 }
 
 // ============================================================================
 // Write tool responses
 // ============================================================================
+
+/// How a delete should dispose of messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeleteMode {
+    /// Move to the account's Trash mailbox when one exists, else permanently
+    /// delete (flag `\Deleted` + UID EXPUNGE).
+    #[default]
+    TrashFirst,
+    /// Always permanently delete, bypassing Trash. Irreversible.
+    Permanent,
+}
 
 /// Response for delete_messages.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -410,6 +424,9 @@ pub struct DeleteMessagesResponse {
     /// fell back to flag+expunge (permanent delete).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub trash_fallback: bool,
+    /// True when the caller requested a permanent delete (Trash bypassed).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub permanent: bool,
 }
 
 /// Per-mailbox deletion result (shared by delete_by_sender and unsubscribe_message).
@@ -438,6 +455,9 @@ pub struct DeleteBySenderResponse {
     /// Mailboxes that could not be selected or searched (skipped during scan).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// True when the caller requested a permanent delete (Trash bypassed).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub permanent: bool,
 }
 
 /// Response for move_message.
@@ -556,6 +576,9 @@ pub struct MatchingMessagesResult {
     /// Mailboxes that could not be selected or searched (skipped during scan).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// True when the caller requested a permanent delete (Trash bypassed).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub permanent: bool,
 }
 
 /// Response for unsubscribe_message.

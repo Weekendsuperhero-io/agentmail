@@ -398,6 +398,36 @@ async fn completion_mailbox_swallows_network_errors() {
 }
 
 #[tokio::test]
+async fn delete_tools_expose_permanent_flag() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in [
+        "delete_messages",
+        "delete_by_sender",
+        "delete_list_id",
+        "unsubscribe_message",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("tool `{name}` missing"));
+        let prop = &tool["inputSchema"]["properties"]["permanent"];
+        assert_eq!(
+            prop["type"].as_str(),
+            Some("boolean"),
+            "`{name}` should expose a boolean `permanent` arg: {prop:#}"
+        );
+        assert!(
+            prop["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("Irreversible")),
+            "`{name}` permanent arg should warn it is irreversible"
+        );
+    }
+}
+
+#[tokio::test]
 async fn rank_limit_documents_default_of_100() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;

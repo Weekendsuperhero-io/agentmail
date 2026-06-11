@@ -664,12 +664,13 @@ impl Agentmail {
         mailbox: Option<&str>,
         account: &str,
         list_id: &str,
+        mode: DeleteMode,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteListIdResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.resolve_trash_mailbox(session.session()).await;
+        let trash = self.trash_for_mode(mode, session.session()).await;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
@@ -745,6 +746,7 @@ impl Agentmail {
             failed: total_failed,
             mailboxes: per_mailbox,
             skipped,
+            permanent: mode == DeleteMode::Permanent,
         })
     }
 
@@ -1018,12 +1020,13 @@ impl Agentmail {
         mailbox: &str,
         account: &str,
         uids: &[u32],
+        mode: DeleteMode,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.resolve_trash_mailbox(session.session()).await;
+        let trash = self.trash_for_mode(mode, session.session()).await;
         imap_client::select(session.session(), mailbox).await?;
         let result = imap_client::bulk_delete_messages(
             session.session(),
@@ -1043,6 +1046,7 @@ impl Agentmail {
             deleted: result.deleted.len(),
             failed: result.failed.len(),
             trash_fallback: result.trash_fallback,
+            permanent: mode == DeleteMode::Permanent,
         })
     }
 
@@ -1057,12 +1061,13 @@ impl Agentmail {
         account: &str,
         uid: u32,
         all_mailboxes: bool,
+        mode: DeleteMode,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteBySenderResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.resolve_trash_mailbox(session.session()).await;
+        let trash = self.trash_for_mode(mode, session.session()).await;
         imap_client::select(session.session(), mailbox).await?;
 
         // 1. Fetch the exact sender from the target message
@@ -1167,6 +1172,7 @@ impl Agentmail {
             failed: total_failed,
             mailboxes: per_mailbox,
             skipped,
+            permanent: mode == DeleteMode::Permanent,
         })
     }
 
@@ -1380,12 +1386,13 @@ impl Agentmail {
         account: &str,
         uid: u32,
         delete_matching: bool,
+        mode: DeleteMode,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<UnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.resolve_trash_mailbox(session.session()).await;
+        let trash = self.trash_for_mode(mode, session.session()).await;
 
         // Fetch unsubscribe + list-id headers from the target message
         let headers =
@@ -1513,6 +1520,7 @@ impl Agentmail {
                     failed: total_failed,
                     mailboxes: per_mailbox,
                     skipped,
+                    permanent: mode == DeleteMode::Permanent,
                 });
             }
         } else {
@@ -1539,6 +1547,20 @@ impl Agentmail {
         session: &mut imap_client::ImapSession,
     ) -> Option<String> {
         find_trash_mailbox(session).await.ok().flatten()
+    }
+
+    /// Resolve the trash destination for a delete, honoring the delete mode:
+    /// `Permanent` bypasses Trash entirely (so deletion goes straight to
+    /// flag + UID EXPUNGE).
+    async fn trash_for_mode(
+        &self,
+        mode: DeleteMode,
+        session: &mut imap_client::ImapSession,
+    ) -> Option<String> {
+        match mode {
+            DeleteMode::Permanent => None,
+            DeleteMode::TrashFirst => self.resolve_trash_mailbox(session).await,
+        }
     }
 }
 

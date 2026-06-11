@@ -5,8 +5,8 @@ use super::args::*;
 use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
 use crate::{
     CreateDraftResponse, CreateMailboxResponse, DeleteBySenderResponse, DeleteListIdResponse,
-    DeleteMessagesResponse, DownloadAttachmentsResponse, DraftAttachment, MoveMessageResponse,
-    UnsubscribeResponse, UpdateFlagsResponse,
+    DeleteMessagesResponse, DeleteMode, DownloadAttachmentsResponse, DraftAttachment,
+    MoveMessageResponse, UnsubscribeResponse, UpdateFlagsResponse,
 };
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
@@ -15,6 +15,15 @@ use rmcp::{
     tool, tool_router,
 };
 use tokio_util::sync::CancellationToken;
+
+/// Map the flat `permanent` tool argument to a `DeleteMode`.
+fn delete_mode(permanent: bool) -> DeleteMode {
+    if permanent {
+        DeleteMode::Permanent
+    } else {
+        DeleteMode::TrashFirst
+    }
+}
 
 #[tool_router(router = write_tools_router, vis = "pub(super)")]
 impl AgentMailServer {
@@ -84,6 +93,7 @@ impl AgentMailServer {
                 &mailbox,
                 &args.account,
                 &args.uids,
+                delete_mode(args.permanent),
                 progress.as_ref(),
                 Some(&cancel),
             )
@@ -118,6 +128,7 @@ impl AgentMailServer {
                 &args.account,
                 args.uid,
                 args.all_mailboxes,
+                delete_mode(args.permanent),
                 progress.as_ref(),
                 Some(&cancel),
             )
@@ -292,6 +303,7 @@ impl AgentMailServer {
                 &args.account,
                 args.uid,
                 args.delete_matching,
+                delete_mode(args.permanent),
                 progress.as_ref(),
                 Some(&cancel),
             )
@@ -323,6 +335,7 @@ impl AgentMailServer {
                 args.mailbox.as_deref(),
                 &args.account,
                 &args.list_id,
+                delete_mode(args.permanent),
                 progress.as_ref(),
                 Some(&cancel),
             )

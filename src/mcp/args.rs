@@ -139,6 +139,11 @@ pub(super) struct DeleteMessagesArgs {
     pub(super) account: String,
     #[schemars(description = "Array of IMAP UIDs to delete. One or more UIDs, up to 500.")]
     pub(super) uids: Vec<u32>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true, permanently delete (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
+    )]
+    pub(super) permanent: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -162,6 +167,11 @@ pub(super) struct DeleteBySenderArgs {
         description = "When true, search and delete across ALL mailboxes in the account (not just the source mailbox). Defaults to false."
     )]
     pub(super) all_mailboxes: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true, permanently delete (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
+    )]
+    pub(super) permanent: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -263,6 +273,11 @@ pub(super) struct UnsubscribeMessageArgs {
         description = "If true, bulk-delete matching messages. For List-Unsubscribe messages: deletes all from the exact sender with a List-Unsubscribe header. For List-Id-only messages: deletes all with the same List-Id."
     )]
     pub(super) delete_matching: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true, permanently delete matching messages (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
+    )]
+    pub(super) permanent: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -325,6 +340,11 @@ pub(super) struct DeleteListIdArgs {
     pub(super) list_id: String,
     #[schemars(description = "Mailbox to search. Omit to search all mailboxes.")]
     pub(super) mailbox: Option<String>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true, permanently delete (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
+    )]
+    pub(super) permanent: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
