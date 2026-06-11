@@ -21,6 +21,11 @@ pub struct ConnectionPool {
     pools: Arc<Mutex<HashMap<String, Vec<IdleSession>>>>,
     /// Per-account semaphores to cap concurrent IMAP operations.
     semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Per-account server capabilities. Capabilities describe the server, not
+    /// the socket, so one CAPABILITY round trip per process per account
+    /// suffices (a server upgraded mid-process only changes which command
+    /// variant we pick — harmless).
+    caps: Arc<parking_lot::Mutex<HashMap<String, Arc<imap_client::ServerCaps>>>>,
 }
 
 /// Max concurrent IMAP operations per account.
@@ -44,7 +49,32 @@ impl ConnectionPool {
             config,
             pools: Arc::new(Mutex::new(HashMap::new())),
             semaphores: Arc::new(Mutex::new(HashMap::new())),
+            caps: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Get the server capabilities for an account, fetching once and caching.
+    /// `session` must be a live session for the account.
+    pub async fn server_caps(
+        &self,
+        account_name: &str,
+        session: &mut ImapSession,
+    ) -> crate::Result<Arc<imap_client::ServerCaps>> {
+        // Fast path: cached. Scoped guard — never held across the await below
+        // (`await_holding_lock` is denied).
+        if let Some(caps) = self.caps.lock().get(account_name).cloned() {
+            return Ok(caps);
+        }
+        let caps = Arc::new(imap_client::ServerCaps::fetch(session).await?);
+        self.caps
+            .lock()
+            .insert(account_name.to_string(), Arc::clone(&caps));
+        Ok(caps)
+    }
+
+    /// Return cached capabilities without a session, if already fetched.
+    pub fn cached_caps(&self, account_name: &str) -> Option<Arc<imap_client::ServerCaps>> {
+        self.caps.lock().get(account_name).cloned()
     }
 
     /// Get or create the semaphore for a given account.

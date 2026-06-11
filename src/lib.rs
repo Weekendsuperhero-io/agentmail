@@ -49,6 +49,18 @@ impl Agentmail {
         self.pool.account_config(name)
     }
 
+    /// Resolve server capabilities for an account, using the pool's cache and
+    /// acquiring a session only on a cold miss.
+    async fn caps_for(&self, account: &str) -> Result<std::sync::Arc<imap_client::ServerCaps>> {
+        if let Some(caps) = self.pool.cached_caps(account) {
+            return Ok(caps);
+        }
+        let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
+        session.release().await;
+        Ok(caps)
+    }
+
     /// Get the underlying config.
     pub fn config(&self) -> &Config {
         self.pool.config()
@@ -130,10 +142,14 @@ impl Agentmail {
         let mut mailboxes: Vec<MailboxInfo> = Vec::new();
         for acct_name in &account_names {
             let acct = acct_name.clone();
+            // Resolve caps once (cached after the first fetch) so the retry
+            // closure captures only the owned Arc — capturing `&pool` would
+            // make the async closure's lifetime too short for `Send`.
+            let caps = self.caps_for(acct_name).await?;
             let mboxes = self
                 .pool
                 .with_session_retry(acct_name, async move |s| {
-                    imap_client::list_mailboxes(s, &acct).await
+                    imap_client::list_mailboxes(s, &acct, &caps).await
                 })
                 .await?;
             mailboxes.extend(mboxes);
@@ -652,6 +668,7 @@ impl Agentmail {
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteListIdResponse> {
         let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self.resolve_trash_mailbox(session.session()).await;
 
         let mailboxes = match mailbox {
@@ -696,6 +713,7 @@ impl Agentmail {
                 session.session(),
                 &uids,
                 trash.as_deref(),
+                &caps,
                 on_progress,
                 cancel,
             )
@@ -1004,12 +1022,14 @@ impl Agentmail {
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self.resolve_trash_mailbox(session.session()).await;
         imap_client::select(session.session(), mailbox).await?;
         let result = imap_client::bulk_delete_messages(
             session.session(),
             uids,
             trash.as_deref(),
+            &caps,
             on_progress,
             cancel,
         )
@@ -1041,6 +1061,7 @@ impl Agentmail {
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteBySenderResponse> {
         let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self.resolve_trash_mailbox(session.session()).await;
         imap_client::select(session.session(), mailbox).await?;
 
@@ -1110,6 +1131,7 @@ impl Agentmail {
                 session.session(),
                 &exact_uids,
                 trash.as_deref(),
+                &caps,
                 on_progress,
                 cancel,
             )
@@ -1172,8 +1194,9 @@ impl Agentmail {
             )));
         }
 
+        let caps = self.pool.server_caps(account, session.session()).await?;
         imap_client::select(session.session(), mailbox).await?;
-        imap_client::move_message(session.session(), uid, destination).await?;
+        imap_client::move_message(session.session(), uid, destination, &caps).await?;
         imap_client::sync(session.session()).await?;
         session.release().await;
 
@@ -1361,6 +1384,7 @@ impl Agentmail {
         cancel: Option<&CancelFn>,
     ) -> Result<UnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self.resolve_trash_mailbox(session.session()).await;
 
         // Fetch unsubscribe + list-id headers from the target message
@@ -1460,6 +1484,7 @@ impl Agentmail {
                         session.session(),
                         &exact_uids,
                         trash.as_deref(),
+                        &caps,
                         on_progress,
                         cancel,
                     )

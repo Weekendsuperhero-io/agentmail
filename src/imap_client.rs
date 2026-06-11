@@ -126,17 +126,63 @@ pub async fn ping(session: &mut ImapSession) -> Result<()> {
 
 /// Query server capabilities via IMAP CAPABILITY command.
 pub async fn list_capabilities(session: &mut ImapSession) -> Result<Vec<String>> {
+    let mut result = capability_strings(session).await?;
+    result.sort();
+    Ok(result)
+}
+
+/// Collect raw capability tokens (uppercased on the wire varies by server, so
+/// callers normalize). `AUTH=` mechanisms are flattened to `AUTH=<mech>`.
+async fn capability_strings(session: &mut ImapSession) -> Result<Vec<String>> {
     let caps = imap_timeout(session.capabilities()).await?;
-    let mut result: Vec<String> = caps
+    Ok(caps
         .iter()
         .map(|c| match c {
             async_imap::types::Capability::Imap4rev1 => "IMAP4rev1".to_string(),
             async_imap::types::Capability::Auth(s) => format!("AUTH={}", s),
             async_imap::types::Capability::Atom(s) => s.clone(),
         })
-        .collect();
-    result.sort();
-    Ok(result)
+        .collect())
+}
+
+/// Parsed server capabilities, used to gate command variants (MOVE, UIDPLUS,
+/// IMAP4rev1-vs-rev2). Tokens are stored uppercased for case-insensitive lookup.
+#[derive(Debug, Clone, Default)]
+pub struct ServerCaps {
+    tokens: hashbrown::HashSet<String>,
+}
+
+impl ServerCaps {
+    pub fn from_strings<I: IntoIterator<Item = String>>(caps: I) -> Self {
+        Self {
+            tokens: caps.into_iter().map(|c| c.to_uppercase()).collect(),
+        }
+    }
+
+    /// Fetch and parse the server's capabilities.
+    pub async fn fetch(session: &mut ImapSession) -> Result<Self> {
+        Ok(Self::from_strings(capability_strings(session).await?))
+    }
+
+    pub fn has(&self, cap: &str) -> bool {
+        self.tokens.contains(&cap.to_uppercase())
+    }
+
+    /// RFC 6851 MOVE / UID MOVE.
+    pub fn has_move(&self) -> bool {
+        self.has("MOVE")
+    }
+
+    /// RFC 4315 UIDPLUS (enables UID EXPUNGE for targeted, concurrent-safe deletes).
+    pub fn has_uidplus(&self) -> bool {
+        self.has("UIDPLUS")
+    }
+
+    /// Whether the server speaks IMAP4rev1 (RFC 3501). IMAP4rev2-only servers
+    /// (RFC 9051) removed the RECENT data item from STATUS.
+    pub fn has_imap4rev1(&self) -> bool {
+        self.has("IMAP4REV1")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +212,7 @@ fn role_from_attributes(attrs: &[async_imap::types::NameAttribute<'_>]) -> Optio
 pub async fn list_mailboxes(
     session: &mut ImapSession,
     account_name: &str,
+    caps: &ServerCaps,
 ) -> Result<Vec<MailboxInfo>> {
     use async_imap::types::NameAttribute;
 
@@ -174,6 +221,15 @@ pub async fn list_mailboxes(
         Ok::<_, async_imap::error::Error>(stream.collect::<Vec<_>>().await)
     })
     .await?;
+
+    // RFC 9051 (IMAP4rev2) removed the RECENT status item; only request it
+    // from servers that still advertise IMAP4rev1, else a rev2-only server
+    // replies BAD.
+    let status_items = if caps.has_imap4rev1() {
+        "(MESSAGES UNSEEN RECENT)"
+    } else {
+        "(MESSAGES UNSEEN)"
+    };
 
     let mut result = Vec::with_capacity(names.len());
     for item in names {
@@ -190,7 +246,7 @@ pub async fn list_mailboxes(
         let (total, unseen, recent) = if no_select {
             (0, 0, 0)
         } else {
-            let status = imap_timeout(session.status(&name, "(MESSAGES UNSEEN RECENT)")).await?;
+            let status = imap_timeout(session.status(&name, status_items)).await?;
             (status.exists, status.unseen.unwrap_or(0), status.recent)
         };
 
@@ -830,14 +886,28 @@ pub struct BulkDeleteResult {
 }
 
 /// Delete messages by UID, processing in chunks.
-/// If `trash_mailbox` is set, attempts MOVE first; falls back to flag+expunge on failure.
+/// If `trash_mailbox` is set, moves there; otherwise flags `\Deleted` and
+/// UID-expunges (permanent). Requires UIDPLUS for any permanent path — see
+/// `flag_and_expunge`. Uses MOVE when available, else COPY+flag+expunge.
 pub async fn bulk_delete_messages(
     session: &mut ImapSession,
     uids: &[u32],
     trash_mailbox: Option<&str>,
+    caps: &ServerCaps,
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
 ) -> Result<BulkDeleteResult> {
+    // A permanent delete (no trash, or trash fallback) requires UIDPLUS: plain
+    // EXPUNGE would purge every \Deleted message in the mailbox, including ones
+    // flagged by other clients. Refuse up-front rather than risk data loss.
+    if trash_mailbox.is_none() && !caps.has_uidplus() {
+        return Err(AgentmailError::Other(
+            "server lacks UIDPLUS; refusing permanent delete because plain EXPUNGE \
+             would remove unrelated \\Deleted messages"
+                .to_string(),
+        ));
+    }
+
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
     let mut trash_fallback = false;
@@ -853,16 +923,16 @@ pub async fn bulk_delete_messages(
             .join(",");
 
         let result: std::result::Result<(), AgentmailError> = if let Some(trash) = use_trash {
-            let move_result = imap_timeout(session.uid_mv(&uid_set, trash))
-                .await
-                .map(|_| ());
-            if move_result.is_err() {
-                // Trash MOVE failed — fall back to flag+expunge for all remaining
-                trash_fallback = true;
-                use_trash = None;
-                flag_and_expunge(session, &uid_set).await
-            } else {
-                move_result
+            match move_uids(session, &uid_set, trash, caps).await {
+                Ok(()) => Ok(()),
+                Err(_) if caps.has_uidplus() => {
+                    // Trash move failed — fall back to permanent delete for all
+                    // remaining chunks (safe: UIDPLUS confirmed above).
+                    trash_fallback = true;
+                    use_trash = None;
+                    flag_and_expunge(session, &uid_set).await
+                }
+                Err(e) => Err(e),
             }
         } else {
             flag_and_expunge(session, &uid_set).await
@@ -888,7 +958,26 @@ pub async fn bulk_delete_messages(
     })
 }
 
-/// Flag messages as deleted and expunge them (permanent delete).
+/// Move a UID set to `destination`, using MOVE when the server advertises it
+/// (RFC 6851) or emulating with COPY + `\Deleted` + UID EXPUNGE otherwise.
+/// The emulation path requires UIDPLUS (callers gate on it).
+async fn move_uids(
+    session: &mut ImapSession,
+    uid_set: &str,
+    destination: &str,
+    caps: &ServerCaps,
+) -> Result<()> {
+    if caps.has_move() {
+        imap_timeout(session.uid_mv(uid_set, destination)).await?;
+        Ok(())
+    } else {
+        imap_timeout(session.uid_copy(uid_set, destination)).await?;
+        flag_and_expunge(session, uid_set).await
+    }
+}
+
+/// Flag messages as deleted and expunge them (permanent delete). Uses UID
+/// EXPUNGE (RFC 4315) — callers must have confirmed UIDPLUS.
 async fn flag_and_expunge(
     session: &mut ImapSession,
     uid_set: &str,
@@ -913,11 +1002,20 @@ async fn flag_and_expunge(
 // Move
 // ---------------------------------------------------------------------------
 
-/// Move a message to another mailbox by UID.
-pub async fn move_message(session: &mut ImapSession, uid: u32, destination: &str) -> Result<()> {
-    let uid_str = uid.to_string();
-    imap_timeout(session.uid_mv(&uid_str, destination)).await?;
-    Ok(())
+/// Move a message to another mailbox by UID. Uses MOVE when available, else
+/// COPY + `\Deleted` + UID EXPUNGE (which needs UIDPLUS).
+pub async fn move_message(
+    session: &mut ImapSession,
+    uid: u32,
+    destination: &str,
+    caps: &ServerCaps,
+) -> Result<()> {
+    if !caps.has_move() && !caps.has_uidplus() {
+        return Err(AgentmailError::Other(
+            "server supports neither MOVE nor UIDPLUS; cannot move messages safely".to_string(),
+        ));
+    }
+    move_uids(session, &uid.to_string(), destination, caps).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,5 +1396,36 @@ mod tests {
         };
         let q = build_search_query(&criteria).unwrap();
         assert_eq!(q, "SEEN UNFLAGGED UNDELETED");
+    }
+
+    #[test]
+    fn server_caps_detect_gmail_features() {
+        // Representative Gmail CAPABILITY tokens.
+        let caps = ServerCaps::from_strings(
+            ["IMAP4rev1", "UIDPLUS", "MOVE", "ID", "XLIST", "CHILDREN"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert!(caps.has_imap4rev1());
+        assert!(caps.has_uidplus());
+        assert!(caps.has_move());
+        assert!(!caps.has("CONDSTORE"));
+    }
+
+    #[test]
+    fn server_caps_lookup_is_case_insensitive() {
+        let caps = ServerCaps::from_strings(["uidplus".to_string(), "MoVe".to_string()]);
+        assert!(caps.has_uidplus());
+        assert!(caps.has_move());
+        assert!(caps.has("UIDPLUS"));
+    }
+
+    #[test]
+    fn server_caps_rev2_only_lacks_imap4rev1() {
+        // An IMAP4rev2-only server advertises IMAP4rev2, not IMAP4rev1.
+        let caps = ServerCaps::from_strings(["IMAP4rev2".to_string(), "UIDPLUS".to_string()]);
+        assert!(!caps.has_imap4rev1());
+        assert!(caps.has("IMAP4REV2"));
+        assert!(caps.has_uidplus());
     }
 }
