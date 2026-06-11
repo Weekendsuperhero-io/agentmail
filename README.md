@@ -343,6 +343,9 @@ Opens a web UI to exercise all 21 tools, 6 prompts, and task calls interactively
 - All reads use `BODY.PEEK` to avoid marking messages as `\Seen`.
 - Long-running operations (`rank_senders`, `rank_unsubscribe`, `rank_list_id`, `find_attachments`, `list_flags`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`) support MCP progress notifications and optional task-based invocation.
 - Cancelling a request (`notifications/cancelled`) stops long scans cooperatively at the next mailbox or fetch-chunk boundary.
+- Delete tools take a `permanent` flag (default false): false moves to Trash when available, true expunges directly (bypassing Trash, irreversible; requires server UIDPLUS).
+- Repeated `rank_*` scans are cached per mailbox and validated with a single STATUS, so re-ranking after a small change re-fetches only new messages.
+- Non-ASCII `search_messages` text is sent with `CHARSET UTF-8`. Drafts include `Date` and `Message-ID` headers.
 - Destructive tasks targeting the same account are automatically serialized to prevent IMAP state conflicts.
 
 ## MCP Prompts

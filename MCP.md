@@ -31,7 +31,7 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 { "mailboxes": [{ "name", "account", "totalMessages", "unseenMessages", "recentMessages", "delimiter?", "path",
     "noSelect?": bool, "noInferiors?": bool, "role?": "trash"|"junk"|"drafts"|"sent"|"archive"|"all"|"flagged" }] }
 ```
-`noSelect` (RFC 3501): mailbox is a virtual container — cannot be selected, searched, or deleted from. `noInferiors`: no child mailboxes exist or can be created. `role` (RFC 6154): server-declared special-use purpose. Omitted for ordinary user mailboxes.
+`noSelect` (RFC 3501): mailbox is a virtual container — cannot be selected, searched, or deleted from. `noInferiors`: no child mailboxes exist or can be created. `role` (RFC 6154): server-declared special-use purpose. Omitted for ordinary user mailboxes. `recentMessages` is always 0 on IMAP4rev2-only servers (RFC 9051 removed the RECENT status item).
 
 **check_connection** → `ConnectionStatus`
 ```json
@@ -70,6 +70,8 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 { "mailbox", "account", "offset", "limit", "totalMatches",
   "messages": [MessageInfo] }
 ```
+
+Non-ASCII search text is sent with a `CHARSET UTF-8` prefix (accepted by Gmail, Dovecot, Courier, iCloud, Outlook, and required by IMAP4rev2). Servers that reject UTF-8 search return `-32602`. CR/LF in search text is rejected.
 
 **MessageInfo** (shared by get_messages, search_messages, get_messages_by_uid)
 ```json
@@ -140,14 +142,16 @@ Grouped by List-Id header — same list with different senders are merged into o
 
 | #   | Tool                   | Description                                                                           | Annotations                              |
 | --- | ---------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------- |
-| 12  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash or expunges.                                | `destructive`, `idempotent`, `taskable`   |
-| 13  | `delete_by_sender`     | Delete all from exact sender. `allMailboxes=true` scans entire account.               | `destructive`, `taskable`                 |
-| 14  | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes.                     | `destructive`, `taskable`                 |
-| 15  | `move_message`         | IMAP MOVE between mailboxes                                                           |                                          |
+| 12  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`, `taskable`   |
+| 13  | `delete_by_sender`     | Delete all from exact sender. `allMailboxes=true` scans entire account. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
+| 14  | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
+| 15  | `move_message`         | IMAP MOVE between mailboxes (COPY+EXPUNGE fallback when MOVE unsupported)             |                                          |
 | 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
 | 17  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. |                                          |
 | 18  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     | `taskable`                               |
-| 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail                  | `destructive`, `open_world`              |
+| 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail. `permanent=true` bypasses Trash. | `destructive`, `open_world`              |
+
+**`permanent` flag (delete tools):** default false moves to Trash when a Trash mailbox exists, else permanently deletes. When true, flags `\Deleted` + UID EXPUNGE directly, bypassing Trash — irreversible. Permanent delete requires the server to advertise UIDPLUS; on servers without it the call is refused (plain EXPUNGE would purge unrelated `\Deleted` messages).
 
 #### Output Schemas
 
