@@ -26,7 +26,10 @@ pub fn compose_draft(
     from: Option<&str>,
     attachments: &[crate::types::DraftAttachment],
 ) -> crate::Result<Vec<u8>> {
-    let mut builder = Message::builder().subject(subject);
+    // `message_id(None)` makes lettre generate a unique `<uuid@host>` —
+    // without it drafts ship with no Message-ID (lettre auto-adds Date but
+    // not Message-ID), which breaks threading and trips some spam filters.
+    let mut builder = Message::builder().subject(subject).message_id(None);
 
     if let Some(from_addr) = from {
         builder = builder.from(parse_mailbox(from_addr)?);
@@ -101,6 +104,13 @@ mod tests {
         assert!(
             !msg.is_content_type("multipart", "mixed"),
             "expected non-multipart message when no attachments"
+        );
+
+        // RFC 5322 required headers must be present.
+        assert!(msg.date().is_some(), "draft must carry a Date header");
+        assert!(
+            msg.message_id().is_some(),
+            "draft must carry a Message-ID header"
         );
     }
 
