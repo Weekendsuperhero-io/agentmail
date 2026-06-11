@@ -46,14 +46,18 @@ const PING_TIMEOUT: Duration = Duration::from_secs(15);
 // ---------------------------------------------------------------------------
 
 /// Wrap a future with the standard IMAP timeout.
+///
+/// Errors convert via `Into<AgentmailError>` so typed variants survive —
+/// the pool's connection-error retry and the MCP error mapping both depend
+/// on seeing `AgentmailError::Imap(...)` rather than a stringified `Other`.
 async fn imap_timeout<F, T, E>(future: F) -> Result<T>
 where
     F: std::future::Future<Output = std::result::Result<T, E>>,
-    E: std::fmt::Display,
+    E: Into<AgentmailError>,
 {
     match tokio::time::timeout(IMAP_TIMEOUT, future).await {
         Ok(Ok(val)) => Ok(val),
-        Ok(Err(e)) => Err(AgentmailError::Other(e.to_string())),
+        Ok(Err(e)) => Err(e.into()),
         Err(_elapsed) => Err(AgentmailError::Other(format!(
             "IMAP operation timed out after {}s",
             IMAP_TIMEOUT.as_secs()
