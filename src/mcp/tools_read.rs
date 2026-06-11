@@ -243,7 +243,7 @@ impl AgentMailServer {
 
         match self
             .agentmail
-            .group_by_sender(
+            .rank_senders(
                 args.mailbox.as_deref(),
                 &args.account,
                 limit,
@@ -276,7 +276,7 @@ impl AgentMailServer {
 
         match self
             .agentmail
-            .group_by_list(
+            .rank_unsubscribe(
                 args.mailbox.as_deref(),
                 &args.account,
                 limit,
@@ -309,7 +309,7 @@ impl AgentMailServer {
 
         match self
             .agentmail
-            .group_by_list_id(
+            .rank_list_id(
                 args.mailbox.as_deref(),
                 &args.account,
                 limit,

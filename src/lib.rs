@@ -336,7 +336,7 @@ impl Agentmail {
     /// Sorted by message count descending.
     ///
     /// When `mailbox` is `None`, scans all mailboxes in the account.
-    pub async fn group_by_sender(
+    pub async fn rank_senders(
         &self,
         mailbox: Option<&str>,
         account: &str,
@@ -430,7 +430,7 @@ impl Agentmail {
     /// unsubscribe info come from the newest message in each group.
     ///
     /// When `mailbox` is `None`, scans all mailboxes in the account.
-    pub async fn group_by_list(
+    pub async fn rank_unsubscribe(
         &self,
         mailbox: Option<&str>,
         account: &str,
@@ -559,7 +559,7 @@ impl Agentmail {
     ///
     /// Groups all messages from the same mailing list regardless of sender.
     /// When `mailbox` is `None`, scans all mailboxes (excluding trash/junk/drafts).
-    pub async fn group_by_list_id(
+    pub async fn rank_list_id(
         &self,
         mailbox: Option<&str>,
         account: &str,

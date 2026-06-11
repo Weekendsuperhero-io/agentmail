@@ -272,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .group_by_sender(mailbox.as_deref(), &account, limit, None, None)
+                .rank_senders(mailbox.as_deref(), &account, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -284,7 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .group_by_list(mailbox.as_deref(), &account, limit, None, None)
+                .rank_unsubscribe(mailbox.as_deref(), &account, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
