@@ -19,10 +19,24 @@ pub use provider::MailProvider;
 pub use secret::init_service_name;
 pub use types::*;
 
+/// Cached special-use mailbox names for one account (RFC 6154 Trash/Drafts),
+/// with the resolution time so the entry can expire.
+struct SpecialMailboxes {
+    trash: Option<String>,
+    drafts: Option<String>,
+    resolved_at: std::time::Instant,
+}
+
+/// How long a resolved special-use mailbox stays cached. Matches the pool's
+/// idle-session window so a moved/renamed folder is re-detected promptly.
+const SPECIAL_MAILBOX_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// High-level facade for IMAP operations.
 /// Owns the connection pool and configuration.
 pub struct Agentmail {
     pool: ConnectionPool,
+    /// Per-account Trash/Drafts resolution cache (one LIST resolves both).
+    special_mailboxes: parking_lot::Mutex<hashbrown::HashMap<String, SpecialMailboxes>>,
 }
 
 impl Agentmail {
@@ -30,6 +44,7 @@ impl Agentmail {
     pub fn new(config: Config) -> Self {
         Self {
             pool: ConnectionPool::new(config),
+            special_mailboxes: parking_lot::Mutex::new(hashbrown::HashMap::new()),
         }
     }
 
@@ -181,6 +196,10 @@ impl Agentmail {
         imap_client::create_mailbox(session.session(), mailbox_name).await?;
         imap_client::sync(session.session()).await?;
         session.release().await;
+
+        // A new mailbox may be the Drafts/Trash folder — drop the cached
+        // special-use resolution so it is re-detected on next use.
+        self.invalidate_special_mailboxes(account);
 
         Ok(CreateMailboxResponse {
             account: account.to_string(),
@@ -670,7 +689,7 @@ impl Agentmail {
     ) -> Result<DeleteListIdResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.trash_for_mode(mode, session.session()).await;
+        let trash = self.trash_for_mode(mode, account, session.session()).await;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
@@ -1026,7 +1045,7 @@ impl Agentmail {
     ) -> Result<DeleteMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.trash_for_mode(mode, session.session()).await;
+        let trash = self.trash_for_mode(mode, account, session.session()).await;
         imap_client::select(session.session(), mailbox).await?;
         let result = imap_client::bulk_delete_messages(
             session.session(),
@@ -1067,7 +1086,7 @@ impl Agentmail {
     ) -> Result<DeleteBySenderResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.trash_for_mode(mode, session.session()).await;
+        let trash = self.trash_for_mode(mode, account, session.session()).await;
         imap_client::select(session.session(), mailbox).await?;
 
         // 1. Fetch the exact sender from the target message
@@ -1248,9 +1267,8 @@ impl Agentmail {
 
         let mut session = self.pool.acquire(account).await?;
 
-        let drafts_name = find_drafts_mailbox(session.session())
-            .await?
-            .unwrap_or_else(|| "Drafts".to_string());
+        let (_, drafts) = self.special_mailboxes(account, session.session()).await?;
+        let drafts_name = drafts.unwrap_or_else(|| "Drafts".to_string());
 
         // Best-effort: create the drafts mailbox if it doesn't exist yet.
         // Many servers auto-create it, but some (Dovecot, etc.) require explicit CREATE first.
@@ -1392,7 +1410,7 @@ impl Agentmail {
     ) -> Result<UnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.trash_for_mode(mode, session.session()).await;
+        let trash = self.trash_for_mode(mode, account, session.session()).await;
 
         // Fetch unsubscribe + list-id headers from the target message
         let headers =
@@ -1541,12 +1559,37 @@ impl Agentmail {
     // Internal helpers
     // -----------------------------------------------------------------
 
-    /// Auto-detect the trash mailbox via RFC 6154 role, with string fallback.
-    async fn resolve_trash_mailbox(
+    /// Resolve this account's Trash and Drafts mailbox names, caching the
+    /// result for `SPECIAL_MAILBOX_TTL` so repeated delete/draft calls don't
+    /// re-LIST every time. One LIST resolves both roles.
+    async fn special_mailboxes(
         &self,
+        account: &str,
         session: &mut imap_client::ImapSession,
-    ) -> Option<String> {
-        find_trash_mailbox(session).await.ok().flatten()
+    ) -> Result<(Option<String>, Option<String>)> {
+        // Fast path: a fresh cached entry. Scoped guard, no await held.
+        {
+            let cache = self.special_mailboxes.lock();
+            if let Some(entry) = cache.get(account)
+                && entry.resolved_at.elapsed() < SPECIAL_MAILBOX_TTL
+            {
+                return Ok((entry.trash.clone(), entry.drafts.clone()));
+            }
+        }
+
+        let entries = imap_client::list_mailbox_entries(session).await?;
+        let trash = resolve_trash_from(&entries);
+        let drafts = resolve_drafts_from(&entries);
+
+        self.special_mailboxes.lock().insert(
+            account.to_string(),
+            SpecialMailboxes {
+                trash: trash.clone(),
+                drafts: drafts.clone(),
+                resolved_at: std::time::Instant::now(),
+            },
+        );
+        Ok((trash, drafts))
     }
 
     /// Resolve the trash destination for a delete, honoring the delete mode:
@@ -1555,12 +1598,23 @@ impl Agentmail {
     async fn trash_for_mode(
         &self,
         mode: DeleteMode,
+        account: &str,
         session: &mut imap_client::ImapSession,
     ) -> Option<String> {
         match mode {
             DeleteMode::Permanent => None,
-            DeleteMode::TrashFirst => self.resolve_trash_mailbox(session).await,
+            DeleteMode::TrashFirst => self
+                .special_mailboxes(account, session)
+                .await
+                .ok()
+                .and_then(|(trash, _)| trash),
         }
+    }
+
+    /// Invalidate the cached special-use mailboxes for an account (e.g. after
+    /// creating a mailbox that may now be the Drafts/Trash folder).
+    fn invalidate_special_mailboxes(&self, account: &str) {
+        self.special_mailboxes.lock().remove(account);
     }
 }
 
@@ -1736,15 +1790,13 @@ pub fn clamp_usize(val: Option<u64>, default: usize, min: usize, max: usize) -> 
 
 /// Auto-detect the Trash mailbox by scanning LIST results.
 /// Auto-detect the Trash mailbox via RFC 6154 `\Trash` role, with string fallback.
-async fn find_trash_mailbox(session: &mut imap_client::ImapSession) -> Result<Option<String>> {
-    let entries = imap_client::list_mailbox_entries(session).await?;
-
-    // Prefer RFC 6154 \Trash role.
+/// Resolve the Trash mailbox name from a mailbox listing: RFC 6154 `\Trash`
+/// role first, then well-known names, then any name containing "trash" or
+/// "deleted". Pure (no I/O) so it can be unit-tested.
+fn resolve_trash_from(entries: &[imap_client::MailboxEntry]) -> Option<String> {
     if let Some(entry) = entries.iter().find(|e| e.role.as_deref() == Some("trash")) {
-        return Ok(Some(entry.name.clone()));
+        return Some(entry.name.clone());
     }
-
-    // Fallback: string matching for servers without RFC 6154 support.
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     for candidate in [
         "Trash",
@@ -1754,38 +1806,31 @@ async fn find_trash_mailbox(session: &mut imap_client::ImapSession) -> Result<Op
         "Deleted",
     ] {
         if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(candidate)) {
-            return Ok(Some(name.to_string()));
+            return Some(name.to_string());
         }
     }
-    if let Some(name) = names
+    names
         .iter()
         .find(|n| n.to_lowercase().contains("trash") || n.to_lowercase().contains("deleted"))
-    {
-        return Ok(Some(name.to_string()));
-    }
-    Ok(None)
+        .map(|n| n.to_string())
 }
 
-/// Auto-detect the Drafts mailbox via RFC 6154 `\Drafts` role, with string fallback.
-async fn find_drafts_mailbox(session: &mut imap_client::ImapSession) -> Result<Option<String>> {
-    let entries = imap_client::list_mailbox_entries(session).await?;
-
-    // Prefer RFC 6154 \Drafts role.
+/// Resolve the Drafts mailbox name from a mailbox listing: RFC 6154 `\Drafts`
+/// role first, then well-known names, then any name containing "draft". Pure.
+fn resolve_drafts_from(entries: &[imap_client::MailboxEntry]) -> Option<String> {
     if let Some(entry) = entries.iter().find(|e| e.role.as_deref() == Some("drafts")) {
-        return Ok(Some(entry.name.clone()));
+        return Some(entry.name.clone());
     }
-
-    // Fallback: string matching for servers without RFC 6154 support.
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     for candidate in ["Drafts", "[Gmail]/Drafts", "INBOX.Drafts"] {
         if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(candidate)) {
-            return Ok(Some(name.to_string()));
+            return Some(name.to_string());
         }
     }
-    if let Some(name) = names.iter().find(|n| n.to_lowercase().contains("draft")) {
-        return Ok(Some(name.to_string()));
-    }
-    Ok(None)
+    names
+        .iter()
+        .find(|n| n.to_lowercase().contains("draft"))
+        .map(|n| n.to_string())
 }
 
 /// List mailbox names suitable for scanning — excludes Trash, Junk, Spam, and Drafts.
@@ -1905,6 +1950,62 @@ pub fn bits_to_color(flags: &[String]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(name: &str, role: Option<&str>) -> imap_client::MailboxEntry {
+        imap_client::MailboxEntry {
+            name: name.to_string(),
+            no_select: false,
+            role: role.map(String::from),
+        }
+    }
+
+    #[test]
+    fn resolve_trash_prefers_rfc6154_role_over_name() {
+        let entries = [
+            entry("INBOX", None),
+            entry("Bin", Some("trash")),
+            entry("Trash", None), // would match by name, but role wins
+        ];
+        assert_eq!(resolve_trash_from(&entries), Some("Bin".to_string()));
+    }
+
+    #[test]
+    fn resolve_trash_falls_back_to_known_names() {
+        let gmail = [entry("INBOX", None), entry("[Gmail]/Trash", None)];
+        assert_eq!(
+            resolve_trash_from(&gmail),
+            Some("[Gmail]/Trash".to_string())
+        );
+
+        let dovecot = [entry("INBOX", None), entry("INBOX.Trash", None)];
+        assert_eq!(
+            resolve_trash_from(&dovecot),
+            Some("INBOX.Trash".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_trash_substring_last_resort_and_none() {
+        let weird = [entry("INBOX", None), entry("Papierkorb Deleted", None)];
+        assert_eq!(
+            resolve_trash_from(&weird),
+            Some("Papierkorb Deleted".to_string())
+        );
+        assert_eq!(resolve_trash_from(&[entry("INBOX", None)]), None);
+    }
+
+    #[test]
+    fn resolve_drafts_prefers_role_then_name() {
+        let role = [entry("INBOX", None), entry("My Drafts", Some("drafts"))];
+        assert_eq!(resolve_drafts_from(&role), Some("My Drafts".to_string()));
+
+        let named = [entry("INBOX", None), entry("[Gmail]/Drafts", None)];
+        assert_eq!(
+            resolve_drafts_from(&named),
+            Some("[Gmail]/Drafts".to_string())
+        );
+        assert_eq!(resolve_drafts_from(&[entry("INBOX", None)]), None);
+    }
 
     /// Fast test for the early validation error in create_draft.
     /// Uses an empty config so no IMAP connection or credentials are needed.
