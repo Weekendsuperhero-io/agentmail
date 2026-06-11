@@ -418,30 +418,29 @@ pub async fn search_uids(session: &mut ImapSession, query: &str) -> Result<Vec<u
     run_uid_search(session, query).await
 }
 
-/// Fetch only FROM and DATE headers for all messages in a mailbox.
-/// Uses BODY.PEEK to avoid setting \Seen.
-pub async fn fetch_sender_dates(
+/// STATUS (UIDVALIDITY UIDNEXT MESSAGES) for a mailbox — cheap metadata used
+/// to validate the rank-scan cache without re-fetching headers.
+pub async fn mailbox_status(
     session: &mut ImapSession,
     mailbox: &str,
+) -> Result<crate::scan_cache::MailboxStatus> {
+    let status = imap_timeout(session.status(mailbox, "(UIDVALIDITY UIDNEXT MESSAGES)")).await?;
+    Ok(crate::scan_cache::MailboxStatus {
+        uid_validity: status.uid_validity,
+        uid_next: status.uid_next,
+        exists: status.exists,
+    })
+}
+
+/// Fetch FROM + DATE rows for an explicit UID list (already-selected mailbox).
+/// Uses BODY.PEEK to avoid setting `\Seen`. Skips unparseable messages.
+pub async fn fetch_sender_dates_for_uids(
+    session: &mut ImapSession,
+    uids: &[u32],
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
 ) -> Result<Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)>> {
-    let mb = imap_timeout(session.select(mailbox)).await?;
-
-    if mb.exists == 0 {
-        return Ok(Vec::new());
-    }
-
-    let uids_raw = imap_timeout(session.uid_search("ALL")).await?;
-    let uids: Vec<u32> = uids_raw.into_iter().collect();
     let total = uids.len() as u64;
-
-    debug!(uid_count = uids.len(), "fetch_sender_dates: UIDs collected");
-
-    if uids.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let mut results = Vec::with_capacity(uids.len());
     let mut completed = 0u64;
 
@@ -460,24 +459,13 @@ pub async fn fetch_sender_dates(
         )
         .await?;
 
-        debug!(
-            chunk_size = chunk.len(),
-            stream_items = fetched.len(),
-            "fetch_sender_dates: batch collected"
-        );
-
         for item in fetched {
             let fetch = item.map_err(AgentmailError::Imap)?;
             let header_bytes = fetch.header().unwrap_or(&[]);
-
             match parser::parse_sender_date(header_bytes) {
                 Ok(tuple) => results.push(tuple),
                 Err(e) => {
-                    debug!(
-                        uid = ?fetch.uid,
-                        error = %e,
-                        "fetch_sender_dates: skipping unparseable message"
-                    );
+                    debug!(uid = ?fetch.uid, error = %e, "fetch_sender_dates: skipping unparseable message");
                 }
             }
         }
@@ -489,6 +477,26 @@ pub async fn fetch_sender_dates(
     }
 
     Ok(results)
+}
+
+/// Fetch only FROM and DATE headers for all messages in a mailbox.
+/// Selects, searches all UIDs, and fetches them. Uses BODY.PEEK.
+pub async fn fetch_sender_dates(
+    session: &mut ImapSession,
+    mailbox: &str,
+    on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
+) -> Result<Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)>> {
+    let mb = imap_timeout(session.select(mailbox)).await?;
+    if mb.exists == 0 {
+        return Ok(Vec::new());
+    }
+    let uids: Vec<u32> = imap_timeout(session.uid_search("ALL"))
+        .await?
+        .into_iter()
+        .collect();
+    debug!(uid_count = uids.len(), "fetch_sender_dates: UIDs collected");
+    fetch_sender_dates_for_uids(session, &uids, on_progress, cancel).await
 }
 
 /// Fetch the parsed sender (email, display_name) for a single UID.
@@ -545,6 +553,7 @@ pub async fn fetch_senders_batch(
 }
 
 /// A row from `fetch_list_headers` — one per message that has List-Unsubscribe or List-Id.
+#[derive(Debug, Clone)]
 pub struct ListHeaderRow {
     pub uid: u32,
     pub list_unsubscribe: Option<String>,
@@ -565,19 +574,26 @@ pub async fn fetch_list_headers(
     cancel: Option<&CancelFn>,
 ) -> Result<Vec<ListHeaderRow>> {
     let mb = imap_timeout(session.select(mailbox)).await?;
-
     if mb.exists == 0 {
         return Ok(Vec::new());
     }
+    let uids: Vec<u32> = imap_timeout(session.uid_search("ALL"))
+        .await?
+        .into_iter()
+        .collect();
+    fetch_list_headers_for_uids(session, &uids, on_progress, cancel).await
+}
 
-    let uids_raw = imap_timeout(session.uid_search("ALL")).await?;
-    let uids: Vec<u32> = uids_raw.into_iter().collect();
+/// Fetch List-* / FROM / DATE rows for an explicit UID list (already-selected
+/// mailbox). Only messages with List-Unsubscribe or List-Unsubscribe-Post are
+/// returned (bulk/marketing mail).
+pub async fn fetch_list_headers_for_uids(
+    session: &mut ImapSession,
+    uids: &[u32],
+    on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
+) -> Result<Vec<ListHeaderRow>> {
     let total = uids.len() as u64;
-
-    if uids.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let mut results = Vec::new();
     let mut completed = 0u64;
 
@@ -607,7 +623,6 @@ pub async fn fetch_list_headers(
 
             let list_unsub = extract_header_value(&header_str, "List-Unsubscribe");
             let list_id = extract_header_value(&header_str, "List-Id");
-
             let list_unsub_post = extract_header_value(&header_str, "List-Unsubscribe-Post");
 
             // Require at least one of List-Unsubscribe or List-Unsubscribe-Post
@@ -636,6 +651,14 @@ pub async fn fetch_list_headers(
     }
 
     Ok(results)
+}
+
+/// Search for UIDs at or above `from_uid` in the selected mailbox. Filters out
+/// the `*`-range quirk (an empty `from:*` range returns the highest UID).
+pub async fn search_uids_from(session: &mut ImapSession, from_uid: u32) -> Result<Vec<u32>> {
+    let query = format!("UID {from_uid}:*");
+    let uids = run_uid_search(session, &query).await?;
+    Ok(uids.into_iter().filter(|&u| u >= from_uid).collect())
 }
 
 /// Fetch specific UIDs and parse them into MessageInfo.

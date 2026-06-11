@@ -8,6 +8,7 @@ pub mod imap_client;
 pub mod mcp;
 pub mod parser;
 pub mod provider;
+pub mod scan_cache;
 pub mod secret;
 pub mod types;
 
@@ -37,6 +38,8 @@ pub struct Agentmail {
     pool: ConnectionPool,
     /// Per-account Trash/Drafts resolution cache (one LIST resolves both).
     special_mailboxes: parking_lot::Mutex<hashbrown::HashMap<String, SpecialMailboxes>>,
+    /// Per-(account, mailbox) header-scan cache backing the `rank_*` tools.
+    scan_cache: parking_lot::Mutex<scan_cache::ScanCache>,
 }
 
 impl Agentmail {
@@ -45,6 +48,7 @@ impl Agentmail {
         Self {
             pool: ConnectionPool::new(config),
             special_mailboxes: parking_lot::Mutex::new(hashbrown::HashMap::new()),
+            scan_cache: parking_lot::Mutex::new(scan_cache::ScanCache::default()),
         }
     }
 
@@ -354,13 +358,13 @@ impl Agentmail {
 
         for mbox in &mailboxes {
             imap_client::check_cancel(cancel)?;
-            let sender_dates =
-                match imap_client::fetch_sender_dates(session.session(), mbox, on_progress, cancel)
-                    .await
-                {
-                    Ok(data) => data,
-                    Err(_) => continue, // skip unselectable mailboxes
-                };
+            let sender_dates = match self
+                .cached_sender_rows(account, mbox, session.session(), on_progress, cancel)
+                .await
+            {
+                Ok(data) => data,
+                Err(_) => continue, // skip unselectable mailboxes
+            };
 
             for (email, display_name, date) in sender_dates {
                 if email.is_empty() {
@@ -449,13 +453,13 @@ impl Agentmail {
 
         for mbox in &mailboxes {
             imap_client::check_cancel(cancel)?;
-            let rows =
-                match imap_client::fetch_list_headers(session.session(), mbox, on_progress, cancel)
-                    .await
-                {
-                    Ok(data) => data,
-                    Err(_) => continue, // skip unselectable mailboxes
-                };
+            let rows = match self
+                .cached_list_rows(account, mbox, session.session(), on_progress, cancel)
+                .await
+            {
+                Ok(data) => data,
+                Err(_) => continue, // skip unselectable mailboxes
+            };
 
             for row in rows {
                 let key = (row.sender_email.clone(), row.sender_name.clone());
@@ -755,6 +759,7 @@ impl Agentmail {
         }
 
         session.release().await;
+        self.invalidate_scan_cache(account);
 
         Ok(DeleteListIdResponse {
             mailbox: mailbox.unwrap_or("*").to_string(),
@@ -1058,6 +1063,7 @@ impl Agentmail {
         .await?;
         imap_client::sync(session.session()).await?;
         session.release().await;
+        self.invalidate_scan_cache(account);
 
         Ok(DeleteMessagesResponse {
             mailbox: mailbox.to_string(),
@@ -1177,6 +1183,7 @@ impl Agentmail {
         }
 
         session.release().await;
+        self.invalidate_scan_cache(account);
 
         Ok(DeleteBySenderResponse {
             mailbox: if all_mailboxes {
@@ -1224,6 +1231,7 @@ impl Agentmail {
         imap_client::move_message(session.session(), uid, destination, &caps).await?;
         imap_client::sync(session.session()).await?;
         session.release().await;
+        self.invalidate_scan_cache(account);
 
         Ok(MoveMessageResponse {
             mailbox: mailbox.to_string(),
@@ -1552,6 +1560,10 @@ impl Agentmail {
         }
 
         session.release().await;
+        // Deletion may have removed messages — drop stale rank-scan rows.
+        if response.matching_messages.is_some() {
+            self.invalidate_scan_cache(account);
+        }
         Ok(response)
     }
 
@@ -1616,6 +1628,161 @@ impl Agentmail {
     fn invalidate_special_mailboxes(&self, account: &str) {
         self.special_mailboxes.lock().remove(account);
     }
+
+    /// Drop all cached rank-scan rows for an account after a mutation that
+    /// changes the message set (delete/move). The STATUS revalidation makes the
+    /// cache correct without this, but it frees known-stale rows immediately.
+    fn invalidate_scan_cache(&self, account: &str) {
+        self.scan_cache.lock().invalidate_account(account);
+    }
+
+    /// Cache-aware sender-row scan for one mailbox (already-acquired session).
+    /// STATUS-validates the cache: reuses rows on a hit, fetches only the new
+    /// tail on an append, and re-scans otherwise.
+    async fn cached_sender_rows(
+        &self,
+        account: &str,
+        mbox: &str,
+        session: &mut imap_client::ImapSession,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<Vec<scan_cache::SenderRow>> {
+        use scan_cache::CacheDecision;
+        let key = (account.to_string(), mbox.to_string());
+        let status = imap_client::mailbox_status(session, mbox).await?;
+
+        let cached_meta = self.scan_cache.lock().sender.get(&key).map(|c| c.meta);
+
+        match CacheDecision::from_status(cached_meta.as_ref(), &status) {
+            CacheDecision::Hit => Ok(self
+                .scan_cache
+                .lock()
+                .sender
+                .get(&key)
+                .map(|c| c.rows.clone())
+                .unwrap_or_default()),
+            CacheDecision::Incremental { from_uid } => {
+                let mb = imap_client::select(session, mbox).await?;
+                let uids = imap_client::search_uids_from(session, from_uid).await?;
+                let new_rows =
+                    imap_client::fetch_sender_dates_for_uids(session, &uids, on_progress, cancel)
+                        .await?;
+                let mut cache = self.scan_cache.lock();
+                let entry = cache
+                    .sender
+                    .entry(key)
+                    .or_insert_with(|| scan_cache::CachedScan {
+                        meta: scan_cache::CacheMeta {
+                            uid_validity: 0,
+                            uid_next: 0,
+                            exists: 0,
+                        },
+                        rows: Vec::new(),
+                    });
+                entry.rows.extend(new_rows);
+                if let Some(meta) = mailbox_meta(&mb) {
+                    entry.meta = meta;
+                }
+                Ok(entry.rows.clone())
+            }
+            CacheDecision::FullRescan => {
+                let mb = imap_client::select(session, mbox).await?;
+                let uids = imap_client::search_uids(session, "ALL").await?;
+                let rows =
+                    imap_client::fetch_sender_dates_for_uids(session, &uids, on_progress, cancel)
+                        .await?;
+                // Only cache when the server gave us validatable metadata.
+                if let Some(meta) = mailbox_meta(&mb) {
+                    self.scan_cache.lock().sender.insert(
+                        key,
+                        scan_cache::CachedScan {
+                            meta,
+                            rows: rows.clone(),
+                        },
+                    );
+                }
+                Ok(rows)
+            }
+        }
+    }
+
+    /// Cache-aware list-header scan for one mailbox (already-acquired session).
+    /// Backs both `rank_unsubscribe` and `rank_list_id`.
+    async fn cached_list_rows(
+        &self,
+        account: &str,
+        mbox: &str,
+        session: &mut imap_client::ImapSession,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<Vec<imap_client::ListHeaderRow>> {
+        use scan_cache::CacheDecision;
+        let key = (account.to_string(), mbox.to_string());
+        let status = imap_client::mailbox_status(session, mbox).await?;
+
+        let cached_meta = self.scan_cache.lock().list.get(&key).map(|c| c.meta);
+
+        match CacheDecision::from_status(cached_meta.as_ref(), &status) {
+            CacheDecision::Hit => Ok(self
+                .scan_cache
+                .lock()
+                .list
+                .get(&key)
+                .map(|c| c.rows.clone())
+                .unwrap_or_default()),
+            CacheDecision::Incremental { from_uid } => {
+                let mb = imap_client::select(session, mbox).await?;
+                let uids = imap_client::search_uids_from(session, from_uid).await?;
+                let new_rows =
+                    imap_client::fetch_list_headers_for_uids(session, &uids, on_progress, cancel)
+                        .await?;
+                let mut cache = self.scan_cache.lock();
+                let entry = cache
+                    .list
+                    .entry(key)
+                    .or_insert_with(|| scan_cache::CachedScan {
+                        meta: scan_cache::CacheMeta {
+                            uid_validity: 0,
+                            uid_next: 0,
+                            exists: 0,
+                        },
+                        rows: Vec::new(),
+                    });
+                entry.rows.extend(new_rows);
+                if let Some(meta) = mailbox_meta(&mb) {
+                    entry.meta = meta;
+                }
+                Ok(entry.rows.clone())
+            }
+            CacheDecision::FullRescan => {
+                let mb = imap_client::select(session, mbox).await?;
+                let uids = imap_client::search_uids(session, "ALL").await?;
+                let rows =
+                    imap_client::fetch_list_headers_for_uids(session, &uids, on_progress, cancel)
+                        .await?;
+                if let Some(meta) = mailbox_meta(&mb) {
+                    self.scan_cache.lock().list.insert(
+                        key,
+                        scan_cache::CachedScan {
+                            meta,
+                            rows: rows.clone(),
+                        },
+                    );
+                }
+                Ok(rows)
+            }
+        }
+    }
+}
+
+/// Build cache metadata from a SELECT response, if the server supplied both
+/// UIDVALIDITY and UIDNEXT (without them the cache can't be validated later).
+fn mailbox_meta(mb: &async_imap::types::Mailbox) -> Option<scan_cache::CacheMeta> {
+    Some(scan_cache::CacheMeta {
+        uid_validity: mb.uid_validity?,
+        uid_next: mb.uid_next?,
+        exists: mb.exists,
+    })
 }
 
 // ---------------------------------------------------------------------------
