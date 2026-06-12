@@ -2027,22 +2027,34 @@ async fn list_scannable_mailbox_names(
 
             // Fallback: string-based filtering for servers that don't send
             // RFC 6154 special-use attributes.
-            if entry.role.is_none() {
-                let lower = entry.name.to_lowercase();
-                if lower.contains("junk")
-                    || lower.contains("spam")
-                    || lower.contains("trash")
-                    || lower.contains("deleted")
-                    || lower.contains("draft")
-                {
-                    return false;
-                }
+            if entry.role.is_none() && is_skippable_scan_name(&entry.name.to_lowercase()) {
+                return false;
             }
 
             true
         })
         .map(|entry| entry.name)
         .collect())
+}
+
+/// True for mailbox names that should be skipped during whole-account scans on
+/// servers that don't advertise RFC 6154 special-use attributes — Junk/Spam/
+/// Trash/Drafts plus Gmail-style "All Mail" (the union folder, which would
+/// otherwise double-count every message). `lower` must be lowercased.
+fn is_skippable_scan_name(lower: &str) -> bool {
+    lower.contains("junk")
+        || lower.contains("spam")
+        || lower.contains("trash")
+        || lower.contains("deleted")
+        || lower.contains("draft")
+        || is_all_mail_name(lower)
+}
+
+/// Tight match for an "All Mail" union folder (Gmail and similar). Deliberately
+/// not a bare `contains("all")`, which would wrongly skip user folders such as
+/// "All Hands" or "Marketing/All Staff". `lower` must be lowercased.
+fn is_all_mail_name(lower: &str) -> bool {
+    lower == "all mail" || lower == "[gmail]/all mail" || lower.ends_with("/all mail")
 }
 
 /// Extract the display name from a List-Id header value.
@@ -2172,6 +2184,34 @@ mod tests {
             Some("[Gmail]/Drafts".to_string())
         );
         assert_eq!(resolve_drafts_from(&[entry("INBOX", None)]), None);
+    }
+
+    #[test]
+    fn all_mail_name_matches_union_folders_only() {
+        assert!(is_all_mail_name("all mail"));
+        assert!(is_all_mail_name("[gmail]/all mail"));
+        assert!(is_all_mail_name("[google mail]/all mail"));
+        // Not all-mail: ordinary user folders with "all" in the name.
+        assert!(!is_all_mail_name("all hands"));
+        assert!(!is_all_mail_name("marketing/all staff"));
+        assert!(!is_all_mail_name("inbox"));
+    }
+
+    #[test]
+    fn skippable_scan_name_covers_special_folders_and_all_mail() {
+        for skip in [
+            "junk",
+            "spam",
+            "deleted items",
+            "[gmail]/trash",
+            "drafts",
+            "[gmail]/all mail",
+        ] {
+            assert!(is_skippable_scan_name(skip), "should skip {skip:?}");
+        }
+        for keep in ["inbox", "work", "receipts", "all hands"] {
+            assert!(!is_skippable_scan_name(keep), "should keep {keep:?}");
+        }
     }
 
     /// Fast test for the early validation error in create_draft.
