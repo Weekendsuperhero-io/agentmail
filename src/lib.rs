@@ -726,7 +726,9 @@ impl Agentmail {
     ) -> Result<DeleteListIdResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.trash_for_mode(mode, account, session.session()).await;
+        let trash = self
+            .trash_for_mode(mode, account, session.session(), &caps)
+            .await;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
@@ -1097,7 +1099,9 @@ impl Agentmail {
     ) -> Result<DeleteMessagesResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.trash_for_mode(mode, account, session.session()).await;
+        let trash = self
+            .trash_for_mode(mode, account, session.session(), &caps)
+            .await;
         imap_client::select(session.session(), mailbox).await?;
         let result = imap_client::bulk_delete_messages(
             session.session(),
@@ -1139,7 +1143,9 @@ impl Agentmail {
     ) -> Result<DeleteBySenderResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.trash_for_mode(mode, account, session.session()).await;
+        let trash = self
+            .trash_for_mode(mode, account, session.session(), &caps)
+            .await;
         imap_client::select(session.session(), mailbox).await?;
 
         // 1. Fetch the exact sender from the target message
@@ -1465,7 +1471,9 @@ impl Agentmail {
     ) -> Result<UnsubscribeResponse> {
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        let trash = self.trash_for_mode(mode, account, session.session()).await;
+        let trash = self
+            .trash_for_mode(mode, account, session.session(), &caps)
+            .await;
 
         // Fetch unsubscribe + list-id headers from the target message
         let headers =
@@ -1651,23 +1659,24 @@ impl Agentmail {
         Ok((trash, drafts))
     }
 
-    /// Resolve the trash destination for a delete, honoring the delete mode:
-    /// `Permanent` bypasses Trash entirely (so deletion goes straight to
-    /// flag + UID EXPUNGE).
+    /// Resolve the trash destination for a delete, honoring the delete mode.
+    /// `Permanent` bypasses Trash (straight to flag + UID EXPUNGE) — except on
+    /// Gmail, where in-place EXPUNGE only removes a label, so even a permanent
+    /// delete must move to `[Gmail]/Trash` (Gmail purges Trash on its own).
     async fn trash_for_mode(
         &self,
         mode: DeleteMode,
         account: &str,
         session: &mut imap_client::ImapSession,
+        caps: &imap_client::ServerCaps,
     ) -> Option<String> {
-        match mode {
-            DeleteMode::Permanent => None,
-            DeleteMode::TrashFirst => self
-                .special_mailboxes(account, session)
-                .await
-                .ok()
-                .and_then(|(trash, _)| trash),
+        if matches!(mode, DeleteMode::Permanent) && !caps.is_gmail() {
+            return None;
         }
+        self.special_mailboxes(account, session)
+            .await
+            .ok()
+            .and_then(|(trash, _)| trash)
     }
 
     /// Invalidate the cached special-use mailboxes for an account (e.g. after

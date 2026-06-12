@@ -183,6 +183,13 @@ impl ServerCaps {
     pub fn has_imap4rev1(&self) -> bool {
         self.has("IMAP4REV1")
     }
+
+    /// Whether this is Gmail (advertises the `X-GM-EXT-1` extension). On Gmail,
+    /// `\Deleted` + EXPUNGE in a label folder only removes that label, so
+    /// deletes must move the message to `[Gmail]/Trash` instead.
+    pub fn is_gmail(&self) -> bool {
+        self.has("X-GM-EXT-1")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +967,17 @@ pub async fn bulk_delete_messages(
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
 ) -> Result<BulkDeleteResult> {
+    // On Gmail, \Deleted + EXPUNGE in a label folder only removes that label —
+    // the message survives in All Mail. A real delete must move to
+    // [Gmail]/Trash, so refuse in-place expunge here (callers resolve Trash for
+    // Gmail even in permanent mode; this guards the can't-resolve-Trash case).
+    if trash_mailbox.is_none() && caps.is_gmail() {
+        return Err(AgentmailError::Other(
+            "Gmail: deletes must move to [Gmail]/Trash (in-place EXPUNGE only \
+             removes a label); could not resolve the Trash mailbox"
+                .to_string(),
+        ));
+    }
     // A permanent delete (no trash, or trash fallback) requires UIDPLUS: plain
     // EXPUNGE would purge every \Deleted message in the mailbox, including ones
     // flagged by other clients. Refuse up-front rather than risk data loss.
@@ -1506,14 +1524,30 @@ mod tests {
     fn server_caps_detect_gmail_features() {
         // Representative Gmail CAPABILITY tokens.
         let caps = ServerCaps::from_strings(
-            ["IMAP4rev1", "UIDPLUS", "MOVE", "ID", "XLIST", "CHILDREN"]
-                .into_iter()
-                .map(String::from),
+            [
+                "IMAP4rev1",
+                "UIDPLUS",
+                "MOVE",
+                "X-GM-EXT-1",
+                "XLIST",
+                "CHILDREN",
+            ]
+            .into_iter()
+            .map(String::from),
         );
         assert!(caps.has_imap4rev1());
         assert!(caps.has_uidplus());
         assert!(caps.has_move());
+        assert!(caps.is_gmail());
         assert!(!caps.has("CONDSTORE"));
+
+        // A non-Gmail server isn't flagged as Gmail.
+        let dovecot = ServerCaps::from_strings(
+            ["IMAP4rev1", "UIDPLUS", "MOVE"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert!(!dovecot.is_gmail());
     }
 
     #[test]
