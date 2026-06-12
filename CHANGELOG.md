@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Tests** — switched `ci-check.sh` to `cargo nextest run` (with a `cargo test` fallback) and added a `.config/nextest.toml`.
 
 ### Fixed
+- **Cross-folder double-counting** — `rank_senders`/`rank_unsubscribe`/`rank_list_id` deduplicate by `Message-ID` across folders, so a message that appears under several Gmail labels (or in All Mail) is counted once. Counts now reflect unique messages; messages without a Message-ID can't be deduped and are counted each.
+- **All Mail in account scans** — account-wide scans now skip a Gmail-style "All Mail" folder even on servers that don't advertise the RFC 6154 `\All` attribute (previously only the role was skipped, so such folders double-counted).
+- **`delete_list_id` over-match** — confirms the exact `List-Id` per candidate before deleting; IMAP `HEADER` search is substring-only, so `"news"` could otherwise delete `"newsletter"` lists.
+- **`rank_list_id` caching** — now uses the same STATUS-validated scan cache as the other two rank tools (it was inadvertently left on the full-refetch path).
 - **Non-ASCII search** — SEARCH queries with non-ASCII text now send a `CHARSET UTF-8` prefix (previously the text was sent as an invalid 7-bit quoted string and servers rejected or silently mismatched it). Server rejections surface as `-32602` invalid-params over MCP.
 - **SEARCH command injection** — search text containing CR/LF was written to the wire unescaped (async-imap sends command bytes raw); such input is now rejected.
 - **Draft Message-ID** — drafts now carry a generated `Message-ID` header (lettre adds `Date` automatically but not Message-ID); its absence broke threading and tripped some spam filters.

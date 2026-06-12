@@ -73,6 +73,8 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 
 Non-ASCII search text is sent with a `CHARSET UTF-8` prefix (accepted by Gmail, Dovecot, Courier, iCloud, Outlook, and required by IMAP4rev2). Servers that reject UTF-8 search return `-32602`. CR/LF in search text is rejected.
 
+Search filters are **AND-combined** (a message must match all provided filters) and matched as **case-insensitive substrings** (IMAP semantics). `header_key` without a value matches messages that merely *have* that header. Date-range (`SINCE`/`BEFORE`), size (`LARGER`/`SMALLER`), and `OR`/`NOT` filters are not yet supported.
+
 **MessageInfo** (shared by get_messages, search_messages, get_messages_by_uid)
 ```json
 { "uid", "subject", "sender", "replyTo", "to": [], "cc": [],
@@ -109,7 +111,7 @@ Non-ASCII search text is sent with a `CHARSET UTF-8` prefix (accepted by Gmail, 
     "count", "oldestDate?", "newestDate?"
   }] }
 ```
-Grouped by (email, display name) — same email with different display names are separate entries. `limit` defaults to 100 on all three rank tools; set it higher to return more.
+Grouped by (email, display name) — same email with different display names are separate entries. `limit` defaults to 100 on all three rank tools; set it higher to return more. Account-wide scans (omit `mailbox`) skip Trash/Junk/Drafts/All Mail and **deduplicate by Message-ID across folders**, so a message under several Gmail labels is counted once (counts reflect unique messages).
 
 **rank_unsubscribe**
 ```json
@@ -144,7 +146,7 @@ Grouped by List-Id header — same list with different senders are merged into o
 | --- | ---------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------- |
 | 12  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`, `taskable`   |
 | 13  | `delete_by_sender`     | Delete all from exact sender. `allMailboxes=true` scans entire account. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
-| 14  | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
+| 14  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
 | 15  | `move_message`         | IMAP MOVE between mailboxes (COPY+EXPUNGE fallback when MOVE unsupported)             |                                          |
 | 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
 | 17  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. |                                          |
