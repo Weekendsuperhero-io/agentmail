@@ -106,7 +106,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "delete_by_sender",
-        description = "Delete all messages from an exact sender. Takes a UID to identify the sender — extracts the full From header (display name + email) and deletes every message with an identical sender. Set allMailboxes=true to search and delete across the entire account. Ideal for bulk cleanup after rank_senders. For mailing list cleanup, use unsubscribe_message instead — it attempts one-click unsubscribe and only deletes bulk mail.",
+        description = "Delete all messages from an exact sender. Takes a UID to identify the sender — extracts the full From header (display name + email) and deletes every message with an identical sender. Set allMailboxes=true to search and delete across the entire account. Ideal for bulk cleanup after top_senders. For mailing list cleanup, use unsubscribe_message instead — it attempts one-click unsubscribe and only deletes bulk mail.",
         annotations(title = "Delete by Sender", destructive_hint = true),
         execution(task_support = "optional")
     )]
@@ -316,7 +316,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "delete_list_id",
-        description = "Delete all messages with a specific List-Id across all mailboxes. Identifies the list by its List-Id header value (from rank_list_id). Deletes ALL messages from that mailing list regardless of sender address. Omit mailbox to search the entire account.",
+        description = "Delete all messages with a specific List-Id across all mailboxes. Identifies the list by its List-Id header value (from top_mailing_lists). Deletes ALL messages from that mailing list regardless of sender address. Omit mailbox to search the entire account.",
         annotations(title = "Delete Mailing List by List-Id", destructive_hint = true),
         execution(task_support = "optional")
     )]

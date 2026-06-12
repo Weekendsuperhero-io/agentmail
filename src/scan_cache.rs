@@ -92,7 +92,7 @@ pub struct SenderRow {
 }
 
 /// Per-account, per-mailbox caches for the two header-scan shapes. List-row
-/// scans back both `rank_unsubscribe` and `rank_list_id` (same fetch).
+/// scans back both `top_subscriptions` and `top_mailing_lists` (same fetch).
 #[derive(Default)]
 pub struct ScanCache {
     pub sender: HashMap<(String, String), CachedScan<SenderRow>>,

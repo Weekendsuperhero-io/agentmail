@@ -1,12 +1,12 @@
-//! Read-only MCP tools: discovery, message reading, search, and ranking.
+//! Read-only MCP tools: discovery, message reading, search, and top-N summaries.
 
 use super::AgentMailServer;
 use super::args::*;
 use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
 use crate::{
     ConnectionStatus, FindAttachmentsResponse, GetMessagesResponse, ListAccountsResponse,
-    ListCapabilitiesResponse, ListFlagsResponse, ListMailboxesResponse, RankListIdResponse,
-    RankSendersResponse, RankUnsubscribeResponse, SearchMessagesResponse,
+    ListCapabilitiesResponse, ListFlagsResponse, ListMailboxesResponse, SearchMessagesResponse,
+    TopMailingListsResponse, TopSendersResponse, TopSubscriptionsResponse,
 };
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
@@ -225,25 +225,25 @@ impl AgentMailServer {
     }
 
     #[tool(
-        name = "rank_senders",
-        description = "Rank all senders by message count. Omit mailbox to scan the entire account across all mailboxes. Groups by (email, display name) — 'Find My <noreply@apple.com>' and 'iCloud <noreply@apple.com>' are separate entries. Sorted by message count descending. Efficient: fetches only FROM+DATE headers using BODY.PEEK.",
-        annotations(title = "Rank Senders", read_only_hint = true),
+        name = "top_senders",
+        description = "List the senders who email you most, by message count (highest first). Omit mailbox to scan the entire account; account-wide scans skip Trash/Junk/Drafts/All Mail, dedupe by Message-ID across folders, and exclude your own address. Groups by (email, display name) — 'Find My <noreply@apple.com>' and 'iCloud <noreply@apple.com>' are separate entries. Efficient: fetches only FROM+DATE headers using BODY.PEEK.",
+        annotations(title = "Top Senders", read_only_hint = true),
         execution(task_support = "optional")
     )]
-    async fn rank_senders_tool(
+    async fn top_senders_tool(
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
         ct: CancellationToken,
-        Parameters(args): Parameters<RankSendersArgs>,
-    ) -> Result<Json<RankSendersResponse>, McpError> {
+        Parameters(args): Parameters<TopSendersArgs>,
+    ) -> Result<Json<TopSendersResponse>, McpError> {
         let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
-            .rank_senders(
+            .top_senders(
                 args.mailbox.as_deref(),
                 &args.account,
                 limit,
@@ -258,25 +258,25 @@ impl AgentMailServer {
     }
 
     #[tool(
-        name = "rank_unsubscribe",
-        description = "Rank bulk-mail senders by message count. Omit mailbox to scan the entire account. Includes messages with either List-Unsubscribe or List-Unsubscribe-Post. Grouped by sender (From), sorted by one-click support first then by count. To clean up a sender, pass the sampleUid and sampleMailbox to unsubscribe_message (not delete_by_sender). Returns count, unsubscribe URL, one-click flag, sample UID + mailbox.",
-        annotations(title = "Rank Bulk-Mail Senders", read_only_hint = true),
+        name = "top_subscriptions",
+        description = "List your top subscriptions — bulk/marketing senders you can unsubscribe from — by message count. Omit mailbox to scan the entire account. Includes messages with either List-Unsubscribe or List-Unsubscribe-Post. Grouped by sender (From), sorted by one-click support first then by count. To clean up a sender, pass the sampleUid and sampleMailbox to unsubscribe_message (not delete_by_sender). Returns count, unsubscribe URL, one-click flag, sample UID + mailbox.",
+        annotations(title = "Top Subscriptions", read_only_hint = true),
         execution(task_support = "optional")
     )]
-    async fn rank_unsubscribe_tool(
+    async fn top_subscriptions_tool(
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
         ct: CancellationToken,
-        Parameters(args): Parameters<RankUnsubscribeArgs>,
-    ) -> Result<Json<RankUnsubscribeResponse>, McpError> {
+        Parameters(args): Parameters<TopSubscriptionsArgs>,
+    ) -> Result<Json<TopSubscriptionsResponse>, McpError> {
         let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
-            .rank_unsubscribe(
+            .top_subscriptions(
                 args.mailbox.as_deref(),
                 &args.account,
                 limit,
@@ -291,25 +291,25 @@ impl AgentMailServer {
     }
 
     #[tool(
-        name = "rank_list_id",
-        description = "Rank mailing lists by List-Id header (RFC 2919). Groups all messages from the same mailing list regardless of sender address — useful for lists like GitHub notifications where multiple senders share one List-Id. Omit mailbox to scan the entire account. Use delete_list_id to remove all messages from a list.",
-        annotations(title = "Rank Mailing Lists by List-Id", read_only_hint = true),
+        name = "top_mailing_lists",
+        description = "List your top mailing lists by List-Id header (RFC 2919), highest volume first. Groups all messages from the same mailing list regardless of sender address — useful for lists like GitHub notifications where multiple senders share one List-Id. Omit mailbox to scan the entire account. Use delete_list_id to remove all messages from a list.",
+        annotations(title = "Top Mailing Lists", read_only_hint = true),
         execution(task_support = "optional")
     )]
-    async fn rank_list_id_tool(
+    async fn top_mailing_lists_tool(
         &self,
         meta: Meta,
         client: Peer<RoleServer>,
         ct: CancellationToken,
-        Parameters(args): Parameters<RankListIdArgs>,
-    ) -> Result<Json<RankListIdResponse>, McpError> {
+        Parameters(args): Parameters<TopMailingListsArgs>,
+    ) -> Result<Json<TopMailingListsResponse>, McpError> {
         let limit = Some(args.limit.map_or(100, |v| v as usize));
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
-            .rank_list_id(
+            .top_mailing_lists(
                 args.mailbox.as_deref(),
                 &args.account,
                 limit,

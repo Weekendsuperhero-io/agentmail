@@ -23,7 +23,7 @@ impl AgentMailServer {
             format!(
                 "Give me a comprehensive overview of my email for account \"{}\". \
                  First, list all mailboxes to see the folder structure, message totals, and unread counts. \
-                 Then use rank_senders with limit 20 (omit mailbox to scan the entire account) to show me the top senders by volume. \
+                 Then use top_senders with limit 20 (omit mailbox to scan the entire account) to show me the top senders by volume. \
                  Finally, show me the 10 most recent unread messages using search_messages with read=false.",
                 params.0.account
             ),
@@ -111,7 +111,7 @@ impl AgentMailServer {
             PromptMessageRole::User,
             format!(
                 "Help me clean up mailing list clutter in account \"{}\". \
-                 Step 1: Use rank_unsubscribe (omit mailbox to scan the entire account) to get a ranked list \
+                 Step 1: Use top_subscriptions (omit mailbox to scan the entire account) to get a ranked list \
                  of bulk-mail senders. Messages with either List-Unsubscribe or List-Unsubscribe-Post are \
                  included. Results are grouped by sender and sorted by one-click support first, then count. \
                  The unsubscribe URL comes from the newest message per sender. \
@@ -137,7 +137,7 @@ impl AgentMailServer {
             PromptMessageRole::User,
             format!(
                 "Help me clean up mailing lists in account \"{}\". \
-                 Step 1: Use rank_list_id (omit mailbox to scan the entire account) to get a ranked list \
+                 Step 1: Use top_mailing_lists (omit mailbox to scan the entire account) to get a ranked list \
                  of mailing lists grouped by their List-Id header. This groups all messages from the same \
                  mailing list regardless of sender — useful for lists like GitHub notifications where \
                  multiple senders share one List-Id. \

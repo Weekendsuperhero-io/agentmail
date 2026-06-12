@@ -432,7 +432,7 @@ async fn rank_limit_documents_default_of_100() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    for name in ["rank_senders", "rank_unsubscribe", "rank_list_id"] {
+    for name in ["top_senders", "top_subscriptions", "top_mailing_lists"] {
         let tool = tools
             .iter()
             .find(|t| t["name"].as_str() == Some(name))

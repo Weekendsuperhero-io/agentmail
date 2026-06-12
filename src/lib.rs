@@ -336,14 +336,14 @@ impl Agentmail {
     /// Sorted by message count descending.
     ///
     /// When `mailbox` is `None`, scans all mailboxes in the account.
-    pub async fn rank_senders(
+    pub async fn top_senders(
         &self,
         mailbox: Option<&str>,
         account: &str,
         limit: Option<usize>,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
-    ) -> Result<RankSendersResponse> {
+    ) -> Result<TopSendersResponse> {
         let mut session = self.pool.acquire(account).await?;
 
         let mailboxes = match mailbox {
@@ -419,7 +419,7 @@ impl Agentmail {
             senders.truncate(n);
         }
 
-        Ok(RankSendersResponse {
+        Ok(TopSendersResponse {
             mailbox: mailbox.unwrap_or("*").to_string(),
             account: account.to_string(),
             total_messages,
@@ -435,14 +435,14 @@ impl Agentmail {
     /// unsubscribe info come from the newest message in each group.
     ///
     /// When `mailbox` is `None`, scans all mailboxes in the account.
-    pub async fn rank_unsubscribe(
+    pub async fn top_subscriptions(
         &self,
         mailbox: Option<&str>,
         account: &str,
         limit: Option<usize>,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
-    ) -> Result<RankUnsubscribeResponse> {
+    ) -> Result<TopSubscriptionsResponse> {
         let mut session = self.pool.acquire(account).await?;
 
         let mailboxes = match mailbox {
@@ -556,7 +556,7 @@ impl Agentmail {
             lists.truncate(n);
         }
 
-        Ok(RankUnsubscribeResponse {
+        Ok(TopSubscriptionsResponse {
             mailbox: mailbox.unwrap_or("*").to_string(),
             account: account.to_string(),
             total_messages,
@@ -569,14 +569,14 @@ impl Agentmail {
     ///
     /// Groups all messages from the same mailing list regardless of sender.
     /// When `mailbox` is `None`, scans all mailboxes (excluding trash/junk/drafts).
-    pub async fn rank_list_id(
+    pub async fn top_mailing_lists(
         &self,
         mailbox: Option<&str>,
         account: &str,
         limit: Option<usize>,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
-    ) -> Result<RankListIdResponse> {
+    ) -> Result<TopMailingListsResponse> {
         let mut session = self.pool.acquire(account).await?;
 
         let mailboxes = match mailbox {
@@ -687,7 +687,7 @@ impl Agentmail {
             lists.truncate(n);
         }
 
-        Ok(RankListIdResponse {
+        Ok(TopMailingListsResponse {
             mailbox: mailbox.unwrap_or("*").to_string(),
             account: account.to_string(),
             total_messages,
@@ -1736,7 +1736,7 @@ impl Agentmail {
     }
 
     /// Cache-aware list-header scan for one mailbox (already-acquired session).
-    /// Backs both `rank_unsubscribe` and `rank_list_id`.
+    /// Backs both `top_subscriptions` and `top_mailing_lists`.
     async fn cached_list_rows(
         &self,
         account: &str,
@@ -2089,7 +2089,7 @@ fn is_all_mail_name(lower: &str) -> bool {
 /// Whether a message's `List-Id` header value matches the requested List-Id.
 /// IMAP `HEADER` search is substring-only, so `delete_list_id` confirms the
 /// exact list here before deleting. Compared case-insensitively after trimming;
-/// the value round-trips exactly from `rank_list_id`'s `listId` output.
+/// the value round-trips exactly from `top_mailing_lists`'s `listId` output.
 fn list_id_matches(requested: &str, candidate: &str) -> bool {
     requested.trim().eq_ignore_ascii_case(candidate.trim())
 }

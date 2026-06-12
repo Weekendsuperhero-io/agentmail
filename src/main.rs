@@ -56,8 +56,8 @@ enum CliCommand {
         #[arg(long)]
         mailbox: Option<String>,
     },
-    /// Rank senders by message count (omit --mailbox to scan all mailboxes)
-    RankSenders {
+    /// Top senders by message count (omit --mailbox to scan all mailboxes)
+    TopSenders {
         #[arg(long)]
         account: String,
         #[arg(long)]
@@ -65,8 +65,8 @@ enum CliCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Rank bulk-mail senders by List-Unsubscribe-Post presence, then count (omit --mailbox to scan all)
-    RankUnsubscribe {
+    /// Top bulk-mail senders by List-Unsubscribe-Post presence, then count (omit --mailbox to scan all)
+    TopSubscriptions {
         #[arg(long)]
         account: String,
         #[arg(long)]
@@ -265,26 +265,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        CliCommand::RankSenders {
+        CliCommand::TopSenders {
             account,
             mailbox,
             limit,
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .rank_senders(mailbox.as_deref(), &account, limit, None, None)
+                .top_senders(mailbox.as_deref(), &account, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        CliCommand::RankUnsubscribe {
+        CliCommand::TopSubscriptions {
             account,
             mailbox,
             limit,
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .rank_unsubscribe(mailbox.as_deref(), &account, limit, None, None)
+                .top_subscriptions(mailbox.as_deref(), &account, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())

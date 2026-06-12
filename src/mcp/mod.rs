@@ -159,13 +159,13 @@ impl ServerHandler for AgentMailServer {
              Read messages with get_messages (paginated, newest-first) or search_messages (with filters). \
              Use search_messages to find specific messages by sender, subject, or content. \
              Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
-             rank_senders, rank_unsubscribe, rank_list_id, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
+             top_senders, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
              All-mailbox scans automatically skip Trash, Junk, Spam, and Drafts. \
-             Two cleanup workflows: (1) rank_senders → delete_by_sender for unwanted personal senders, (2) rank_unsubscribe → unsubscribe_message for mailing lists. \
+             Two cleanup workflows: (1) top_senders → delete_by_sender for unwanted personal senders, (2) top_subscriptions → unsubscribe_message for mailing lists. \
              Never use delete_by_sender for mailing list cleanup — it deletes ALL messages from a sender including non-bulk ones. \
-             rank_list_id groups by List-Id header (RFC 2919) — all messages from the same mailing list regardless of sender. Use delete_list_id to remove an entire list. \
-             rank_senders groups by (email, display name) — same email with different display names are separate entries. \
-             rank_unsubscribe returns sample UIDs + mailboxes that can be passed directly to unsubscribe_message. \
+             top_mailing_lists groups by List-Id header (RFC 2919) — all messages from the same mailing list regardless of sender. Use delete_list_id to remove an entire list. \
+             top_senders groups by (email, display name) — same email with different display names are separate entries. \
+             top_subscriptions returns sample UIDs + mailboxes that can be passed directly to unsubscribe_message. \
              unsubscribe_message deletes by matching sender + either unsubscribe header when delete_matching=true; the unsubscribe POST is best-effort and never blocks deletion. \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
              find_attachments detects multipart/mixed and multipart/related; download_attachments saves them to disk. \

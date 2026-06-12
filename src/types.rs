@@ -321,10 +321,10 @@ pub struct MailboxAttachmentCount {
     pub count: usize,
 }
 
-/// Response for rank_senders.
+/// Response for top_senders.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct RankSendersResponse {
+pub struct TopSendersResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,
@@ -332,10 +332,10 @@ pub struct RankSendersResponse {
     pub senders: Vec<SenderSummary>,
 }
 
-/// Response for rank_unsubscribe.
+/// Response for top_subscriptions.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct RankUnsubscribeResponse {
+pub struct TopSubscriptionsResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,
@@ -367,10 +367,10 @@ pub struct ListIdSummary {
     pub newest_date: Option<DateTime<Utc>>,
 }
 
-/// Response for rank_list_id.
+/// Response for top_mailing_lists.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct RankListIdResponse {
+pub struct TopMailingListsResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,

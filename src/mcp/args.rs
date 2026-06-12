@@ -282,8 +282,8 @@ pub(super) struct UnsubscribeMessageArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[schemars(description = "Arguments for ranking senders by message count.")]
-pub(super) struct RankSendersArgs {
+#[schemars(description = "Arguments for listing top senders by message count.")]
+pub(super) struct TopSendersArgs {
     #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
     pub(super) mailbox: Option<String>,
     #[schemars(
@@ -298,8 +298,10 @@ pub(super) struct RankSendersArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[schemars(description = "Arguments for ranking mailing-list senders by message count.")]
-pub(super) struct RankUnsubscribeArgs {
+#[schemars(
+    description = "Arguments for listing top subscriptions (bulk senders) by message count."
+)]
+pub(super) struct TopSubscriptionsArgs {
     #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
     pub(super) mailbox: Option<String>,
     #[schemars(
@@ -314,8 +316,8 @@ pub(super) struct RankUnsubscribeArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[schemars(description = "Arguments for ranking mailing lists by List-Id header.")]
-pub(super) struct RankListIdArgs {
+#[schemars(description = "Arguments for listing top mailing lists by List-Id header.")]
+pub(super) struct TopMailingListsArgs {
     #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
     pub(super) mailbox: Option<String>,
     #[schemars(
@@ -336,7 +338,7 @@ pub(super) struct DeleteListIdArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "The List-Id header value to match (from rank_list_id).")]
+    #[schemars(description = "The List-Id header value to match (from top_mailing_lists).")]
     pub(super) list_id: String,
     #[schemars(description = "Mailbox to search. Omit to search all mailboxes.")]
     pub(super) mailbox: Option<String>,
