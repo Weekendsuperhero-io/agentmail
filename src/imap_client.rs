@@ -90,8 +90,46 @@ pub async fn select(
 // Connection
 // ---------------------------------------------------------------------------
 
-/// Connect to an IMAP server over TLS and authenticate.
+/// Maximum connect attempts (1 initial + retries) for a single `connect`.
+/// Kept small so a genuinely wrong password surfaces quickly and cannot
+/// hammer the server into a rate-limit / lockout.
+const MAX_CONNECT_ATTEMPTS: usize = 3;
+
+/// Whether a failed connect is worth retrying with backoff. Covers transient
+/// network drops AND transient auth rejections: iCloud/Gmail routinely reply
+/// `[AUTHENTICATIONFAILED]` to a login (especially several in quick
+/// succession) and then accept the same credentials moments later. We can't
+/// distinguish a transient rejection from a truly-wrong password, so the
+/// retry count is deliberately tiny.
+fn is_retryable_connect_error(e: &AgentmailError) -> bool {
+    e.is_connection_error() || matches!(e, AgentmailError::Imap(async_imap::error::Error::No(_)))
+}
+
+/// Connect to an IMAP server over TLS and authenticate, retrying a transient
+/// failure a few times with backoff (fresh connection each attempt).
 pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSession> {
+    let mut backoff = Duration::from_millis(400);
+    for attempt in 1..=MAX_CONNECT_ATTEMPTS {
+        match connect_once(config, password).await {
+            Ok(session) => return Ok(session),
+            Err(e) if attempt < MAX_CONNECT_ATTEMPTS && is_retryable_connect_error(&e) => {
+                debug!(
+                    target: "agentmail",
+                    attempt,
+                    max = MAX_CONNECT_ATTEMPTS,
+                    "transient connect/login failure, retrying after backoff: {e}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on the final attempt")
+}
+
+/// A single TLS connect + login, no retry.
+async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSession> {
     let addr = format!("{}:{}", config.host, config.port);
     let tcp = imap_timeout(TcpStream::connect(&addr)).await?;
 
@@ -1548,6 +1586,29 @@ mod tests {
                 .map(String::from),
         );
         assert!(!dovecot.is_gmail());
+    }
+
+    #[test]
+    fn retryable_connect_covers_transient_auth_and_network() {
+        use async_imap::error::Error as ImapErr;
+        // Transient auth rejection (iCloud/Gmail "rejected then accepted").
+        assert!(is_retryable_connect_error(&AgentmailError::Imap(
+            ImapErr::No("[AUTHENTICATIONFAILED] Invalid credentials".into())
+        )));
+        // Transient network drops.
+        assert!(is_retryable_connect_error(&AgentmailError::Imap(
+            ImapErr::ConnectionLost
+        )));
+        assert!(is_retryable_connect_error(&AgentmailError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")
+        )));
+        // A protocol BAD or a config/credential-resolution error is not retried.
+        assert!(!is_retryable_connect_error(&AgentmailError::Imap(
+            ImapErr::Bad("syntax".into())
+        )));
+        assert!(!is_retryable_connect_error(&AgentmailError::Credential(
+            "no password".into()
+        )));
     }
 
     #[test]

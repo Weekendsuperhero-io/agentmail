@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Tests** — switched `ci-check.sh` to `cargo nextest run` (with a `cargo test` fallback) and added a `.config/nextest.toml`.
 
 ### Fixed
+- **Transient login failures** — `connect` now retries a transient connect/auth failure up to twice with backoff (fresh connection each time). iCloud and Gmail routinely reply `[AUTHENTICATIONFAILED]` to a login and then accept the same credentials moments later; previously that one-off surfaced to the host as `-32603`. The retry count is small so a genuinely wrong password still fails fast without risking account lockout.
 - **Cross-folder double-counting** — `top_senders`/`top_subscriptions`/`top_mailing_lists` deduplicate by `Message-ID` across folders, so a message that appears under several Gmail labels (or in All Mail) is counted once. Counts now reflect unique messages; messages without a Message-ID can't be deduped and are counted each.
 - **All Mail in account scans** — account-wide scans now skip a Gmail-style "All Mail" folder even on servers that don't advertise the RFC 6154 `\All` attribute (previously only the role was skipped, so such folders double-counted).
 - **`delete_list_id` over-match** — confirms the exact `List-Id` per candidate before deleting; IMAP `HEADER` search is substring-only, so `"news"` could otherwise delete `"newsletter"` lists.
