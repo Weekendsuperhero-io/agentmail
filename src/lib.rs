@@ -590,13 +590,13 @@ impl Agentmail {
 
         for mbox in &mailboxes {
             imap_client::check_cancel(cancel)?;
-            let rows =
-                match imap_client::fetch_list_headers(session.session(), mbox, on_progress, cancel)
-                    .await
-                {
-                    Ok(data) => data,
-                    Err(_) => continue,
-                };
+            let rows = match self
+                .cached_list_rows(account, mbox, session.session(), on_progress, cancel)
+                .await
+            {
+                Ok(data) => data,
+                Err(_) => continue,
+            };
 
             for row in rows {
                 let list_id = match row.list_id {
