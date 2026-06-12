@@ -68,6 +68,17 @@ impl Agentmail {
         self.pool.account_config(name)
     }
 
+    /// The account's own email address(es), lowercased. Used to exclude the
+    /// user's own sent mail from sender rankings ("skip myself as a sender")
+    /// without hiding the Sent folder from other tools.
+    fn own_addresses(&self, account: &str) -> hashbrown::HashSet<String> {
+        let mut set = hashbrown::HashSet::new();
+        if let Some(cfg) = self.pool.account_config(account) {
+            set.insert(cfg.username.to_lowercase());
+        }
+        set
+    }
+
     /// Resolve server capabilities for an account, using the pool's cache and
     /// acquiring a session only on a cold miss.
     async fn caps_for(&self, account: &str) -> Result<std::sync::Arc<imap_client::ServerCaps>> {
@@ -357,6 +368,8 @@ impl Agentmail {
         let mut map: HashMap<(String, String), SenderSummary> = HashMap::new();
         // Dedup the same logical message across folders (Gmail labels / All Mail).
         let mut seen: HashSet<String> = HashSet::new();
+        // Don't rank the user themselves (their own sent mail).
+        let own = self.own_addresses(account);
 
         for mbox in &mailboxes {
             imap_client::check_cancel(cancel)?;
@@ -369,7 +382,7 @@ impl Agentmail {
             };
 
             for row in sender_dates {
-                if row.email.is_empty() {
+                if row.email.is_empty() || own.contains(&row.email) {
                     continue;
                 }
                 if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
@@ -457,6 +470,8 @@ impl Agentmail {
         let mut map: HashMap<(String, String), ListSummary> = HashMap::new();
         // Dedup the same logical message across folders (Gmail labels / All Mail).
         let mut seen: HashSet<String> = HashSet::new();
+        // Don't rank the user themselves (their own sent mail).
+        let own = self.own_addresses(account);
 
         for mbox in &mailboxes {
             imap_client::check_cancel(cancel)?;
@@ -469,6 +484,9 @@ impl Agentmail {
             };
 
             for row in rows {
+                if own.contains(&row.sender_email) {
+                    continue;
+                }
                 if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
                     continue; // already counted this message from another folder
                 }
@@ -2221,6 +2239,27 @@ mod tests {
             Some("[Gmail]/Drafts".to_string())
         );
         assert_eq!(resolve_drafts_from(&[entry("INBOX", None)]), None);
+    }
+
+    #[test]
+    fn own_addresses_returns_lowercased_username() {
+        let cfg = Config::from_accounts(vec![(
+            "work".to_string(),
+            config::AccountConfig {
+                host: "imap.example.com".to_string(),
+                port: 993,
+                username: "Me@Example.COM".to_string(),
+                password: None,
+                tls: true,
+                max_connections: None,
+            },
+        )]);
+        let mk = Agentmail::new(cfg);
+        let own = mk.own_addresses("work");
+        assert!(own.contains("me@example.com"));
+        assert!(!own.contains("someone@else.com"));
+        // Unknown account → empty set (nothing excluded).
+        assert!(mk.own_addresses("missing").is_empty());
     }
 
     #[test]
