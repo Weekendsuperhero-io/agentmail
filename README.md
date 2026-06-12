@@ -256,8 +256,8 @@ agentmail list-capabilities --account gmail
 agentmail set-password --account gmail
 agentmail get-messages --account gmail --mailbox INBOX --limit 10
 agentmail get-messages-by-uid --account gmail --uids 123 456
-agentmail rank-senders --account gmail --limit 20
-agentmail rank-unsubscribe --account gmail --limit 20
+agentmail top-senders --account gmail --limit 20
+agentmail top-subscriptions --account gmail --limit 20
 agentmail find-attachments --account gmail
 agentmail download-attachments --account gmail --uid 123 --output-dir ./downloads
 agentmail list-flags --account gmail
@@ -318,11 +318,11 @@ Opens a web UI to exercise all 21 tools, 6 prompts, and task calls interactively
 | `check_connection`     | Test IMAP connectivity for an account                                                 |
 | `list_capabilities`    | List IMAP server capabilities (IDLE, MOVE, etc.)                                      |
 | `get_messages`         | Paginated message fetch, newest-first by UID                                          |
-| `search_messages`      | IMAP SEARCH with text, header, sender, subject, and status filters                    |
+| `search_messages`      | IMAP SEARCH: text, header, sender, subject, status, date range, and size filters      |
 | `list_flags`           | List all flags in use with counts; resolves Apple Mail color flags                    |
-| `rank_senders`         | Rank senders by message count across one or all mailboxes                             |
-| `rank_unsubscribe`     | Rank bulk-mail senders by List-Unsubscribe presence, sorted by one-click support      |
-| `rank_list_id`         | Rank mailing lists by List-Id header (RFC 2919), groups regardless of sender          |
+| `top_senders`         | Top senders by message volume across one or all mailboxes                             |
+| `top_subscriptions`     | Top bulk-mail senders by List-Unsubscribe presence, sorted by one-click support       |
+| `top_mailing_lists`         | Top mailing lists by List-Id header (RFC 2919), groups regardless of sender           |
 | `find_attachments`     | Scan for messages with attachments (multipart/mixed or multipart/related)              |
 | `download_attachments` | Download attachments from a message to disk                                           |
 | `delete_messages`      | Delete messages by UID (up to 500 per call, moves to Trash or expunges)               |
@@ -337,15 +337,16 @@ Opens a web UI to exercise all 21 tools, 6 prompts, and task calls interactively
 ### Key parameters
 
 - `account` is **required** for most tools. Use `list_accounts` to discover valid names.
-- `mailbox` defaults to `INBOX` when omitted. Omit it on `rank_senders`, `rank_unsubscribe`, `rank_list_id`, `list_flags`, and `find_attachments` to scan the entire account (auto-skips Trash, Junk, Spam, Drafts).
-- `limit` defaults to 25, clamped to 1..50. On `rank_senders`, `rank_unsubscribe`, and `rank_list_id` it defaults to 100 — set it higher to return more.
+- `mailbox` defaults to `INBOX` when omitted. Omit it on `top_senders`, `top_subscriptions`, `top_mailing_lists`, `list_flags`, and `find_attachments` to scan the entire account (auto-skips Trash, Junk, Spam, Drafts).
+- `limit` defaults to 25, clamped to 1..50. On `top_senders`, `top_subscriptions`, and `top_mailing_lists` it defaults to 100 — set it higher to return more.
 - `includeContent` (default false) returns normalized markdown body text, trimmed for context window safety.
 - All reads use `BODY.PEEK` to avoid marking messages as `\Seen`.
-- Long-running operations (`rank_senders`, `rank_unsubscribe`, `rank_list_id`, `find_attachments`, `list_flags`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`) support MCP progress notifications and optional task-based invocation.
+- Long-running operations (`top_senders`, `top_subscriptions`, `top_mailing_lists`, `find_attachments`, `list_flags`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`) support MCP progress notifications and optional task-based invocation.
 - Cancelling a request (`notifications/cancelled`) stops long scans cooperatively at the next mailbox or fetch-chunk boundary.
 - Delete tools take a `permanent` flag (default false): false moves to Trash when available, true expunges directly (bypassing Trash, irreversible; requires server UIDPLUS).
-- Repeated `rank_*` scans are cached per mailbox and validated with a single STATUS, so re-ranking after a small change re-fetches only new messages. Account-wide scans skip Trash/Junk/Drafts/All Mail and dedupe by Message-ID, so a message under several Gmail labels is counted once.
-- Search filters are AND-combined case-insensitive substrings; `delete_list_id` matches the List-Id exactly (not as a substring).
+- Repeated `top_*` scans are cached per mailbox and validated with a single STATUS, so re-running after a small change re-fetches only new messages. Account-wide scans skip Trash/Junk/Drafts/All Mail, dedupe by Message-ID (a message under several Gmail labels is counted once), and exclude your own address.
+- `search_messages` supports date range (`since`/`before`, YYYY-MM-DD) and size (`larger_than`/`smaller_than`, bytes) for "older than" / "bigger than" cleanup, plus AND-combined case-insensitive substring text filters. `delete_list_id` matches the List-Id exactly (not as a substring).
+- On Gmail, deletes route through `[Gmail]/Trash` (in-place expunge only removes a label); `permanent` also goes to Trash, which Gmail purges on its own.
 - Non-ASCII `search_messages` text is sent with `CHARSET UTF-8`. Drafts include `Date` and `Message-ID` headers.
 - Destructive tasks targeting the same account are automatically serialized to prevent IMAP state conflicts.
 
@@ -371,7 +372,7 @@ Single messages are addressable as resources — the read-one-message primitive 
 | `email://{account}/{mailbox}/{uid}`           | `text/markdown`   | Message rendered as markdown (headers + body)    |
 | `email://{account}/{mailbox}/{uid}/source`    | `message/rfc822`  | Raw RFC822 source with all headers and MIME      |
 
-Encoding rules: `account` and `mailbox` are percent-encoded URI segments — a `/` inside a mailbox name (hierarchy delimiter) must be encoded as `%2F`, e.g. `email://work/Archive%2F2024/1234`. Get UIDs from `get_messages`, `search_messages`, or the `rank_*` tools. `resources/list` is intentionally empty: discovery is template-based, since mailboxes hold thousands of messages.
+Encoding rules: `account` and `mailbox` are percent-encoded URI segments — a `/` inside a mailbox name (hierarchy delimiter) must be encoded as `%2F`, e.g. `email://work/Archive%2F2024/1234`. Get UIDs from `get_messages`, `search_messages`, or the `top_*` tools. `resources/list` is intentionally empty: discovery is template-based, since mailboxes hold thousands of messages.
 
 ## MCP Completions
 
@@ -393,8 +394,8 @@ agentmail (binary crate: agentmail-mcp)
   ├── list-capabilities    → CLI
   ├── get-messages         → CLI
   ├── get-messages-by-uid  → CLI
-  ├── rank-senders         → CLI
-  ├── rank-unsubscribe     → CLI
+  ├── top-senders          → CLI
+  ├── top-subscriptions    → CLI
   ├── find-attachments     → CLI
   ├── download-attachments → CLI
   ├── list-flags           → CLI

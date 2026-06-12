@@ -12,9 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Search date & size filters** — `search_messages` gains `since`/`before` (YYYY-MM-DD, by server internal date → IMAP `SINCE`/`BEFORE`) and `larger_than`/`smaller_than` (bytes → `LARGER`/`SMALLER`) for "older than" / "bigger than" cleanup queries. Filters are AND-combined; bad dates return `-32602`.
+- **Gmail-aware delete** — on Gmail (`X-GM-EXT-1`), deletes route through `[Gmail]/Trash` because in-place `\Deleted`+EXPUNGE only removes a label, leaving the message in All Mail. Permanent deletes also route to Trash on Gmail (Gmail purges Trash on its own).
 - **Permanent delete** — `delete_messages`, `delete_by_sender`, `delete_list_id`, and `unsubscribe_message` accept a `permanent` flag (default false). When true, messages are flagged `\Deleted` and UID-expunged directly, bypassing Trash. Backed by a new `DeleteMode` enum in the library API.
 - **Capability gating** — per-account `ServerCaps` (cached in the connection pool) selects command variants: UID MOVE when the server advertises MOVE, else COPY + `\Deleted` + UID EXPUNGE; the RECENT STATUS item is omitted on IMAP4rev2-only servers (RFC 9051 removed it).
-- **Rank-scan cache** — `rank_senders`/`rank_unsubscribe`/`rank_list_id` validate each mailbox with a single STATUS (UIDVALIDITY/UIDNEXT/MESSAGES) and reuse cached header rows when unchanged, or fetch only newly-arrived messages — cutting a warm whole-account scan from ~100 round trips to ~1 per mailbox.
+- **Top-N scan cache** — `top_senders`/`top_subscriptions`/`top_mailing_lists` validate each mailbox with a single STATUS (UIDVALIDITY/UIDNEXT/MESSAGES) and reuse cached header rows when unchanged, or fetch only newly-arrived messages — cutting a warm whole-account scan from ~100 round trips to ~1 per mailbox.
 - **MCP resources** — single messages are addressable via two URI templates: `email://{account}/{mailbox}/{uid}` (markdown) and `email://{account}/{mailbox}/{uid}/source` (raw RFC822). Account/mailbox segments are percent-encoded (`/` in mailbox names as `%2F`). Missing UIDs return `-32002` (resource not found).
 - **MCP completions** — `completion/complete` for prompt arguments and the `email://` template variables: `account` completes instantly from config; `mailbox` runs a context-scoped IMAP LIST and never errors on failure.
 - **Cooperative cancellation** — a `CancelFn` callback (mirroring `ProgressFn`) threaded through all scan/delete paths, checked at mailbox and fetch-chunk boundaries; MCP wires it to the request's cancellation token, so `notifications/cancelled` and transport shutdown stop long scans.
@@ -26,10 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Keychain tests** — added unit tests for `Secret` (Raw/Command paths plus a keyring roundtrip via `keyring_core::mock::Store`) and for the macOS error-code classifier (-25307, -25308, -34018).
 
 ### Changed
+- **Tool rename** — `rank_senders`/`rank_unsubscribe`/`rank_list_id` are now **`top_senders`/`top_subscriptions`/`top_mailing_lists`** (clearer: a volume-sorted summary, not an action). Lib fns, MCP tool names, and CLI subcommands renamed to match.
+- **Top senders exclude self** — `top_senders` and `top_subscriptions` skip the account's own address, so your own sent mail no longer ranks you as a top sender.
 - **Special-use caching** — Trash and Drafts mailboxes are resolved by a single LIST and cached per account (5-minute TTL, invalidated on `create_mailbox`), instead of re-LISTing on every delete and draft.
-- **rank tools default limit** — `rank_senders`, `rank_unsubscribe`, and `rank_list_id` now return at most 100 entries over MCP unless a higher `limit` is passed (previously unlimited; CLI behavior unchanged).
+- **Top tools default limit** — `top_senders`, `top_subscriptions`, and `top_mailing_lists` return at most 100 entries over MCP unless a higher `limit` is passed (previously unlimited; CLI behavior unchanged).
 - **Module layout** — `src/mcp.rs` split into `src/mcp/` modules (args, tools_read, tools_write, prompts, resources, tasks); no behavior change.
-- **Library API (breaking, → 0.3.0)** — scan/delete functions gained a `cancel: Option<&CancelFn>` parameter and the delete functions a `mode: DeleteMode` parameter; the `rank_*` library functions were renamed from `group_by_sender`/`group_by_list`/`group_by_list_id`; `build_search_query_pub` now returns `Result`; `imap_timeout` preserves typed errors.
+- **Library API (breaking, → 0.3.0)** — scan/delete functions gained a `cancel: Option<&CancelFn>` parameter and the delete functions a `mode: DeleteMode` parameter; the top-N library functions are now `top_senders`/`top_subscriptions`/`top_mailing_lists` (was `group_by_sender`/`group_by_list`/`group_by_list_id`); `build_search_query_pub` now returns `Result`; `imap_timeout` preserves typed errors.
 - **MCP error codes** — input-validation and not-found failures now return `-32602` (invalid params) instead of `-32603` (internal error), so clients can distinguish bad arguments from server faults.
 - **MCP tool schemas** — nested parameter/response types are inlined via `#[schemars(inline)]` so tool input/output schemas contain no `$defs`/`$ref`; fixes hosts (Gemini CLI, n8n, some gateways) that reject or drop referenced schemas.
 - **Mailbox detection** — replaced hardcoded mailbox names with auto-detection using RFC 6154 special-use attributes (`Trash`, `Drafts`).
@@ -41,10 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Tests** — switched `ci-check.sh` to `cargo nextest run` (with a `cargo test` fallback) and added a `.config/nextest.toml`.
 
 ### Fixed
-- **Cross-folder double-counting** — `rank_senders`/`rank_unsubscribe`/`rank_list_id` deduplicate by `Message-ID` across folders, so a message that appears under several Gmail labels (or in All Mail) is counted once. Counts now reflect unique messages; messages without a Message-ID can't be deduped and are counted each.
+- **Cross-folder double-counting** — `top_senders`/`top_subscriptions`/`top_mailing_lists` deduplicate by `Message-ID` across folders, so a message that appears under several Gmail labels (or in All Mail) is counted once. Counts now reflect unique messages; messages without a Message-ID can't be deduped and are counted each.
 - **All Mail in account scans** — account-wide scans now skip a Gmail-style "All Mail" folder even on servers that don't advertise the RFC 6154 `\All` attribute (previously only the role was skipped, so such folders double-counted).
 - **`delete_list_id` over-match** — confirms the exact `List-Id` per candidate before deleting; IMAP `HEADER` search is substring-only, so `"news"` could otherwise delete `"newsletter"` lists.
-- **`rank_list_id` caching** — now uses the same STATUS-validated scan cache as the other two rank tools (it was inadvertently left on the full-refetch path).
+- **`top_mailing_lists` caching** — now uses the same STATUS-validated scan cache as the other two top-N tools (it was inadvertently left on the full-refetch path).
 - **Non-ASCII search** — SEARCH queries with non-ASCII text now send a `CHARSET UTF-8` prefix (previously the text was sent as an invalid 7-bit quoted string and servers rejected or silently mismatched it). Server rejections surface as `-32602` invalid-params over MCP.
 - **SEARCH command injection** — search text containing CR/LF was written to the wire unescaped (async-imap sends command bytes raw); such input is now rejected.
 - **Draft Message-ID** — drafts now carry a generated `Message-ID` header (lettre adds `Date` automatically but not Message-ID); its absence broke threading and tripped some spam filters.

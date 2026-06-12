@@ -53,9 +53,9 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 | 6   | `search_messages`  | IMAP SEARCH: sender, subject, to, full-text, read/flagged/deleted, header key/value. Paginated.     | `read_only`            |
 | 7   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only`, `taskable` |
 | 8   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only`, `taskable` |
-| 9   | `rank_senders`     | Group by (email, display name) with counts + date ranges. Omit mailbox to scan all.                 | `read_only`, `taskable` |
-| 10  | `rank_unsubscribe` | Rank bulk-mail senders by volume. Returns unsubscribe URLs, sample UIDs.                            | `read_only`, `taskable` |
-| 11  | `rank_list_id`     | Rank mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.          | `read_only`, `taskable` |
+| 9   | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only`, `taskable` |
+| 10  | `top_subscriptions` | Top bulk-mail senders by volume. Returns unsubscribe URLs, sample UIDs.                             | `read_only`, `taskable` |
+| 11  | `top_mailing_lists`     | Top mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.           | `read_only`, `taskable` |
 
 #### Output Schemas
 
@@ -73,7 +73,7 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 
 Non-ASCII search text is sent with a `CHARSET UTF-8` prefix (accepted by Gmail, Dovecot, Courier, iCloud, Outlook, and required by IMAP4rev2). Servers that reject UTF-8 search return `-32602`. CR/LF in search text is rejected.
 
-Search filters are **AND-combined** (a message must match all provided filters) and matched as **case-insensitive substrings** (IMAP semantics). `header_key` without a value matches messages that merely *have* that header. Date-range (`SINCE`/`BEFORE`), size (`LARGER`/`SMALLER`), and `OR`/`NOT` filters are not yet supported.
+Search filters are **AND-combined** (a message must match all provided filters) and matched as **case-insensitive substrings** (IMAP semantics). `header_key` without a value matches messages that merely *have* that header. Date range: `since`/`before` (YYYY-MM-DD, server internal date → IMAP `SINCE`/`BEFORE`, since=inclusive, before=exclusive). Size: `larger_than`/`smaller_than` in bytes (`LARGER`/`SMALLER`). Arbitrary `OR`/`NOT` boolean expressions are not supported — a recursive query tree would reintroduce `$defs`/`$ref` into the tool schema (which some hosts reject); issue multiple searches instead.
 
 **MessageInfo** (shared by get_messages, search_messages, get_messages_by_uid)
 ```json
@@ -103,7 +103,7 @@ Search filters are **AND-combined** (a message must match all provided filters) 
 ```
 `perMailbox` present when mailbox omitted. UIDs paginated (default 25, max 100).
 
-**rank_senders**
+**top_senders**
 ```json
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueSenders",
   "senders": [{
@@ -111,9 +111,9 @@ Search filters are **AND-combined** (a message must match all provided filters) 
     "count", "oldestDate?", "newestDate?"
   }] }
 ```
-Grouped by (email, display name) — same email with different display names are separate entries. `limit` defaults to 100 on all three rank tools; set it higher to return more. Account-wide scans (omit `mailbox`) skip Trash/Junk/Drafts/All Mail and **deduplicate by Message-ID across folders**, so a message under several Gmail labels is counted once (counts reflect unique messages).
+Grouped by (email, display name) — same email with different display names are separate entries. `limit` defaults to 100 on all three top-N tools; set it higher to return more. Account-wide scans (omit `mailbox`) skip Trash/Junk/Drafts/All Mail, **deduplicate by Message-ID across folders** (so a message under several Gmail labels is counted once — counts reflect unique messages), and **exclude the account's own address** (so your sent mail doesn't rank you as a sender). `top_subscriptions` also excludes self.
 
-**rank_unsubscribe**
+**top_subscriptions**
 ```json
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueLists",
   "lists": [{
@@ -125,7 +125,7 @@ Grouped by (email, display name) — same email with different display names are
 ```
 Sorted: one-click senders first, then by count. `sampleMailbox` needed because UIDs are per-mailbox.
 
-**rank_list_id**
+**top_mailing_lists**
 ```json
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueLists",
   "lists": [{
@@ -154,6 +154,8 @@ Grouped by List-Id header — same list with different senders are merged into o
 | 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail. `permanent=true` bypasses Trash. | `destructive`, `open_world`              |
 
 **`permanent` flag (delete tools):** default false moves to Trash when a Trash mailbox exists, else permanently deletes. When true, flags `\Deleted` + UID EXPUNGE directly, bypassing Trash — irreversible. Permanent delete requires the server to advertise UIDPLUS; on servers without it the call is refused (plain EXPUNGE would purge unrelated `\Deleted` messages).
+
+**Gmail:** on Gmail (`X-GM-EXT-1`), in-place `\Deleted`+EXPUNGE only removes a *label* — the message survives in All Mail. agentmail therefore routes every delete, including `permanent`, through `[Gmail]/Trash` (which removes the message from all labels; Gmail purges Trash on its own schedule). Immediate hard-purge isn't available on Gmail.
 
 #### Output Schemas
 
@@ -253,7 +255,7 @@ Returns the full updated flag set after the operation.
 
 9 long-running tools support `execution.taskSupport = "optional"` — clients can invoke them normally (synchronous with progress notifications) or as background tasks (enqueue, poll, retrieve result).
 
-**Taskable tools:** `list_flags`, `find_attachments`, `rank_senders`, `rank_unsubscribe`, `rank_list_id`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`
+**Taskable tools:** `list_flags`, `find_attachments`, `top_senders`, `top_subscriptions`, `top_mailing_lists`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`
 
 **Destructive task serialization:** Destructive tasks (`delete_messages`, `delete_by_sender`, `delete_list_id`, `unsubscribe_message`) targeting the same account are serialized — each waits for the previous destructive task to finish before starting. Non-destructive tasks run concurrently without restriction.
 
