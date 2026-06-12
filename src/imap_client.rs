@@ -439,7 +439,7 @@ pub async fn fetch_sender_dates_for_uids(
     uids: &[u32],
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
-) -> Result<Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)>> {
+) -> Result<Vec<crate::scan_cache::SenderRow>> {
     let total = uids.len() as u64;
     let mut results = Vec::with_capacity(uids.len());
     let mut completed = 0u64;
@@ -455,7 +455,7 @@ pub async fn fetch_sender_dates_for_uids(
         let fetched = timed_uid_fetch_collect(
             session,
             &uid_set,
-            "(UID BODY.PEEK[HEADER.FIELDS (FROM DATE)])",
+            "(UID BODY.PEEK[HEADER.FIELDS (FROM DATE Message-ID)])",
         )
         .await?;
 
@@ -463,7 +463,14 @@ pub async fn fetch_sender_dates_for_uids(
             let fetch = item.map_err(AgentmailError::Imap)?;
             let header_bytes = fetch.header().unwrap_or(&[]);
             match parser::parse_sender_date(header_bytes) {
-                Ok(tuple) => results.push(tuple),
+                Ok((email, display_name, date, message_id)) => {
+                    results.push(crate::scan_cache::SenderRow {
+                        email,
+                        display_name,
+                        date,
+                        message_id,
+                    });
+                }
                 Err(e) => {
                     debug!(uid = ?fetch.uid, error = %e, "fetch_sender_dates: skipping unparseable message");
                 }
@@ -486,7 +493,7 @@ pub async fn fetch_sender_dates(
     mailbox: &str,
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
-) -> Result<Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)>> {
+) -> Result<Vec<crate::scan_cache::SenderRow>> {
     let mb = imap_timeout(session.select(mailbox)).await?;
     if mb.exists == 0 {
         return Ok(Vec::new());
@@ -513,7 +520,7 @@ pub async fn fetch_sender(session: &mut ImapSession, uid: u32) -> Result<(String
         .map_err(AgentmailError::Imap)?;
 
     let header_bytes = fetch.header().unwrap_or(&[]);
-    let (email, name, _date) = parser::parse_sender_date(header_bytes)?;
+    let (email, name, _date, _msgid) = parser::parse_sender_date(header_bytes)?;
     Ok((email, name))
 }
 
@@ -544,7 +551,7 @@ pub async fn fetch_senders_batch(
                 None => continue,
             };
             let header_bytes = fetch.header().unwrap_or(&[]);
-            if let Ok((email, name, _)) = parser::parse_sender_date(header_bytes) {
+            if let Ok((email, name, _, _)) = parser::parse_sender_date(header_bytes) {
                 results.push((uid, email, name));
             }
         }
@@ -562,6 +569,8 @@ pub struct ListHeaderRow {
     pub sender_email: String,
     pub sender_name: String,
     pub date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Logical-message identifier, for cross-folder deduplication.
+    pub message_id: Option<String>,
 }
 
 /// Fetch List-Unsubscribe, List-Unsubscribe-Post, List-Id, FROM, and DATE headers.
@@ -608,7 +617,7 @@ pub async fn fetch_list_headers_for_uids(
         let fetched = timed_uid_fetch_collect(
             session,
             &uid_set,
-            "(UID BODY.PEEK[HEADER.FIELDS (List-Unsubscribe List-Unsubscribe-Post List-Id FROM DATE)])",
+            "(UID BODY.PEEK[HEADER.FIELDS (List-Unsubscribe List-Unsubscribe-Post List-Id FROM DATE Message-ID)])",
         )
         .await?;
 
@@ -630,7 +639,7 @@ pub async fn fetch_list_headers_for_uids(
                 continue;
             }
 
-            let (sender_email, sender_name, date) =
+            let (sender_email, sender_name, date, message_id) =
                 parser::parse_sender_date(header_bytes).unwrap_or_default();
 
             results.push(ListHeaderRow {
@@ -641,6 +650,7 @@ pub async fn fetch_list_headers_for_uids(
                 sender_email,
                 sender_name,
                 date,
+                message_id,
             });
         }
 

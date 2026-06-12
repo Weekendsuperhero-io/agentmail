@@ -351,10 +351,12 @@ impl Agentmail {
             None => list_scannable_mailbox_names(session.session()).await?,
         };
 
-        use hashbrown::HashMap;
+        use hashbrown::{HashMap, HashSet};
         // Key by (email, display_name) so "Find My <noreply@apple.com>" and
         // "iCloud <noreply@apple.com>" are separate entries.
         let mut map: HashMap<(String, String), SenderSummary> = HashMap::new();
+        // Dedup the same logical message across folders (Gmail labels / All Mail).
+        let mut seen: HashSet<String> = HashSet::new();
 
         for mbox in &mailboxes {
             imap_client::check_cancel(cancel)?;
@@ -366,15 +368,18 @@ impl Agentmail {
                 Err(_) => continue, // skip unselectable mailboxes
             };
 
-            for (email, display_name, date) in sender_dates {
-                if email.is_empty() {
+            for row in sender_dates {
+                if row.email.is_empty() {
                     continue;
                 }
-                let key = (email.clone(), display_name.clone());
+                if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
+                    continue; // already counted this message from another folder
+                }
+                let key = (row.email.clone(), row.display_name.clone());
                 let entry = map.entry(key).or_insert_with(|| SenderSummary {
                     sender: String::new(),
-                    address: email,
-                    display_name: display_name.clone(),
+                    address: row.email.clone(),
+                    display_name: row.display_name.clone(),
                     count: 0,
                     oldest_date: None,
                     newest_date: None,
@@ -382,7 +387,7 @@ impl Agentmail {
 
                 entry.count += 1;
 
-                if let Some(d) = date {
+                if let Some(d) = row.date {
                     entry.oldest_date = Some(match entry.oldest_date {
                         Some(existing) => existing.min(d),
                         None => d,
@@ -445,11 +450,13 @@ impl Agentmail {
             None => list_scannable_mailbox_names(session.session()).await?,
         };
 
-        use hashbrown::HashMap;
+        use hashbrown::{HashMap, HashSet};
         use types::ListSummary;
 
         // Key by (email, display_name) for exact sender grouping
         let mut map: HashMap<(String, String), ListSummary> = HashMap::new();
+        // Dedup the same logical message across folders (Gmail labels / All Mail).
+        let mut seen: HashSet<String> = HashSet::new();
 
         for mbox in &mailboxes {
             imap_client::check_cancel(cancel)?;
@@ -462,6 +469,9 @@ impl Agentmail {
             };
 
             for row in rows {
+                if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
+                    continue; // already counted this message from another folder
+                }
                 let key = (row.sender_email.clone(), row.sender_name.clone());
                 let entry = map.entry(key).or_insert_with(|| {
                     let sender_display = if row.sender_name.is_empty() {
@@ -587,6 +597,8 @@ impl Agentmail {
         }
 
         let mut map: HashMap<String, ListIdEntry> = HashMap::new();
+        // Dedup the same logical message across folders (Gmail labels / All Mail).
+        let mut seen: HashSet<String> = HashSet::new();
 
         for mbox in &mailboxes {
             imap_client::check_cancel(cancel)?;
@@ -603,6 +615,9 @@ impl Agentmail {
                     Some(ref id) if !id.is_empty() => id.clone(),
                     _ => continue, // Skip messages without List-Id
                 };
+                if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
+                    continue; // already counted this message from another folder
+                }
 
                 let entry = map.entry(list_id.clone()).or_insert_with(|| {
                     let display = extract_list_id_display(&list_id);
@@ -1849,7 +1864,7 @@ async fn filter_sender_bulk_mail(
             }
 
             // Must match exact sender
-            if let Ok((email, name, _)) = parser::parse_sender_date(header_bytes)
+            if let Ok((email, name, _, _)) = parser::parse_sender_date(header_bytes)
                 && email == target_email
                 && name == target_name
             {

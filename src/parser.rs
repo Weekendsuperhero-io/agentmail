@@ -108,9 +108,15 @@ pub fn parse_rfc822(
 
 /// Lightweight parse of just FROM and DATE from partial header bytes.
 /// Returns (email_address, display_name, date).
-pub fn parse_sender_date(
-    raw: &[u8],
-) -> crate::Result<(String, String, Option<chrono::DateTime<chrono::Utc>>)> {
+/// Parsed partial-header fields: `(email, display_name, date, message_id)`.
+pub type SenderHeaders = (
+    String,
+    String,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+);
+
+pub fn parse_sender_date(raw: &[u8]) -> crate::Result<SenderHeaders> {
     let parsed = MessageParser::default().parse(raw).ok_or_else(|| {
         crate::AgentmailError::Parse("Failed to parse partial headers".to_string())
     })?;
@@ -121,7 +127,12 @@ pub fn parse_sender_date(
         .date()
         .and_then(|d| chrono::DateTime::from_timestamp(d.to_timestamp(), 0));
 
-    Ok((email, name, date))
+    // Message-ID identifies the logical message across folders — used to
+    // deduplicate account-wide scans (the same message appears under each
+    // Gmail label / in All Mail with a different per-mailbox UID).
+    let message_id = parsed.message_id().map(|s| s.to_string());
+
+    Ok((email, name, date, message_id))
 }
 
 /// Extract (email, display_name) from a From address. Email is lowercased for grouping.

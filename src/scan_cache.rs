@@ -11,7 +11,7 @@
 //! the UID/MESSAGE deltas apart) forces a full rescan on its own. Hooks merely
 //! free known-stale rows sooner.
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::imap_client::ListHeaderRow;
 
@@ -81,9 +81,15 @@ pub struct CachedScan<T> {
     pub rows: Vec<T>,
 }
 
-/// Sender-scan row: `(email, display_name, date)` as produced by
-/// `fetch_sender_dates`.
-pub type SenderRow = (String, String, Option<chrono::DateTime<chrono::Utc>>);
+/// One sender-scan row as produced by `fetch_sender_dates`. `message_id` is
+/// the logical-message identifier used to deduplicate across folders.
+#[derive(Debug, Clone)]
+pub struct SenderRow {
+    pub email: String,
+    pub display_name: String,
+    pub date: Option<chrono::DateTime<chrono::Utc>>,
+    pub message_id: Option<String>,
+}
 
 /// Per-account, per-mailbox caches for the two header-scan shapes. List-row
 /// scans back both `rank_unsubscribe` and `rank_list_id` (same fetch).
@@ -98,6 +104,18 @@ impl ScanCache {
     pub fn invalidate_account(&mut self, account: &str) {
         self.sender.retain(|(acct, _), _| acct != account);
         self.list.retain(|(acct, _), _| acct != account);
+    }
+}
+
+/// Whether a scanned row should be counted, given the Message-IDs already
+/// counted this scan. The same logical message appears in every Gmail label
+/// (and All Mail) with a different per-mailbox UID; deduping by Message-ID
+/// counts it once. Rows without a Message-ID can't be deduped and are always
+/// counted (`true`).
+pub fn first_seen(seen: &mut HashSet<String>, message_id: Option<&str>) -> bool {
+    match message_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => seen.insert(id.to_string()),
+        None => true,
     }
 }
 
@@ -190,6 +208,21 @@ mod tests {
             CacheDecision::from_status(Some(&c), &status(Some(1), None, 104)),
             CacheDecision::FullRescan
         );
+    }
+
+    #[test]
+    fn first_seen_dedups_by_message_id() {
+        let mut seen = HashSet::new();
+        // First sighting counts; the same id in another folder does not.
+        assert!(first_seen(&mut seen, Some("<a@x>")));
+        assert!(!first_seen(&mut seen, Some("<a@x>")));
+        assert!(!first_seen(&mut seen, Some("  <a@x>  "))); // trimmed-equal
+        // A different message counts.
+        assert!(first_seen(&mut seen, Some("<b@x>")));
+        // No Message-ID can't be deduped — always counted.
+        assert!(first_seen(&mut seen, None));
+        assert!(first_seen(&mut seen, None));
+        assert!(first_seen(&mut seen, Some("   "))); // empty → treated as no id
     }
 
     #[test]
