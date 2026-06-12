@@ -720,13 +720,27 @@ impl Agentmail {
                 ..Default::default()
             };
             let query = imap_client::build_search_query_pub(&criteria)?;
-            let uids = match imap_client::search_uids(session.session(), &query).await {
+            let candidates = match imap_client::search_uids(session.session(), &query).await {
                 Ok(u) => u,
                 Err(_) => {
                     skipped.push(mbox.clone());
                     continue;
                 }
             };
+
+            if candidates.is_empty() {
+                continue;
+            }
+
+            // IMAP HEADER search is substring-only, so "news" would also match
+            // "newsletter". Confirm the exact List-Id before deleting.
+            let with_ids =
+                imap_client::fetch_list_ids_for_uids(session.session(), &candidates).await?;
+            let uids: Vec<u32> = with_ids
+                .into_iter()
+                .filter(|(_, id)| id.as_deref().is_some_and(|v| list_id_matches(list_id, v)))
+                .map(|(uid, _)| uid)
+                .collect();
 
             if uids.is_empty() {
                 continue;
@@ -2057,6 +2071,14 @@ fn is_all_mail_name(lower: &str) -> bool {
     lower == "all mail" || lower == "[gmail]/all mail" || lower.ends_with("/all mail")
 }
 
+/// Whether a message's `List-Id` header value matches the requested List-Id.
+/// IMAP `HEADER` search is substring-only, so `delete_list_id` confirms the
+/// exact list here before deleting. Compared case-insensitively after trimming;
+/// the value round-trips exactly from `rank_list_id`'s `listId` output.
+fn list_id_matches(requested: &str, candidate: &str) -> bool {
+    requested.trim().eq_ignore_ascii_case(candidate.trim())
+}
+
 /// Extract the display name from a List-Id header value.
 /// Format: `Cool List <cool.example.com>` → "Cool List"
 /// If no display name, returns the identifier: `<cool.example.com>` → "cool.example.com"
@@ -2195,6 +2217,19 @@ mod tests {
         assert!(!is_all_mail_name("all hands"));
         assert!(!is_all_mail_name("marketing/all staff"));
         assert!(!is_all_mail_name("inbox"));
+    }
+
+    #[test]
+    fn list_id_matches_is_exact_not_substring() {
+        assert!(list_id_matches("news.example.com", "news.example.com"));
+        assert!(list_id_matches(
+            "Cool List <cool.example.com>",
+            "cool list <cool.example.com>"
+        )); // case-insensitive, trimmed
+        assert!(list_id_matches("news.example.com", "  news.example.com  "));
+        // Substring must NOT match — this is the over-deletion guard.
+        assert!(!list_id_matches("news", "newsletter.example.com"));
+        assert!(!list_id_matches("list.example.com", "sub.list.example.com"));
     }
 
     #[test]

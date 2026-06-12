@@ -661,6 +661,36 @@ pub async fn search_uids_from(session: &mut ImapSession, from_uid: u32) -> Resul
     Ok(uids.into_iter().filter(|&u| u >= from_uid).collect())
 }
 
+/// Fetch the raw `List-Id` header for a set of UIDs (already-selected mailbox).
+/// Returns `(uid, Option<List-Id value>)`. Used to confirm an exact List-Id
+/// match before deletion, since IMAP `HEADER` search is substring-only.
+pub async fn fetch_list_ids_for_uids(
+    session: &mut ImapSession,
+    uids: &[u32],
+) -> Result<Vec<(u32, Option<String>)>> {
+    let mut results = Vec::with_capacity(uids.len());
+    for chunk in uids.chunks(1000) {
+        let uid_set: String = chunk
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetched = timed_uid_fetch_collect(
+            session,
+            &uid_set,
+            "(UID BODY.PEEK[HEADER.FIELDS (List-Id)])",
+        )
+        .await?;
+        for item in fetched {
+            let fetch = item.map_err(AgentmailError::Imap)?;
+            let Some(uid) = fetch.uid else { continue };
+            let header_str = String::from_utf8_lossy(fetch.header().unwrap_or(&[]));
+            results.push((uid, extract_header_value(&header_str, "List-Id")));
+        }
+    }
+    Ok(results)
+}
+
 /// Fetch specific UIDs and parse them into MessageInfo.
 pub async fn fetch_by_uids(
     session: &mut ImapSession,
