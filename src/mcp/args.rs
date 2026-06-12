@@ -98,6 +98,18 @@ pub(super) struct SearchMessagesArgs {
     pub(super) flagged: Option<bool>,
     #[schemars(description = "Filter by read/seen status.")]
     pub(super) read: Option<bool>,
+    #[schemars(
+        description = "Only messages received on or after this date (inclusive), as YYYY-MM-DD (IMAP SINCE, by server internal date)."
+    )]
+    pub(super) since: Option<String>,
+    #[schemars(
+        description = "Only messages received before this date (exclusive), as YYYY-MM-DD (IMAP BEFORE, by server internal date)."
+    )]
+    pub(super) before: Option<String>,
+    #[schemars(description = "Only messages larger than this many bytes (IMAP LARGER).")]
+    pub(super) larger_than: Option<u32>,
+    #[schemars(description = "Only messages smaller than this many bytes (IMAP SMALLER).")]
+    pub(super) smaller_than: Option<u32>,
     #[serde(default = "default_false")]
     #[schemars(description = "Include deleted messages. Defaults to false.")]
     pub(super) deleted: bool,

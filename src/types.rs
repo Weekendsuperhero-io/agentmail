@@ -136,6 +136,14 @@ pub struct SearchCriteria {
     pub flagged: Option<bool>,
     pub deleted: Option<bool>,
     pub header: Option<(String, String)>,
+    /// Internal-date lower bound (inclusive) — IMAP `SINCE`.
+    pub since: Option<chrono::NaiveDate>,
+    /// Internal-date upper bound (exclusive) — IMAP `BEFORE`.
+    pub before: Option<chrono::NaiveDate>,
+    /// Minimum RFC822 size in octets — IMAP `LARGER`.
+    pub larger_than: Option<u32>,
+    /// Maximum RFC822 size in octets — IMAP `SMALLER`.
+    pub smaller_than: Option<u32>,
 }
 
 /// Summary of messages from a single sender address.

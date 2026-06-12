@@ -1243,6 +1243,19 @@ fn build_search_query(criteria: &SearchCriteria) -> Result<String> {
         ascii_only &= key.is_ascii() && value.is_ascii();
         parts.push(format!("HEADER {} {}", quoted(key)?, quoted(value)?));
     }
+    // IMAP date format is `dd-Mon-yyyy` (e.g. 01-Jan-2024), always ASCII.
+    if let Some(since) = criteria.since {
+        parts.push(format!("SINCE {}", since.format("%d-%b-%Y")));
+    }
+    if let Some(before) = criteria.before {
+        parts.push(format!("BEFORE {}", before.format("%d-%b-%Y")));
+    }
+    if let Some(n) = criteria.larger_than {
+        parts.push(format!("LARGER {n}"));
+    }
+    if let Some(n) = criteria.smaller_than {
+        parts.push(format!("SMALLER {n}"));
+    }
 
     if parts.is_empty() {
         Ok("ALL".to_string())
@@ -1459,6 +1472,34 @@ mod tests {
         };
         let q = build_search_query(&criteria).unwrap();
         assert_eq!(q, "SEEN UNFLAGGED UNDELETED");
+    }
+
+    #[test]
+    fn date_and_size_criteria_compose() {
+        let criteria = SearchCriteria {
+            since: chrono::NaiveDate::from_ymd_opt(2024, 1, 5),
+            before: chrono::NaiveDate::from_ymd_opt(2024, 12, 31),
+            larger_than: Some(1_000_000),
+            smaller_than: Some(5_000_000),
+            ..Default::default()
+        };
+        let q = build_search_query(&criteria).unwrap();
+        assert_eq!(
+            q,
+            "SINCE 05-Jan-2024 BEFORE 31-Dec-2024 LARGER 1000000 SMALLER 5000000"
+        );
+    }
+
+    #[test]
+    fn date_filter_combines_with_text_and_stays_ascii() {
+        let criteria = SearchCriteria {
+            from: Some("news@example.com".to_string()),
+            since: chrono::NaiveDate::from_ymd_opt(2023, 6, 1),
+            ..Default::default()
+        };
+        // No CHARSET prefix — date tokens are ASCII.
+        let q = build_search_query(&criteria).unwrap();
+        assert_eq!(q, "FROM \"news@example.com\" SINCE 01-Jun-2023");
     }
 
     #[test]

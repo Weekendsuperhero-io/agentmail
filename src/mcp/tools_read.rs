@@ -16,6 +16,19 @@ use rmcp::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Parse an optional `YYYY-MM-DD` search-date argument into a `NaiveDate`,
+/// surfacing a bad format as an actionable invalid-params error.
+fn parse_search_date(s: Option<&str>) -> Result<Option<chrono::NaiveDate>, McpError> {
+    match s {
+        None => Ok(None),
+        Some(d) => chrono::NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d")
+            .map(Some)
+            .map_err(|_| {
+                McpError::invalid_params(format!("invalid date '{d}', expected YYYY-MM-DD"), None)
+            }),
+    }
+}
+
 #[tool_router(router = read_tools_router, vis = "pub(super)")]
 impl AgentMailServer {
     #[tool(
@@ -115,7 +128,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "search_messages",
-        description = "Search messages with filters: sender_contains, subject_contains, to_contains, query (full-text), read, flagged, and header key/value. Returns paginated results newest-first. Content excluded by default — set include_content=true to get message bodies. Set include_headers=true for the full raw headers map.",
+        description = "Search messages with filters: sender_contains, subject_contains, to_contains, query (full-text), read, flagged, header key/value, date range (since/before, YYYY-MM-DD), and size (larger_than/smaller_than, bytes). Filters are AND-combined; text filters match case-insensitive substrings. Returns paginated results newest-first. Content excluded by default — set include_content=true to get message bodies. Set include_headers=true for the full raw headers map.",
         annotations(title = "Search Messages", read_only_hint = true)
     )]
     async fn search_messages_tool(
@@ -139,6 +152,10 @@ impl AgentMailServer {
                 (Some(k), None) => Some((k, String::new())),
                 _ => None,
             },
+            since: parse_search_date(args.since.as_deref())?,
+            before: parse_search_date(args.before.as_deref())?,
+            larger_than: args.larger_than,
+            smaller_than: args.smaller_than,
         };
 
         match self
