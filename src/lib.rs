@@ -1692,9 +1692,26 @@ impl Agentmail {
         self.scan_cache.lock().invalidate_account(account);
     }
 
+    /// Whether STATUS should request HIGHESTMODSEQ for this account.
+    /// Uses cached capabilities when available; otherwise warms them once.
+    async fn status_wants_modseq(
+        &self,
+        account: &str,
+        session: &mut imap_client::ImapSession,
+    ) -> bool {
+        if let Some(caps) = self.pool.cached_caps(account) {
+            return caps.has_condstore();
+        }
+        match self.pool.server_caps(account, session).await {
+            Ok(caps) => caps.has_condstore(),
+            Err(_) => false,
+        }
+    }
+
     /// Cache-aware sender-row scan for one mailbox (already-acquired session).
     /// STATUS-validates the cache: reuses rows on a hit, fetches only the new
-    /// tail on an append, and re-scans otherwise.
+    /// tail on an append, membership-refreshes on deletes/mixed changes, and
+    /// full-rescans when UIDVALIDITY is unusable.
     async fn cached_sender_rows(
         &self,
         account: &str,
@@ -1705,7 +1722,8 @@ impl Agentmail {
     ) -> Result<Vec<scan_cache::SenderRow>> {
         use scan_cache::CacheDecision;
         let key = (account.to_string(), mbox.to_string());
-        let status = imap_client::mailbox_status(session, mbox).await?;
+        let with_modseq = self.status_wants_modseq(account, session).await;
+        let status = imap_client::mailbox_status(session, mbox, with_modseq).await?;
 
         let cached_meta = self.scan_cache.lock().sender.get(&key).map(|c| c.meta);
 
@@ -1723,18 +1741,54 @@ impl Agentmail {
                 let new_rows =
                     imap_client::fetch_sender_dates_for_uids(session, &uids, on_progress, cancel)
                         .await?;
+                // Only commit after a successful fetch.
                 let mut cache = self.scan_cache.lock();
                 let entry = cache
                     .sender
                     .entry(key)
-                    .or_insert_with(|| scan_cache::CachedScan {
-                        meta: scan_cache::CacheMeta {
-                            uid_validity: 0,
-                            uid_next: 0,
-                            exists: 0,
-                        },
-                        rows: Vec::new(),
-                    });
+                    .or_insert_with(empty_sender_scan);
+                entry.scanned_uids.extend(uids.iter().copied());
+                entry.rows.extend(new_rows);
+                if let Some(meta) = mailbox_meta(&mb) {
+                    entry.meta = meta;
+                }
+                Ok(entry.rows.clone())
+            }
+            CacheDecision::MembershipRefresh => {
+                let mb = imap_client::select(session, mbox).await?;
+                let live: hashbrown::HashSet<u32> = imap_client::search_uids(session, "ALL")
+                    .await?
+                    .into_iter()
+                    .collect();
+                let scanned: hashbrown::HashSet<u32> = {
+                    let cache = self.scan_cache.lock();
+                    cache
+                        .sender
+                        .get(&key)
+                        .map(|c| c.scanned_uids.clone())
+                        .unwrap_or_default()
+                };
+                let missing = scan_cache::missing_uids(&scanned, &live);
+                let new_rows = if missing.is_empty() {
+                    Vec::new()
+                } else {
+                    imap_client::fetch_sender_dates_for_uids(
+                        session,
+                        &missing,
+                        on_progress,
+                        cancel,
+                    )
+                    .await?
+                };
+                // Commit prune + append only after fetch succeeds.
+                let mut cache = self.scan_cache.lock();
+                let entry = cache
+                    .sender
+                    .entry(key)
+                    .or_insert_with(empty_sender_scan);
+                entry.scanned_uids.retain(|u| live.contains(u));
+                entry.scanned_uids.extend(missing.iter().copied());
+                entry.rows.retain(|r| live.contains(&r.uid));
                 entry.rows.extend(new_rows);
                 if let Some(meta) = mailbox_meta(&mb) {
                     entry.meta = meta;
@@ -1754,6 +1808,7 @@ impl Agentmail {
                         scan_cache::CachedScan {
                             meta,
                             rows: rows.clone(),
+                            scanned_uids: uids.into_iter().collect(),
                         },
                     );
                 }
@@ -1774,7 +1829,8 @@ impl Agentmail {
     ) -> Result<Vec<imap_client::ListHeaderRow>> {
         use scan_cache::CacheDecision;
         let key = (account.to_string(), mbox.to_string());
-        let status = imap_client::mailbox_status(session, mbox).await?;
+        let with_modseq = self.status_wants_modseq(account, session).await;
+        let status = imap_client::mailbox_status(session, mbox, with_modseq).await?;
 
         let cached_meta = self.scan_cache.lock().list.get(&key).map(|c| c.meta);
 
@@ -1793,17 +1849,47 @@ impl Agentmail {
                     imap_client::fetch_list_headers_for_uids(session, &uids, on_progress, cancel)
                         .await?;
                 let mut cache = self.scan_cache.lock();
-                let entry = cache
-                    .list
-                    .entry(key)
-                    .or_insert_with(|| scan_cache::CachedScan {
-                        meta: scan_cache::CacheMeta {
-                            uid_validity: 0,
-                            uid_next: 0,
-                            exists: 0,
-                        },
-                        rows: Vec::new(),
-                    });
+                let entry = cache.list.entry(key).or_insert_with(empty_list_scan);
+                // Mark all examined UIDs scanned — including non-bulk that
+                // produced no list row — so MembershipRefresh stays cheap.
+                entry.scanned_uids.extend(uids.iter().copied());
+                entry.rows.extend(new_rows);
+                if let Some(meta) = mailbox_meta(&mb) {
+                    entry.meta = meta;
+                }
+                Ok(entry.rows.clone())
+            }
+            CacheDecision::MembershipRefresh => {
+                let mb = imap_client::select(session, mbox).await?;
+                let live: hashbrown::HashSet<u32> = imap_client::search_uids(session, "ALL")
+                    .await?
+                    .into_iter()
+                    .collect();
+                let scanned: hashbrown::HashSet<u32> = {
+                    let cache = self.scan_cache.lock();
+                    cache
+                        .list
+                        .get(&key)
+                        .map(|c| c.scanned_uids.clone())
+                        .unwrap_or_default()
+                };
+                let missing = scan_cache::missing_uids(&scanned, &live);
+                let new_rows = if missing.is_empty() {
+                    Vec::new()
+                } else {
+                    imap_client::fetch_list_headers_for_uids(
+                        session,
+                        &missing,
+                        on_progress,
+                        cancel,
+                    )
+                    .await?
+                };
+                let mut cache = self.scan_cache.lock();
+                let entry = cache.list.entry(key).or_insert_with(empty_list_scan);
+                entry.scanned_uids.retain(|u| live.contains(u));
+                entry.scanned_uids.extend(missing.iter().copied());
+                entry.rows.retain(|r| live.contains(&r.uid));
                 entry.rows.extend(new_rows);
                 if let Some(meta) = mailbox_meta(&mb) {
                     entry.meta = meta;
@@ -1822,6 +1908,7 @@ impl Agentmail {
                         scan_cache::CachedScan {
                             meta,
                             rows: rows.clone(),
+                            scanned_uids: uids.into_iter().collect(),
                         },
                     );
                 }
@@ -1831,13 +1918,31 @@ impl Agentmail {
     }
 }
 
+fn empty_sender_scan() -> scan_cache::CachedScan<scan_cache::SenderRow> {
+    scan_cache::CachedScan {
+        meta: scan_cache::CacheMeta::placeholder(),
+        rows: Vec::new(),
+        scanned_uids: hashbrown::HashSet::new(),
+    }
+}
+
+fn empty_list_scan() -> scan_cache::CachedScan<imap_client::ListHeaderRow> {
+    scan_cache::CachedScan {
+        meta: scan_cache::CacheMeta::placeholder(),
+        rows: Vec::new(),
+        scanned_uids: hashbrown::HashSet::new(),
+    }
+}
+
 /// Build cache metadata from a SELECT response, if the server supplied both
 /// UIDVALIDITY and UIDNEXT (without them the cache can't be validated later).
+/// Captures HIGHESTMODSEQ when CONDSTORE provided it.
 fn mailbox_meta(mb: &async_imap::types::Mailbox) -> Option<scan_cache::CacheMeta> {
     Some(scan_cache::CacheMeta {
         uid_validity: mb.uid_validity?,
         uid_next: mb.uid_next?,
         exists: mb.exists,
+        highest_modseq: mb.highest_modseq,
     })
 }
 

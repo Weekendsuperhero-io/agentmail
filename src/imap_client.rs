@@ -228,6 +228,12 @@ impl ServerCaps {
     pub fn is_gmail(&self) -> bool {
         self.has("X-GM-EXT-1")
     }
+
+    /// RFC 7162 CONDSTORE (HIGHESTMODSEQ / CHANGEDSINCE). Used by the rank-scan
+    /// cache for strong Hit detection when both sides report a matching modseq.
+    pub fn has_condstore(&self) -> bool {
+        self.has("CONDSTORE")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,17 +469,40 @@ pub async fn search_uids(session: &mut ImapSession, query: &str) -> Result<Vec<u
     run_uid_search(session, query).await
 }
 
-/// STATUS (UIDVALIDITY UIDNEXT MESSAGES) for a mailbox — cheap metadata used
-/// to validate the rank-scan cache without re-fetching headers.
+/// STATUS for a mailbox — cheap metadata used to validate the rank-scan cache
+/// without re-fetching headers.
+///
+/// When `with_highest_modseq` is true (server advertises CONDSTORE), also
+/// requests `HIGHESTMODSEQ`. Falls back without it if the server replies BAD.
 pub async fn mailbox_status(
     session: &mut ImapSession,
     mailbox: &str,
+    with_highest_modseq: bool,
 ) -> Result<crate::scan_cache::MailboxStatus> {
-    let status = imap_timeout(session.status(mailbox, "(UIDVALIDITY UIDNEXT MESSAGES)")).await?;
+    let items = if with_highest_modseq {
+        "(UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ)"
+    } else {
+        "(UIDVALIDITY UIDNEXT MESSAGES)"
+    };
+    let status = match imap_timeout(session.status(mailbox, items)).await {
+        Ok(s) => s,
+        Err(e) if with_highest_modseq => {
+            // Server advertised CONDSTORE but rejected HIGHESTMODSEQ on STATUS
+            // (or a proxy stripped it) — fall back to the base triple.
+            debug!(
+                mailbox,
+                error = %e,
+                "STATUS HIGHESTMODSEQ failed; retrying without modseq"
+            );
+            imap_timeout(session.status(mailbox, "(UIDVALIDITY UIDNEXT MESSAGES)")).await?
+        }
+        Err(e) => return Err(e),
+    };
     Ok(crate::scan_cache::MailboxStatus {
         uid_validity: status.uid_validity,
         uid_next: status.uid_next,
         exists: status.exists,
+        highest_modseq: status.highest_modseq,
     })
 }
 
@@ -506,10 +535,15 @@ pub async fn fetch_sender_dates_for_uids(
 
         for item in fetched {
             let fetch = item.map_err(AgentmailError::Imap)?;
+            let uid = match fetch.uid {
+                Some(u) => u,
+                None => continue,
+            };
             let header_bytes = fetch.header().unwrap_or(&[]);
             match parser::parse_sender_date(header_bytes) {
                 Ok((email, display_name, date, message_id)) => {
                     results.push(crate::scan_cache::SenderRow {
+                        uid,
                         email,
                         display_name,
                         date,
@@ -517,7 +551,7 @@ pub async fn fetch_sender_dates_for_uids(
                     });
                 }
                 Err(e) => {
-                    debug!(uid = ?fetch.uid, error = %e, "fetch_sender_dates: skipping unparseable message");
+                    debug!(uid, error = %e, "fetch_sender_dates: skipping unparseable message");
                 }
             }
         }
@@ -1578,14 +1612,16 @@ mod tests {
         assert!(caps.has_move());
         assert!(caps.is_gmail());
         assert!(!caps.has("CONDSTORE"));
+        assert!(!caps.has_condstore());
 
         // A non-Gmail server isn't flagged as Gmail.
         let dovecot = ServerCaps::from_strings(
-            ["IMAP4rev1", "UIDPLUS", "MOVE"]
+            ["IMAP4rev1", "UIDPLUS", "MOVE", "CONDSTORE"]
                 .into_iter()
                 .map(String::from),
         );
         assert!(!dovecot.is_gmail());
+        assert!(dovecot.has_condstore());
     }
 
     #[test]
