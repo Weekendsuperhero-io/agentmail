@@ -346,12 +346,14 @@ impl Agentmail {
     /// Group messages by sender address with counts and date ranges.
     /// Sorted by message count descending.
     ///
-    /// When `mailbox` is `None`, scans all mailboxes in the account.
+    /// When `mailbox` is `None`, scans scannable mailboxes in the account
+    /// (skips trash/drafts/sent/all/noselect; junk only if `include_junk`).
     pub async fn top_senders(
         &self,
         mailbox: Option<&str>,
         account: &str,
         limit: Option<usize>,
+        include_junk: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopSendersResponse> {
@@ -359,7 +361,7 @@ impl Agentmail {
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
-            None => list_scannable_mailbox_names(session.session()).await?,
+            None => list_scannable_mailbox_names(session.session(), include_junk).await?,
         };
 
         use hashbrown::{HashMap, HashSet};
@@ -447,12 +449,14 @@ impl Agentmail {
     /// Groups by exact sender (email + display name). The sample_uid and
     /// unsubscribe info come from the newest message in each group.
     ///
-    /// When `mailbox` is `None`, scans all mailboxes in the account.
+    /// When `mailbox` is `None`, scans scannable mailboxes in the account
+    /// (skips trash/drafts/sent/all/noselect; junk only if `include_junk`).
     pub async fn top_subscriptions(
         &self,
         mailbox: Option<&str>,
         account: &str,
         limit: Option<usize>,
+        include_junk: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopSubscriptionsResponse> {
@@ -460,7 +464,7 @@ impl Agentmail {
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
-            None => list_scannable_mailbox_names(session.session()).await?,
+            None => list_scannable_mailbox_names(session.session(), include_junk).await?,
         };
 
         use hashbrown::{HashMap, HashSet};
@@ -586,12 +590,14 @@ impl Agentmail {
     /// Group messages by List-Id header (RFC 2919).
     ///
     /// Groups all messages from the same mailing list regardless of sender.
-    /// When `mailbox` is `None`, scans all mailboxes (excluding trash/junk/drafts).
+    /// When `mailbox` is `None`, scans scannable mailboxes
+    /// (skips trash/drafts/sent/all/noselect; junk only if `include_junk`).
     pub async fn top_mailing_lists(
         &self,
         mailbox: Option<&str>,
         account: &str,
         limit: Option<usize>,
+        include_junk: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopMailingListsResponse> {
@@ -599,7 +605,7 @@ impl Agentmail {
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
-            None => list_scannable_mailbox_names(session.session()).await?,
+            None => list_scannable_mailbox_names(session.session(), include_junk).await?,
         };
 
         use hashbrown::{HashMap, HashSet};
@@ -721,6 +727,7 @@ impl Agentmail {
         account: &str,
         list_id: &str,
         mode: DeleteMode,
+        include_junk: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteListIdResponse> {
@@ -732,7 +739,7 @@ impl Agentmail {
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
-            None => list_scannable_mailbox_names(session.session()).await?,
+            None => list_scannable_mailbox_names(session.session(), include_junk).await?,
         };
 
         let mut total_found = 0usize;
@@ -829,12 +836,14 @@ impl Agentmail {
 
     /// List all flags actually in use across messages, with counts.
     ///
-    /// When `mailbox` is `None`, scans all mailboxes in the account.
+    /// When `mailbox` is `None`, scans scannable mailboxes in the account
+    /// (skips trash/drafts/sent/all/noselect; junk only if `include_junk`).
     /// Resolves Apple Mail `$MailFlagBit*` combinations to color names per-message.
     pub async fn list_flags(
         &self,
         mailbox: Option<&str>,
         account: &str,
+        include_junk: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<ListFlagsResponse> {
@@ -842,7 +851,7 @@ impl Agentmail {
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
-            None => list_scannable_mailbox_names(session.session()).await?,
+            None => list_scannable_mailbox_names(session.session(), include_junk).await?,
         };
 
         use hashbrown::HashMap;
@@ -1019,14 +1028,15 @@ impl Agentmail {
     /// Find messages with attachments via Content-Type header scan.
     /// Returns UIDs and total count; use get_messages_by_uid to fetch details.
     ///
-    /// When `mailbox` is `None`, scans all mailboxes in the account and
-    /// includes a per-mailbox breakdown in the output.
+    /// When `mailbox` is `None`, scans scannable mailboxes in the account and
+    /// includes a per-mailbox breakdown in the output (junk only if `include_junk`).
     pub async fn find_attachments(
         &self,
         mailbox: Option<&str>,
         account: &str,
         offset: usize,
         limit: usize,
+        include_junk: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<FindAttachmentsResponse> {
@@ -1034,7 +1044,7 @@ impl Agentmail {
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
-            None => list_scannable_mailbox_names(session.session()).await?,
+            None => list_scannable_mailbox_names(session.session(), include_junk).await?,
         };
 
         let mut all_uids: Vec<u32> = Vec::new();
@@ -1129,8 +1139,8 @@ impl Agentmail {
     /// Delete all messages from an exact sender identified by UID.
     ///
     /// `mailbox` is the mailbox containing the target `uid`.
-    /// When `all_mailboxes` is true, searches and deletes across every
-    /// mailbox in the account (not just the source mailbox).
+    /// When `all_mailboxes` is true, searches and deletes across scannable
+    /// mailboxes (junk only if `include_junk`).
     pub async fn delete_by_sender(
         &self,
         mailbox: &str,
@@ -1138,6 +1148,7 @@ impl Agentmail {
         uid: u32,
         all_mailboxes: bool,
         mode: DeleteMode,
+        include_junk: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteBySenderResponse> {
@@ -1158,7 +1169,7 @@ impl Agentmail {
         };
 
         let search_mailboxes = if all_mailboxes {
-            list_scannable_mailbox_names(session.session()).await?
+            list_scannable_mailbox_names(session.session(), include_junk).await?
         } else {
             vec![mailbox.to_string()]
         };
@@ -1466,6 +1477,7 @@ impl Agentmail {
         uid: u32,
         delete_matching: bool,
         mode: DeleteMode,
+        include_junk: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<UnsubscribeResponse> {
@@ -1518,9 +1530,10 @@ impl Agentmail {
                     format!("{} <{}>", target_name, target_email)
                 };
 
-                // Search every mailbox for messages from this sender that
+                // Search scannable mailboxes for messages from this sender that
                 // have a List-Unsubscribe header (bulk/marketing mail)
-                let all_mailboxes = list_scannable_mailbox_names(session.session()).await?;
+                let all_mailboxes =
+                    list_scannable_mailbox_names(session.session(), include_junk).await?;
 
                 let mut total_found = 0usize;
                 let mut total_deleted = 0usize;
@@ -2161,54 +2174,83 @@ fn resolve_drafts_from(entries: &[imap_client::MailboxEntry]) -> Option<String> 
         .map(|n| n.to_string())
 }
 
-/// List mailbox names suitable for scanning — excludes Trash, Junk, Spam, and Drafts.
-/// These mailboxes contain deleted/spam/incomplete messages that skew scan results.
+/// List mailbox names suitable for whole-account scans.
+///
+/// Always skips `\Noselect` folders and special-use roles: trash, drafts, sent,
+/// all (plus junk unless `include_junk`). Falls back to name heuristics when the
+/// server does not advertise RFC 6154 roles.
 async fn list_scannable_mailbox_names(
     session: &mut imap_client::ImapSession,
+    include_junk: bool,
 ) -> Result<Vec<String>> {
     let entries = imap_client::list_mailbox_entries(session).await?;
-
-    /// Roles that should be skipped during whole-account scans.
-    const SKIP_ROLES: &[&str] = &["trash", "junk", "drafts", "all"];
-
     Ok(entries
         .into_iter()
-        .filter(|entry| {
-            // Skip non-selectable mailboxes (\NoSelect).
-            if entry.no_select {
-                return false;
-            }
-
-            // Skip mailboxes with a skip-listed RFC 6154 role.
-            if let Some(ref role) = entry.role
-                && SKIP_ROLES.contains(&role.as_str())
-            {
-                return false;
-            }
-
-            // Fallback: string-based filtering for servers that don't send
-            // RFC 6154 special-use attributes.
-            if entry.role.is_none() && is_skippable_scan_name(&entry.name.to_lowercase()) {
-                return false;
-            }
-
-            true
-        })
+        .filter(|entry| is_scannable_mailbox(entry, include_junk))
         .map(|entry| entry.name)
         .collect())
 }
 
+/// Whether a LIST entry should be included in a whole-account scan.
+fn is_scannable_mailbox(entry: &imap_client::MailboxEntry, include_junk: bool) -> bool {
+    // Skip non-selectable mailboxes (\Noselect) — cannot hold messages.
+    if entry.no_select {
+        return false;
+    }
+
+    // Roles always skipped on whole-account scans (junk optional).
+    const SKIP_ROLES: &[&str] = &["trash", "drafts", "sent", "all"];
+    if let Some(ref role) = entry.role {
+        if SKIP_ROLES.contains(&role.as_str()) {
+            return false;
+        }
+        if role == "junk" && !include_junk {
+            return false;
+        }
+        // Known role and not skipped → include (don't also apply name heuristics).
+        return true;
+    }
+
+    // Fallback: string-based filtering for servers without SPECIAL-USE.
+    !is_skippable_scan_name(&entry.name.to_lowercase(), include_junk)
+}
+
 /// True for mailbox names that should be skipped during whole-account scans on
-/// servers that don't advertise RFC 6154 special-use attributes — Junk/Spam/
-/// Trash/Drafts plus Gmail-style "All Mail" (the union folder, which would
-/// otherwise double-count every message). `lower` must be lowercased.
-fn is_skippable_scan_name(lower: &str) -> bool {
-    lower.contains("junk")
-        || lower.contains("spam")
-        || lower.contains("trash")
+/// servers that don't advertise RFC 6154 special-use attributes.
+/// `lower` must be lowercased. When `include_junk` is true, junk/spam names are kept.
+fn is_skippable_scan_name(lower: &str, include_junk: bool) -> bool {
+    let is_junkish = lower.contains("junk") || lower.contains("spam");
+    if is_junkish {
+        if include_junk {
+            // Keep junk/spam folders unless the name is also another skip target.
+            return lower.contains("trash")
+                || lower.contains("deleted")
+                || lower.contains("draft")
+                || is_sent_name(lower)
+                || is_all_mail_name(lower);
+        }
+        return true;
+    }
+    lower.contains("trash")
         || lower.contains("deleted")
         || lower.contains("draft")
+        || is_sent_name(lower)
         || is_all_mail_name(lower)
+}
+
+/// Tight match for Sent / Sent Mail (avoid bare `contains("sent")`, which would
+/// match user folders like "Presentations"). `lower` must be lowercased.
+fn is_sent_name(lower: &str) -> bool {
+    lower == "sent"
+        || lower == "sent mail"
+        || lower == "sent messages"
+        || lower == "sent items"
+        || lower == "[gmail]/sent mail"
+        || lower.ends_with("/sent")
+        || lower.ends_with("/sent mail")
+        || lower.ends_with("/sent messages")
+        || lower.ends_with("/sent items")
+        || lower.ends_with(".sent")
 }
 
 /// Tight match for an "All Mail" union folder (Gmail and similar). Deliberately
@@ -2409,12 +2451,50 @@ mod tests {
             "[gmail]/trash",
             "drafts",
             "[gmail]/all mail",
+            "sent",
+            "sent mail",
+            "[gmail]/sent mail",
+            "inbox.sent",
         ] {
-            assert!(is_skippable_scan_name(skip), "should skip {skip:?}");
+            assert!(
+                is_skippable_scan_name(skip, false),
+                "should skip {skip:?}"
+            );
         }
-        for keep in ["inbox", "work", "receipts", "all hands"] {
-            assert!(!is_skippable_scan_name(keep), "should keep {keep:?}");
+        for keep in ["inbox", "work", "receipts", "all hands", "presentations"] {
+            assert!(
+                !is_skippable_scan_name(keep, false),
+                "should keep {keep:?}"
+            );
         }
+        // include_junk keeps spam/junk names scannable.
+        assert!(!is_skippable_scan_name("junk", true));
+        assert!(!is_skippable_scan_name("spam", true));
+        assert!(is_skippable_scan_name("trash", true));
+    }
+
+    #[test]
+    fn is_scannable_mailbox_respects_roles_and_include_junk() {
+        let inbox = entry("INBOX", None);
+        assert!(is_scannable_mailbox(&inbox, false));
+
+        let junk = entry("Spam", Some("junk"));
+        assert!(!is_scannable_mailbox(&junk, false));
+        assert!(is_scannable_mailbox(&junk, true));
+
+        let sent = entry("Sent", Some("sent"));
+        assert!(!is_scannable_mailbox(&sent, false));
+        assert!(!is_scannable_mailbox(&sent, true));
+
+        let trash = entry("Trash", Some("trash"));
+        assert!(!is_scannable_mailbox(&trash, false));
+
+        let noselect = imap_client::MailboxEntry {
+            name: "Containers".to_string(),
+            no_select: true,
+            role: None,
+        };
+        assert!(!is_scannable_mailbox(&noselect, false));
     }
 
     /// Fast test for the early validation error in create_draft.

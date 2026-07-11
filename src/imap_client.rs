@@ -293,13 +293,18 @@ pub async fn list_mailboxes(
         let no_inferiors = attrs.contains(&NameAttribute::NoInferiors);
         let role = role_from_attributes(attrs);
 
-        // NoSelect mailboxes can't be SELECTed — skip the STATUS call.
-        let (total, unseen, recent) = if no_select {
-            (0, 0, 0)
-        } else {
-            let status = imap_timeout(session.status(&name, status_items)).await?;
-            (status.exists, status.unseen.unwrap_or(0), status.recent)
-        };
+        // \Noselect mailboxes are not usable (can't SELECT / hold messages).
+        // Omit them from the public listing — STATUS would be pointless.
+        if no_select {
+            continue;
+        }
+
+        let status = imap_timeout(session.status(&name, status_items)).await?;
+        let (total, unseen, recent) = (
+            status.exists,
+            status.unseen.unwrap_or(0),
+            status.recent,
+        );
 
         result.push(MailboxInfo {
             name: name.clone(),
@@ -309,7 +314,7 @@ pub async fn list_mailboxes(
             recent_messages: recent,
             delimiter,
             path: name,
-            no_select,
+            no_select: false,
             no_inferiors,
             role,
         });

@@ -133,10 +133,15 @@ pub(super) struct SearchMessagesArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for listing flags in use.")]
 pub(super) struct ListFlagsArgs {
-    #[schemars(description = "Mailbox to scan. Omit to scan all mailboxes in the account.")]
+    #[schemars(description = "Mailbox to scan. Omit to scan all scannable mailboxes in the account.")]
     pub(super) mailbox: Option<String>,
     #[schemars(description = "Account name (required).")]
     pub(super) account: String,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true and mailbox is omitted, include Junk/Spam folders in the account-wide scan. Defaults to false."
+    )]
+    pub(super) include_junk: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -176,9 +181,14 @@ pub(super) struct DeleteBySenderArgs {
     pub(super) uid: u32,
     #[serde(default = "default_false")]
     #[schemars(
-        description = "When true, search and delete across ALL mailboxes in the account (not just the source mailbox). Defaults to false."
+        description = "When true, search and delete across ALL scannable mailboxes in the account (not just the source mailbox). Defaults to false."
     )]
     pub(super) all_mailboxes: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true and allMailboxes is set, include Junk/Spam folders. Defaults to false."
+    )]
+    pub(super) include_junk: bool,
     #[serde(default = "default_false")]
     #[schemars(
         description = "When true, permanently delete (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
@@ -190,7 +200,7 @@ pub(super) struct DeleteBySenderArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for finding messages with attachments.")]
 pub(super) struct FindAttachmentsArgs {
-    #[schemars(description = "Mailbox name. Omit to scan all mailboxes in the account.")]
+    #[schemars(description = "Mailbox name. Omit to scan all scannable mailboxes in the account.")]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
@@ -200,6 +210,11 @@ pub(super) struct FindAttachmentsArgs {
     pub(super) offset: Option<u64>,
     #[schemars(description = "Max UIDs to return. Defaults to 25, max 100.")]
     pub(super) limit: Option<u64>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true and mailbox is omitted, include Junk/Spam folders in the account-wide scan. Defaults to false."
+    )]
+    pub(super) include_junk: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -290,13 +305,20 @@ pub(super) struct UnsubscribeMessageArgs {
         description = "When true, permanently delete matching messages (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
     )]
     pub(super) permanent: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When deleteMatching is true, also search Junk/Spam folders. Defaults to false."
+    )]
+    pub(super) include_junk: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for listing top senders by message count.")]
 pub(super) struct TopSendersArgs {
-    #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
+    #[schemars(
+        description = "Mailbox name. When omitted, scans scannable mailboxes (skips Trash/Drafts/Sent/All Mail/Noselect; Junk only if includeJunk)."
+    )]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
@@ -306,6 +328,11 @@ pub(super) struct TopSendersArgs {
         description = "Maximum number of senders to return. Defaults to 100; set higher to return more."
     )]
     pub(super) limit: Option<u64>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true and mailbox is omitted, include Junk/Spam folders in the account-wide scan. Defaults to false. You can also pass a junk mailbox name in mailbox to scan only that folder."
+    )]
+    pub(super) include_junk: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -314,7 +341,9 @@ pub(super) struct TopSendersArgs {
     description = "Arguments for listing top subscriptions (bulk senders) by message count."
 )]
 pub(super) struct TopSubscriptionsArgs {
-    #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
+    #[schemars(
+        description = "Mailbox name. When omitted, scans scannable mailboxes (skips Trash/Drafts/Sent/All Mail/Noselect; Junk only if includeJunk)."
+    )]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
@@ -324,13 +353,20 @@ pub(super) struct TopSubscriptionsArgs {
         description = "Maximum number of lists to return. Defaults to 100; set higher to return more."
     )]
     pub(super) limit: Option<u64>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true and mailbox is omitted, include Junk/Spam folders in the account-wide scan. Defaults to false."
+    )]
+    pub(super) include_junk: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for listing top mailing lists by List-Id header.")]
 pub(super) struct TopMailingListsArgs {
-    #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
+    #[schemars(
+        description = "Mailbox name. When omitted, scans scannable mailboxes (skips Trash/Drafts/Sent/All Mail/Noselect; Junk only if includeJunk)."
+    )]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
@@ -340,6 +376,11 @@ pub(super) struct TopMailingListsArgs {
         description = "Maximum number of lists to return. Defaults to 100; set higher to return more."
     )]
     pub(super) limit: Option<u64>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true and mailbox is omitted, include Junk/Spam folders in the account-wide scan. Defaults to false."
+    )]
+    pub(super) include_junk: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
