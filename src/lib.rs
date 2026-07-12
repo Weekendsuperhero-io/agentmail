@@ -1743,10 +1743,7 @@ impl Agentmail {
                         .await?;
                 // Only commit after a successful fetch.
                 let mut cache = self.scan_cache.lock();
-                let entry = cache
-                    .sender
-                    .entry(key)
-                    .or_insert_with(empty_sender_scan);
+                let entry = cache.sender.entry(key).or_insert_with(empty_sender_scan);
                 entry.scanned_uids.extend(uids.iter().copied());
                 entry.rows.extend(new_rows);
                 if let Some(meta) = mailbox_meta(&mb) {
@@ -1772,20 +1769,12 @@ impl Agentmail {
                 let new_rows = if missing.is_empty() {
                     Vec::new()
                 } else {
-                    imap_client::fetch_sender_dates_for_uids(
-                        session,
-                        &missing,
-                        on_progress,
-                        cancel,
-                    )
-                    .await?
+                    imap_client::fetch_sender_dates_for_uids(session, &missing, on_progress, cancel)
+                        .await?
                 };
                 // Commit prune + append only after fetch succeeds.
                 let mut cache = self.scan_cache.lock();
-                let entry = cache
-                    .sender
-                    .entry(key)
-                    .or_insert_with(empty_sender_scan);
+                let entry = cache.sender.entry(key).or_insert_with(empty_sender_scan);
                 entry.scanned_uids.retain(|u| live.contains(u));
                 entry.scanned_uids.extend(missing.iter().copied());
                 entry.rows.retain(|r| live.contains(&r.uid));
@@ -1877,13 +1866,8 @@ impl Agentmail {
                 let new_rows = if missing.is_empty() {
                     Vec::new()
                 } else {
-                    imap_client::fetch_list_headers_for_uids(
-                        session,
-                        &missing,
-                        on_progress,
-                        cancel,
-                    )
-                    .await?
+                    imap_client::fetch_list_headers_for_uids(session, &missing, on_progress, cancel)
+                        .await?
                 };
                 let mut cache = self.scan_cache.lock();
                 let entry = cache.list.entry(key).or_insert_with(empty_list_scan);

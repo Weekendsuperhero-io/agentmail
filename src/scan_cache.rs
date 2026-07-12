@@ -85,8 +85,7 @@ impl CacheDecision {
         }
 
         // CONDSTORE strong hit: equal HIGHESTMODSEQ means no mailbox change.
-        if let (Some(cached_ms), Some(status_ms)) =
-            (cached.highest_modseq, status.highest_modseq)
+        if let (Some(cached_ms), Some(status_ms)) = (cached.highest_modseq, status.highest_modseq)
             && cached_ms == status_ms
         {
             return Self::Hit;
