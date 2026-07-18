@@ -43,6 +43,78 @@ fn idle_is_fresh(idle_for: Duration) -> bool {
     idle_for < MAX_IDLE
 }
 
+/// Drive one acquire→run→release cycle, retrying **once** with a freshly
+/// acquired handle when the operation fails with a connection-level error.
+/// Shared by [`ConnectionPool::with_session_retry`] and its unit tests so the
+/// control flow is testable without a real IMAP session:
+/// - `Ok` or a non-connection error on the first attempt → handle released,
+///   result returned (no retry).
+/// - Connection error on the first attempt → the dead handle is dropped (never
+///   released) and the op runs exactly once more on a fresh handle.
+/// - The second result is returned as-is; the second handle is released unless
+///   it also died with a connection error, in which case it is dropped too.
+///
+/// This is a macro rather than a generic `async fn`: a generic helper nests
+/// the caller's `AsyncFnMut` call-future inside another opaque future, which
+/// makes its `Send` obligation higher-ranked and unsolvable at the MCP tool
+/// boundaries ("implementation of `Send` is not general enough"). Expanding
+/// inline keeps every type concrete, exactly like handwritten code.
+///
+/// `$acquire` is a closure returning a `crate::Result<H>` future, `$session_of`
+/// projects `&mut H` to the value handed to `$op`, and `$release` consumes an
+/// `H`. Expands to a `crate::Result<T>` expression; errors are yielded, not
+/// `?`-propagated, so tests can observe them.
+macro_rules! retry_once {
+    ($acquire:expr, $session_of:expr, $op:expr, $release:expr $(,)?) => {{
+        #[allow(unused_mut)]
+        let mut acquire = $acquire;
+        #[allow(unused_mut)]
+        let mut session_of = $session_of;
+        #[allow(unused_mut)]
+        let mut op = $op;
+        #[allow(unused_mut)]
+        let mut release = $release;
+        match acquire().await {
+            Err(e) => Err(e),
+            Ok(mut handle) => {
+                // Bound as a `let` so the scrutinee's `&mut handle` borrow ends
+                // here — in `match op(...)` scrutinee position it would be
+                // extended to the end of the match, forbidding `drop(handle)`.
+                let first = op(session_of(&mut handle)).await;
+                match first {
+                    Err(e) if e.is_connection_error() => {
+                        drop(handle); // dead — don't hand it back to the pool
+                        tracing::warn!(
+                            target: "agentmail",
+                            retry = 1,
+                            "IMAP connection dropped mid-operation; retrying with a fresh connection",
+                        );
+                        match acquire().await {
+                            Err(e) => Err(e),
+                            Ok(mut fresh) => {
+                                let result = op(session_of(&mut fresh)).await;
+                                match &result {
+                                    // The retry died too — drop this handle as
+                                    // well rather than returning a dead session
+                                    // to the pool, where a later acquire would
+                                    // pay a dead-NOOP ping for it.
+                                    Err(e) if e.is_connection_error() => drop(fresh),
+                                    _ => release(fresh).await,
+                                }
+                                result
+                            }
+                        }
+                    }
+                    other => {
+                        release(handle).await;
+                        other
+                    }
+                }
+            }
+        }
+    }};
+}
+
 impl ConnectionPool {
     pub fn new(config: Config) -> Self {
         Self {
@@ -164,34 +236,23 @@ impl ConnectionPool {
 
     /// Run an IMAP operation against a pooled session, retrying it **once** with
     /// a fresh connection if it fails with a connection-level error (the socket
-    /// died mid-operation — after `acquire`'s liveness ping passed). The dead
-    /// session is dropped, not returned to the pool. Server rejections, parse
-    /// errors, etc. are returned as-is (no retry). This closes the
-    /// connection-died-*during*-an-op race that the idle-TTL eviction can't see.
+    /// died mid-operation — after `acquire`'s liveness ping passed). A dead
+    /// session — first or retry attempt — is dropped, never returned to the
+    /// pool. Server rejections, parse errors, etc. are returned as-is (no
+    /// retry). This closes the connection-died-*during*-an-op race that the
+    /// idle-TTL eviction can't see. Control flow lives in [`retry_once`], which
+    /// is unit-tested without real sessions.
     pub async fn with_session_retry<T>(
         &self,
         account: &str,
-        mut op: impl AsyncFnMut(&mut ImapSession) -> crate::Result<T>,
+        op: impl AsyncFnMut(&mut ImapSession) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        let mut session = self.acquire(account).await?;
-        match op(session.session()).await {
-            Err(e) if e.is_connection_error() => {
-                drop(session); // dead — don't hand it back to the pool
-                tracing::warn!(
-                    target: "agentmail",
-                    retry = 1,
-                    "IMAP connection dropped mid-operation; retrying with a fresh connection",
-                );
-                let mut fresh = self.acquire(account).await?;
-                let result = op(fresh.session()).await;
-                fresh.release().await;
-                result
-            }
-            other => {
-                session.release().await;
-                other
-            }
-        }
+        retry_once!(
+            || self.acquire(account),
+            PooledSession::session,
+            op,
+            PooledSession::release,
+        )
     }
 
     /// List all configured account names.
@@ -258,6 +319,8 @@ impl Drop for PooledSession {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     /// A just-released session is reusable; one idle past `MAX_IDLE` is evicted
@@ -279,6 +342,202 @@ mod tests {
         assert!(
             !idle_is_fresh(MAX_IDLE + Duration::from_secs(30 * 60)),
             "long-idle (likely server-dropped) session is evicted",
+        );
+    }
+
+    /// Handle whose release-vs-drop fate is observable: the flag flips only if
+    /// the release path ran; a plain drop leaves it false.
+    struct TestHandle {
+        released: Arc<AtomicBool>,
+    }
+
+    /// Stand-in for `PooledSession::session`: the test handle is its own
+    /// "session".
+    fn test_session(handle: &mut TestHandle) -> &mut TestHandle {
+        handle
+    }
+
+    /// Forces a test op closure to be inferred higher-ranked over the session
+    /// borrow — the same shape `with_session_retry`'s declared bound gives real
+    /// ops. Without this, the closure gets one specific region shared by both
+    /// attempts and borrowck rejects dropping the first handle.
+    fn hr_op<T, F>(op: F) -> F
+    where
+        F: AsyncFnMut(&mut TestHandle) -> crate::Result<T>,
+    {
+        op
+    }
+
+    fn release_flags(n: usize) -> Vec<Arc<AtomicBool>> {
+        (0..n).map(|_| Arc::new(AtomicBool::new(false))).collect()
+    }
+
+    fn dead_socket() -> AgentmailError {
+        AgentmailError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "socket died",
+        ))
+    }
+
+    /// A connection-dropped first attempt is retried exactly once on a fresh
+    /// handle; the dead handle is dropped while the fresh one is released.
+    #[tokio::test]
+    async fn retry_once_retries_connection_error_on_fresh_handle() {
+        let flags = release_flags(2);
+        let mut acquired = 0;
+        let mut calls = 0;
+
+        let result = retry_once!(
+            async || {
+                acquired += 1;
+                Ok(TestHandle {
+                    released: Arc::clone(&flags[acquired - 1]),
+                })
+            },
+            test_session,
+            hr_op(async |_session| {
+                calls += 1;
+                if calls == 1 {
+                    Err(dead_socket())
+                } else {
+                    Ok(42)
+                }
+            }),
+            async |handle: TestHandle| handle.released.store(true, Ordering::SeqCst),
+        );
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls, 2, "op runs once per attempt, exactly twice");
+        assert!(
+            !flags[0].load(Ordering::SeqCst),
+            "dead first handle is dropped, not returned to the pool"
+        );
+        assert!(
+            flags[1].load(Ordering::SeqCst),
+            "healthy second handle is released back to the pool"
+        );
+    }
+
+    /// Server rejections, parse failures, etc. are not retried; the session is
+    /// healthy, so it goes back to the pool.
+    #[tokio::test]
+    async fn retry_once_returns_non_connection_error_without_retry() {
+        let flags = release_flags(1);
+        let mut calls = 0;
+
+        let result: crate::Result<()> = retry_once!(
+            async || {
+                Ok(TestHandle {
+                    released: Arc::clone(&flags[0]),
+                })
+            },
+            test_session,
+            hr_op(async |_session| {
+                calls += 1;
+                Err(AgentmailError::Parse("malformed".to_string()))
+            }),
+            async |handle: TestHandle| handle.released.store(true, Ordering::SeqCst),
+        );
+
+        assert!(matches!(result, Err(AgentmailError::Parse(_))));
+        assert_eq!(calls, 1, "non-connection errors abort without a retry");
+        assert!(
+            flags[0].load(Ordering::SeqCst),
+            "healthy session is released back to the pool"
+        );
+    }
+
+    /// The success path releases the session for reuse.
+    #[tokio::test]
+    async fn retry_once_releases_handle_after_success() {
+        let flags = release_flags(1);
+        let mut calls = 0;
+
+        let result = retry_once!(
+            async || {
+                Ok(TestHandle {
+                    released: Arc::clone(&flags[0]),
+                })
+            },
+            test_session,
+            hr_op(async |_session| {
+                calls += 1;
+                Ok("done")
+            }),
+            async |handle: TestHandle| handle.released.store(true, Ordering::SeqCst),
+        );
+
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(calls, 1);
+        assert!(
+            flags[0].load(Ordering::SeqCst),
+            "session is released after a successful op"
+        );
+    }
+
+    /// If the retry also dies with a connection error, that session is dropped
+    /// too — a dead session must never re-enter the pool, where a later
+    /// `acquire` would pay a dead-NOOP ping for it.
+    #[tokio::test]
+    async fn retry_once_drops_second_dead_handle_instead_of_releasing() {
+        let flags = release_flags(2);
+        let mut acquired = 0;
+        let mut calls = 0;
+
+        let result: crate::Result<()> = retry_once!(
+            async || {
+                acquired += 1;
+                Ok(TestHandle {
+                    released: Arc::clone(&flags[acquired - 1]),
+                })
+            },
+            test_session,
+            hr_op(async |_session| {
+                calls += 1;
+                Err(dead_socket())
+            }),
+            async |handle: TestHandle| handle.released.store(true, Ordering::SeqCst),
+        );
+
+        assert!(matches!(&result, Err(e) if e.is_connection_error()));
+        assert_eq!(calls, 2, "exactly one retry — never a third attempt");
+        assert!(
+            !flags[0].load(Ordering::SeqCst) && !flags[1].load(Ordering::SeqCst),
+            "both dead handles are dropped, not returned to the pool"
+        );
+    }
+
+    /// A failure to reconnect for the retry propagates as-is.
+    #[tokio::test]
+    async fn retry_once_propagates_reacquire_failure() {
+        let flags = release_flags(1);
+        let mut acquired = 0;
+        let mut calls = 0;
+
+        let result: crate::Result<()> = retry_once!(
+            async || {
+                acquired += 1;
+                if acquired == 1 {
+                    Ok(TestHandle {
+                        released: Arc::clone(&flags[0]),
+                    })
+                } else {
+                    Err(AgentmailError::AccountNotFound("gone".to_string()))
+                }
+            },
+            test_session,
+            hr_op(async |_session| {
+                calls += 1;
+                Err(dead_socket())
+            }),
+            async |handle: TestHandle| handle.released.store(true, Ordering::SeqCst),
+        );
+
+        assert!(matches!(result, Err(AgentmailError::AccountNotFound(_))));
+        assert_eq!(calls, 1, "op does not run again without a fresh session");
+        assert!(
+            !flags[0].load(Ordering::SeqCst),
+            "the dead first handle is dropped"
         );
     }
 }

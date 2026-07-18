@@ -182,7 +182,7 @@ impl ServerHandler for AgentMailServer {
              Start with list_accounts to discover configured accounts. \
              list_mailboxes requires one account and returns selectable mailboxes only, paginated with a default of 100. \
              get_messages and search_messages return metadata only, newest-first, with the mailbox UIDVALIDITY and a UIDVALIDITY-safe resourceUri for each row. \
-             Read resourceUri for markdown content; append /headers for exact headers or /source for bounded raw RFC822. \
+             Read resourceUri for markdown content; append /headers for exact headers, /source for bounded raw RFC822, /info for JSON metadata with the attachment inventory, or /attachments/{index} for one attachment blob. \
              Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
              top_senders, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
              Ranked tools use live offset pages with a default of 10 and maximum of 100; pages may shift when mail changes. \
@@ -197,7 +197,8 @@ impl ServerHandler for AgentMailServer {
              unsubscribe_message requires explicit confirmOneClick=true. deleteMatching defaults false, requires the exact normalized List-Id to be covered by the same passing DKIM signature, stops after a failed POST by default, and never silently escalates a Trash failure to permanent deletion. \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
              find_attachments returns mailbox-safe {mailbox, uidValidity, uid, date, resourceUri} hits; pass that identity to download_attachments. \
-             Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), email://{account}/{mailbox}/{uidValidity}/{uid}/headers (exact headers), and email://{account}/{mailbox}/{uidValidity}/{uid}/source (bounded raw RFC822). Percent-encode account and mailbox, including '/' in mailbox names as %2F. \
+             Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), plus /headers (exact headers), /source (bounded raw RFC822), /info (JSON metadata: subject, sender, date, flags, size, attachment inventory), and /attachments/{index} (one attachment as a blob with its own content type, 4 MiB limit). Percent-encode account and mailbox, including '/' in mailbox names as %2F. \
+             Read /info first to discover attachment indices; each attachment carries the canonical filename {uid}_{index}_{name} — the same name download_attachments writes to disk. \
              All reads use BODY.PEEK to avoid marking messages as read.",
         )
     }

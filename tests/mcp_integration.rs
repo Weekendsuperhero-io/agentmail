@@ -528,13 +528,13 @@ async fn discovery_outputs_have_safe_complete_message_identities() {
 }
 
 #[tokio::test]
-async fn resources_templates_list_three_uidvalidity_safe_templates() {
+async fn resources_templates_list_five_uidvalidity_safe_templates() {
     let mut client = McpClient::start().await;
     let resp = client.request("resources/templates/list", json!({})).await;
     let templates = resp["result"]["resourceTemplates"]
         .as_array()
         .expect("resourceTemplates array");
-    assert_eq!(templates.len(), 3, "template count drifted: {templates:#?}");
+    assert_eq!(templates.len(), 5, "template count drifted: {templates:#?}");
 
     let body = &templates[0];
     assert_eq!(
@@ -556,6 +556,37 @@ async fn resources_templates_list_three_uidvalidity_safe_templates() {
         Some("email://{account}/{mailbox}/{uidValidity}/{uid}/source")
     );
     assert_eq!(source["mimeType"].as_str(), Some("message/rfc822"));
+
+    let info = &templates[3];
+    assert_eq!(
+        info["uriTemplate"].as_str(),
+        Some("email://{account}/{mailbox}/{uidValidity}/{uid}/info")
+    );
+    assert_eq!(info["mimeType"].as_str(), Some("application/json"));
+    assert!(
+        info["description"]
+            .as_str()
+            .expect("info description")
+            .contains("attachment inventory"),
+        "info template should advertise the attachment inventory"
+    );
+
+    let attachment = &templates[4];
+    assert_eq!(
+        attachment["uriTemplate"].as_str(),
+        Some("email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}")
+    );
+    assert!(
+        attachment["mimeType"].is_null(),
+        "attachment mime type varies per part and must not be pinned"
+    );
+    assert!(
+        attachment["description"]
+            .as_str()
+            .expect("attachment description")
+            .contains("download_attachments"),
+        "attachment template should point large files at download_attachments"
+    );
 }
 
 #[tokio::test]

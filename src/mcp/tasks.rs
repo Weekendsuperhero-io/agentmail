@@ -428,6 +428,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use rmcp::model::Content;
+    use tokio::sync::oneshot;
 
     use super::*;
 
@@ -620,5 +621,185 @@ mod tests {
             .expect_err("tampered cursor should be rejected");
 
         assert!(error.message.contains("invalid task cursor"));
+    }
+
+    #[test]
+    fn destructive_lock_should_return_same_mutex_per_account() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+
+        let work_first = manager.destructive_lock("work");
+        let work_second = manager.destructive_lock("work");
+        let personal = manager.destructive_lock("personal");
+
+        assert!(
+            Arc::ptr_eq(&work_first, &work_second) && !Arc::ptr_eq(&work_first, &personal),
+            "same account shares one serialization lock; different accounts get distinct locks"
+        );
+    }
+
+    /// Two destructive tasks on the same account run strictly one after the
+    /// other. Mirrors `enqueue_task`'s wiring: each spawned worker holds the
+    /// account's destructive lock across its tool call and is registered via
+    /// `reserve_task`/`commit_task`.
+    #[tokio::test]
+    async fn destructive_tasks_should_serialize_on_same_account() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+        let lock = manager.destructive_lock("work");
+        let events: Arc<parking_lot::Mutex<Vec<&'static str>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let (done_tx, mut done_rx) = oneshot::channel();
+
+        manager
+            .reserve_task("first".to_string())
+            .expect("task reservation should succeed");
+        let first_slot = Arc::new(parking_lot::Mutex::new(None));
+        let slot = Arc::clone(&first_slot);
+        let worker_lock = Arc::clone(&lock);
+        let worker_events = Arc::clone(&events);
+        let first_handle = tokio::spawn(async move {
+            let _guard = worker_lock.lock().await;
+            worker_events.lock().push("first:acquired");
+            started_tx
+                .send(())
+                .expect("test should await the start signal");
+            finish_rx.await.expect("test should signal completion");
+            worker_events.lock().push("first:releasing");
+            *slot.lock() = Some(Ok(CallToolResult::success(vec![Content::text("first")])));
+        });
+        manager
+            .commit_task("first", first_slot, CancellationToken::new(), first_handle)
+            .expect("task commit should succeed");
+
+        started_rx
+            .await
+            .expect("first worker should acquire the lock");
+        // The first worker provably holds the lock; only now enqueue the
+        // second so the acquisition order is fixed.
+        manager
+            .reserve_task("second".to_string())
+            .expect("task reservation should succeed");
+        let second_slot = Arc::new(parking_lot::Mutex::new(None));
+        let slot = Arc::clone(&second_slot);
+        let worker_lock = Arc::clone(&lock);
+        let worker_events = Arc::clone(&events);
+        let second_handle = tokio::spawn(async move {
+            let _guard = worker_lock.lock().await;
+            worker_events.lock().push("second:acquired");
+            *slot.lock() = Some(Ok(CallToolResult::success(vec![Content::text("second")])));
+            done_tx.send(()).expect("test should await the done signal");
+        });
+        manager
+            .commit_task(
+                "second",
+                second_slot,
+                CancellationToken::new(),
+                second_handle,
+            )
+            .expect("task commit should succeed");
+
+        // Give the second worker every chance to (incorrectly) run: on the
+        // current-thread test runtime each yield lets every ready task reach
+        // its next await point.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lock.try_lock().is_err(),
+            "account lock should still be held by the first worker"
+        );
+        assert!(
+            matches!(done_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "second destructive task must not run while the first holds the lock"
+        );
+
+        finish_tx
+            .send(())
+            .expect("first worker should be waiting for the finish signal");
+        done_rx
+            .await
+            .expect("second worker should acquire after the first releases");
+
+        (&mut manager
+            .tasks
+            .get_mut("first")
+            .expect("first task should be tracked")
+            .handle)
+            .await
+            .expect("first worker should not panic");
+        (&mut manager
+            .tasks
+            .get_mut("second")
+            .expect("second task should be tracked")
+            .handle)
+            .await
+            .expect("second worker should not panic");
+
+        assert_eq!(
+            events.lock().clone(),
+            vec!["first:acquired", "first:releasing", "second:acquired"],
+            "second destructive task starts only after the first releases the account lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn destructive_lock_should_not_block_other_accounts() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+        let work = manager.destructive_lock("work");
+        let personal = manager.destructive_lock("personal");
+
+        let _work_guard = work.lock().await;
+
+        assert!(
+            personal.try_lock().is_ok(),
+            "holding one account's destructive lock must not block another account"
+        );
+    }
+
+    #[test]
+    fn prune_expired_should_drop_destructive_locks_once_unused() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+
+        // The local clone stands in for a worker's clone: retention depends
+        // only on the Arc's strong count.
+        let lock = manager.destructive_lock("work");
+        manager.prune_expired();
+        assert!(
+            manager.destructive_locks.contains_key("work"),
+            "an outstanding clone keeps the account lock registered"
+        );
+
+        drop(lock);
+        manager.prune_expired();
+        assert!(
+            !manager.destructive_locks.contains_key("work"),
+            "unused destructive locks are pruned"
+        );
+    }
+
+    #[test]
+    fn extract_account_should_read_string_account_argument() {
+        let mut args = serde_json::Map::new();
+        args.insert("account".to_string(), serde_json::json!("work"));
+
+        assert_eq!(extract_account(&Some(args)).as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn extract_account_should_reject_missing_or_non_string_account() {
+        let mut non_string = serde_json::Map::new();
+        non_string.insert("account".to_string(), serde_json::json!(7));
+
+        assert!(
+            extract_account(&None).is_none()
+                && extract_account(&Some(serde_json::Map::new())).is_none()
+                && extract_account(&Some(non_string)).is_none(),
+            "account extraction should require a string account value"
+        );
     }
 }

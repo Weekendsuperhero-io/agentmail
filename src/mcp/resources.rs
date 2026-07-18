@@ -1,10 +1,18 @@
 //! MCP resources: addressable single-message reads via `email://` URIs.
 //!
-//! Three URI templates are exposed. Every URI carries the complete IMAP
+//! Five URI templates are exposed. Every URI carries the complete IMAP
 //! message identity so a delayed read cannot silently use a recycled UID:
 //! - `email://{account}/{mailbox}/{uidValidity}/{uid}` — markdown body
 //! - `email://{account}/{mailbox}/{uidValidity}/{uid}/headers` — exact headers
 //! - `email://{account}/{mailbox}/{uidValidity}/{uid}/source` — raw RFC822
+//! - `email://{account}/{mailbox}/{uidValidity}/{uid}/info` — JSON metadata
+//!   (subject, sender, date, flags, attachment inventory, sibling URIs)
+//! - `email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}` —
+//!   one MIME attachment as a blob, addressed by zero-based part index
+//!
+//! Attachment parts follow one naming nomenclature everywhere: the canonical
+//! filename is `{uid}_{index}_{sanitized-original-name}` ("unnamed" when the
+//! part has no name), identical to what `download_attachments` writes to disk.
 //!
 //! Account and mailbox are percent-encoded URI segments; a `/` inside a
 //! mailbox name (hierarchy delimiter) must be encoded as `%2F` so it cannot
@@ -24,10 +32,14 @@ pub(super) const EMAIL_HEADERS_TEMPLATE: &str =
     "email://{account}/{mailbox}/{uidValidity}/{uid}/headers";
 pub(super) const EMAIL_SOURCE_TEMPLATE: &str =
     "email://{account}/{mailbox}/{uidValidity}/{uid}/source";
+pub(super) const EMAIL_INFO_TEMPLATE: &str = "email://{account}/{mailbox}/{uidValidity}/{uid}/info";
+pub(super) const EMAIL_ATTACHMENT_TEMPLATE: &str =
+    "email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}";
 
 const MAX_BODY_CHARS: usize = 100_000;
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
+const MAX_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRANSIENT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Characters percent-encoded inside a single URI segment. `/` is the
@@ -69,6 +81,9 @@ pub(super) enum EmailResourceKind {
     Body,
     Headers,
     Source,
+    Info,
+    /// One MIME attachment part, addressed by zero-based index.
+    Attachment(usize),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -109,6 +124,11 @@ fn format_email_uri_for_kind(
         EmailResourceKind::Body => {}
         EmailResourceKind::Headers => uri.push_str("/headers"),
         EmailResourceKind::Source => uri.push_str("/source"),
+        EmailResourceKind::Info => uri.push_str("/info"),
+        EmailResourceKind::Attachment(index) => {
+            uri.push_str("/attachments/");
+            uri.push_str(&index.to_string());
+        }
     }
     uri
 }
@@ -124,9 +144,16 @@ pub(super) fn parse_email_uri(uri: &str) -> Result<EmailResourceUri, String> {
         [a, m, v, u] => (a, m, v, u, EmailResourceKind::Body),
         [a, m, v, u, "headers"] => (a, m, v, u, EmailResourceKind::Headers),
         [a, m, v, u, "source"] => (a, m, v, u, EmailResourceKind::Source),
+        [a, m, v, u, "info"] => (a, m, v, u, EmailResourceKind::Info),
+        [a, m, v, u, "attachments", index] => {
+            let index: usize = index.parse().map_err(|_| {
+                format!("invalid attachment index segment (expected unsigned integer) in {uri}")
+            })?;
+            (a, m, v, u, EmailResourceKind::Attachment(index))
+        }
         _ => {
             return Err(format!(
-                "expected email://{{account}}/{{mailbox}}/{{uidValidity}}/{{uid}}[/headers|/source], got: {uri}"
+                "expected email://{{account}}/{{mailbox}}/{{uidValidity}}/{{uid}}[/headers|/source|/info|/attachments/{{index}}], got: {uri}"
             ));
         }
     };
@@ -185,6 +212,28 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
             )
             .with_mime_type("message/rfc822")
             .no_annotation(),
+        RawResourceTemplate::new(EMAIL_INFO_TEMPLATE, "email-message-info")
+            .with_title("Email message info (JSON metadata)")
+            .with_description(
+                "Compact JSON metadata for a live message: subject, sender, \
+                 recipients, date, flags, size, and the attachment inventory — \
+                 each attachment's index, original name, canonical filename \
+                 ({uid}_{index}_{name}), content type, size, and its \
+                 /attachments/{index} resource URI — plus sibling body, headers, \
+                 and source resource URIs. Read this before fetching attachments.",
+            )
+            .with_mime_type("application/json")
+            .no_annotation(),
+        RawResourceTemplate::new(EMAIL_ATTACHMENT_TEMPLATE, "email-message-attachment")
+            .with_title("Email attachment (binary)")
+            .with_description(
+                "One MIME attachment of a live message, addressed by zero-based \
+                 part index and returned as a base64 blob with the part's own \
+                 content type. Discover indices, names, and sizes via the /info \
+                 resource. Attachments above 4 MiB are refused — use the \
+                 download_attachments tool to save large files to disk.",
+            )
+            .no_annotation(),
     ]
 }
 
@@ -227,6 +276,88 @@ fn render_message_markdown(msg: &crate::MessageInfo) -> String {
         out.push_str("\n\n*(body truncated)*");
     }
     cap_chars(&out, MAX_BODY_CHARS)
+}
+
+/// Canonical exposed filename for an attachment part — the same nomenclature
+/// `download_attachments` uses on disk: `{uid}_{index}_{sanitized-name}`.
+fn attachment_filename(uid: u32, index: usize, name: Option<&str>) -> String {
+    format!(
+        "{uid}_{index}_{}",
+        crate::sanitize_filename(name.unwrap_or("unnamed"))
+    )
+}
+
+/// Drop `null` members recursively so the info document stays compact,
+/// matching the wire policy of omitting absent optional fields.
+fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(members) => serde_json::Value::Object(
+            members
+                .into_iter()
+                .filter(|(_, member)| !member.is_null())
+                .map(|(key, member)| (key, strip_nulls(member)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(strip_nulls).collect())
+        }
+        other => other,
+    }
+}
+
+/// Render the JSON info document for a message: identity, headline metadata,
+/// the attachment inventory (with canonical filenames and resource URIs), and
+/// sibling resource URIs.
+fn render_message_info(parsed: &EmailResourceUri, msg: &crate::MessageInfo) -> String {
+    let uri_for = |kind| {
+        format_email_uri_for_kind(
+            &parsed.account,
+            &parsed.mailbox,
+            parsed.uid_validity,
+            parsed.uid,
+            kind,
+        )
+    };
+    let attachments: Vec<serde_json::Value> = msg
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            serde_json::json!({
+                "index": index,
+                "name": attachment.name,
+                "filename": attachment_filename(parsed.uid, index, attachment.name.as_deref()),
+                "contentType": attachment.content_type,
+                "size": attachment.size,
+                "contentId": attachment.content_id,
+                "resourceUri": uri_for(EmailResourceKind::Attachment(index)),
+            })
+        })
+        .collect();
+    let info = serde_json::json!({
+        "account": parsed.account,
+        "mailbox": parsed.mailbox,
+        "uidValidity": parsed.uid_validity,
+        "uid": parsed.uid,
+        "subject": msg.subject,
+        "from": msg.sender,
+        "to": msg.to,
+        "cc": msg.cc,
+        "date": msg.date.as_ref().map(|date| date.to_rfc3339()),
+        "flags": msg.flags,
+        "size": msg.size,
+        "messageId": msg.message_id,
+        "listId": msg.list_id,
+        "mimeType": msg.mime_type,
+        "attachmentCount": msg.attachments.len(),
+        "attachments": attachments,
+        "resources": {
+            "body": uri_for(EmailResourceKind::Body),
+            "headers": uri_for(EmailResourceKind::Headers),
+            "source": uri_for(EmailResourceKind::Source),
+        },
+    });
+    serde_json::to_string_pretty(&strip_nulls(info)).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn cap_chars(value: &str, max_chars: usize) -> String {
@@ -396,6 +527,63 @@ impl AgentMailServer {
                     &source, uri,
                 )]))
             }
+            EmailResourceKind::Info => {
+                let response = self
+                    .agentmail
+                    .get_messages_by_uid(
+                        &parsed.mailbox,
+                        &parsed.account,
+                        &[parsed.uid],
+                        parsed.uid_validity,
+                        true,
+                        false,
+                    )
+                    .await
+                    .map_err(|error| map_resource_error(&parsed, &error))?;
+                let Some(message) = response.messages.into_iter().next() else {
+                    return Err(resource_not_found(&parsed, "the UID no longer exists"));
+                };
+                // No oversize guard: the rendered info document is bounded by
+                // the attachment inventory, not the message body size.
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(render_message_info(&parsed, &message), uri)
+                        .with_mime_type("application/json"),
+                ]))
+            }
+            EmailResourceKind::Attachment(index) => {
+                let attachments = self
+                    .agentmail
+                    .get_attachment_data(
+                        &parsed.mailbox,
+                        &parsed.account,
+                        parsed.uid,
+                        parsed.uid_validity,
+                    )
+                    .await
+                    .map_err(|error| map_resource_error(&parsed, &error))?;
+                let count = attachments.len();
+                let Some((name, content_type, bytes)) = attachments.into_iter().nth(index) else {
+                    return Err(resource_not_found(
+                        &parsed,
+                        &format!(
+                            "no attachment at index {index}; the message has {count} attachment parts (see the /info resource)"
+                        ),
+                    ));
+                };
+                if bytes.len() > MAX_ATTACHMENT_BYTES {
+                    return Err(oversize_error(
+                        &parsed,
+                        &format!("attachment {index} ('{name}')"),
+                        bytes.len(),
+                        MAX_ATTACHMENT_BYTES,
+                        "use the download_attachments tool to save it to disk instead",
+                    ));
+                }
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::blob(STANDARD.encode(&bytes), uri)
+                        .with_mime_type(content_type),
+                ]))
+            }
         }
     }
 }
@@ -416,7 +604,11 @@ impl AgentMailServer {
     ) -> Result<CompleteResult, McpError> {
         let is_prompt = request.r#ref.as_prompt_name().is_some();
         let is_email_template = request.r#ref.as_resource_uri().is_some_and(|u| {
-            u == EMAIL_BODY_TEMPLATE || u == EMAIL_HEADERS_TEMPLATE || u == EMAIL_SOURCE_TEMPLATE
+            u == EMAIL_BODY_TEMPLATE
+                || u == EMAIL_HEADERS_TEMPLATE
+                || u == EMAIL_SOURCE_TEMPLATE
+                || u == EMAIL_INFO_TEMPLATE
+                || u == EMAIL_ATTACHMENT_TEMPLATE
         });
 
         let values = if is_prompt || is_email_template {
@@ -599,10 +791,115 @@ mod tests {
             "email://acct//1/1",               // empty mailbox
             "email://acct/INBOX/0/1",          // zero UIDVALIDITY
             "email://acct/INBOX/1/0",          // zero UID
+            "email://acct/INBOX/1/2/info/extra",
+            "email://acct/INBOX/1/2/attachments", // missing index
+            "email://acct/INBOX/1/2/attachments/", // empty index
+            "email://acct/INBOX/1/2/attachments/x",
+            "email://acct/INBOX/1/2/attachments/-1",
+            "email://acct/INBOX/1/2/attachments/1/extra",
         ];
         for uri in bad {
             assert!(parse_email_uri(uri).is_err(), "should reject: {uri}");
         }
+    }
+
+    #[test]
+    fn info_and_attachment_uris_round_trip() {
+        let info_uri = format_email_uri_for_kind(
+            "work acct",
+            "Archive/2024",
+            9001,
+            42,
+            EmailResourceKind::Info,
+        );
+        assert_eq!(info_uri, "email://work%20acct/Archive%2F2024/9001/42/info");
+        assert_eq!(
+            parse_email_uri(&info_uri).unwrap().kind,
+            EmailResourceKind::Info
+        );
+
+        let attachment_uri = format_email_uri_for_kind(
+            "work acct",
+            "Archive/2024",
+            9001,
+            42,
+            EmailResourceKind::Attachment(3),
+        );
+        assert_eq!(
+            attachment_uri,
+            "email://work%20acct/Archive%2F2024/9001/42/attachments/3"
+        );
+        assert_eq!(
+            parse_email_uri(&attachment_uri).unwrap().kind,
+            EmailResourceKind::Attachment(3)
+        );
+    }
+
+    #[test]
+    fn attachment_filenames_follow_download_nomenclature() {
+        assert_eq!(
+            attachment_filename(42, 0, Some("Q3 report.pdf")),
+            "42_0_Q3 report.pdf"
+        );
+        assert_eq!(
+            attachment_filename(42, 1, Some("../evil/../../path.bin")),
+            "42_1_.._evil_.._.._path.bin",
+            "path separators are sanitized like download_attachments does"
+        );
+        assert_eq!(attachment_filename(42, 2, None), "42_2_unnamed");
+    }
+
+    fn message_with_attachments() -> crate::MessageInfo {
+        serde_json::from_value(serde_json::json!({
+            "uid": 42,
+            "subject": "Quarterly report",
+            "sender": "Alice <alice@example.com>",
+            "replyTo": "",
+            "to": ["me@example.com"],
+            "cc": [],
+            "mailbox": "INBOX",
+            "account": "work",
+            "flags": ["\\Seen"],
+            "size": 2048,
+            "attachments": [
+                {"name": "Q3 report.pdf", "contentType": "application/pdf", "size": 1024},
+                {"contentType": "image/png", "size": 10, "contentId": "cid:logo"},
+            ],
+        }))
+        .expect("valid MessageInfo fixture")
+    }
+
+    #[test]
+    fn info_document_lists_attachment_inventory_with_canonical_names() {
+        let parsed = EmailResourceUri {
+            account: "work".to_string(),
+            mailbox: "INBOX".to_string(),
+            uid_validity: 9001,
+            uid: 42,
+            kind: EmailResourceKind::Info,
+        };
+
+        let rendered = render_message_info(&parsed, &message_with_attachments());
+        let info: serde_json::Value =
+            serde_json::from_str(&rendered).expect("info document is valid JSON");
+
+        assert_eq!(info["subject"], "Quarterly report");
+        assert_eq!(info["attachmentCount"], 2);
+        assert_eq!(info["attachments"][0]["filename"], "42_0_Q3 report.pdf");
+        assert_eq!(info["attachments"][0]["contentType"], "application/pdf");
+        assert_eq!(
+            info["attachments"][1]["resourceUri"],
+            "email://work/INBOX/9001/42/attachments/1"
+        );
+        assert_eq!(info["attachments"][1]["filename"], "42_1_unnamed");
+        assert_eq!(
+            info["resources"]["headers"],
+            "email://work/INBOX/9001/42/headers"
+        );
+        assert!(
+            info["attachments"][1].get("name").is_none() && info.get("date").is_none(),
+            "absent optional fields are stripped, not serialized as null"
+        );
     }
 
     #[test]
@@ -650,10 +947,23 @@ mod tests {
     }
 
     #[test]
-    fn templates_include_body_headers_and_source() {
+    fn templates_include_message_info_and_attachment_forms() {
         let templates = email_resource_templates();
 
-        assert_eq!(templates.len(), 3);
+        let uris: Vec<&str> = templates
+            .iter()
+            .map(|t| t.raw.uri_template.as_str())
+            .collect();
+        assert_eq!(
+            uris,
+            [
+                EMAIL_BODY_TEMPLATE,
+                EMAIL_HEADERS_TEMPLATE,
+                EMAIL_SOURCE_TEMPLATE,
+                EMAIL_INFO_TEMPLATE,
+                EMAIL_ATTACHMENT_TEMPLATE,
+            ]
+        );
     }
 
     #[test]

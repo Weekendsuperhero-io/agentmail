@@ -1926,6 +1926,30 @@ impl Agentmail {
     // Download attachments
     // -----------------------------------------------------------------
 
+    /// Fetch a message's raw source and parse out its MIME attachment parts
+    /// as `(filename, content type, bytes)` triples in part order. Nameless
+    /// parts get the filename "unnamed". UIDVALIDITY-guarded like every other
+    /// delayed UID consumer.
+    pub async fn get_attachment_data(
+        &self,
+        mailbox: &str,
+        account: &str,
+        uid: u32,
+        expected_uid_validity: u32,
+    ) -> Result<Vec<(String, String, Vec<u8>)>> {
+        Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
+        let mut session = self.pool.acquire(account).await?;
+        let raw =
+            imap_client::get_message_source(session.session(), mailbox, uid, expected_uid_validity)
+                .await?;
+        session.release().await;
+
+        // Parse attachments on a blocking thread (CPU-intensive MIME parsing)
+        tokio::task::spawn_blocking(move || parser::extract_attachment_data(&raw, uid))
+            .await
+            .map_err(|e| AgentmailError::Other(format!("spawn_blocking join error: {}", e)))?
+    }
+
     /// Download attachments from a message to a directory.
     /// Files are named `{uid}_{index}_{original_name}`.
     pub async fn download_attachments(
@@ -1936,20 +1960,9 @@ impl Agentmail {
         expected_uid_validity: u32,
         output_dir: &std::path::Path,
     ) -> Result<DownloadAttachmentsResponse> {
-        Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
-        let mut session = self.pool.acquire(account).await?;
-        let raw =
-            imap_client::get_message_source(session.session(), mailbox, uid, expected_uid_validity)
-                .await?;
-        session.release().await;
-
-        // Parse attachments on a blocking thread (CPU-intensive MIME parsing)
-        let attachments =
-            tokio::task::spawn_blocking(move || parser::extract_attachment_data(&raw, uid))
-                .await
-                .map_err(|e| {
-                    AgentmailError::Other(format!("spawn_blocking join error: {}", e))
-                })??;
+        let attachments = self
+            .get_attachment_data(mailbox, account, uid, expected_uid_validity)
+            .await?;
 
         if attachments.is_empty() {
             return Ok(DownloadAttachmentsResponse {
@@ -2556,7 +2569,7 @@ fn extract_list_id_display(list_id: &str) -> String {
 }
 
 /// Sanitize a filename: replace path separators and control chars with underscores.
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',

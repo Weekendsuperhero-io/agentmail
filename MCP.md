@@ -406,15 +406,17 @@ Potentially long mailbox/skipped breakdowns are capped at 50 rows and include
 five addresses. These caps reduce model-context payloads without discarding
 destructive-operation counts or audit state.
 
-## Resources (3 templates)
+## Resources (5 templates)
 
 Single messages are addressable as resources. `resources/list` is intentionally empty — discovery is template-based (`resources/templates/list`), since mailboxes hold thousands of messages.
 
-| URI template                                                        | MIME type             | Content                                      |
-| ------------------------------------------------------------------- | --------------------- | -------------------------------------------- |
-| `email://{account}/{mailbox}/{uidValidity}/{uid}`                   | `text/markdown`       | Normalized message body, capped at 100K chars |
-| `email://{account}/{mailbox}/{uidValidity}/{uid}/headers`           | `text/rfc822-headers` | Exact RFC822 header block, maximum 64 KiB    |
-| `email://{account}/{mailbox}/{uidValidity}/{uid}/source`            | `message/rfc822`      | Lossless base64 MCP blob, maximum 256 KiB    |
+| URI template                                                              | MIME type             | Content                                      |
+| ------------------------------------------------------------------------- | --------------------- | -------------------------------------------- |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}`                         | `text/markdown`       | Normalized message body, capped at 100K chars |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/headers`                 | `text/rfc822-headers` | Exact RFC822 header block, maximum 64 KiB    |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/source`                  | `message/rfc822`      | Lossless base64 MCP blob, maximum 256 KiB    |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/info`                    | `application/json`    | Message metadata + attachment inventory      |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}`     | per part              | One MIME attachment blob, maximum 4 MiB      |
 
 `account` and `mailbox` are percent-encoded URI segments; a `/` inside a
 mailbox name must be encoded as `%2F`, for example
@@ -422,12 +424,30 @@ mailbox name must be encoded as `%2F`, for example
 non-zero. Old three-segment UID-only URIs are invalid because an IMAP server may
 reuse a UID after changing UIDVALIDITY.
 
+`/info` is the discovery entry point for a single message: a compact JSON
+document with the message identity (`account`, `mailbox`, `uidValidity`,
+`uid`), headline metadata (`subject`, `from`, `to`, `cc`, `date`, `flags`,
+`size`, `messageId`, `listId`, `mimeType`), `attachmentCount`, the attachment
+inventory, and the sibling `resources` URIs (`body`, `headers`, `source`).
+Absent optional fields are omitted, never `null`.
+
+Each inventory entry carries `index`, the original `name` (omitted for
+nameless parts), the canonical `filename`, `contentType`, `size`, an optional
+`contentId`, and the part's `resourceUri`. Attachments follow one naming
+nomenclature everywhere: the canonical filename is
+`{uid}_{index}_{sanitized-name}` (`unnamed` for nameless parts) — exactly what
+`download_attachments` writes to disk. `/attachments/{index}` (zero-based part
+index, stable within a UIDVALIDITY epoch) returns the part as an MCP resource
+`blob` served with the part's own content type; parts above 4 MiB fail with
+guidance to use the `download_attachments` tool instead.
+
 Every resource read selects the mailbox and validates the expected epoch before
-fetching. A missing UID, unavailable UIDVALIDITY, or changed epoch returns
-resource-not-found. Body reads may transiently fetch at most 64 MiB before
-rendering the bounded view; oversized headers/source representations fail with
-guidance to use the narrower resource or attachment tools. `/source` returns an
-MCP resource `blob` whose field value is base64, preserving the original RFC822
+fetching. A missing UID, unavailable UIDVALIDITY, changed epoch, or
+out-of-range attachment index returns resource-not-found. Body, info, and
+attachment reads may transiently fetch at most 64 MiB before rendering the
+bounded view; oversized headers/source representations fail with guidance to
+use the narrower resource or attachment tools. `/source` returns an MCP
+resource `blob` whose field value is base64, preserving the original RFC822
 bytes without lossy UTF-8 conversion.
 
 **Error codes for `resources/read`:**
@@ -444,7 +464,7 @@ bytes without lossy UTF-8 conversion.
 
 - `account` — instant, from configured account names, prefix-filtered.
 - `mailbox` — reads a bounded, five-minute, process-local layout catalog scoped to the `account` from the completion context (falling back to the default account). Cold or expired lookups issue one IMAP LIST; warm lookups do not use the network. Only path, delimiter, attributes, and recognized special-use roles are retained—never counts, UIDs, or message metadata. The same catalog plans account-wide scans. Resource-template values are percent-encoded for substitution. Failures yield an empty list, never an error.
-- Other arguments (`uidValidity`, `uid`, `sender`, `to`, `subject`) are not enumerable and return no values.
+- Other arguments (`uidValidity`, `uid`, `index`, `sender`, `to`, `subject`) are not enumerable and return no values.
 
 ## Annotations Key
 
