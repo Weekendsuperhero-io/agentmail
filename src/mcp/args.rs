@@ -54,8 +54,8 @@ pub(super) struct ListCapabilitiesArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for fetching a paginated chunk of messages.")]
 pub(super) struct GetMessagesArgs {
-    #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
-    pub(super) mailbox: Option<String>,
+    #[schemars(description = "Mailbox name (required). Get names from list_mailboxes.")]
+    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
@@ -76,8 +76,8 @@ pub(super) struct GetMessagesArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for mailbox message search with optional filters.")]
 pub(super) struct SearchMessagesArgs {
-    #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
-    pub(super) mailbox: Option<String>,
+    #[schemars(description = "Mailbox name (required). Get names from list_mailboxes.")]
+    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
@@ -139,8 +139,10 @@ pub(super) struct ListFlagsArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for deleting one or more messages.")]
 pub(super) struct DeleteMessagesArgs {
-    #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
-    pub(super) mailbox: Option<String>,
+    #[schemars(
+        description = "Mailbox containing the UIDs (required) — the same mailbox that produced expectedUidValidity."
+    )]
+    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
@@ -169,8 +171,10 @@ pub(super) struct DeleteMessagesArgs {
     description = "Arguments for deleting all messages from the exact sender extracted from a specific message UID."
 )]
 pub(super) struct DeleteBySenderArgs {
-    #[schemars(description = "Mailbox containing the target UID. Defaults to INBOX when omitted.")]
-    pub(super) mailbox: Option<String>,
+    #[schemars(
+        description = "Mailbox containing the sample UID (required), e.g. sample.mailbox from top_senders."
+    )]
+    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
@@ -296,9 +300,9 @@ pub(super) struct MoveMessageArgs {
 #[schemars(description = "Arguments for unsubscribe + optional list cleanup.")]
 pub(super) struct UnsubscribeMessageArgs {
     #[schemars(
-        description = "Mailbox containing the target message. Defaults to INBOX. Matching-message cleanup uses the account-wide mutation plan regardless of this value."
+        description = "Mailbox containing the target message (required), e.g. sample.mailbox from top_subscriptions. Matching-message cleanup uses the account-wide mutation plan regardless of this value."
     )]
-    pub(super) mailbox: Option<String>,
+    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
@@ -439,15 +443,17 @@ pub(super) struct CreateMailboxArgs {
     #[schemars(
         description = "Mailbox name to create. Use delimiter (usually '/') for nested mailboxes, e.g. 'Archive/2024'."
     )]
-    pub(super) mailbox_name: String,
+    pub(super) mailbox: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for downloading message attachments to disk.")]
 pub(super) struct DownloadAttachmentsArgs {
-    #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
-    pub(super) mailbox: Option<String>,
+    #[schemars(
+        description = "Mailbox containing the message (required) — the same mailbox that produced expectedUidValidity."
+    )]
+    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
@@ -469,8 +475,10 @@ pub(super) struct DownloadAttachmentsArgs {
     description = "Arguments for adding flags and/or setting an Apple Mail color on a message."
 )]
 pub(super) struct AddFlagsArgs {
-    #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
-    pub(super) mailbox: Option<String>,
+    #[schemars(
+        description = "Mailbox containing the message (required) — the same mailbox that produced expectedUidValidity."
+    )]
+    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
@@ -499,8 +507,10 @@ pub(super) struct AddFlagsArgs {
     description = "Arguments for removing flags and/or clearing Apple Mail color from a message."
 )]
 pub(super) struct RemoveFlagsArgs {
-    #[schemars(description = "Mailbox name. Defaults to INBOX when omitted.")]
-    pub(super) mailbox: Option<String>,
+    #[schemars(
+        description = "Mailbox containing the message (required) — the same mailbox that produced expectedUidValidity."
+    )]
+    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
@@ -521,7 +531,7 @@ pub(super) struct RemoveFlagsArgs {
     #[schemars(
         description = "If true, removes the Apple Mail color flag (\\\\Flagged + all $MailFlagBit keywords). Defaults to false."
     )]
-    pub(super) color: bool,
+    pub(super) clear_color: bool,
 }
 
 // ---------------------------------------------------------------------------
