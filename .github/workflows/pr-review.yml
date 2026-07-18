@@ -30,9 +30,6 @@ jobs:
       pull-requests: write
     uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-review.yml@main
     with:
-      runs-on: warp-ubuntu-latest-x64-4x
+      runs-on: ubuntu-latest
       # House rules appended to each agent's prompt, per lens.
-      review-guidelines: "RULES.md"
-      security-guidelines: "CREDENTIALS.md,acp-fs/SANDBOXING.md,src-tauri/ENTITLEMENTS.md"
-      tests-guidelines: "ARCHITECTURE.md"
     secrets: inherit
