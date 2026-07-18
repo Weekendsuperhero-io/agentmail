@@ -3,10 +3,6 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-pub(super) fn default_true() -> bool {
-    true
-}
-
 pub(super) fn default_false() -> bool {
     false
 }
@@ -24,10 +20,18 @@ pub(super) struct ListAccountsArgs {}
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for listing mailboxes.")]
 pub(super) struct ListMailboxesArgs {
+    #[schemars(description = "Account name (required).")]
+    pub(super) account: String,
     #[schemars(
-        description = "Optional account name. If omitted, list mailboxes across all accounts."
+        range(max = 1_000_000),
+        description = "Zero-based selectable-mailbox offset. Defaults to 0; maximum 1,000,000."
     )]
-    pub(super) account: Option<String>,
+    pub(super) offset: Option<u64>,
+    #[schemars(
+        range(min = 1, max = 500),
+        description = "Page size. Defaults to 100; maximum 500."
+    )]
+    pub(super) limit: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -56,20 +60,16 @@ pub(super) struct GetMessagesArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "Zero-based row offset. Defaults to 0.")]
+    #[schemars(
+        range(max = 1_000_000),
+        description = "Zero-based row offset. Defaults to 0; maximum 1,000,000."
+    )]
     pub(super) offset: Option<u64>,
-    #[schemars(description = "Page size. Defaults to 25 and is clamped to 1..50.")]
+    #[schemars(
+        range(min = 1, max = 50),
+        description = "Page size. Defaults to 25; valid range 1..50."
+    )]
     pub(super) limit: Option<u64>,
-    #[serde(default = "default_false")]
-    #[schemars(
-        description = "If true, include normalized markdown content (trimmed for context window safety)."
-    )]
-    pub(super) include_content: bool,
-    #[serde(default = "default_false")]
-    #[schemars(
-        description = "If true, include the full raw headers map. Off by default — structured fields (subject, sender, to, cc, date, message_id, etc.) are always returned."
-    )]
-    pub(super) include_headers: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -113,27 +113,23 @@ pub(super) struct SearchMessagesArgs {
     #[serde(default = "default_false")]
     #[schemars(description = "Include deleted messages. Defaults to false.")]
     pub(super) deleted: bool,
-    #[schemars(description = "Zero-based row offset. Defaults to 0.")]
+    #[schemars(
+        range(max = 1_000_000),
+        description = "Zero-based row offset. Defaults to 0; maximum 1,000,000."
+    )]
     pub(super) offset: Option<u64>,
-    #[schemars(description = "Page size. Defaults to 25 and is clamped to 1..50.")]
+    #[schemars(
+        range(min = 1, max = 50),
+        description = "Page size. Defaults to 25; valid range 1..50."
+    )]
     pub(super) limit: Option<u64>,
-    #[serde(default = "default_false")]
-    #[schemars(
-        description = "If true, include normalized markdown content (trimmed for context window safety)."
-    )]
-    pub(super) include_content: bool,
-    #[serde(default = "default_false")]
-    #[schemars(
-        description = "If true, include the full raw headers map. Off by default — structured fields (subject, sender, to, cc, date, message_id, etc.) are always returned."
-    )]
-    pub(super) include_headers: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for listing flags in use.")]
 pub(super) struct ListFlagsArgs {
-    #[schemars(description = "Mailbox to scan. Omit to scan all mailboxes in the account.")]
+    #[schemars(description = "Mailbox to scan. Omit to use the account-wide discovery plan.")]
     pub(super) mailbox: Option<String>,
     #[schemars(description = "Account name (required).")]
     pub(super) account: String,
@@ -149,8 +145,17 @@ pub(super) struct DeleteMessagesArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "Array of IMAP UIDs to delete. One or more UIDs, up to 500.")]
+    #[schemars(
+        length(min = 1, max = 500),
+        inner(range(min = 1)),
+        description = "Array of non-zero IMAP UIDs to delete. One or more UIDs, up to 500."
+    )]
     pub(super) uids: Vec<u32>,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY returned by the discovery response. The action fails if the mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
     #[serde(default = "default_false")]
     #[schemars(
         description = "When true, permanently delete (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
@@ -161,7 +166,7 @@ pub(super) struct DeleteMessagesArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(
-    description = "Arguments for deleting all messages from a specific sender. The sender string is matched as a substring against the full From header (covers both display name and email address)."
+    description = "Arguments for deleting all messages from the exact sender extracted from a specific message UID."
 )]
 pub(super) struct DeleteBySenderArgs {
     #[schemars(description = "Mailbox containing the target UID. Defaults to INBOX when omitted.")]
@@ -171,12 +176,18 @@ pub(super) struct DeleteBySenderArgs {
     )]
     pub(super) account: String,
     #[schemars(
+        range(min = 1),
         description = "UID of a message from the sender to delete. The exact sender (email + display name) is extracted from this message and used to find all other messages from the same sender."
     )]
     pub(super) uid: u32,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY paired with the sample UID. The action fails if the mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
     #[serde(default = "default_false")]
     #[schemars(
-        description = "When true, search and delete across ALL mailboxes in the account (not just the source mailbox). Defaults to false."
+        description = "When true, use the account-wide mutation plan to enumerate selectable storage mailboxes (not just the source mailbox). Defaults to false."
     )]
     pub(super) all_mailboxes: bool,
     #[serde(default = "default_false")]
@@ -190,15 +201,21 @@ pub(super) struct DeleteBySenderArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for finding messages with attachments.")]
 pub(super) struct FindAttachmentsArgs {
-    #[schemars(description = "Mailbox name. Omit to scan all mailboxes in the account.")]
+    #[schemars(description = "Mailbox name. Omit to use the account-wide discovery plan.")]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "Number of UIDs to skip. Defaults to 0.")]
+    #[schemars(
+        range(max = 1_000_000),
+        description = "Number of attachment hits to skip. Defaults to 0; maximum 1,000,000."
+    )]
     pub(super) offset: Option<u64>,
-    #[schemars(description = "Max UIDs to return. Defaults to 25, max 100.")]
+    #[schemars(
+        range(min = 1, max = 100),
+        description = "Maximum attachment hits to return. Defaults to 25; maximum 100."
+    )]
     pub(super) limit: Option<u64>,
 }
 
@@ -260,8 +277,16 @@ pub(super) struct MoveMessageArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "IMAP UID of the message to move.")]
+    #[schemars(
+        range(min = 1),
+        description = "Non-zero IMAP UID of the message to move."
+    )]
     pub(super) uid: u32,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY paired with the UID. The action fails if the source mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
     #[schemars(description = "Destination mailbox name.")]
     pub(super) destination: String,
 }
@@ -271,23 +296,47 @@ pub(super) struct MoveMessageArgs {
 #[schemars(description = "Arguments for unsubscribe + optional list cleanup.")]
 pub(super) struct UnsubscribeMessageArgs {
     #[schemars(
-        description = "Mailbox containing the target message. Defaults to INBOX. When deleting matching messages, all mailboxes are searched regardless of this value."
+        description = "Mailbox containing the target message. Defaults to INBOX. Matching-message cleanup uses the account-wide mutation plan regardless of this value."
     )]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "IMAP UID of the message.")]
+    #[schemars(range(min = 1), description = "Non-zero IMAP UID of the message.")]
     pub(super) uid: u32,
-    #[serde(default = "default_true")]
     #[schemars(
-        description = "If true, bulk-delete matching messages. For List-Unsubscribe messages: deletes all from the exact sender with a List-Unsubscribe header. For List-Id-only messages: deletes all with the same List-Id."
+        range(min = 1),
+        description = "UIDVALIDITY from top_subscriptions sample.uidValidity. The action fails if the mailbox UID epoch has changed."
+    )]
+    pub(super) expected_uid_validity: u32,
+    #[schemars(
+        description = "Required explicit user consent for the RFC 8058 HTTPS POST. Must be true; tool annotations are not authorization."
+    )]
+    pub(super) confirm_one_click: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "If true, bulk-delete messages with the target's exact normalized List-Id account-wide, but only when the same passing DKIM signature also covers List-Id. Defaults to false."
     )]
     pub(super) delete_matching: bool,
     #[serde(default = "default_false")]
     #[schemars(
-        description = "When true, permanently delete matching messages (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
+        description = "If true, allow cleanup policy evaluation even when DKIM, URL validation, DNS, or the HTTPS POST fails. Cleanup still requires a DKIM-authenticated List-Id or the separate sender fallback. Defaults to false."
+    )]
+    pub(super) delete_on_unsubscribe_failure: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "If true and no usable DKIM-authenticated List-Id exists, allow the narrower legacy exact-sender plus list-header cleanup. Defaults to false."
+    )]
+    pub(super) allow_sender_fallback: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "If true, allow irreversible UID EXPUNGE when Trash is unavailable or moving to Trash fails. Defaults to false. Never used as a Gmail fallback because in-place EXPUNGE only removes a label."
+    )]
+    pub(super) allow_permanent_fallback: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true, request permanent matching-message deletion (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible on standard IMAP. On Gmail this safely moves to Trash because in-place EXPUNGE only removes a label. Defaults to false."
     )]
     pub(super) permanent: bool,
 }
@@ -296,14 +345,20 @@ pub(super) struct UnsubscribeMessageArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for listing top senders by message count.")]
 pub(super) struct TopSendersArgs {
-    #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
+    #[schemars(description = "Mailbox name. Omit to use the account-wide discovery plan.")]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
     #[schemars(
-        description = "Maximum number of senders to return. Defaults to 100; set higher to return more."
+        range(max = 1_000_000),
+        description = "Zero-based ranked-row offset. Defaults to 0; maximum 1,000,000."
+    )]
+    pub(super) offset: Option<u64>,
+    #[schemars(
+        range(min = 1, max = 100),
+        description = "Page size. Defaults to 10; maximum 100."
     )]
     pub(super) limit: Option<u64>,
 }
@@ -314,14 +369,20 @@ pub(super) struct TopSendersArgs {
     description = "Arguments for listing top subscriptions (bulk senders) by message count."
 )]
 pub(super) struct TopSubscriptionsArgs {
-    #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
+    #[schemars(description = "Mailbox name. Omit to use the account-wide discovery plan.")]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
     #[schemars(
-        description = "Maximum number of lists to return. Defaults to 100; set higher to return more."
+        range(max = 1_000_000),
+        description = "Zero-based ranked-row offset. Defaults to 0; maximum 1,000,000."
+    )]
+    pub(super) offset: Option<u64>,
+    #[schemars(
+        range(min = 1, max = 100),
+        description = "Page size. Defaults to 10; maximum 100."
     )]
     pub(super) limit: Option<u64>,
 }
@@ -330,14 +391,20 @@ pub(super) struct TopSubscriptionsArgs {
 #[serde(rename_all = "camelCase")]
 #[schemars(description = "Arguments for listing top mailing lists by List-Id header.")]
 pub(super) struct TopMailingListsArgs {
-    #[schemars(description = "Mailbox name. When omitted, scans ALL mailboxes in the account.")]
+    #[schemars(description = "Mailbox name. Omit to use the account-wide discovery plan.")]
     pub(super) mailbox: Option<String>,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
     #[schemars(
-        description = "Maximum number of lists to return. Defaults to 100; set higher to return more."
+        range(max = 1_000_000),
+        description = "Zero-based ranked-row offset. Defaults to 0; maximum 1,000,000."
+    )]
+    pub(super) offset: Option<u64>,
+    #[schemars(
+        range(min = 1, max = 100),
+        description = "Page size. Defaults to 10; maximum 100."
     )]
     pub(super) limit: Option<u64>,
 }
@@ -352,7 +419,7 @@ pub(super) struct DeleteListIdArgs {
     pub(super) account: String,
     #[schemars(description = "The List-Id header value to match (from top_mailing_lists).")]
     pub(super) list_id: String,
-    #[schemars(description = "Mailbox to search. Omit to search all mailboxes.")]
+    #[schemars(description = "Mailbox to search. Omit to use the account-wide mutation plan.")]
     pub(super) mailbox: Option<String>,
     #[serde(default = "default_false")]
     #[schemars(
@@ -385,8 +452,13 @@ pub(super) struct DownloadAttachmentsArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "IMAP UID of the message.")]
+    #[schemars(range(min = 1), description = "Non-zero IMAP UID of the message.")]
     pub(super) uid: u32,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY paired with the UID. The download fails if the mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
     #[schemars(description = "Directory to save attachments to. Defaults to current directory.")]
     pub(super) output_dir: Option<String>,
 }
@@ -403,8 +475,13 @@ pub(super) struct AddFlagsArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "IMAP UID of the message.")]
+    #[schemars(range(min = 1), description = "Non-zero IMAP UID of the message.")]
     pub(super) uid: u32,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY paired with the UID. The update fails if the mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
     #[serde(default)]
     #[schemars(
         description = "Flags to add. System flags use backslash prefix (e.g. \"\\\\Seen\", \"\\\\Flagged\"). Custom keywords are plain strings. Cannot include \\\\Deleted or \\\\Recent."
@@ -428,8 +505,13 @@ pub(super) struct RemoveFlagsArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "IMAP UID of the message.")]
+    #[schemars(range(min = 1), description = "Non-zero IMAP UID of the message.")]
     pub(super) uid: u32,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY paired with the UID. The update fails if the mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
     #[serde(default)]
     #[schemars(
         description = "Flags to remove. System flags use backslash prefix (e.g. \"\\\\Seen\"). Cannot include \\\\Deleted or \\\\Recent."

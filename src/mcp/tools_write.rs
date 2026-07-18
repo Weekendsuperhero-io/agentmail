@@ -2,16 +2,17 @@
 
 use super::AgentMailServer;
 use super::args::*;
-use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
-use crate::{
-    CreateDraftResponse, CreateMailboxResponse, DeleteBySenderResponse, DeleteListIdResponse,
-    DeleteMessagesResponse, DeleteMode, DownloadAttachmentsResponse, DraftAttachment,
-    MoveMessageResponse, UnsubscribeResponse, UpdateFlagsResponse,
+use super::wire::{
+    AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteBySenderOutput,
+    DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput, MoveMessageOutput,
+    RemoveFlagsOutput, UnsubscribeMessageOutput, compact_result,
 };
+use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
+use crate::{DeleteMode, DraftAttachment, UnsubscribeOptions};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
-    handler::server::wrapper::{Json, Parameters},
-    model::Meta,
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, Meta},
     tool, tool_router,
 };
 use tokio_util::sync::CancellationToken;
@@ -29,7 +30,8 @@ fn delete_mode(permanent: bool) -> DeleteMode {
 impl AgentMailServer {
     #[tool(
         name = "create_mailbox",
-        description = "Create a new mailbox (folder) on the IMAP server. Use delimiter (usually '/') for nested mailboxes.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CreateMailboxOutput>().expect("valid create_mailbox output schema"),
+        description = "Create a mailbox on the IMAP server. For a nested mailboxName, use the hierarchy delimiter reported by list_mailboxes (commonly '/').",
         annotations(
             title = "Create Mailbox",
             read_only_hint = false,
@@ -40,7 +42,7 @@ impl AgentMailServer {
     async fn create_mailbox_tool(
         &self,
         Parameters(args): Parameters<CreateMailboxArgs>,
-    ) -> Result<Json<CreateMailboxResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         if args.mailbox_name.trim().is_empty() {
             return Err(McpError::invalid_params("mailbox_name is required", None));
         }
@@ -49,14 +51,15 @@ impl AgentMailServer {
             .create_mailbox(&args.account, &args.mailbox_name)
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(CreateMailboxOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "delete_messages",
-        description = "Delete one or more messages by UID. Moves to Trash if configured, otherwise flags \\Deleted and expunges. Supports up to 500 UIDs per call.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteMessagesOutput>().expect("valid delete_messages output schema"),
+        description = "Delete one or more messages by UID. Requires expectedUidValidity from the same mailbox discovery response and fails before mutation if the UID epoch changed. Moves to Trash when available; otherwise permanent fallback follows the requested policy. Supports 1 to 500 non-zero UIDs per call.",
         annotations(
             title = "Delete Messages",
             destructive_hint = true,
@@ -70,7 +73,7 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteMessagesArgs>,
-    ) -> Result<Json<DeleteMessagesResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         if args.uids.is_empty() {
             return Err(McpError::invalid_params(
@@ -93,20 +96,22 @@ impl AgentMailServer {
                 &mailbox,
                 &args.account,
                 &args.uids,
+                args.expected_uid_validity,
                 delete_mode(args.permanent),
                 progress.as_ref(),
                 Some(&cancel),
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(DeleteMessagesOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "delete_by_sender",
-        description = "Delete all messages from an exact sender. Takes a UID to identify the sender — extracts the full From header (display name + email) and deletes every message with an identical sender. Set allMailboxes=true to search and delete across the entire account. Ideal for bulk cleanup after top_senders. For mailing list cleanup, use unsubscribe_message instead — it attempts one-click unsubscribe and only deletes bulk mail.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteBySenderOutput>().expect("valid delete_by_sender output schema"),
+        description = "Delete messages from the exact address + display name represented by a sample message. From top_senders sample, pass sample.mailbox as mailbox, sample.uid as uid, and sample.uidValidity as expectedUidValidity; the action fails before mutation if the epoch changed. Set allMailboxes=true to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views. Do not use this for mailing-list cleanup.",
         annotations(title = "Delete by Sender", destructive_hint = true),
         execution(task_support = "optional")
     )]
@@ -116,7 +121,7 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteBySenderArgs>,
-    ) -> Result<Json<DeleteBySenderResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
 
         let progress = make_progress_fn(&meta, &client);
@@ -127,6 +132,7 @@ impl AgentMailServer {
                 &mailbox,
                 &args.account,
                 args.uid,
+                args.expected_uid_validity,
                 args.all_mailboxes,
                 delete_mode(args.permanent),
                 progress.as_ref(),
@@ -134,14 +140,15 @@ impl AgentMailServer {
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(DeleteBySenderOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "download_attachments",
-        description = "Download all attachments from a message to disk. Files are saved as {uid}_{originalname}. Returns file paths, content types, and sizes.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadAttachmentsOutput>().expect("valid download_attachments output schema"),
+        description = "Download all attachments from one message to disk. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Files are saved as {uid}_{originalname}. Returns paths, content types, and sizes.",
         annotations(
             title = "Download Attachments",
             read_only_hint = false,
@@ -153,7 +160,7 @@ impl AgentMailServer {
     async fn download_attachments_tool(
         &self,
         Parameters(args): Parameters<DownloadAttachmentsArgs>,
-    ) -> Result<Json<DownloadAttachmentsResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         let output_dir = args
             .output_dir
@@ -162,17 +169,27 @@ impl AgentMailServer {
 
         match self
             .agentmail
-            .download_attachments(&mailbox, &args.account, args.uid, &output_dir)
+            .download_attachments(
+                &mailbox,
+                &args.account,
+                args.uid,
+                args.expected_uid_validity,
+                &output_dir,
+            )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(DownloadAttachmentsOutput::new(
+                data,
+                args.expected_uid_validity,
+            )),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "create_draft",
-        description = "Create and save a draft email. Composes an RFC822 message and appends it to the account's Drafts folder (creating the Drafts mailbox if necessary). Requires at least one recipient (to, cc, or bcc). Subject and body are optional. Supports optional attachments via local file paths.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>().expect("valid create_draft output schema"),
+        description = "Create and save a complete RFC822 draft. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Requires at least one to, cc, or bcc recipient. Subject and body are optional; attachments may reference local file paths.",
         annotations(
             title = "Create Draft",
             read_only_hint = false,
@@ -182,7 +199,7 @@ impl AgentMailServer {
     async fn create_draft_tool(
         &self,
         Parameters(args): Parameters<CreateDraftArgs>,
-    ) -> Result<Json<CreateDraftResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         if args.to.is_empty() && args.cc.is_empty() && args.bcc.is_empty() {
             return Err(McpError::invalid_params(
                 "At least one recipient (to, cc, or bcc) is required",
@@ -241,14 +258,15 @@ impl AgentMailServer {
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(CreateDraftOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "move_message",
-        description = "Move a single message from one mailbox to another by UID. Uses IMAP MOVE command. Requires source mailbox, destination mailbox, and the message UID.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveMessageOutput>().expect("valid move_message output schema"),
+        description = "Move one message between mailboxes. Requires source mailbox, destination, uid, and expectedUidValidity from the message's discovery response; the action fails before mutation if the source UID epoch changed. Success confirms source-to-destination completion but does not claim a destination UID.",
         annotations(
             title = "Move Message",
             read_only_hint = false,
@@ -258,7 +276,7 @@ impl AgentMailServer {
     async fn move_message_tool(
         &self,
         Parameters(args): Parameters<MoveMessageArgs>,
-    ) -> Result<Json<MoveMessageResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         if args.mailbox.trim().is_empty() {
             return Err(McpError::invalid_params("mailbox is required", None));
         }
@@ -268,22 +286,30 @@ impl AgentMailServer {
 
         match self
             .agentmail
-            .move_message(&args.mailbox, &args.account, args.uid, &args.destination)
+            .move_message(
+                &args.mailbox,
+                &args.account,
+                args.uid,
+                args.expected_uid_validity,
+                &args.destination,
+            )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(MoveMessageOutput::new(data, args.expected_uid_validity)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "unsubscribe_message",
-        description = "Unsubscribe from a mailing list and delete matching messages across ALL mailboxes. Requires the message to have a List-Unsubscribe header. Attempts RFC 8058 one-click unsubscribe POST (best-effort — if it fails, messages are still deleted). When delete_matching is true, searches every mailbox for messages from the exact sender that have a List-Unsubscribe-Post header and deletes them. This ensures only bulk/marketing mail is removed, not legitimate messages from the same sender.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<UnsubscribeMessageOutput>().expect("valid unsubscribe_message output schema"),
+        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally clean up the same List-Id account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. deleteMatching defaults false; cleanup stops after failure and never becomes permanent unless separately authorized.",
         annotations(
             title = "Unsubscribe from Mailing List",
             destructive_hint = true,
             open_world_hint = true
-        )
+        ),
+        execution(task_support = "optional")
     )]
     async fn unsubscribe_message_tool(
         &self,
@@ -291,7 +317,7 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<UnsubscribeMessageArgs>,
-    ) -> Result<Json<UnsubscribeResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
@@ -302,21 +328,29 @@ impl AgentMailServer {
                 &mailbox,
                 &args.account,
                 args.uid,
-                args.delete_matching,
-                delete_mode(args.permanent),
+                UnsubscribeOptions {
+                    expected_uid_validity: args.expected_uid_validity,
+                    confirm_one_click: args.confirm_one_click,
+                    delete_matching: args.delete_matching,
+                    delete_on_unsubscribe_failure: args.delete_on_unsubscribe_failure,
+                    allow_sender_fallback: args.allow_sender_fallback,
+                    allow_permanent_fallback: args.allow_permanent_fallback,
+                    mode: delete_mode(args.permanent),
+                },
                 progress.as_ref(),
                 Some(&cancel),
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(UnsubscribeMessageOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "delete_list_id",
-        description = "Delete all messages with a specific List-Id across all mailboxes. Identifies the list by its List-Id header value (from top_mailing_lists). Deletes ALL messages from that mailing list regardless of sender address. Omit mailbox to search the entire account.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteListIdOutput>().expect("valid delete_list_id output schema"),
+        description = "Delete all messages with a specific List-Id. Identifies the list by its exact List-Id value from top_mailing_lists and deletes matching messages regardless of sender. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views.",
         annotations(title = "Delete Mailing List by List-Id", destructive_hint = true),
         execution(task_support = "optional")
     )]
@@ -326,7 +360,7 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteListIdArgs>,
-    ) -> Result<Json<DeleteListIdResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
         match self
@@ -341,14 +375,15 @@ impl AgentMailServer {
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(DeleteListIdOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "add_flags",
-        description = "Add flags and/or set an Apple Mail color on a message. Flags use union semantics — existing flags are preserved. Use color for Apple Mail colored flags (red, orange, yellow, green, blue, purple, gray). Cannot set \\Deleted (use delete_messages) or \\Recent (read-only).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<AddFlagsOutput>().expect("valid add_flags output schema"),
+        description = "Add flags and/or set an Apple Mail color on a message identified by mailbox, uid, and expectedUidValidity. The update fails before mutation if the mailbox UID epoch changed. Flags use union semantics, preserving existing flags. Cannot set \\Deleted (use delete_messages) or \\Recent (read-only).",
         annotations(
             title = "Add Flags / Set Color",
             read_only_hint = false,
@@ -359,7 +394,7 @@ impl AgentMailServer {
     async fn add_flags_tool(
         &self,
         Parameters(args): Parameters<AddFlagsArgs>,
-    ) -> Result<Json<UpdateFlagsResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         if args.flags.is_empty() && args.color.is_none() {
             return Err(McpError::invalid_params(
@@ -389,19 +424,21 @@ impl AgentMailServer {
                 &mailbox,
                 &args.account,
                 args.uid,
+                args.expected_uid_validity,
                 &args.flags,
                 args.color.as_deref(),
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(AddFlagsOutput::new(data, args.expected_uid_validity)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "remove_flags",
-        description = "Remove flags and/or clear Apple Mail color from a message. Only specified flags are removed; all others preserved. Set color=true to remove the colored flag (\\Flagged + all $MailFlagBit keywords). Cannot remove \\Deleted (use delete_messages) or \\Recent (read-only).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<RemoveFlagsOutput>().expect("valid remove_flags output schema"),
+        description = "Remove flags and/or clear Apple Mail color from a message identified by mailbox, uid, and expectedUidValidity. The update fails before mutation if the mailbox UID epoch changed. Only specified flags are removed; all others remain. Set color=true to clear \\Flagged plus $MailFlagBit keywords. Cannot remove \\Deleted or \\Recent.",
         annotations(
             title = "Remove Flags / Clear Color",
             read_only_hint = false,
@@ -412,7 +449,7 @@ impl AgentMailServer {
     async fn remove_flags_tool(
         &self,
         Parameters(args): Parameters<RemoveFlagsArgs>,
-    ) -> Result<Json<UpdateFlagsResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
         if args.flags.is_empty() && !args.color {
             return Err(McpError::invalid_params(
@@ -438,10 +475,17 @@ impl AgentMailServer {
         }
         match self
             .agentmail
-            .remove_flags(&mailbox, &args.account, args.uid, &args.flags, args.color)
+            .remove_flags(
+                &mailbox,
+                &args.account,
+                args.uid,
+                args.expected_uid_validity,
+                &args.flags,
+                args.color,
+            )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(RemoveFlagsOutput::new(data, args.expected_uid_validity)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }

@@ -2,16 +2,16 @@
 
 use super::AgentMailServer;
 use super::args::*;
-use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
-use crate::{
-    ConnectionStatus, FindAttachmentsResponse, GetMessagesResponse, ListAccountsResponse,
-    ListCapabilitiesResponse, ListFlagsResponse, ListMailboxesResponse, SearchMessagesResponse,
-    TopMailingListsResponse, TopSendersResponse, TopSubscriptionsResponse,
+use super::wire::{
+    CheckConnectionOutput, FindAttachmentsOutput, GetMessagesOutput, ListAccountsOutput,
+    ListCapabilitiesOutput, ListFlagsOutput, ListMailboxesOutput, SearchMessagesOutput,
+    TopMailingListsOutput, TopSendersOutput, TopSubscriptionsOutput, compact_result,
 };
+use super::{bounded_offset, bounded_usize, make_cancel_fn, make_progress_fn, to_mcp_error};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
-    handler::server::wrapper::{Json, Parameters},
-    model::Meta,
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, Meta},
     tool, tool_router,
 };
 use tokio_util::sync::CancellationToken;
@@ -33,6 +33,7 @@ fn parse_search_date(s: Option<&str>) -> Result<Option<chrono::NaiveDate>, McpEr
 impl AgentMailServer {
     #[tool(
         name = "list_accounts",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ListAccountsOutput>().expect("valid list_accounts output schema"),
         description = "Return configured IMAP account names. Use this first to discover valid account selectors.",
         annotations(
             title = "List Accounts",
@@ -43,101 +44,113 @@ impl AgentMailServer {
     async fn list_accounts_tool(
         &self,
         Parameters(_args): Parameters<ListAccountsArgs>,
-    ) -> Result<Json<ListAccountsResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         match self.agentmail.list_accounts().await {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(ListAccountsOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "list_mailboxes",
-        description = "List all mailboxes (folders) with message counts: total, unseen, and recent. Shows the full folder tree. Optionally filter to a single account.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ListMailboxesOutput>().expect("valid list_mailboxes output schema"),
+        description = "List selectable mailboxes for one required account. Returns a page of mailbox names, total and unseen counts, hierarchy delimiters, no-inferiors state, and all recognized special-use roles. Non-selectable containers are omitted. Defaults: offset=0, limit=100 (max 500).",
         annotations(title = "List Mailboxes", read_only_hint = true)
     )]
     async fn list_mailboxes_tool(
         &self,
         Parameters(args): Parameters<ListMailboxesArgs>,
-    ) -> Result<Json<ListMailboxesResponse>, McpError> {
-        let account = args.account.filter(|s| !s.trim().is_empty());
-        match self.agentmail.list_mailboxes(account.as_deref()).await {
-            Ok(data) => Ok(Json(data)),
+    ) -> Result<CallToolResult, McpError> {
+        if args.account.trim().is_empty() {
+            return Err(McpError::invalid_params("account is required", None));
+        }
+        let offset = bounded_offset(args.offset)?;
+        let limit = bounded_usize(args.limit, 100, 1, 500, "limit")?;
+        match self
+            .agentmail
+            .list_mailboxes_page(&args.account, offset, limit)
+            .await
+        {
+            Ok((data, total)) => compact_result(ListMailboxesOutput::new(
+                data,
+                &args.account,
+                offset,
+                limit,
+                total,
+            )),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "check_connection",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CheckConnectionOutput>().expect("valid check_connection output schema"),
         description = "Test IMAP connectivity for an account. Connects, authenticates, and reports status.",
         annotations(title = "Check Connection", read_only_hint = true)
     )]
     async fn check_connection_tool(
         &self,
         Parameters(args): Parameters<CheckConnectionArgs>,
-    ) -> Result<Json<ConnectionStatus>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         match self.agentmail.check_connection(&args.account).await {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(CheckConnectionOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "list_capabilities",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ListCapabilitiesOutput>().expect("valid list_capabilities output schema"),
         description = "List IMAP server capabilities for an account. Shows supported extensions like IDLE, MOVE, CONDSTORE, etc.",
         annotations(title = "List IMAP Capabilities", read_only_hint = true)
     )]
     async fn list_capabilities_tool(
         &self,
         Parameters(args): Parameters<ListCapabilitiesArgs>,
-    ) -> Result<Json<ListCapabilitiesResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         match self.agentmail.list_capabilities(&args.account).await {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(ListCapabilitiesOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "get_messages",
-        description = "Fetch a paginated list of messages from a mailbox, newest-first. Returns metadata (subject, from, date, flags, UID) by default. Set include_content=true to also get the message body as markdown. Set include_headers=true for the full raw headers map. Defaults: mailbox=INBOX, offset=0, limit=25 (max 50).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<GetMessagesOutput>().expect("valid get_messages output schema"),
+        description = "Fetch a metadata-only page of messages from a mailbox, newest-first. Returns account, mailbox, UIDVALIDITY, pagination data, and compact rows with UID, subject, sender, date, flags, size, and a UIDVALIDITY-safe resourceUri. Read resourceUri for markdown content, append /headers for exact headers, or append /source for bounded raw RFC822. Defaults: mailbox=INBOX, offset=0, limit=25 (max 50).",
         annotations(title = "Get Messages", read_only_hint = true)
     )]
     async fn get_messages_tool(
         &self,
         Parameters(args): Parameters<GetMessagesArgs>,
-    ) -> Result<Json<GetMessagesResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
-        let offset = crate::clamp_usize(args.offset, 0, 0, 1_000_000);
-        let limit = crate::clamp_usize(args.limit, 25, 1, 50);
+        let offset = bounded_offset(args.offset)?;
+        let limit = bounded_usize(args.limit, 25, 1, 50, "limit")?;
 
         match self
             .agentmail
-            .get_messages(
-                &mailbox,
-                &args.account,
-                offset,
-                limit,
-                args.include_content,
-                args.include_headers,
-            )
+            .get_messages(&mailbox, &args.account, offset, limit, false, false)
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(GetMessagesOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "search_messages",
-        description = "Search messages with filters: sender_contains, subject_contains, to_contains, query (full-text), read, flagged, header key/value, date range (since/before, YYYY-MM-DD), and size (larger_than/smaller_than, bytes). Filters are AND-combined; text filters match case-insensitive substrings. Returns paginated results newest-first. Content excluded by default — set include_content=true to get message bodies. Set include_headers=true for the full raw headers map.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SearchMessagesOutput>().expect("valid search_messages output schema"),
+        description = "Search messages with filters: senderContains, subjectContains, toContains, query (IMAP full-text), read, flagged, headerKey/headerValueContains, since/before (YYYY-MM-DD), and largerThan/smallerThan (bytes). Filters are AND-combined. Returns metadata-only results newest-first with the mailbox UIDVALIDITY and one UIDVALIDITY-safe resourceUri per row; read that resource for content or append /headers or /source. Defaults: mailbox=INBOX, offset=0, limit=25 (max 50).",
         annotations(title = "Search Messages", read_only_hint = true)
     )]
     async fn search_messages_tool(
         &self,
         Parameters(args): Parameters<SearchMessagesArgs>,
-    ) -> Result<Json<SearchMessagesResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
-        let offset = crate::clamp_usize(args.offset, 0, 0, 1_000_000);
-        let limit = crate::clamp_usize(args.limit, 25, 1, 50);
+        let offset = bounded_offset(args.offset)?;
+        let limit = bounded_usize(args.limit, 25, 1, 50, "limit")?;
 
         let criteria = crate::SearchCriteria {
             text: args.query,
@@ -166,19 +179,20 @@ impl AgentMailServer {
                 &criteria,
                 offset,
                 limit,
-                args.include_content,
-                args.include_headers,
+                false,
+                false,
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(SearchMessagesOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "list_flags",
-        description = "List all IMAP flags in use with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Omit mailbox to scan the entire account across all mailboxes. Resolves Apple Mail $MailFlagBit color flags to color names (red, orange, yellow, green, blue, purple, gray).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ListFlagsOutput>().expect("valid list_flags output schema"),
+        description = "List all IMAP flags in use with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without Trash/Junk/Drafts or virtual aggregate views. Resolves Apple Mail $MailFlagBit color flags to color names (red, orange, yellow, green, blue, purple, gray).",
         annotations(title = "List Flags", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -188,7 +202,7 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<ListFlagsArgs>,
-    ) -> Result<Json<ListFlagsResponse>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
         match self
@@ -201,14 +215,15 @@ impl AgentMailServer {
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(ListFlagsOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "find_attachments",
-        description = "Scan for messages with attachments (multipart/mixed or multipart/related). Returns paginated UIDs (newest-first) and total count. Omit mailbox to scan the entire account with a per-mailbox breakdown. Use download_attachments with a specific UID to save files to disk.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<FindAttachmentsOutput>().expect("valid find_attachments output schema"),
+        description = "Find messages with attachments (multipart/mixed or multipart/related), newest-first. Each hit includes mailbox, UIDVALIDITY, UID, date, and resourceUri so account-wide UID collisions are unambiguous. Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without excluded or virtual views. Defaults: offset=0, limit=25 (max 100). To save files, pass a hit's mailbox, uid, and uidValidity as expectedUidValidity to download_attachments.",
         annotations(title = "Find Attachments", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -218,9 +233,9 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<FindAttachmentsArgs>,
-    ) -> Result<Json<FindAttachmentsResponse>, McpError> {
-        let offset = crate::clamp_usize(args.offset, 0, 0, 100_000);
-        let limit = crate::clamp_usize(args.limit, 25, 1, 100);
+    ) -> Result<CallToolResult, McpError> {
+        let offset = bounded_offset(args.offset)?;
+        let limit = bounded_usize(args.limit, 25, 1, 100, "limit")?;
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
@@ -236,14 +251,15 @@ impl AgentMailServer {
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(FindAttachmentsOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "top_senders",
-        description = "List the senders who email you most, by message count (highest first). Omit mailbox to scan the entire account; account-wide scans skip Trash/Junk/Drafts/All Mail, dedupe by Message-ID across folders, and exclude your own address. Groups by (email, display name) — 'Find My <noreply@apple.com>' and 'iCloud <noreply@apple.com>' are separate entries. Efficient: fetches only FROM+DATE headers using BODY.PEEK.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<TopSendersOutput>().expect("valid top_senders output schema"),
+        description = "List the senders who email you most, by message count. Omit mailbox for account-wide discovery: one selectable \\All mailbox is scanned alone when available; otherwise selectable storage mailboxes are enumerated, virtual/excluded views are skipped, and Message-ID deduplicates across folders. Excludes your own address and groups by exact address + display name. Every row has a safe nested sample {mailbox, uidValidity, uid, resourceUri} for inspection or delete_by_sender. Live offset pagination defaults to 10 rows (max 100).",
         annotations(title = "Top Senders", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -253,8 +269,9 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<TopSendersArgs>,
-    ) -> Result<Json<TopSendersResponse>, McpError> {
-        let limit = Some(args.limit.map_or(100, |v| v as usize));
+    ) -> Result<CallToolResult, McpError> {
+        let offset = bounded_offset(args.offset)?;
+        let limit = bounded_usize(args.limit, 10, 1, 100, "limit")?;
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
@@ -263,20 +280,22 @@ impl AgentMailServer {
             .top_senders(
                 args.mailbox.as_deref(),
                 &args.account,
+                offset,
                 limit,
                 progress.as_ref(),
                 Some(&cancel),
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(TopSendersOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "top_subscriptions",
-        description = "List your top subscriptions — bulk/marketing senders you can unsubscribe from — by message count. Omit mailbox to scan the entire account. Includes messages with either List-Unsubscribe or List-Unsubscribe-Post. Grouped by sender (From), sorted by one-click support first then by count. To clean up a sender, pass the sampleUid and sampleMailbox to unsubscribe_message (not delete_by_sender). Returns count, unsubscribe URL, one-click flag, sample UID + mailbox.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<TopSubscriptionsOutput>().expect("valid top_subscriptions output schema"),
+        description = "List bulk/marketing subscriptions by message count. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Rows are grouped by exact address + display name and sorted by advertised one-click syntax, then count. Each has a nested sample {mailbox, uidValidity, uid, resourceUri}; map it to unsubscribe_message mailbox, expectedUidValidity, and uid. advertisedOneClick is syntactic only—the action re-fetches exact headers and verifies DKIM. Live offset pagination defaults to 10 rows (max 100).",
         annotations(title = "Top Subscriptions", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -286,8 +305,9 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<TopSubscriptionsArgs>,
-    ) -> Result<Json<TopSubscriptionsResponse>, McpError> {
-        let limit = Some(args.limit.map_or(100, |v| v as usize));
+    ) -> Result<CallToolResult, McpError> {
+        let offset = bounded_offset(args.offset)?;
+        let limit = bounded_usize(args.limit, 10, 1, 100, "limit")?;
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
@@ -296,20 +316,22 @@ impl AgentMailServer {
             .top_subscriptions(
                 args.mailbox.as_deref(),
                 &args.account,
+                offset,
                 limit,
                 progress.as_ref(),
                 Some(&cancel),
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(TopSubscriptionsOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }
 
     #[tool(
         name = "top_mailing_lists",
-        description = "List your top mailing lists by List-Id header (RFC 2919), highest volume first. Groups all messages from the same mailing list regardless of sender address — useful for lists like GitHub notifications where multiple senders share one List-Id. Omit mailbox to scan the entire account. Use delete_list_id to remove all messages from a list.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<TopMailingListsOutput>().expect("valid top_mailing_lists output schema"),
+        description = "List mailing lists by normalized List-Id (RFC 2919), highest volume first, including List-Id-only messages and grouping across senders. Each row includes a bounded sender preview, senderCount, and a UIDVALIDITY-safe nested sample for inspection. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Live offset pagination defaults to 10 rows (max 100). Use delete_list_id with an approved listId to remove matching messages.",
         annotations(title = "Top Mailing Lists", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -319,8 +341,9 @@ impl AgentMailServer {
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<TopMailingListsArgs>,
-    ) -> Result<Json<TopMailingListsResponse>, McpError> {
-        let limit = Some(args.limit.map_or(100, |v| v as usize));
+    ) -> Result<CallToolResult, McpError> {
+        let offset = bounded_offset(args.offset)?;
+        let limit = bounded_usize(args.limit, 10, 1, 100, "limit")?;
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
@@ -329,13 +352,14 @@ impl AgentMailServer {
             .top_mailing_lists(
                 args.mailbox.as_deref(),
                 &args.account,
+                offset,
                 limit,
                 progress.as_ref(),
                 Some(&cancel),
             )
             .await
         {
-            Ok(data) => Ok(Json(data)),
+            Ok(data) => compact_result(TopMailingListsOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }

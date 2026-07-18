@@ -6,8 +6,9 @@ mod resources;
 mod tasks;
 mod tools_read;
 mod tools_write;
+mod wire;
 
-use self::tasks::{DESTRUCTIVE_TOOLS, ManagedTask, TaskManager, extract_account};
+use self::tasks::{DESTRUCTIVE_TOOLS, TaskManager, extract_account};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
@@ -17,8 +18,7 @@ use rmcp::{
         GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult,
         GetTaskResultParams, Implementation, ListPromptsResult, ListResourceTemplatesResult,
         ListTasksResult, Meta, PaginatedRequestParams, ProgressNotificationParam,
-        ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo, Task,
-        TaskStatus,
+        ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
     },
     prompt_handler,
     service::RequestContext,
@@ -29,10 +29,6 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-fn utc_now_iso8601() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
 
 fn mask_prefix_for_log(value: &str) -> String {
     let char_count = value.chars().count();
@@ -98,6 +94,10 @@ fn to_mcp_error(e: &crate::AgentmailError) -> McpError {
         E::AccountNotFound(_)
         | E::MailboxNotFound(_)
         | E::MessageNotFound(_)
+        | E::UidValidityUnavailable { .. }
+        | E::UidValidityChanged { .. }
+        | E::UnsubscribeConsentRequired
+        | E::InvalidUnsubscribePolicy(_)
         | E::InvalidSearch(_)
         | E::Config(_)
         | E::Credential(_) => McpError::invalid_params(e.to_string(), None),
@@ -107,8 +107,33 @@ fn to_mcp_error(e: &crate::AgentmailError) -> McpError {
         | E::Parse(_)
         | E::NotConnected
         | E::PoolExhausted
+        | E::Cancelled
         | E::Other(_) => McpError::internal_error(e.to_string(), None),
     }
+}
+
+pub(super) fn bounded_usize(
+    value: Option<u64>,
+    default: usize,
+    min: usize,
+    max: usize,
+    name: &str,
+) -> Result<usize, McpError> {
+    let value = value.unwrap_or(default as u64);
+    let value = usize::try_from(value).map_err(|_| {
+        McpError::invalid_params(format!("{name} is too large; maximum is {max}"), None)
+    })?;
+    if !(min..=max).contains(&value) {
+        return Err(McpError::invalid_params(
+            format!("{name} must be between {min} and {max}"),
+            None,
+        ));
+    }
+    Ok(value)
+}
+
+pub(super) fn bounded_offset(value: Option<u64>) -> Result<usize, McpError> {
+    bounded_usize(value, 0, 0, 1_000_000, "offset")
 }
 
 // ---------------------------------------------------------------------------
@@ -155,21 +180,24 @@ impl ServerHandler for AgentMailServer {
         .with_instructions(
             "AgentMail is a full-featured IMAP email client. \
              Start with list_accounts to discover configured accounts. \
-             Use list_mailboxes to see folder structure and message counts. \
-             Read messages with get_messages (paginated, newest-first) or search_messages (with filters). \
-             Use search_messages to find specific messages by sender, subject, or content. \
+             list_mailboxes requires one account and returns selectable mailboxes only, paginated with a default of 100. \
+             get_messages and search_messages return metadata only, newest-first, with the mailbox UIDVALIDITY and a UIDVALIDITY-safe resourceUri for each row. \
+             Read resourceUri for markdown content; append /headers for exact headers or /source for bounded raw RFC822. \
              Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
              top_senders, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
-             All-mailbox scans automatically skip Trash, Junk, Spam, and Drafts. \
+             Ranked tools use live offset pages with a default of 10 and maximum of 100; pages may shift when mail changes. \
+             Account-wide discovery uses one selectable All mailbox when available; otherwise it skips Trash, Junk, Spam, Drafts, and virtual aggregate views. Destructive scans never write through aggregate views. \
+             Every action that consumes a UID requires the same mailbox and non-zero expectedUidValidity returned during discovery, and fails closed if the mailbox UID epoch changed. \
              Two cleanup workflows: (1) top_senders → delete_by_sender for unwanted personal senders, (2) top_subscriptions → unsubscribe_message for mailing lists. \
              Never use delete_by_sender for mailing list cleanup — it deletes ALL messages from a sender including non-bulk ones. \
              top_mailing_lists groups by List-Id header (RFC 2919) — all messages from the same mailing list regardless of sender. Use delete_list_id to remove an entire list. \
              top_senders groups by (email, display name) — same email with different display names are separate entries. \
-             top_subscriptions returns sample UIDs + mailboxes that can be passed directly to unsubscribe_message. \
-             unsubscribe_message deletes by matching sender + either unsubscribe header when delete_matching=true; the unsubscribe POST is best-effort and never blocks deletion. \
+             Ranking rows include a nested sample {mailbox, uidValidity, uid, resourceUri}; map those fields to mailbox, expectedUidValidity, and uid for a later action. \
+             top_subscriptions advertisedOneClick is syntactic only; unsubscribe_message re-fetches exact headers and verifies DKIM. \
+             unsubscribe_message requires explicit confirmOneClick=true. deleteMatching defaults false, requires the exact normalized List-Id to be covered by the same passing DKIM signature, stops after a failed POST by default, and never silently escalates a Trash failure to permanent deletion. \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
-             find_attachments detects multipart/mixed and multipart/related; download_attachments saves them to disk. \
-             Single messages are also readable as resources: email://{account}/{mailbox}/{uid} (markdown) and email://{account}/{mailbox}/{uid}/source (raw RFC822); percent-encode account and mailbox, encoding '/' in mailbox names as %2F. \
+             find_attachments returns mailbox-safe {mailbox, uidValidity, uid, date, resourceUri} hits; pass that identity to download_attachments. \
+             Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), email://{account}/{mailbox}/{uidValidity}/{uid}/headers (exact headers), and email://{account}/{mailbox}/{uidValidity}/{uid}/source (bounded raw RFC822). Percent-encode account and mailbox, including '/' in mailbox names as %2F. \
              All reads use BODY.PEEK to avoid marking messages as read.",
         )
     }
@@ -203,10 +231,9 @@ impl ServerHandler for AgentMailServer {
     async fn enqueue_task(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<CreateTaskResult, McpError> {
         let task_id = uuid::Uuid::new_v4().to_string();
-        let now = utc_now_iso8601();
 
         let is_destructive = DESTRUCTIVE_TOOLS.contains(&request.name.as_ref());
         let destructive_lock = if is_destructive {
@@ -221,11 +248,19 @@ impl ServerHandler for AgentMailServer {
             None
         };
 
+        // Reserve before spawning so capacity rejection cannot start work.
+        let task = self.task_manager.lock().reserve_task(task_id.clone())?;
+
         let result_slot: Arc<parking_lot::Mutex<Option<Result<CallToolResult, McpError>>>> =
             Arc::new(parking_lot::Mutex::new(None));
 
         let server = self.clone();
         let slot = Arc::clone(&result_slot);
+        // Keep transport cancellation inherited from the request while also
+        // giving tasks/cancel a token that reaches cooperative library work
+        // and spawn_blocking SQLite publication.
+        let task_cancel = context.ct.child_token();
+        context.ct = task_cancel.clone();
         let handle = tokio::spawn(async move {
             // If destructive, acquire the per-account lock first.
             // This serializes destructive tasks — the task waits here until
@@ -235,40 +270,25 @@ impl ServerHandler for AgentMailServer {
                 Some(ref lock) => Some(lock.lock().await),
                 None => None,
             };
-            // Cancellation: `tasks/cancel` → JoinHandle::abort() is the
-            // effective cancel path for task-based execution (rmcp keeps the
-            // original request's cancellation token alive after the
-            // CreateTaskResult response, but spec-compliant clients never
-            // cancel an already-responded request id). The cooperative
-            // CancelFn threaded through `context.ct` serves direct tools/call
-            // requests and transport shutdown.
             let result = server.call_tool(request, context).await;
             *slot.lock() = Some(result);
         });
 
-        let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
-            .with_poll_interval(2000);
-
-        let managed = ManagedTask {
-            meta: task.clone(),
-            result: result_slot,
-            handle,
-        };
-
-        self.task_manager.lock().tasks.insert(task_id, managed);
+        self.task_manager
+            .lock()
+            .commit_task(&task_id, result_slot, task_cancel, handle)?;
 
         Ok(CreateTaskResult::new(task))
     }
 
     async fn list_tasks(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListTasksResult, McpError> {
-        let mut mgr = self.task_manager.lock();
-        mgr.refresh_all();
-        let tasks: Vec<Task> = mgr.tasks.values().map(|m| m.meta.clone()).collect();
-        Ok(ListTasksResult::new(tasks))
+        self.task_manager
+            .lock()
+            .list_page(request.as_ref().and_then(|params| params.cursor.as_deref()))
     }
 
     async fn get_task_info(
@@ -276,15 +296,8 @@ impl ServerHandler for AgentMailServer {
         request: GetTaskInfoParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        let mut mgr = self.task_manager.lock();
-        mgr.refresh_status(&request.task_id);
-        let managed = mgr.tasks.get(&request.task_id).ok_or_else(|| {
-            McpError::invalid_params(format!("unknown task: {}", request.task_id), None)
-        })?;
-        Ok(GetTaskResult {
-            meta: None,
-            task: managed.meta.clone(),
-        })
+        let task = self.task_manager.lock().task_info(&request.task_id)?;
+        Ok(GetTaskResult { meta: None, task })
     }
 
     async fn get_task_result(
@@ -292,31 +305,10 @@ impl ServerHandler for AgentMailServer {
         request: GetTaskResultParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
-        let mut mgr = self.task_manager.lock();
-        mgr.refresh_status(&request.task_id);
-        let managed = mgr.tasks.get(&request.task_id).ok_or_else(|| {
-            McpError::invalid_params(format!("unknown task: {}", request.task_id), None)
-        })?;
-        match managed.meta.status {
-            TaskStatus::Working => Err(McpError::invalid_params("task is still running", None)),
-            TaskStatus::Cancelled => Err(McpError::invalid_params("task was cancelled", None)),
-            _ => {
-                // Take the result out of the slot.
-                let result = managed.result.try_lock().and_then(|mut guard| guard.take());
-                match result {
-                    Some(Ok(call_result)) => {
-                        let value = serde_json::to_value(call_result)
-                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                        Ok(GetTaskPayloadResult::new(value))
-                    }
-                    Some(Err(e)) => Err(e),
-                    None => Err(McpError::internal_error(
-                        "task result already consumed",
-                        None,
-                    )),
-                }
-            }
-        }
+        let result = self.task_manager.lock().task_result(&request.task_id)?;
+        let value = serde_json::to_value(result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(GetTaskPayloadResult::new(value))
     }
 
     async fn cancel_task(
@@ -324,19 +316,8 @@ impl ServerHandler for AgentMailServer {
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CancelTaskResult, McpError> {
-        let mut mgr = self.task_manager.lock();
-        let managed = mgr.tasks.get_mut(&request.task_id).ok_or_else(|| {
-            McpError::invalid_params(format!("unknown task: {}", request.task_id), None)
-        })?;
-        if managed.meta.status == TaskStatus::Working {
-            managed.handle.abort();
-            managed.meta.status = TaskStatus::Cancelled;
-            managed.meta.last_updated_at = utc_now_iso8601();
-        }
-        Ok(CancelTaskResult {
-            meta: None,
-            task: managed.meta.clone(),
-        })
+        let task = self.task_manager.lock().cancel_task(&request.task_id)?;
+        Ok(CancelTaskResult { meta: None, task })
     }
 }
 
@@ -469,6 +450,72 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn uid_actions_require_nonzero_uid_validity() {
+        let tools = AgentMailServer::tool_router().list_all();
+        for name in [
+            "delete_messages",
+            "delete_by_sender",
+            "download_attachments",
+            "move_message",
+            "unsubscribe_message",
+            "add_flags",
+            "remove_flags",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing tool `{name}`"));
+            let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+            let required = schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("tool `{name}` has no required array"));
+            assert!(
+                required
+                    .iter()
+                    .any(|field| field.as_str() == Some("expectedUidValidity")),
+                "tool `{name}` must require expectedUidValidity"
+            );
+            assert_eq!(
+                schema["properties"]["expectedUidValidity"]["minimum"],
+                serde_json::json!(1),
+                "tool `{name}` must reject UIDVALIDITY zero in its schema"
+            );
+            if name == "delete_messages" {
+                assert_eq!(
+                    schema["properties"]["uids"]["items"]["minimum"],
+                    serde_json::json!(1),
+                    "delete_messages must reject UID zero in its schema"
+                );
+            } else {
+                assert_eq!(
+                    schema["properties"]["uid"]["minimum"],
+                    serde_json::json!(1),
+                    "tool `{name}` must reject UID zero in its schema"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_mailboxes_requires_account() {
+        let tools = AgentMailServer::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "list_mailboxes")
+            .expect("missing list_mailboxes tool");
+        let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+        let required = schema["required"]
+            .as_array()
+            .expect("list_mailboxes has no required array");
+
+        assert!(
+            required
+                .iter()
+                .any(|field| field.as_str() == Some("account"))
+        );
     }
 
     /// `DESTRUCTIVE_TOOLS` gates task serialization and must stay in sync with

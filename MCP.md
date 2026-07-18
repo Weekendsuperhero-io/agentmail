@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-05-29T19:20
+updated: 2026-07-18T00:00
 ---
 # Agentmail MCP — Tool & Prompt Reference
 
@@ -15,7 +15,7 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 | #   | Tool                | Description                                      | Annotations |
 | --- | ------------------- | ------------------------------------------------ | ----------- |
 | 1   | `list_accounts`     | Return configured IMAP account names             | `read_only` |
-| 2   | `list_mailboxes`    | List all folders with counts, attributes, and RFC 6154 roles | `read_only` |
+| 2   | `list_mailboxes`    | Paginate selectable folders with counts and registered special-use roles | `read_only` |
 | 3   | `check_connection`  | Test IMAP connectivity and auth for an account   | `read_only` |
 | 4   | `list_capabilities` | Query IMAP extensions (IDLE, MOVE, CONDSTORE)    | `read_only` |
 
@@ -23,19 +23,31 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 
 **list_accounts** → `ListAccountsResponse`
 ```json
-{ "accounts": [{ "name", "host", "username", "isDefault?" }] }
+{ "accounts": [{ "name", "isDefault": bool }] }
 ```
+
+The MCP projection intentionally omits IMAP hostnames and login usernames.
 
 **list_mailboxes** → `ListMailboxesResponse`
 ```json
-{ "mailboxes": [{ "name", "account", "totalMessages", "unseenMessages", "recentMessages", "delimiter?", "path",
-    "noSelect?": bool, "noInferiors?": bool, "role?": "trash"|"junk"|"drafts"|"sent"|"archive"|"all"|"flagged" }] }
+{ "account", "offset", "limit", "total", "nextOffset?",
+  "mailboxes": [{ "name", "totalMessages", "unseenMessages", "delimiter?",
+    "noInferiors": bool, "roles?": ["all", "archive", ...] }] }
 ```
-`noSelect` (RFC 3501): mailbox is a virtual container — cannot be selected, searched, or deleted from. `noInferiors`: no child mailboxes exist or can be created. `role` (RFC 6154): server-declared special-use purpose. Omitted for ordinary user mailboxes. `recentMessages` is always 0 on IMAP4rev2-only servers (RFC 9051 removed the RECENT status item).
+
+`account` is required. `offset` defaults to 0 and `limit` defaults to 100
+(maximum 500). Only selectable mailboxes are exposed, because unselectable
+containers cannot be searched or used as mutation targets. `roles` preserves
+every recognized registered special-use purpose and is omitted for ordinary
+mailboxes. Filtering and pagination happen before per-mailbox `STATUS`, so only
+the returned page incurs count queries. The query is always live; counts never
+come from the layout catalog.
+The currently supported/tested client profile is IMAP4rev1; pure IMAP4rev2
+servers are not yet supported end to end.
 
 **check_connection** → `ConnectionStatus`
 ```json
-{ "account", "connected": bool, "error?", "serverGreeting?" }
+{ "account", "connected": bool, "error?" }
 ```
 
 **list_capabilities** → `ListCapabilitiesResponse`
@@ -49,94 +61,134 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 
 | #   | Tool               | Description                                                                                         | Annotations            |
 | --- | ------------------ | --------------------------------------------------------------------------------------------------- | ---------------------- |
-| 5   | `get_messages`     | Paginated fetch, newest-first. Optional body + headers. Default: INBOX, offset=0, limit=25 (max 50) | `read_only`            |
-| 6   | `search_messages`  | IMAP SEARCH: sender, subject, to, full-text, read/flagged/deleted, header key/value. Paginated.     | `read_only`            |
+| 5   | `get_messages`     | Paginated metadata discovery, newest-first. Default: INBOX, offset=0, limit=25 (max 50) | `read_only`            |
+| 6   | `search_messages`  | Paginated IMAP metadata search with text, headers, status, date, and size filters.     | `read_only`            |
 | 7   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only`, `taskable` |
 | 8   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only`, `taskable` |
 | 9   | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only`, `taskable` |
-| 10  | `top_subscriptions` | Top bulk-mail senders by volume. Returns unsubscribe URLs, sample UIDs.                             | `read_only`, `taskable` |
+| 10  | `top_subscriptions` | Top bulk-mail senders with advertised one-click syntax and UIDVALIDITY-guarded samples.             | `read_only`, `taskable` |
 | 11  | `top_mailing_lists`     | Top mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.           | `read_only`, `taskable` |
 
 #### Output Schemas
 
 **get_messages**
 ```json
-{ "mailbox", "account", "offset", "limit", "total",
-  "messages": [MessageInfo] }
+{ "mailbox", "account", "uidValidity", "offset", "limit", "total",
+  "messages": [MessageMetadata] }
 ```
 
 **search_messages**
 ```json
-{ "mailbox", "account", "offset", "limit", "totalMatches",
-  "messages": [MessageInfo] }
+{ "mailbox", "account", "uidValidity", "offset", "limit", "totalMatches",
+  "messages": [MessageMetadata] }
 ```
 
-Non-ASCII search text is sent with a `CHARSET UTF-8` prefix (accepted by Gmail, Dovecot, Courier, iCloud, Outlook, and required by IMAP4rev2). Servers that reject UTF-8 search return `-32602`. CR/LF in search text is rejected.
+Non-ASCII search text is sent with a `CHARSET UTF-8` prefix (accepted by Gmail, Dovecot, Courier, iCloud, and Outlook). Servers that reject UTF-8 search return `-32602`. CR/LF in search text is rejected.
 
 Search filters are **AND-combined** (a message must match all provided filters) and matched as **case-insensitive substrings** (IMAP semantics). `header_key` without a value matches messages that merely *have* that header. Date range: `since`/`before` (YYYY-MM-DD, server internal date → IMAP `SINCE`/`BEFORE`, since=inclusive, before=exclusive). Size: `larger_than`/`smaller_than` in bytes (`LARGER`/`SMALLER`). Arbitrary `OR`/`NOT` boolean expressions are not supported — a recursive query tree would reintroduce `$defs`/`$ref` into the tool schema (which some hosts reject); issue multiple searches instead.
 
-**MessageInfo** (shared by get_messages, search_messages, get_messages_by_uid)
+**MessageMetadata** (shared by `get_messages` and `search_messages`)
 ```json
-{ "uid", "subject", "sender", "replyTo", "to": [], "cc": [],
-  "mailbox", "account", "date?", "flags": [],
-  "size?", "content?", "contentFormat?", "contentTruncated?",
-  "listUnsubscribe?", "listUnsubscribePost?", "listId?", "listHelp?",
-  "messageId?", "inReplyTo?", "references?": [], "bcc?": [],
-  "mimeType?", "attachments?": [{ "name?", "contentType", "size", "contentId?" }],
-  "headers?": { "Header-Name": ["value"] } }
+{ "uid", "subject", "sender", "date?", "flags": [], "size?", "resourceUri" }
 ```
+
+These two tools are metadata-only over MCP. They do not accept
+`includeContent` or `includeHeaders`, and they never return bodies, complete
+headers, recipient lists, or raw list-action values. Follow `resourceUri` when
+body, exact-header, or raw-source data is actually needed.
 
 **list_flags**
 ```json
 { "mailbox": "INBOX" | "*", "account", "totalFlags",
   "flags": [{ "flag": "\\Seen", "count": 5000 }],
   "colors?": [{ "color": "red", "count": 8 }],
-  "perMailbox?": [{ "mailbox", "totalFlags", "flags": [...] }] }
+  "perMailbox?": [{ "mailbox", "totalFlags", "flags": [...] }],
+  "perMailboxTotal", "perMailboxTruncated" }
 ```
-`colors` present when Apple $MailFlagBit flags exist. `perMailbox` present when mailbox omitted.
+`colors` is present when Apple $MailFlagBit flags exist. Account-wide mailbox
+breakdowns are capped at 50 rows and include total/truncation metadata.
 
 **find_attachments**
 ```json
 { "mailbox": "INBOX" | "*", "account", "total", "offset", "limit",
-  "uids": [501, 498, ...],
-  "perMailbox?": [{ "mailbox", "count" }] }
+  "nextOffset?",
+  "messages": [{ "mailbox", "uidValidity", "uid", "date?", "resourceUri" }],
+  "perMailbox?": [{ "mailbox", "count" }],
+  "perMailboxTotal", "perMailboxTruncated" }
 ```
-`perMailbox` present when mailbox omitted. UIDs paginated (default 25, max 100).
+
+Results are paginated newest-first (default 25, maximum 100). Every hit carries
+its owning mailbox and UID epoch, so account-wide UIDs are never ambiguous.
+Mailbox breakdowns are capped at 50 rows and include total/truncation metadata.
 
 **top_senders**
 ```json
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueSenders",
+  "offset", "limit", "nextOffset?",
   "senders": [{
-    "sender": "Display Name <email>", "address", "displayName",
-    "count", "oldestDate?", "newestDate?"
+    "address", "displayName", "count", "oldestDate?", "newestDate?",
+    "sample": MessageIdentity
   }] }
 ```
-Grouped by (email, display name) — same email with different display names are separate entries. `limit` defaults to 100 on all three top-N tools; set it higher to return more. Account-wide scans (omit `mailbox`) skip Trash/Junk/Drafts/All Mail, **deduplicate by Message-ID across folders** (so a message under several Gmail labels is counted once — counts reflect unique messages), and **exclude the account's own address** (so your sent mail doesn't rank you as a sender). `top_subscriptions` also excludes self.
+
+Grouped by `(email, display name)`; the same address with different display
+names is separate. All three `top_*` tools use `offset`/`limit` pagination with
+a default of 10 and maximum of 100. Account-wide discovery uses one selectable
+`\All` mailbox when available. Otherwise it enumerates storage mailboxes,
+excludes Trash/Junk/Drafts and virtual All/Flagged/Important views, and
+deduplicates by Message-ID across folders. Sender rankings exclude the
+account's own address.
 
 **top_subscriptions**
 ```json
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueLists",
+  "offset", "limit", "nextOffset?",
   "lists": [{
-    "sender": "Newsletter <email>", "address",
-    "unsubscribeUrl?", "listUnsubscribePost?", "oneClick": bool,
-    "sampleUid", "sampleMailbox?",
-    "count", "oldestDate?", "newestDate?"
+    "address", "displayName", "advertisedOneClick": bool,
+    "count", "oldestDate?", "newestDate?", "sample": MessageIdentity
   }] }
 ```
-Sorted: one-click senders first, then by count. `sampleMailbox` needed because UIDs are per-mailbox.
+Sorted: advertised one-click senders first, then by count. `advertisedOneClick`
+checks exact local RFC 2369/8058 syntax; it does not claim DKIM success.
+Opaque unsubscribe URLs and recipient tokens are not exposed. Use the nested
+`sample` identity for a later `unsubscribe_message` call.
 
 **top_mailing_lists**
 ```json
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueLists",
+  "offset", "limit", "nextOffset?",
   "lists": [{
     "listId": "list-id.example.com",
-    "displayName": "Example List",
-    "senders": ["noreply@example.com"],
-    "count", "sampleUid", "sampleMailbox?",
-    "oldestDate?", "newestDate?"
+    "displayName": "Example List", "senders": ["noreply@example.com"],
+    "senderCount", "count", "oldestDate?", "newestDate?",
+    "sample": MessageIdentity
   }] }
 ```
-Grouped by List-Id header — same list with different senders are merged into one entry.
+
+Grouped by List-Id header; the same list with different senders is one entry.
+`senders` is a preview of at most five values and `senderCount` reports the
+complete count.
+
+```json
+MessageIdentity = { "mailbox", "uidValidity", "uid", "resourceUri" }
+```
+
+The three `top_*` tools share a persistent ranking-header projection. Every reuse is validated with live `EXAMINE` metadata and the RFC identity tuple `(mailbox, UIDVALIDITY, UID)`. Cache hits avoid header fetches, proven appends fetch only new UIDs, and deletions reconcile UID membership without refetching unchanged headers. A busy-mailbox snapshot is returned but remains reconcile-required until a stable snapshot is observed.
+
+The schema-v3 cache contains account mutation state, mailbox snapshot state,
+UID membership, sender address/name, date, Message-ID, normalized List-Id and
+display name, plus booleans for list-header and advertised-one-click presence.
+It does not store List-Unsubscribe URLs, recipient tokens, raw list-action
+headers, bodies, subjects, recipients, flags, attachments, passwords,
+authentication tokens, keychain secrets, or complete messages. The cache
+namespace necessarily includes the configured account name, IMAP
+host/port/TLS mode, and login username to prevent identities from different
+servers colliding. SQLite uses WAL mode with
+`synchronous=NORMAL`. Set
+`AGENTMAIL_DISABLE_HEADER_CACHE=1` to disable it or `AGENTMAIL_CACHE_DIR` to
+override its root; cache errors fall back to live IMAP.
+
+`list_flags` and `find_attachments` use the same discovery plan. Discovery uses one selectable `\All` mailbox exclusively when available. Enumerated fallback and account-wide destructive tools skip `\All`, `\Drafts`, `\Flagged`, `\Important`, `\Junk`, and `\Trash`, while retaining storage roles including `\Archive`, `\Sent`, `\Memos`, `\Scheduled`, and `\Snoozed`. A caller-provided mailbox bypasses planning and is honored directly. IMAP defines `\NoSelect`, not a separate `\NoScan` attribute; `\NoSelect` is always excluded automatically.
 
 ---
 
@@ -151,17 +203,37 @@ Grouped by List-Id header — same list with different senders are merged into o
 | 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
 | 17  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. |                                          |
 | 18  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     | `taskable`                               |
-| 19  | `unsubscribe_message`  | RFC 8058 one-click unsubscribe POST + bulk delete matching bulk mail. `permanent=true` bypasses Trash. | `destructive`, `open_world`              |
+| 19  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional exact List-Id cleanup defaults off.             | `destructive`, `open_world`, `taskable`  |
 
 **`permanent` flag (delete tools):** default false moves to Trash when a Trash mailbox exists, else permanently deletes. When true, flags `\Deleted` + UID EXPUNGE directly, bypassing Trash — irreversible. Permanent delete requires the server to advertise UIDPLUS; on servers without it the call is refused (plain EXPUNGE would purge unrelated `\Deleted` messages).
 
+`unsubscribe_message` is stricter than the legacy generic delete behavior:
+Trash unavailability or MOVE failure does not become a permanent deletion
+unless `allowPermanentFallback=true` was separately supplied.
+
 **Gmail:** on Gmail (`X-GM-EXT-1`), in-place `\Deleted`+EXPUNGE only removes a *label* — the message survives in All Mail. agentmail therefore routes every delete, including `permanent`, through `[Gmail]/Trash` (which removes the message from all labels; Gmail purges Trash on its own schedule). Immediate hard-purge isn't available on Gmail.
+
+`delete_messages` accepts at most 500 explicitly supplied UIDs over MCP. `delete_by_sender`, `delete_list_id`, and unsubscribe matching have no total match limit; they split server mutations into 500-UID wire batches. A `top_*` ranking `limit` never becomes a deletion limit.
+
+UID-based tools never accept a bare UID as durable identity. The following
+arguments are required together with `expectedUidValidity`:
+
+- `delete_messages`: one or more UIDs discovered in one mailbox epoch.
+- `delete_by_sender`: the `sample.uid` from `top_senders`.
+- `move_message`, `download_attachments`, `add_flags`, and `remove_flags`:
+  the UID from a current discovery result.
+- `unsubscribe_message`: the `sample` from `top_subscriptions`.
+
+Each tool performs a live mailbox selection and fails before acting when the
+observed UIDVALIDITY differs. Refresh discovery instead of retrying a stale
+identity.
 
 #### Output Schemas
 
 **delete_messages**
 ```json
-{ "mailbox", "account", "deleted": 5, "failed": 0 }
+{ "mailbox", "account", "deleted": 5, "failed": 0,
+  "trashFallback": bool, "permanent": bool }
 ```
 
 **delete_by_sender**
@@ -169,9 +241,13 @@ Grouped by List-Id header — same list with different senders are merged into o
 { "mailbox": "INBOX" | "*", "account",
   "sender": "Display Name <email>",
   "found", "deleted", "failed",
-  "mailboxes?": [{ "mailbox", "found", "deleted", "failed" }] }
+  "mailboxes?": [{ "mailbox", "found", "deleted", "failed" }],
+  "mailboxesTotal", "mailboxesTruncated",
+  "skipped?": [], "skippedTotal", "skippedTruncated", "permanent": bool }
 ```
-`mailboxes` present when `allMailboxes=true`.
+
+Mailbox and skipped breakdowns are capped at 50 rows; their total and
+truncation fields preserve audit completeness.
 
 **delete_list_id**
 ```json
@@ -179,47 +255,94 @@ Grouped by List-Id header — same list with different senders are merged into o
   "listId": "list-id.example.com",
   "found", "deleted", "failed",
   "mailboxes?": [{ "mailbox", "found", "deleted", "failed" }],
-  "skipped?": ["Trash", "Junk"] }
+  "mailboxesTotal", "mailboxesTruncated",
+  "skipped?": ["mailbox"], "skippedTotal", "skippedTruncated",
+  "permanent": bool }
 ```
-`mailboxes` present when scanning all mailboxes. `skipped` lists mailboxes excluded from scan.
+`mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched; policy-excluded special-use views are not reported as errors.
 
 **move_message**
 ```json
-{ "mailbox", "account", "uid", "destination", "moved": true }
+{ "mailbox", "account", "uidValidity", "uid", "destination" }
 ```
 
 **create_mailbox**
 ```json
-{ "account", "mailbox", "created": true }
+{ "account", "mailbox", "created": bool, "alreadyExists": bool }
 ```
 
 **create_draft**
 ```json
-{ "created": true, "account", "draftsMailbox",
-  "subject", "recipients": { "to": [], "cc": [], "bcc": [] },
-  "attachments?": ["report.pdf", "photo.jpg"] }
+{ "created": true, "account", "draftsMailbox", "attachmentCount" }
 ```
-`attachments` lists the filenames that were successfully attached (empty when none provided).
+
+The compact result confirms placement without echoing the subject, recipients,
+local input paths, or filenames. `create_draft` composes a complete RFC822
+message with Date and Message-ID and appends it to a selectable Drafts mailbox
+with the `\Draft` flag.
 
 **download_attachments**
 ```json
-{ "mailbox", "account", "uid",
-  "downloaded": [{ "filename", "path", "contentType", "size" }] }
+{ "mailbox", "account", "uidValidity", "uid",
+  "downloaded": [{ "index", "filename", "path", "contentType", "size" }] }
 ```
 
 **unsubscribe_message**
+
+Required action identity and consent:
+
 ```json
-{ "mailbox", "account", "uid",
-  "listUnsubscribe?", "listUnsubscribePost?", "listId?",
-  "pathway?": "list-unsubscribe",
-  "unsubscribed": { "success": bool, "method?": "one-click", "url?", "httpStatus?", "reason?" },
-  "matchingMessages?": {
-    "matchedBy": "sender+list-unsubscribe",
-    "sender", "found", "deleted", "failed",
-    "mailboxes": [{ "mailbox", "found", "deleted", "failed" }]
-  } }
+{
+  "mailbox": "INBOX",
+  "account": "work",
+  "uid": 42,
+  "expectedUidValidity": 3857529045,
+  "confirmOneClick": true,
+  "deleteMatching": false,
+  "deleteOnUnsubscribeFailure": false,
+  "allowSenderFallback": false,
+  "allowPermanentFallback": false,
+  "permanent": false
+}
 ```
-`matchingMessages` present when `deleteMatching=true`. `unsubscribed.success` is best-effort.
+
+The first four fields after `mailbox` identify a live-ranked message and record
+explicit RFC 8058 consent. All four cleanup/fallback switches default to
+`false`. List-Id cleanup additionally requires the same passing DKIM signature
+to cover the single `List-Id` header. `permanent=true` is an explicit
+hard-delete request on standard IMAP; on Gmail it safely moves to Trash because
+in-place EXPUNGE only removes a label. `allowPermanentFallback=true` separately
+permits escalation only when a Trash-first cleanup cannot use Trash, and is
+never applied on Gmail.
+
+```json
+{ "mailbox", "account", "uid", "uidValidity", "listId?",
+  "dkimVerified": bool, "listIdAuthenticated": bool, "dkimDomain?",
+  "unsubscribed": { "success": bool, "httpStatus?", "reason?" },
+  "matchingMessages?": {
+    "matchedBy": "list-id" | "exact-sender-fallback",
+    "sender", "listId?", "found", "deleted", "failed",
+    "mailboxes": [{ "mailbox", "found", "deleted", "failed" }],
+    "mailboxesTotal", "mailboxesTruncated",
+    "skipped": [], "skippedTotal", "skippedTruncated",
+    "permanent": bool, "trashFallback": bool, "complete": bool
+  },
+  "cleanupSkippedReason?"
+}
+```
+
+Neither the advertised URL, raw unsubscribe headers, recipient token, nor a
+duplicated method/pathway value is returned. Failure text is URL-redacted.
+
+The POST runs only after an exact header parse, local DKIM verification covering
+both RFC 8058 headers, public-destination DNS validation and pinning, and a
+second cancellation check. Redirects are disabled and only a direct 2xx is
+success. `matchingMessages` is present only when requested cleanup actually
+runs; otherwise `cleanupSkippedReason` explains a safety-policy stop.
+
+The transient DKIM source is preflighted with `RFC822.SIZE` and capped at 64
+MiB. This bounds one selected message only; account-wide cleanup has no total
+message ceiling and continues to mutate in 500-UID batches.
 
 ---
 
@@ -234,7 +357,8 @@ Grouped by List-Id header — same list with different senders are merged into o
 
 **add_flags** / **remove_flags**
 ```json
-{ "mailbox", "account", "uid", "flags": ["\\Seen", "\\Flagged", ...] }
+{ "mailbox", "account", "uidValidity", "uid",
+  "flags": ["\\Seen", "\\Flagged", ...], "color?" }
 ```
 Returns the full updated flag set after the operation.
 
@@ -248,38 +372,70 @@ Returns the full updated flag set after the operation.
 | 2   | `cleanup-sender`      | Find & bulk-delete from a specific sender         | `account`, `sender`          |
 | 3   | `find-attachments`    | Scan for downloadable attachments                 | `account`, `mailbox?`        |
 | 4   | `compose-email`       | Guided draft composition (supports attachments via create_draft) | `account`, `to?`, `subject?` |
-| 5   | `unsubscribe-cleanup` | Identify high-volume lists, unsubscribe + delete  | `account`                    |
+| 5   | `unsubscribe-cleanup` | Rank lists, obtain consent, verified unsubscribe  | `account`                    |
 | 6   | `list-id-cleanup`     | Identify mailing lists by List-Id, bulk-delete    | `account`                    |
 
 ## Task Support (SEP-1686)
 
-9 long-running tools support `execution.taskSupport = "optional"` — clients can invoke them normally (synchronous with progress notifications) or as background tasks (enqueue, poll, retrieve result).
+10 long-running tools support `execution.taskSupport = "optional"` — clients can invoke them normally (synchronous with progress notifications) or as background tasks (enqueue, poll, retrieve result).
 
-**Taskable tools:** `list_flags`, `find_attachments`, `top_senders`, `top_subscriptions`, `top_mailing_lists`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`
+**Taskable tools:** `list_flags`, `find_attachments`, `top_senders`, `top_subscriptions`, `top_mailing_lists`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `download_attachments`, `unsubscribe_message`
 
 **Destructive task serialization:** Destructive tasks (`delete_messages`, `delete_by_sender`, `delete_list_id`, `unsubscribe_message`) targeting the same account are serialized — each waits for the previous destructive task to finish before starting. Non-destructive tasks run concurrently without restriction.
 
 **Task lifecycle:** `tasks/list`, `tasks/get`, `tasks/getResult`, `tasks/cancel`
 
-**Cancellation:** `tasks/cancel` aborts the task's future at its next await point. For direct (non-task) calls, `notifications/cancelled` stops long scans cooperatively at the next mailbox or fetch-chunk boundary; transport shutdown triggers the same path.
+**Cancellation:** `tasks/cancel` first cancels the cooperative task token and then aborts the async future; active SQLite publication checks that token and rolls back. For direct calls, `notifications/cancelled` stops scans at mailbox/fetch-chunk boundaries and interrupts unsubscribe DNS, DKIM, and HTTP waits through a 25 ms cancellation poll. Cancellation during an HTTP send is inherently ambiguous because the endpoint may already have received the POST.
 
-## Resources (2 templates)
+Tasks are retained for 24 hours from creation, including completed, failed, and
+cancelled metadata. At most 128 live tasks/reservations are accepted per server
+process. `tasks/list` is newest-first in pages of 25 and uses an opaque,
+process-local cursor. `tasks/getResult` is repeatable until expiry; retrieving a
+result does not evict it. Expired active tasks are cancelled and removed.
+
+## Tool Result Encoding
+
+Every tool returns one short text block for clients that do not consume
+structured output and one authoritative `structuredContent` object. The text
+block is a summary capped at 8,000 characters, not a second escaped copy of the
+JSON payload. All 21 output schemas are root objects with nested definitions
+inlined, so they contain no `$defs` or `$ref`.
+
+Potentially long mailbox/skipped breakdowns are capped at 50 rows and include
+`*Total` and `*Truncated` fields. Mailing-list sender previews are capped at
+five addresses. These caps reduce model-context payloads without discarding
+destructive-operation counts or audit state.
+
+## Resources (3 templates)
 
 Single messages are addressable as resources. `resources/list` is intentionally empty — discovery is template-based (`resources/templates/list`), since mailboxes hold thousands of messages.
 
-| URI template                               | MIME type        | Content                                       |
-| ------------------------------------------ | ---------------- | --------------------------------------------- |
-| `email://{account}/{mailbox}/{uid}`        | `text/markdown`  | Message rendered as markdown (headers + body) |
-| `email://{account}/{mailbox}/{uid}/source` | `message/rfc822` | Raw RFC822 source with all headers and MIME   |
+| URI template                                                        | MIME type             | Content                                      |
+| ------------------------------------------------------------------- | --------------------- | -------------------------------------------- |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}`                   | `text/markdown`       | Normalized message body, capped at 100K chars |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/headers`           | `text/rfc822-headers` | Exact RFC822 header block, maximum 64 KiB    |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/source`            | `message/rfc822`      | Lossless base64 MCP blob, maximum 256 KiB    |
 
-`account` and `mailbox` are percent-encoded URI segments; a `/` inside a mailbox name must be encoded as `%2F` (e.g. `email://work/Archive%2F2024/1234`). The markdown body is the same normalized, length-capped content `get_messages` returns with `includeContent=true`.
+`account` and `mailbox` are percent-encoded URI segments; a `/` inside a
+mailbox name must be encoded as `%2F`, for example
+`email://work/Archive%2F2024/3857529045/1234`. `uidValidity` and `uid` must be
+non-zero. Old three-segment UID-only URIs are invalid because an IMAP server may
+reuse a UID after changing UIDVALIDITY.
+
+Every resource read selects the mailbox and validates the expected epoch before
+fetching. A missing UID, unavailable UIDVALIDITY, or changed epoch returns
+resource-not-found. Body reads may transiently fetch at most 64 MiB before
+rendering the bounded view; oversized headers/source representations fail with
+guidance to use the narrower resource or attachment tools. `/source` returns an
+MCP resource `blob` whose field value is base64, preserving the original RFC822
+bytes without lossy UTF-8 conversion.
 
 **Error codes for `resources/read`:**
 
 | Code     | Meaning                                                    |
 | -------- | ---------------------------------------------------------- |
 | `-32602` | Malformed URI, unknown account                             |
-| `-32002` | UID does not exist in the mailbox (resource not found)     |
+| `-32002` | UID is missing or its UIDVALIDITY identity is stale        |
 | `-32603` | Transport/IMAP failure (including unselectable mailboxes)  |
 
 ## Completions
@@ -287,8 +443,8 @@ Single messages are addressable as resources. `resources/list` is intentionally 
 `completion/complete` is supported for prompt arguments and the `email://` resource-template variables:
 
 - `account` — instant, from configured account names, prefix-filtered.
-- `mailbox` — IMAP LIST scoped to the `account` from the completion context (falls back to the default account); for resource templates the values are returned percent-encoded, ready for substitution. Failures yield an empty list, never an error.
-- Other arguments (`uid`, `sender`, `to`, `subject`) are not enumerable and return no values.
+- `mailbox` — reads a bounded, five-minute, process-local layout catalog scoped to the `account` from the completion context (falling back to the default account). Cold or expired lookups issue one IMAP LIST; warm lookups do not use the network. Only path, delimiter, attributes, and recognized special-use roles are retained—never counts, UIDs, or message metadata. The same catalog plans account-wide scans. Resource-template values are percent-encoded for substitution. Failures yield an empty list, never an error.
+- Other arguments (`uidValidity`, `uid`, `sender`, `to`, `subject`) are not enumerable and return no values.
 
 ## Annotations Key
 

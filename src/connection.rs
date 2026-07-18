@@ -179,7 +179,8 @@ impl ConnectionPool {
                 drop(session); // dead — don't hand it back to the pool
                 tracing::warn!(
                     target: "agentmail",
-                    "IMAP connection dropped mid-operation for {account}; retrying once with a fresh connection: {e}",
+                    retry = 1,
+                    "IMAP connection dropped mid-operation; retrying with a fresh connection",
                 );
                 let mut fresh = self.acquire(account).await?;
                 let result = op(fresh.session()).await;

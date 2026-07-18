@@ -22,9 +22,10 @@ impl AgentMailServer {
             PromptMessageRole::User,
             format!(
                 "Give me a comprehensive overview of my email for account \"{}\". \
-                 First, list all mailboxes to see the folder structure, message totals, and unread counts. \
-                 Then use top_senders with limit 20 (omit mailbox to scan the entire account) to show me the top senders by volume. \
-                 Finally, show me the 10 most recent unread messages using search_messages with read=false.",
+                 First, call list_mailboxes with this account to see selectable folders, message totals, and unread counts. \
+                 Then use top_senders with mailbox and limit omitted so its account-wide default page of 10 ranks the top senders by volume. \
+                 Finally, show the 10 most recent unread INBOX messages using search_messages with read=false and limit=10. \
+                 Search results are metadata-only; read a row's UIDVALIDITY-safe resourceUri only when more content is needed.",
                 params.0.account
             ),
         )]
@@ -42,9 +43,11 @@ impl AgentMailServer {
             PromptMessageRole::User,
             format!(
                 "Help me clean up all emails from \"{}\" in account \"{}\". \
-                 First, search for messages from this sender in INBOX to see how many there are. \
-                 Show me the 5 most recent ones with include_content=false so I can confirm. \
-                 Then wait for my confirmation before bulk-deleting them all.",
+                 First, use search_messages with senderContains in INBOX and limit=5. Results are metadata-only; \
+                 show each returned sender, subject, and date plus totalMatches so I can confirm the exact sender identity. \
+                 Wait for confirmation. Then call delete_by_sender using one approved row's uid, the search wrapper's \
+                 uidValidity as expectedUidValidity, mailbox=INBOX, and allMailboxes=true. Explain that deletion \
+                 matches the sample message's exact address + display name and may differ from the original substring.",
                 params.0.sender, params.0.account
             ),
         )]
@@ -63,9 +66,10 @@ impl AgentMailServer {
             PromptMessageRole::User,
             format!(
                 "Find all messages with attachments in mailbox \"{}\" for account \"{}\". \
-                 Use find_attachments to get the UIDs. \
-                 Show me the first 10 so I can see who sent them and the subjects. \
-                 I may ask you to download specific attachments afterward.",
+                 Use find_attachments with limit=10. Each hit has mailbox, uidValidity, uid, date, and resourceUri. \
+                 Show those safe identities and dates; read resourceUri for any hit whose sender or subject I ask to inspect. \
+                 If I approve a download, call download_attachments with the hit's mailbox and uid, mapping uidValidity \
+                 to expectedUidValidity so a recycled UID cannot target another message.",
                 mailbox, params.0.account
             ),
         )]
@@ -91,7 +95,8 @@ impl AgentMailServer {
         }
         instructions.push_str(
             " Ask me what I want to say, help me write the body, then use create_draft \
-             (with optional attachments) to save it. Show me a preview of the draft before saving.",
+             (with optional attachments) to save it. Show me a preview before saving; create_draft resolves \
+             the proper Drafts mailbox and applies the Draft flag itself.",
         );
         vec![PromptMessage::new_text(
             PromptMessageRole::User,
@@ -101,7 +106,7 @@ impl AgentMailServer {
 
     #[prompt(
         name = "unsubscribe-cleanup",
-        description = "Identify high-volume mailing lists and unsubscribe + bulk-delete them."
+        description = "Identify high-volume mailing lists and perform consented, verified unsubscribe actions."
     )]
     async fn unsubscribe_cleanup_prompt(
         &self,
@@ -111,15 +116,18 @@ impl AgentMailServer {
             PromptMessageRole::User,
             format!(
                 "Help me clean up mailing list clutter in account \"{}\". \
-                 Step 1: Use top_subscriptions (omit mailbox to scan the entire account) to get a ranked list \
-                 of bulk-mail senders. Messages with either List-Unsubscribe or List-Unsubscribe-Post are \
-                 included. Results are grouped by sender and sorted by one-click support first, then count. \
-                 The unsubscribe URL comes from the newest message per sender. \
-                 Step 2: Present me with the ranked list so I can pick which ones to clean up. \
-                 Step 3: For each one I approve, call unsubscribe_message with the sample UID and mailbox, \
-                 and delete_matching=true. Deletion matches by exact sender + either List-Unsubscribe \
-                 or List-Unsubscribe-Post header to ensure only bulk mail is removed. The unsubscribe \
-                 POST is best-effort — if it fails, the messages are still deleted across all mailboxes.",
+                 Step 1: Use top_subscriptions with mailbox and limit omitted to get the default account-wide page of 10 \
+                 of bulk-mail senders. Results are grouped by sender and sorted by advertised one-click \
+                 syntax first, then count; execution still requires live DKIM verification. \
+                 Step 2: Present each row's address, display name, count, advertisedOneClick, and nested \
+                 sample {{mailbox, uidValidity, uid, resourceUri}}. Ask me to approve each unsubscribe POST. \
+                 Step 3: For each one I explicitly approve, call unsubscribe_message with sample.uid as uid, \
+                 sample.uidValidity as expectedUidValidity, sample.mailbox as mailbox, and confirmOneClick=true. Leave \
+                 deleteMatching=false unless I separately approve deleting matching mail. If I approve \
+                 cleanup, set deleteMatching=true; it matches an exact normalized List-Id only \
+                 when that header is covered by the same passing DKIM signature. Keep \
+                 deleteOnUnsubscribeFailure=false and allowPermanentFallback=false unless I separately \
+                 and explicitly authorize those higher-risk policies.",
                 params.0.account
             ),
         )]
@@ -137,13 +145,13 @@ impl AgentMailServer {
             PromptMessageRole::User,
             format!(
                 "Help me clean up mailing lists in account \"{}\". \
-                 Step 1: Use top_mailing_lists (omit mailbox to scan the entire account) to get a ranked list \
+                 Step 1: Use top_mailing_lists with mailbox and limit omitted to get the default account-wide page of 10 \
                  of mailing lists grouped by their List-Id header. This groups all messages from the same \
                  mailing list regardless of sender — useful for lists like GitHub notifications where \
                  multiple senders share one List-Id. \
                  Step 2: Present me with the ranked list so I can see which lists have the most messages. \
-                 Show the list name, message count, and the unique senders for each. \
-                 Step 3: For each list I approve, call delete_list_id with the list_id value to remove \
+                 Show listId, display name, message count, senderCount, the bounded sender preview, and safe sample resourceUri. \
+                 Step 3: For each list I approve, call delete_list_id with its listId value to remove \
                  all messages from that mailing list across all mailboxes.",
                 params.0.account
             ),

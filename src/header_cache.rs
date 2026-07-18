@@ -1,0 +1,2736 @@
+//! Persistent UID membership and immutable ranking-header cache.
+//!
+//! The cache never stores complete messages, bodies, subjects, recipients,
+//! flags, or credentials. Correctness is rooted in the RFC identity tuple
+//! `(mailbox, UIDVALIDITY, UID)`; SQLite is only an optimization around live
+//! IMAP validation.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
+use std::time::Instant;
+
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
+
+use crate::AgentmailError;
+use crate::config::AccountConfig;
+use crate::imap_client::{self, CancelFn, ImapSession, ListHeaderRow, ProgressFn};
+use crate::scan_cache::MailboxStatus;
+
+const CACHE_SCHEMA_VERSION: i64 = 3;
+const HEADER_PROJECTION_VERSION: i64 = 3;
+const FETCH_CHUNK_SIZE: usize = 1_000;
+const MAX_STABLE_SEARCH_ATTEMPTS: usize = 3;
+const MAX_RANK_PAGE_SIZE: usize = 100;
+const MAILING_LIST_SENDER_PREVIEW_LIMIT: usize = 5;
+
+type CacheResult<T> = std::result::Result<T, CacheError>;
+
+#[derive(Debug, thiserror::Error)]
+enum CacheError {
+    #[error("cache I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("cache database error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("cache blocking task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+    #[error("cache publication conflicted with a newer snapshot")]
+    Conflict,
+    #[error("cache publication cancelled")]
+    Cancelled,
+    #[error("cache invariant failed: {0}")]
+    Invariant(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CacheSyncError {
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+    #[error(transparent)]
+    Mail(#[from] AgentmailError),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoredState {
+    uid_validity: u32,
+    uid_next: Option<u32>,
+    exists: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoadedState {
+    mailbox: Option<StoredState>,
+    existing_revision: Option<i64>,
+    account_revision: i64,
+}
+
+/// Stable mailbox-local identity for a representative ranking message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedRankSample {
+    pub(crate) mailbox: String,
+    pub(crate) uid_validity: u32,
+    pub(crate) uid: u32,
+    pub(crate) date: Option<DateTime<Utc>>,
+}
+
+/// A bounded page from a SQL-backed ranking query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedRankPage<T> {
+    pub(crate) total_messages: u64,
+    pub(crate) total_groups: u64,
+    pub(crate) items: Vec<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedSenderRank {
+    pub(crate) address: String,
+    pub(crate) display_name: String,
+    pub(crate) count: u64,
+    pub(crate) oldest_date: Option<DateTime<Utc>>,
+    pub(crate) newest_date: Option<DateTime<Utc>>,
+    pub(crate) sample: CachedRankSample,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedSubscriptionRank {
+    pub(crate) address: String,
+    pub(crate) display_name: String,
+    pub(crate) count: u64,
+    pub(crate) oldest_date: Option<DateTime<Utc>>,
+    pub(crate) newest_date: Option<DateTime<Utc>>,
+    pub(crate) advertised_one_click: bool,
+    pub(crate) sample: CachedRankSample,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedMailingListRank {
+    /// Canonical RFC 2919 identifier without the surrounding angle brackets.
+    pub(crate) list_id: String,
+    pub(crate) display_name: String,
+    pub(crate) senders: Vec<String>,
+    pub(crate) sender_count: u64,
+    pub(crate) count: u64,
+    pub(crate) oldest_date: Option<DateTime<Utc>>,
+    pub(crate) newest_date: Option<DateTime<Utc>>,
+    pub(crate) sample: CachedRankSample,
+}
+
+#[derive(Debug, Clone)]
+struct RankScope {
+    path: Arc<PathBuf>,
+    account: String,
+    mailboxes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CacheKey {
+    account: String,
+    mailbox: String,
+}
+
+impl CacheKey {
+    fn new(account_name: &str, config: &AccountConfig, mailbox: &str) -> Self {
+        // Length prefixes avoid ambiguous separators while keeping the key
+        // inspectable when diagnosing a local cache file.
+        let host = config.host.to_ascii_lowercase();
+        let account = format!(
+            "{}:{}|{}:{}|{}|{}|{}:{}",
+            account_name.len(),
+            account_name,
+            host.len(),
+            host,
+            config.port,
+            u8::from(config.tls),
+            config.username.len(),
+            config.username
+        );
+        Self {
+            account,
+            mailbox: normalize_mailbox(mailbox),
+        }
+    }
+
+    fn gate_key(&self) -> String {
+        format!("{}\0{}", self.account, self.mailbox)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncKind {
+    Cold,
+    Hit,
+    Tail,
+    Membership,
+}
+
+impl SyncKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Hit => "hit",
+            Self::Tail => "tail",
+            Self::Membership => "membership",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishOutcome {
+    Published,
+    Conflict,
+}
+
+/// Persistent header cache used by account ranking operations.
+pub(crate) struct HeaderCache {
+    path: Option<Arc<PathBuf>>,
+    gates: parking_lot::Mutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl Default for HeaderCache {
+    fn default() -> Self {
+        Self {
+            path: default_cache_path().map(Arc::new),
+            gates: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl HeaderCache {
+    #[cfg(test)]
+    fn at_path(path: PathBuf) -> Self {
+        Self {
+            path: Some(Arc::new(path)),
+            gates: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn gate(&self, key: &CacheKey) -> Arc<Mutex<()>> {
+        let gate_key = key.gate_key();
+        let mut gates = self.gates.lock();
+        if let Some(gate) = gates.get(&gate_key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        if gates.len() >= 64 {
+            gates.retain(|_, gate| gate.strong_count() > 0);
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(gate_key, Arc::downgrade(&gate));
+        gate
+    }
+
+    /// Synchronize the selected mailboxes, then aggregate a bounded sender
+    /// page in SQLite. `None` asks the caller to use its live in-memory
+    /// fallback because the local optimization was disabled or unavailable.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn top_senders_page(
+        &self,
+        session: &mut ImapSession,
+        account_name: &str,
+        config: &AccountConfig,
+        mailboxes: &[String],
+        own_addresses: &[String],
+        offset: usize,
+        limit: usize,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> crate::Result<Option<CachedRankPage<CachedSenderRank>>> {
+        let Some(scope) = self
+            .validated_rank_scope(
+                session,
+                account_name,
+                config,
+                mailboxes,
+                on_progress,
+                cancel,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let own_addresses = own_addresses.to_vec();
+        match query_sender_page(scope, own_addresses, offset, limit).await {
+            Ok(page) => Ok(Some(page)),
+            Err(error) => {
+                warn!(target: "agentmail", error = %error, "sender cache query unavailable");
+                Ok(None)
+            }
+        }
+    }
+
+    /// SQL-backed subscription ranking without retaining unsubscribe URLs or
+    /// recipient tokens in the cache projection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn top_subscriptions_page(
+        &self,
+        session: &mut ImapSession,
+        account_name: &str,
+        config: &AccountConfig,
+        mailboxes: &[String],
+        own_addresses: &[String],
+        offset: usize,
+        limit: usize,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> crate::Result<Option<CachedRankPage<CachedSubscriptionRank>>> {
+        let Some(scope) = self
+            .validated_rank_scope(
+                session,
+                account_name,
+                config,
+                mailboxes,
+                on_progress,
+                cancel,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let own_addresses = own_addresses.to_vec();
+        match query_subscription_page(scope, own_addresses, offset, limit).await {
+            Ok(page) => Ok(Some(page)),
+            Err(error) => {
+                warn!(target: "agentmail", error = %error, "subscription cache query unavailable");
+                Ok(None)
+            }
+        }
+    }
+
+    /// SQL-backed RFC 2919 ranking. Sender previews and pages are bounded even
+    /// when a list spans a very large mailbox.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn top_mailing_lists_page(
+        &self,
+        session: &mut ImapSession,
+        account_name: &str,
+        config: &AccountConfig,
+        mailboxes: &[String],
+        offset: usize,
+        limit: usize,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> crate::Result<Option<CachedRankPage<CachedMailingListRank>>> {
+        let Some(scope) = self
+            .validated_rank_scope(
+                session,
+                account_name,
+                config,
+                mailboxes,
+                on_progress,
+                cancel,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        match query_mailing_list_page(scope, offset, limit).await {
+            Ok(page) => Ok(Some(page)),
+            Err(error) => {
+                warn!(target: "agentmail", error = %error, "mailing-list cache query unavailable");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn validated_rank_scope(
+        &self,
+        session: &mut ImapSession,
+        account_name: &str,
+        config: &AccountConfig,
+        mailboxes: &[String],
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> crate::Result<Option<RankScope>> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(None);
+        };
+        let account = CacheKey::new(account_name, config, "").account;
+        let mut selected = Vec::with_capacity(mailboxes.len());
+        let mut seen = HashSet::with_capacity(mailboxes.len());
+
+        for mailbox in mailboxes {
+            imap_client::check_cancel(cancel)?;
+            let key = CacheKey::new(account_name, config, mailbox);
+            if !seen.insert(key.mailbox.clone()) {
+                continue;
+            }
+            let gate = self.gate(&key);
+            let _guard = gate.lock().await;
+            match self
+                .sync_cached(Arc::clone(path), session, &key, on_progress, cancel)
+                .await
+            {
+                Ok(_) => selected.push(key.mailbox),
+                Err(CacheSyncError::Mail(error)) => return Err(error),
+                Err(CacheSyncError::Cache(CacheError::Cancelled)) => {
+                    return Err(AgentmailError::Other("cancelled by client".to_string()));
+                }
+                Err(CacheSyncError::Cache(error)) => {
+                    imap_client::check_cancel(cancel)?;
+                    warn!(
+                        target: "agentmail",
+                        mailbox,
+                        error = %error,
+                        "header cache unavailable; using live ranking scan"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(Some(RankScope {
+            path: Arc::clone(path),
+            account,
+            mailboxes: selected,
+        }))
+    }
+
+    /// Fence all published mailbox snapshots for an account before a mutation.
+    /// Immutable header rows are retained for the next membership reconcile.
+    pub(crate) async fn fence_account_mutation(&self, account_name: &str, config: &AccountConfig) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        // Do not create a cache (and account identity row) for users who have
+        // never used a ranking operation. A cold sync creates the database
+        // before doing network work, so an actually in-flight publisher is
+        // still fenced here.
+        match tokio::fs::try_exists(path.as_ref()).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                warn!(
+                    target: "agentmail",
+                    error = %error,
+                    "could not inspect header cache before mutation"
+                );
+                return;
+            }
+        }
+        let key = CacheKey::new(account_name, config, "");
+        if let Err(error) = advance_account_revision(Arc::clone(path), key.account).await {
+            warn!(
+                target: "agentmail",
+                error = %error,
+                "could not fence header cache publication"
+            );
+        }
+    }
+
+    async fn sync_cached(
+        &self,
+        path: Arc<PathBuf>,
+        session: &mut ImapSession,
+        key: &CacheKey,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> std::result::Result<StoredState, CacheSyncError> {
+        let started = Instant::now();
+
+        // One retry resolves a cross-process publisher or a local mutation
+        // that wins the compare-and-swap while this scan is in flight.
+        for _ in 0..2 {
+            imap_client::check_cancel(cancel)?;
+            let loaded = load_sync_state(Arc::clone(&path), key.clone()).await?;
+            let state = loaded.mailbox;
+            let expected_account_revision = loaded.account_revision;
+            let live_status = examine_status(session, &key.mailbox).await?;
+
+            if let Some(state) = state
+                && is_cache_hit(state, &live_status)
+            {
+                let covered = load_covered_count(Arc::clone(&path), key.clone(), state).await?;
+                if covered == u64::from(state.exists) {
+                    imap_client::check_cancel(cancel)?;
+                    if let Some(progress) = on_progress {
+                        progress(state.exists.into(), state.exists.into());
+                    }
+                    trace_sync(SyncKind::Hit, started, state.exists as usize, 0, 0);
+                    return Ok(state);
+                }
+                // A complete publication always has one marker row per member.
+                // Treat a mismatch as recoverable cache damage and reconcile.
+                warn!(
+                    target: "agentmail",
+                    mailbox = key.mailbox,
+                    expected = state.exists,
+                    actual = covered,
+                    "header cache snapshot was incomplete; reconciling"
+                );
+            }
+
+            let Some(uid_validity) = live_status.uid_validity else {
+                return Err(CacheError::Invariant(format!(
+                    "mailbox {:?} omitted UIDVALIDITY",
+                    key.mailbox
+                ))
+                .into());
+            };
+            if uid_validity == 0 {
+                return Err(CacheError::Invariant(format!(
+                    "mailbox {:?} returned UIDVALIDITY 0",
+                    key.mailbox
+                ))
+                .into());
+            }
+
+            let expected_revision = loaded.existing_revision;
+            let regression = state.is_some_and(|value| {
+                value.uid_validity == uid_validity
+                    && matches!((value.uid_next, live_status.uid_next), (Some(old), Some(new)) if new < old)
+            });
+
+            let tail_base = state.and_then(|value| match (value.uid_next, live_status.uid_next) {
+                (Some(old), Some(new)) if value.uid_validity == uid_validity && new > old => {
+                    Some((value, old))
+                }
+                _ => None,
+            });
+
+            let (snapshot, mut live_uids, sync_kind, snapshot_stable) =
+                if let Some((base, from_uid)) = tail_base {
+                    let (snapshot, tail, tail_stable) = stable_uid_search(
+                        session,
+                        &key.mailbox,
+                        SearchScope::Tail(from_uid),
+                        cancel,
+                    )
+                    .await?;
+                    let membership = load_membership(Arc::clone(&path), key.clone()).await?;
+                    if tail_stable && pure_append_is_proven(base, &snapshot, &membership, &tail) {
+                        let mut combined = membership;
+                        combined.extend(tail);
+                        combined.sort_unstable();
+                        combined.dedup();
+                        (snapshot, combined, SyncKind::Tail, true)
+                    } else {
+                        let (snapshot, membership, stable) =
+                            stable_uid_search(session, &key.mailbox, SearchScope::All, cancel)
+                                .await?;
+                        (snapshot, membership, SyncKind::Membership, stable)
+                    }
+                } else {
+                    let kind = if state.is_none()
+                        || state.is_some_and(|value| value.uid_validity != uid_validity)
+                        || regression
+                    {
+                        SyncKind::Cold
+                    } else {
+                        SyncKind::Membership
+                    };
+                    let (snapshot, membership, stable) =
+                        stable_uid_search(session, &key.mailbox, SearchScope::All, cancel).await?;
+                    (snapshot, membership, kind, stable)
+                };
+
+            let Some(snapshot_uid_validity) = snapshot.uid_validity else {
+                return Err(CacheError::Invariant(format!(
+                    "mailbox {:?} omitted UIDVALIDITY while reconciling",
+                    key.mailbox
+                ))
+                .into());
+            };
+
+            let snapshot_regression = state.is_some_and(|value| {
+                value.uid_validity == snapshot_uid_validity
+                    && matches!((value.uid_next, snapshot.uid_next), (Some(old), Some(new)) if new < old)
+            });
+            // Chunk commits from an interrupted cold scan are reusable too:
+            // the immutable identity key includes the newly observed
+            // UIDVALIDITY even before a mailbox_state row is published.
+            let reuse_existing = !regression && !snapshot_regression;
+            let known_uids = if reuse_existing {
+                load_header_uids(Arc::clone(&path), key.clone(), snapshot_uid_validity).await?
+            } else {
+                HashSet::new()
+            };
+
+            let mut missing: Vec<u32> = live_uids
+                .iter()
+                .copied()
+                .filter(|uid| !known_uids.contains(uid))
+                .collect();
+            missing.sort_unstable();
+            let reused = live_uids.len().saturating_sub(missing.len());
+            if let Some(progress) = on_progress {
+                progress(reused as u64, live_uids.len() as u64);
+            }
+
+            let mut processed = 0usize;
+            for chunk in missing.chunks(FETCH_CHUNK_SIZE) {
+                imap_client::check_cancel(cancel)?;
+                let rows =
+                    imap_client::fetch_rank_headers_for_uids(session, chunk, None, cancel).await?;
+                let mut rows = rows;
+                for row in &mut rows {
+                    row.uid_validity = Some(snapshot_uid_validity);
+                }
+                let returned: HashSet<u32> = rows.iter().map(|row| row.uid).collect();
+                let omitted: HashSet<u32> = chunk
+                    .iter()
+                    .copied()
+                    .filter(|uid| !returned.contains(uid))
+                    .collect();
+                if !omitted.is_empty() {
+                    live_uids.retain(|uid| !omitted.contains(uid));
+                }
+                store_headers(Arc::clone(&path), key.clone(), snapshot_uid_validity, rows).await?;
+                processed += chunk.len();
+                if let Some(progress) = on_progress {
+                    progress(
+                        (reused + processed).min(reused + missing.len()) as u64,
+                        (reused + missing.len()) as u64,
+                    );
+                }
+            }
+
+            imap_client::check_cancel(cancel)?;
+            // Header fetching can take a long time on a cold 216K-message
+            // mailbox. UIDNEXT/count may advance during that work, but cached
+            // immutable headers remain valid only while the UIDVALIDITY epoch
+            // itself is unchanged.
+            let final_status = examine_status(session, &key.mailbox).await?;
+            if final_status.uid_validity != Some(snapshot_uid_validity) {
+                continue;
+            }
+            let outcome = publish_snapshot(
+                Arc::clone(&path),
+                key.clone(),
+                expected_revision,
+                expected_account_revision,
+                snapshot_uid_validity,
+                snapshot_stable.then_some(snapshot.uid_next).flatten(),
+                &live_uids,
+                cancel.cloned(),
+            )
+            .await?;
+            if outcome == PublishOutcome::Conflict {
+                continue;
+            }
+
+            let published_state = load_state(Arc::clone(&path), key.clone())
+                .await?
+                .ok_or_else(|| CacheError::Invariant("published state disappeared".to_string()))?;
+            let covered =
+                load_covered_count(Arc::clone(&path), key.clone(), published_state).await?;
+            if covered != live_uids.len() as u64 {
+                return Err(CacheError::Invariant(format!(
+                    "published {} members but covered {covered} rows",
+                    live_uids.len(),
+                ))
+                .into());
+            }
+            trace_sync(
+                sync_kind,
+                started,
+                live_uids.len(),
+                missing.len(),
+                state
+                    .map_or(0, |value| value.exists as usize)
+                    .saturating_sub(live_uids.len()),
+            );
+            return Ok(published_state);
+        }
+
+        Err(CacheError::Conflict.into())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SearchScope {
+    All,
+    Tail(u32),
+}
+
+async fn stable_uid_search(
+    session: &mut ImapSession,
+    mailbox: &str,
+    scope: SearchScope,
+    cancel: Option<&CancelFn>,
+) -> crate::Result<(MailboxStatus, Vec<u32>, bool)> {
+    let mut same_epoch_fallback = None;
+    for _ in 0..MAX_STABLE_SEARCH_ATTEMPTS {
+        imap_client::check_cancel(cancel)?;
+        let before = examine_status(session, mailbox).await?;
+        let mut uids = match scope {
+            SearchScope::All => imap_client::search_uids(session, "ALL").await?,
+            SearchScope::Tail(from_uid) => imap_client::search_uids_from(session, from_uid).await?,
+        };
+        uids.sort_unstable();
+        uids.dedup();
+        let after = examine_status(session, mailbox).await?;
+        if same_snapshot(&before, &after) {
+            return Ok((after, uids, true));
+        }
+        if before.uid_validity.is_some() && before.uid_validity == after.uid_validity {
+            same_epoch_fallback = Some((after, uids, false));
+        }
+    }
+
+    if let Some(snapshot) = same_epoch_fallback {
+        debug!(
+            target: "agentmail",
+            mailbox,
+            "mailbox remained busy during UID search; publishing a reconcile-required snapshot"
+        );
+        Ok(snapshot)
+    } else {
+        Err(AgentmailError::Other(format!(
+            "mailbox {mailbox:?} changed UIDVALIDITY continuously while synchronizing"
+        )))
+    }
+}
+
+async fn examine_status(session: &mut ImapSession, mailbox: &str) -> crate::Result<MailboxStatus> {
+    let selected = imap_client::examine(session, mailbox).await?;
+    Ok(MailboxStatus {
+        uid_validity: selected.uid_validity,
+        uid_next: selected.uid_next,
+        exists: selected.exists,
+        highest_modseq: None,
+    })
+}
+
+fn same_snapshot(left: &MailboxStatus, right: &MailboxStatus) -> bool {
+    left.uid_validity == right.uid_validity
+        && left.uid_next == right.uid_next
+        && left.exists == right.exists
+}
+
+fn is_cache_hit(state: StoredState, status: &MailboxStatus) -> bool {
+    status.uid_validity == Some(state.uid_validity)
+        && state.uid_next.is_some()
+        && status.uid_next == state.uid_next
+        && status.exists == state.exists
+}
+
+fn pure_append_is_proven(
+    state: StoredState,
+    status: &MailboxStatus,
+    membership: &[u32],
+    tail: &[u32],
+) -> bool {
+    let Some(old_uid_next) = state.uid_next else {
+        return false;
+    };
+    let Some(new_uid_next) = status.uid_next else {
+        return false;
+    };
+    status.uid_validity == Some(state.uid_validity)
+        && new_uid_next >= old_uid_next
+        && membership.len() == state.exists as usize
+        && strictly_increasing(membership)
+        && membership.iter().all(|uid| *uid < old_uid_next)
+        && strictly_increasing(tail)
+        && tail.iter().all(|uid| *uid >= old_uid_next)
+        && u32::try_from(tail.len())
+            .ok()
+            .and_then(|tail_count| state.exists.checked_add(tail_count))
+            .is_some_and(|expected| expected == status.exists)
+}
+
+fn strictly_increasing(values: &[u32]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn trace_sync(
+    kind: SyncKind,
+    started: Instant,
+    result_count: usize,
+    fetched_count: usize,
+    pruned_count: usize,
+) {
+    debug!(
+        target: "agentmail",
+        operation = "rank_header_sync",
+        cache = kind.as_str(),
+        elapsed_ms = started.elapsed().as_millis(),
+        result_count,
+        fetched_count,
+        pruned_count,
+        "validated header cache sync complete"
+    );
+}
+
+fn normalize_mailbox(mailbox: &str) -> String {
+    if mailbox.eq_ignore_ascii_case("INBOX") {
+        "INBOX".to_string()
+    } else {
+        mailbox.to_string()
+    }
+}
+
+/// Return the RFC 2919 identifier and a display label without retaining the
+/// complete header field. Invalid or ambiguous List-Id values are not cached.
+fn normalized_list_id_fields(value: &str) -> Option<(String, String)> {
+    let value = value.trim();
+    let start = value.find('<')?;
+    let end = value[start + 1..].find('>')? + start + 1;
+    if !value[end + 1..].trim().is_empty()
+        || value[..start].contains(['<', '>'])
+        || value[start + 1..end].contains(['<', '>', ' ', '\t', '\r', '\n'])
+    {
+        return None;
+    }
+    let identifier = value[start + 1..end].trim();
+    if identifier.is_empty() {
+        return None;
+    }
+    let identifier = identifier.to_ascii_lowercase();
+    let display = value[..start].trim();
+    let display = if display.is_empty() {
+        identifier.clone()
+    } else {
+        display.to_string()
+    };
+    Some((identifier, display))
+}
+
+fn default_cache_path() -> Option<PathBuf> {
+    if std::env::var("AGENTMAIL_DISABLE_HEADER_CACHE")
+        .ok()
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    {
+        return None;
+    }
+    let root = std::env::var_os("AGENTMAIL_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::cache_dir)?;
+    Some(root.join("agentmail").join("header-cache-v1.sqlite3"))
+}
+
+fn open_connection(path: &Path) -> CacheResult<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        restrict_directory(parent)?;
+    }
+    let mut connection = Connection::open(path)?;
+    // Tighten an existing legacy file before reading or rebuilding any
+    // token-bearing projection it may contain.
+    restrict_file(path)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "synchronous", "NORMAL")?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    migrate_schema(&mut connection)?;
+    Ok(connection)
+}
+
+fn migrate_schema(connection: &mut Connection) -> CacheResult<()> {
+    let observed: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if observed == CACHE_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // Version upgrades replace this disposable projection. Secure deletion,
+    // VACUUM, and a truncated WAL ensure obsolete token-bearing columns from
+    // pre-v3 databases are not left in SQLite free pages or the WAL file.
+    connection.pragma_update(None, "secure_delete", true)?;
+
+    // Serialize the version check with the migration itself. Without the
+    // immediate transaction, two fresh MCP calls could both observe an old
+    // version and the second migrator could drop the first one's new tables.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == CACHE_SCHEMA_VERSION {
+        transaction.commit()?;
+        return Ok(());
+    }
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS membership;
+         DROP TABLE IF EXISTS header_rows;
+         DROP TABLE IF EXISTS mailbox_state;
+         DROP TABLE IF EXISTS account_state;",
+    )?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_state (
+             account_key TEXT NOT NULL PRIMARY KEY,
+             mutation_revision INTEGER NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS mailbox_state (
+             account_key TEXT NOT NULL,
+             mailbox TEXT NOT NULL,
+             uid_validity INTEGER NOT NULL,
+             uid_next INTEGER,
+             message_count INTEGER NOT NULL,
+             revision INTEGER NOT NULL,
+             projection_version INTEGER NOT NULL,
+             PRIMARY KEY (account_key, mailbox)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS membership (
+             account_key TEXT NOT NULL,
+             mailbox TEXT NOT NULL,
+             uid INTEGER NOT NULL,
+             PRIMARY KEY (account_key, mailbox, uid)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS header_rows (
+             account_key TEXT NOT NULL,
+             mailbox TEXT NOT NULL,
+             uid_validity INTEGER NOT NULL,
+             uid INTEGER NOT NULL,
+             projection_version INTEGER NOT NULL,
+             sender_email TEXT NOT NULL,
+             sender_name TEXT NOT NULL,
+             date_unix_ms INTEGER,
+             message_id TEXT,
+             list_id TEXT,
+             list_display_name TEXT,
+             has_list_headers INTEGER NOT NULL CHECK (has_list_headers IN (0, 1)),
+             advertised_one_click INTEGER NOT NULL CHECK (advertised_one_click IN (0, 1)),
+             PRIMARY KEY (
+                 account_key, mailbox, uid_validity, uid, projection_version
+             )
+         ) WITHOUT ROWID;",
+    )?;
+    transaction.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    connection.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_directory(path: &Path) -> CacheResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_directory(_path: &Path) -> CacheResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> CacheResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) -> CacheResult<()> {
+    Ok(())
+}
+
+fn prepare_rank_connection(scope: &RankScope, own_addresses: &[String]) -> CacheResult<Connection> {
+    let mut connection = open_connection(&scope.path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TEMP TABLE selected_scope (
+             account_key TEXT NOT NULL,
+             projection_version INTEGER NOT NULL
+         );
+         CREATE TEMP TABLE selected_mailboxes (
+             mailbox TEXT NOT NULL PRIMARY KEY
+         ) WITHOUT ROWID;
+         CREATE TEMP TABLE own_addresses (
+             address TEXT NOT NULL PRIMARY KEY
+         ) WITHOUT ROWID;",
+    )?;
+    transaction.execute(
+        "INSERT INTO selected_scope (account_key, projection_version) VALUES (?1, ?2)",
+        params![scope.account, HEADER_PROJECTION_VERSION],
+    )?;
+    {
+        let mut insert = transaction
+            .prepare("INSERT OR IGNORE INTO selected_mailboxes (mailbox) VALUES (?1)")?;
+        for mailbox in &scope.mailboxes {
+            insert.execute(params![mailbox])?;
+        }
+    }
+    {
+        let mut insert =
+            transaction.prepare("INSERT OR IGNORE INTO own_addresses (address) VALUES (?1)")?;
+        for address in own_addresses {
+            insert.execute(params![address])?;
+        }
+    }
+    transaction.commit()?;
+
+    // A non-empty Message-ID is account-wide identity. Missing IDs partition
+    // by mailbox epoch and UID so unrelated messages are never collapsed.
+    // The representative ordering mirrors the live ranking tie-breaker while
+    // remaining deterministic across mailbox scan-order changes.
+    connection.execute_batch(
+        "CREATE TEMP VIEW rank_rows AS
+         SELECT mailbox, uid_validity, uid, sender_email, sender_name,
+                date_unix_ms, message_id, list_id, list_display_name,
+                has_list_headers, advertised_one_click
+           FROM (
+             SELECT h.mailbox, h.uid_validity, h.uid, h.sender_email,
+                    h.sender_name, h.date_unix_ms, h.message_id, h.list_id,
+                    h.list_display_name, h.has_list_headers,
+                    h.advertised_one_click,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                          CASE WHEN NULLIF(TRIM(h.message_id), '') IS NULL
+                               THEN 1 ELSE 0 END,
+                          CASE WHEN NULLIF(TRIM(h.message_id), '') IS NULL
+                               THEN h.mailbox ELSE TRIM(h.message_id) END,
+                          CASE WHEN NULLIF(TRIM(h.message_id), '') IS NULL
+                               THEN h.uid_validity ELSE 0 END,
+                          CASE WHEN NULLIF(TRIM(h.message_id), '') IS NULL
+                               THEN h.uid ELSE 0 END
+                        ORDER BY (h.date_unix_ms IS NOT NULL) DESC,
+                                 h.date_unix_ms DESC, h.mailbox DESC, h.uid DESC
+                    ) AS duplicate_rank
+               FROM selected_scope AS scope
+               JOIN selected_mailboxes AS selected
+               JOIN mailbox_state AS state
+                 ON state.account_key = scope.account_key
+                AND state.mailbox = selected.mailbox
+                AND state.projection_version = scope.projection_version
+               JOIN membership AS membership
+                 ON membership.account_key = state.account_key
+                AND membership.mailbox = state.mailbox
+               JOIN header_rows AS h
+                 ON h.account_key = membership.account_key
+                AND h.mailbox = membership.mailbox
+                AND h.uid = membership.uid
+                AND h.uid_validity = state.uid_validity
+                AND h.projection_version = scope.projection_version
+           ) AS candidates
+          WHERE duplicate_rank = 1;",
+    )?;
+    Ok(connection)
+}
+
+async fn query_sender_page(
+    scope: RankScope,
+    own_addresses: Vec<String>,
+    offset: usize,
+    limit: usize,
+) -> CacheResult<CachedRankPage<CachedSenderRank>> {
+    tokio::task::spawn_blocking(move || {
+        let connection = prepare_rank_connection(&scope, &own_addresses)?;
+        connection.execute_batch(
+            "CREATE TEMP VIEW sender_rank_groups AS
+             WITH eligible AS (
+                 SELECT * FROM rank_rows AS row
+                  WHERE row.sender_email != ''
+                    AND NOT EXISTS (
+                        SELECT 1 FROM own_addresses AS own
+                         WHERE own.address = row.sender_email
+                    )
+             ),
+             grouped AS (
+                 SELECT sender_email, sender_name, COUNT(*) AS message_count,
+                        MIN(date_unix_ms) AS oldest_date_unix_ms,
+                        MAX(date_unix_ms) AS newest_date_unix_ms
+                   FROM eligible
+                  GROUP BY sender_email, sender_name
+             ),
+             samples AS (
+                 SELECT sender_email, sender_name, mailbox, uid_validity, uid,
+                        date_unix_ms,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY sender_email, sender_name
+                            ORDER BY (date_unix_ms IS NOT NULL) DESC,
+                                     date_unix_ms DESC, mailbox DESC, uid DESC
+                        ) AS sample_rank
+                   FROM eligible
+             )
+             SELECT grouped.sender_email, grouped.sender_name,
+                    grouped.message_count, grouped.oldest_date_unix_ms,
+                    grouped.newest_date_unix_ms, samples.mailbox,
+                    samples.uid_validity, samples.uid, samples.date_unix_ms
+               FROM grouped
+               JOIN samples
+                 ON samples.sender_email = grouped.sender_email
+                AND samples.sender_name = grouped.sender_name
+                AND samples.sample_rank = 1;",
+        )?;
+        let (total_groups, total_messages) = rank_totals(&connection, "sender_rank_groups")?;
+        let mut statement = connection.prepare(
+            "SELECT sender_email, sender_name, message_count,
+                    oldest_date_unix_ms, newest_date_unix_ms, mailbox,
+                    uid_validity, uid, date_unix_ms
+               FROM sender_rank_groups
+              ORDER BY message_count DESC, sender_email, sender_name
+              LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(
+            params![bounded_rank_limit(limit), sql_offset(offset)],
+            |row| {
+                Ok(CachedSenderRank {
+                    address: row.get(0)?,
+                    display_name: row.get(1)?,
+                    count: sql_u64(row.get::<_, i64>(2)?)?,
+                    oldest_date: sql_date(row.get(3)?),
+                    newest_date: sql_date(row.get(4)?),
+                    sample: CachedRankSample {
+                        mailbox: row.get(5)?,
+                        uid_validity: sql_u32(row.get::<_, i64>(6)?)?,
+                        uid: sql_u32(row.get::<_, i64>(7)?)?,
+                        date: sql_date(row.get(8)?),
+                    },
+                })
+            },
+        )?;
+        let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(CachedRankPage {
+            total_messages,
+            total_groups,
+            items,
+        })
+    })
+    .await?
+}
+
+async fn query_subscription_page(
+    scope: RankScope,
+    own_addresses: Vec<String>,
+    offset: usize,
+    limit: usize,
+) -> CacheResult<CachedRankPage<CachedSubscriptionRank>> {
+    tokio::task::spawn_blocking(move || {
+        let connection = prepare_rank_connection(&scope, &own_addresses)?;
+        connection.execute_batch(
+            "CREATE TEMP VIEW subscription_rank_groups AS
+             WITH eligible AS (
+                 SELECT * FROM rank_rows AS row
+                  WHERE row.has_list_headers = 1
+                    AND row.sender_email != ''
+                    AND NOT EXISTS (
+                        SELECT 1 FROM own_addresses AS own
+                         WHERE own.address = row.sender_email
+                    )
+             ),
+             grouped AS (
+                 SELECT sender_email, sender_name, COUNT(*) AS message_count,
+                        MIN(date_unix_ms) AS oldest_date_unix_ms,
+                        MAX(date_unix_ms) AS newest_date_unix_ms
+                   FROM eligible
+                  GROUP BY sender_email, sender_name
+             ),
+             samples AS (
+                 SELECT sender_email, sender_name, mailbox, uid_validity, uid,
+                        date_unix_ms, advertised_one_click,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY sender_email, sender_name
+                            ORDER BY (date_unix_ms IS NOT NULL) DESC,
+                                     date_unix_ms DESC, mailbox DESC, uid DESC
+                        ) AS sample_rank
+                   FROM eligible
+             )
+             SELECT grouped.sender_email, grouped.sender_name,
+                    grouped.message_count, grouped.oldest_date_unix_ms,
+                    grouped.newest_date_unix_ms, samples.mailbox,
+                    samples.uid_validity, samples.uid, samples.date_unix_ms,
+                    samples.advertised_one_click
+               FROM grouped
+               JOIN samples
+                 ON samples.sender_email = grouped.sender_email
+                AND samples.sender_name = grouped.sender_name
+                AND samples.sample_rank = 1;",
+        )?;
+        let (total_groups, total_messages) = rank_totals(&connection, "subscription_rank_groups")?;
+        let mut statement = connection.prepare(
+            "SELECT sender_email, sender_name, message_count,
+                    oldest_date_unix_ms, newest_date_unix_ms, mailbox,
+                    uid_validity, uid, date_unix_ms, advertised_one_click
+               FROM subscription_rank_groups
+              ORDER BY advertised_one_click DESC, message_count DESC,
+                       sender_email, sender_name
+              LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(
+            params![bounded_rank_limit(limit), sql_offset(offset)],
+            |row| {
+                Ok(CachedSubscriptionRank {
+                    address: row.get(0)?,
+                    display_name: row.get(1)?,
+                    count: sql_u64(row.get::<_, i64>(2)?)?,
+                    oldest_date: sql_date(row.get(3)?),
+                    newest_date: sql_date(row.get(4)?),
+                    sample: CachedRankSample {
+                        mailbox: row.get(5)?,
+                        uid_validity: sql_u32(row.get::<_, i64>(6)?)?,
+                        uid: sql_u32(row.get::<_, i64>(7)?)?,
+                        date: sql_date(row.get(8)?),
+                    },
+                    advertised_one_click: row.get::<_, i64>(9)? != 0,
+                })
+            },
+        )?;
+        let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(CachedRankPage {
+            total_messages,
+            total_groups,
+            items,
+        })
+    })
+    .await?
+}
+
+async fn query_mailing_list_page(
+    scope: RankScope,
+    offset: usize,
+    limit: usize,
+) -> CacheResult<CachedRankPage<CachedMailingListRank>> {
+    tokio::task::spawn_blocking(move || {
+        let mut connection = prepare_rank_connection(&scope, &[])?;
+        connection.execute_batch(
+            "CREATE TEMP VIEW mailing_list_rank_groups AS
+             WITH eligible AS (
+                 SELECT * FROM rank_rows WHERE list_id IS NOT NULL
+             ),
+             grouped AS (
+                 SELECT list_id, COUNT(*) AS message_count,
+                        COUNT(DISTINCT NULLIF(sender_email, '')) AS sender_count,
+                        MIN(date_unix_ms) AS oldest_date_unix_ms,
+                        MAX(date_unix_ms) AS newest_date_unix_ms
+                   FROM eligible
+                  GROUP BY list_id
+             ),
+             samples AS (
+                 SELECT list_id, list_display_name, mailbox, uid_validity, uid,
+                        date_unix_ms,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY list_id
+                            ORDER BY (date_unix_ms IS NOT NULL) DESC,
+                                     date_unix_ms DESC, mailbox DESC, uid DESC
+                        ) AS sample_rank
+                   FROM eligible
+             )
+             SELECT grouped.list_id,
+                    COALESCE(NULLIF(samples.list_display_name, ''), grouped.list_id)
+                        AS list_display_name,
+                    grouped.message_count, grouped.sender_count,
+                    grouped.oldest_date_unix_ms, grouped.newest_date_unix_ms,
+                    samples.mailbox, samples.uid_validity, samples.uid,
+                    samples.date_unix_ms
+               FROM grouped
+               JOIN samples
+                 ON samples.list_id = grouped.list_id
+                AND samples.sample_rank = 1;",
+        )?;
+        let (total_groups, total_messages) = rank_totals(&connection, "mailing_list_rank_groups")?;
+        let mut statement = connection.prepare(
+            "SELECT list_id, list_display_name, message_count, sender_count,
+                    oldest_date_unix_ms, newest_date_unix_ms, mailbox,
+                    uid_validity, uid, date_unix_ms
+               FROM mailing_list_rank_groups
+              ORDER BY message_count DESC, list_id
+              LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(
+            params![bounded_rank_limit(limit), sql_offset(offset)],
+            |row| {
+                Ok(CachedMailingListRank {
+                    list_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    count: sql_u64(row.get::<_, i64>(2)?)?,
+                    sender_count: sql_u64(row.get::<_, i64>(3)?)?,
+                    oldest_date: sql_date(row.get(4)?),
+                    newest_date: sql_date(row.get(5)?),
+                    sample: CachedRankSample {
+                        mailbox: row.get(6)?,
+                        uid_validity: sql_u32(row.get::<_, i64>(7)?)?,
+                        uid: sql_u32(row.get::<_, i64>(8)?)?,
+                        date: sql_date(row.get(9)?),
+                    },
+                    senders: Vec::new(),
+                })
+            },
+        )?;
+        let mut items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TEMP TABLE selected_list_ids (
+                 list_id TEXT NOT NULL PRIMARY KEY
+             ) WITHOUT ROWID;",
+        )?;
+        {
+            let mut insert =
+                transaction.prepare("INSERT INTO selected_list_ids (list_id) VALUES (?1)")?;
+            for item in &items {
+                insert.execute(params![item.list_id])?;
+            }
+        }
+        transaction.commit()?;
+
+        let mut previews: HashMap<String, Vec<String>> = HashMap::with_capacity(items.len());
+        let mut preview_statement = connection.prepare(
+            "WITH distinct_senders AS (
+                 SELECT row.list_id, row.sender_email
+                   FROM rank_rows AS row
+                   JOIN selected_list_ids AS selected
+                     ON selected.list_id = row.list_id
+                  WHERE row.sender_email != ''
+                  GROUP BY row.list_id, row.sender_email
+             ),
+             ranked_senders AS (
+                 SELECT list_id, sender_email,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY list_id ORDER BY sender_email
+                        ) AS sender_rank
+                   FROM distinct_senders
+             )
+             SELECT list_id, sender_email
+               FROM ranked_senders
+              WHERE sender_rank <= ?1
+              ORDER BY list_id, sender_email",
+        )?;
+        let preview_rows = preview_statement
+            .query_map(params![MAILING_LIST_SENDER_PREVIEW_LIMIT as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+        for row in preview_rows {
+            let (list_id, sender) = row?;
+            previews.entry(list_id).or_default().push(sender);
+        }
+        for item in &mut items {
+            item.senders = previews.remove(&item.list_id).unwrap_or_default();
+        }
+
+        Ok(CachedRankPage {
+            total_messages,
+            total_groups,
+            items,
+        })
+    })
+    .await?
+}
+
+fn rank_totals(connection: &Connection, view: &str) -> CacheResult<(u64, u64)> {
+    // `view` is always one of the three fixed identifiers above, never caller
+    // input. Keeping totals separate preserves them when `offset` is past EOF.
+    let sql = format!("SELECT COUNT(*), COALESCE(SUM(message_count), 0) FROM {view}");
+    connection
+        .query_row(&sql, [], |row| {
+            Ok((
+                sql_u64(row.get::<_, i64>(0)?)?,
+                sql_u64(row.get::<_, i64>(1)?)?,
+            ))
+        })
+        .map_err(CacheError::from)
+}
+
+fn bounded_rank_limit(limit: usize) -> i64 {
+    i64::try_from(limit.min(MAX_RANK_PAGE_SIZE)).unwrap_or(MAX_RANK_PAGE_SIZE as i64)
+}
+
+fn sql_offset(offset: usize) -> i64 {
+    i64::try_from(offset).unwrap_or(i64::MAX)
+}
+
+fn sql_date(value: Option<i64>) -> Option<DateTime<Utc>> {
+    value.and_then(DateTime::<Utc>::from_timestamp_millis)
+}
+
+async fn load_sync_state(path: Arc<PathBuf>, key: CacheKey) -> CacheResult<LoadedState> {
+    tokio::task::spawn_blocking(move || {
+        let connection = open_connection(&path)?;
+        connection
+            .query_row(
+                "SELECT COALESCE(a.mutation_revision, 0),
+                        m.uid_validity, m.uid_next, m.message_count, m.revision,
+                        m.projection_version
+                   FROM (SELECT 1) AS singleton
+                   LEFT JOIN account_state AS a ON a.account_key = ?1
+                   LEFT JOIN mailbox_state AS m
+                     ON m.account_key = ?1 AND m.mailbox = ?2",
+                params![key.account, key.mailbox],
+                |row| {
+                    let account_revision = row.get(0)?;
+                    let uid_validity = row.get::<_, Option<i64>>(1)?.map(sql_u32).transpose()?;
+                    let existing_revision = row.get::<_, Option<i64>>(4)?;
+                    let projection_version = row.get::<_, Option<i64>>(5)?;
+                    let mailbox = match (uid_validity, projection_version) {
+                        (Some(uid_validity), Some(HEADER_PROJECTION_VERSION)) => {
+                            Some(StoredState {
+                                uid_validity,
+                                uid_next: row.get::<_, Option<i64>>(2)?.map(sql_u32).transpose()?,
+                                exists: sql_u32(row.get::<_, i64>(3)?)?,
+                            })
+                        }
+                        _ => None,
+                    };
+                    Ok(LoadedState {
+                        mailbox,
+                        existing_revision,
+                        account_revision,
+                    })
+                },
+            )
+            .map_err(CacheError::from)
+    })
+    .await?
+}
+
+async fn load_state(path: Arc<PathBuf>, key: CacheKey) -> CacheResult<Option<StoredState>> {
+    Ok(load_sync_state(path, key).await?.mailbox)
+}
+
+async fn load_membership(path: Arc<PathBuf>, key: CacheKey) -> CacheResult<Vec<u32>> {
+    tokio::task::spawn_blocking(move || {
+        let connection = open_connection(&path)?;
+        let mut statement = connection.prepare(
+            "SELECT uid FROM membership
+              WHERE account_key = ?1 AND mailbox = ?2
+              ORDER BY uid",
+        )?;
+        let rows = statement.query_map(params![key.account, key.mailbox], |row| {
+            sql_u32(row.get::<_, i64>(0)?)
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(CacheError::from)
+    })
+    .await?
+}
+
+async fn load_header_uids(
+    path: Arc<PathBuf>,
+    key: CacheKey,
+    uid_validity: u32,
+) -> CacheResult<HashSet<u32>> {
+    tokio::task::spawn_blocking(move || {
+        let connection = open_connection(&path)?;
+        let mut statement = connection.prepare(
+            "SELECT uid FROM header_rows
+              WHERE account_key = ?1 AND mailbox = ?2
+                AND uid_validity = ?3 AND projection_version = ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                key.account,
+                key.mailbox,
+                i64::from(uid_validity),
+                HEADER_PROJECTION_VERSION
+            ],
+            |row| sql_u32(row.get::<_, i64>(0)?),
+        )?;
+        rows.collect::<std::result::Result<HashSet<_>, _>>()
+            .map_err(CacheError::from)
+    })
+    .await?
+}
+
+async fn load_covered_count(
+    path: Arc<PathBuf>,
+    key: CacheKey,
+    state: StoredState,
+) -> CacheResult<u64> {
+    tokio::task::spawn_blocking(move || {
+        let connection = open_connection(&path)?;
+        let count = connection.query_row(
+            "SELECT COUNT(*)
+               FROM membership AS m
+               JOIN header_rows AS h
+                 ON h.account_key = m.account_key
+                AND h.mailbox = m.mailbox
+                AND h.uid = m.uid
+              WHERE m.account_key = ?1 AND m.mailbox = ?2
+                AND h.uid_validity = ?3 AND h.projection_version = ?4",
+            params![
+                key.account,
+                key.mailbox,
+                i64::from(state.uid_validity),
+                HEADER_PROJECTION_VERSION
+            ],
+            |row| sql_u64(row.get::<_, i64>(0)?),
+        )?;
+        Ok(count)
+    })
+    .await?
+}
+
+async fn store_headers(
+    path: Arc<PathBuf>,
+    key: CacheKey,
+    uid_validity: u32,
+    rows: Vec<ListHeaderRow>,
+) -> CacheResult<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut connection = open_connection(&path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO header_rows (
+                     account_key, mailbox, uid_validity, uid, projection_version,
+                     sender_email, sender_name, date_unix_ms, message_id,
+                     list_id, list_display_name, has_list_headers,
+                     advertised_one_click
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT DO UPDATE SET
+                     sender_email = excluded.sender_email,
+                     sender_name = excluded.sender_name,
+                     date_unix_ms = excluded.date_unix_ms,
+                     message_id = excluded.message_id,
+                     list_id = excluded.list_id,
+                     list_display_name = excluded.list_display_name,
+                     has_list_headers = excluded.has_list_headers,
+                     advertised_one_click = excluded.advertised_one_click",
+            )?;
+            for row in rows {
+                let (list_id, list_display_name) = row
+                    .list_id
+                    .as_deref()
+                    .and_then(normalized_list_id_fields)
+                    .map_or((None, None), |(identifier, display)| {
+                        (Some(identifier), Some(display))
+                    });
+                let has_list_headers =
+                    row.list_unsubscribe.is_some() || row.list_unsubscribe_post.is_some();
+                let advertised_one_click = crate::unsubscribe::advertises_one_click(
+                    row.list_unsubscribe.as_deref(),
+                    row.list_unsubscribe_post.as_deref(),
+                );
+                statement.execute(params![
+                    key.account,
+                    key.mailbox,
+                    i64::from(uid_validity),
+                    i64::from(row.uid),
+                    HEADER_PROJECTION_VERSION,
+                    row.sender_email,
+                    row.sender_name,
+                    row.date.map(|date| date.timestamp_millis()),
+                    row.message_id,
+                    list_id,
+                    list_display_name,
+                    i64::from(has_list_headers),
+                    i64::from(advertised_one_click),
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+async fn publish_snapshot(
+    path: Arc<PathBuf>,
+    key: CacheKey,
+    expected_revision: Option<i64>,
+    expected_account_revision: i64,
+    uid_validity: u32,
+    uid_next: Option<u32>,
+    live_uids: &[u32],
+    cancel: Option<CancelFn>,
+) -> CacheResult<PublishOutcome> {
+    let live_uids = live_uids.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = open_connection(&path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let account_revision: i64 = transaction.query_row(
+            "SELECT COALESCE(
+                 (SELECT mutation_revision FROM account_state WHERE account_key = ?1),
+                 0
+             )",
+            params![key.account],
+            |row| row.get(0),
+        )?;
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM mailbox_state
+                  WHERE account_key = ?1 AND mailbox = ?2",
+                params![key.account, key.mailbox],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if current_revision != expected_revision || account_revision != expected_account_revision {
+            return Ok(PublishOutcome::Conflict);
+        }
+        if cancel.as_ref().is_some_and(|check| check()) {
+            return Err(CacheError::Cancelled);
+        }
+
+        transaction.execute(
+            "DELETE FROM membership WHERE account_key = ?1 AND mailbox = ?2",
+            params![key.account, key.mailbox],
+        )?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO membership (account_key, mailbox, uid)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (index, uid) in live_uids.iter().enumerate() {
+                if index % 1_024 == 0 && cancel.as_ref().is_some_and(|check| check()) {
+                    return Err(CacheError::Cancelled);
+                }
+                insert.execute(params![key.account, key.mailbox, i64::from(*uid)])?;
+            }
+        }
+        if cancel.as_ref().is_some_and(|check| check()) {
+            return Err(CacheError::Cancelled);
+        }
+
+        let covered: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+               FROM membership AS m
+               JOIN header_rows AS h
+                 ON h.account_key = m.account_key
+                AND h.mailbox = m.mailbox
+                AND h.uid = m.uid
+              WHERE m.account_key = ?1 AND m.mailbox = ?2
+                AND h.uid_validity = ?3 AND h.projection_version = ?4",
+            params![
+                key.account,
+                key.mailbox,
+                i64::from(uid_validity),
+                HEADER_PROJECTION_VERSION
+            ],
+            |row| row.get(0),
+        )?;
+        if covered != live_uids.len() as i64 {
+            return Err(CacheError::Invariant(format!(
+                "{} membership UIDs have only {covered} header markers",
+                live_uids.len()
+            )));
+        }
+        if cancel.as_ref().is_some_and(|check| check()) {
+            return Err(CacheError::Cancelled);
+        }
+
+        let next_revision = expected_revision.map_or(1, |value| value + 1);
+        transaction.execute(
+            "INSERT INTO mailbox_state (
+                 account_key, mailbox, uid_validity, uid_next, message_count,
+                 revision, projection_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (account_key, mailbox) DO UPDATE SET
+                 uid_validity = excluded.uid_validity,
+                 uid_next = excluded.uid_next,
+                 message_count = excluded.message_count,
+                 revision = excluded.revision,
+                 projection_version = excluded.projection_version",
+            params![
+                key.account,
+                key.mailbox,
+                i64::from(uid_validity),
+                uid_next.map(i64::from),
+                live_uids.len() as i64,
+                next_revision,
+                HEADER_PROJECTION_VERSION,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM header_rows
+              WHERE account_key = ?1 AND mailbox = ?2
+                AND (
+                    uid_validity != ?3 OR projection_version != ?4 OR
+                    NOT EXISTS (
+                        SELECT 1 FROM membership AS m
+                         WHERE m.account_key = header_rows.account_key
+                           AND m.mailbox = header_rows.mailbox
+                           AND m.uid = header_rows.uid
+                    )
+                )",
+            params![
+                key.account,
+                key.mailbox,
+                i64::from(uid_validity),
+                HEADER_PROJECTION_VERSION
+            ],
+        )?;
+        if cancel.as_ref().is_some_and(|check| check()) {
+            return Err(CacheError::Cancelled);
+        }
+        transaction.commit()?;
+        Ok(PublishOutcome::Published)
+    })
+    .await?
+}
+
+async fn advance_account_revision(path: Arc<PathBuf>, account: String) -> CacheResult<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut connection = open_connection(&path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO account_state (account_key, mutation_revision)
+             VALUES (?1, 1)
+             ON CONFLICT (account_key) DO UPDATE SET
+                 mutation_revision = account_state.mutation_revision + 1",
+            params![account],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+fn sql_u32(value: i64) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn sql_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    fn test_key(mailbox: &str) -> CacheKey {
+        CacheKey {
+            account: "test-account".to_string(),
+            mailbox: mailbox.to_string(),
+        }
+    }
+
+    fn test_row(uid: u32) -> ListHeaderRow {
+        ListHeaderRow {
+            uid,
+            uid_validity: Some(10),
+            list_unsubscribe: None,
+            list_unsubscribe_post: None,
+            list_id: None,
+            sender_email: format!("sender{uid}@example.com"),
+            sender_name: String::new(),
+            date: None,
+            message_id: Some(format!("<{uid}@example.com>")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rank_row(
+        uid: u32,
+        sender_email: &str,
+        sender_name: &str,
+        date_unix_ms: Option<i64>,
+        message_id: Option<&str>,
+        list_id: Option<&str>,
+        has_list_headers: bool,
+        advertised_one_click: bool,
+    ) -> ListHeaderRow {
+        ListHeaderRow {
+            uid,
+            uid_validity: Some(7),
+            list_unsubscribe: if advertised_one_click {
+                Some(format!(
+                    "<https://unsubscribe.example.test/{uid}?recipient=secret-{uid}>"
+                ))
+            } else if has_list_headers {
+                Some(format!("<mailto:list-{uid}@example.test>"))
+            } else {
+                None
+            },
+            list_unsubscribe_post: advertised_one_click
+                .then(|| "List-Unsubscribe=One-Click".to_string()),
+            list_id: list_id.map(str::to_string),
+            sender_email: sender_email.to_string(),
+            sender_name: sender_name.to_string(),
+            date: date_unix_ms.and_then(DateTime::<Utc>::from_timestamp_millis),
+            message_id: message_id.map(str::to_string),
+        }
+    }
+
+    async fn publish_test_rows(cache: &HeaderCache, mailbox: &str, rows: Vec<ListHeaderRow>) {
+        let key = test_key(mailbox);
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let uids: Vec<u32> = rows.iter().map(|row| row.uid).collect();
+        store_headers(path.clone(), key.clone(), 7, rows)
+            .await
+            .expect("store ranking rows");
+        let outcome = publish_snapshot(
+            path,
+            key,
+            None,
+            0,
+            7,
+            uids.iter().max().and_then(|uid| uid.checked_add(1)),
+            &uids,
+            None,
+        )
+        .await
+        .expect("publish ranking rows");
+        assert_eq!(outcome, PublishOutcome::Published);
+    }
+
+    fn test_scope(cache: &HeaderCache, mailboxes: &[&str]) -> RankScope {
+        RankScope {
+            path: Arc::clone(cache.path.as_ref().expect("test cache path")),
+            account: "test-account".to_string(),
+            mailboxes: mailboxes
+                .iter()
+                .map(|mailbox| mailbox.to_string())
+                .collect(),
+        }
+    }
+
+    fn reference_sender_page(
+        mut rows: Vec<(String, ListHeaderRow)>,
+        own_addresses: &HashSet<String>,
+        offset: usize,
+        limit: usize,
+    ) -> CachedRankPage<CachedSenderRank> {
+        rows.sort_by(|(left_mailbox, left), (right_mailbox, right)| {
+            (right.date, right_mailbox, right.uid).cmp(&(left.date, left_mailbox, left.uid))
+        });
+        let mut seen = HashSet::new();
+        let mut groups: HashMap<(String, String), CachedSenderRank> = HashMap::new();
+        for (mailbox, row) in rows {
+            if row.sender_email.is_empty() || own_addresses.contains(&row.sender_email) {
+                continue;
+            }
+            if let Some(message_id) = row.message_id.as_deref().map(str::trim)
+                && !message_id.is_empty()
+                && !seen.insert(message_id.to_string())
+            {
+                continue;
+            }
+            let key = (row.sender_email.clone(), row.sender_name.clone());
+            let candidate = CachedRankSample {
+                mailbox,
+                uid_validity: row.uid_validity.expect("test UIDVALIDITY"),
+                uid: row.uid,
+                date: row.date,
+            };
+            let group = groups.entry(key).or_insert_with(|| CachedSenderRank {
+                address: row.sender_email,
+                display_name: row.sender_name,
+                count: 0,
+                oldest_date: None,
+                newest_date: None,
+                sample: candidate.clone(),
+            });
+            group.count += 1;
+            if let Some(date) = row.date {
+                group.oldest_date = Some(group.oldest_date.map_or(date, |oldest| oldest.min(date)));
+                group.newest_date = Some(group.newest_date.map_or(date, |newest| newest.max(date)));
+            }
+            if (candidate.date, &candidate.mailbox, candidate.uid)
+                > (group.sample.date, &group.sample.mailbox, group.sample.uid)
+            {
+                group.sample = candidate;
+            }
+        }
+        let mut items: Vec<_> = groups.into_values().collect();
+        items.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.address.cmp(&right.address))
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+        let total_groups = items.len() as u64;
+        let total_messages = items.iter().map(|item| item.count).sum();
+        let items = items
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_RANK_PAGE_SIZE))
+            .collect();
+        CachedRankPage {
+            total_messages,
+            total_groups,
+            items,
+        }
+    }
+
+    fn test_path(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("agentmail-cache-test-{}", uuid::Uuid::new_v4()))
+            .join(format!("{name}.sqlite3"))
+    }
+
+    #[test]
+    fn header_cache_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HeaderCache>();
+    }
+
+    #[test]
+    fn unchanged_complete_state_is_a_hit() {
+        let state = StoredState {
+            uid_validity: 10,
+            uid_next: Some(20),
+            exists: 3,
+        };
+        let status = MailboxStatus {
+            uid_validity: Some(10),
+            uid_next: Some(20),
+            exists: 3,
+            highest_modseq: Some(999),
+        };
+        assert!(is_cache_hit(state, &status));
+    }
+
+    #[test]
+    fn missing_uidnext_prevents_a_hit() {
+        let state = StoredState {
+            uid_validity: 10,
+            uid_next: None,
+            exists: 3,
+        };
+        let status = MailboxStatus {
+            uid_validity: Some(10),
+            uid_next: Some(20),
+            exists: 3,
+            highest_modseq: None,
+        };
+        assert!(!is_cache_hit(state, &status));
+    }
+
+    #[test]
+    fn tail_count_proves_append_even_with_uid_gaps() {
+        let state = StoredState {
+            uid_validity: 10,
+            uid_next: Some(20),
+            exists: 3,
+        };
+        let status = MailboxStatus {
+            uid_validity: Some(10),
+            uid_next: Some(30),
+            exists: 5,
+            highest_modseq: None,
+        };
+        assert!(pure_append_is_proven(state, &status, &[1, 2, 3], &[20, 29]));
+    }
+
+    #[test]
+    fn tail_count_exposes_an_old_message_deletion() {
+        let state = StoredState {
+            uid_validity: 10,
+            uid_next: Some(20),
+            exists: 3,
+        };
+        let status = MailboxStatus {
+            uid_validity: Some(10),
+            uid_next: Some(22),
+            exists: 3,
+            highest_modseq: None,
+        };
+        assert!(!pure_append_is_proven(state, &status, &[1, 2, 3], &[20]));
+    }
+
+    #[test]
+    fn tail_proof_rejects_corrupt_or_overlapping_membership() {
+        let state = StoredState {
+            uid_validity: 10,
+            uid_next: Some(20),
+            exists: 3,
+        };
+        let status = MailboxStatus {
+            uid_validity: Some(10),
+            uid_next: Some(22),
+            exists: 4,
+            highest_modseq: None,
+        };
+        assert!(!pure_append_is_proven(state, &status, &[1, 2, 20], &[20]));
+        assert!(!pure_append_is_proven(
+            state,
+            &status,
+            &[1, 2, 3],
+            &[20, 20]
+        ));
+    }
+
+    #[tokio::test]
+    async fn published_snapshot_survives_a_new_cache_instance() {
+        let path = test_path("restart");
+        let cache = HeaderCache::at_path(path.clone());
+        let key = test_key("INBOX");
+        store_headers(
+            Arc::clone(cache.path.as_ref().expect("test cache path")),
+            key.clone(),
+            7,
+            vec![test_row(1), test_row(2)],
+        )
+        .await
+        .expect("store headers");
+        let outcome = publish_snapshot(
+            Arc::clone(cache.path.as_ref().expect("test cache path")),
+            key.clone(),
+            None,
+            0,
+            7,
+            Some(3),
+            &[1, 2],
+            None,
+        )
+        .await
+        .expect("publish snapshot");
+        assert_eq!(outcome, PublishOutcome::Published);
+
+        let reopened = HeaderCache::at_path(path);
+        let state = load_state(
+            Arc::clone(reopened.path.as_ref().expect("test cache path")),
+            key.clone(),
+        )
+        .await
+        .expect("load state")
+        .expect("published state");
+        let covered = load_covered_count(
+            Arc::clone(reopened.path.as_ref().expect("test cache path")),
+            key,
+            state,
+        )
+        .await
+        .expect("count rows");
+        assert_eq!(covered, 2);
+    }
+
+    #[tokio::test]
+    async fn account_revision_fences_an_in_flight_publisher() {
+        let path = test_path("mutation-fence");
+        let cache = HeaderCache::at_path(path);
+        let key = test_key("INBOX");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        store_headers(path.clone(), key.clone(), 7, vec![test_row(1)])
+            .await
+            .expect("store headers");
+        publish_snapshot(path.clone(), key.clone(), None, 0, 7, Some(2), &[1], None)
+            .await
+            .expect("publish initial snapshot");
+        let before = load_sync_state(path.clone(), key.clone())
+            .await
+            .expect("load state");
+        assert!(before.mailbox.is_some());
+        advance_account_revision(path.clone(), key.account.clone())
+            .await
+            .expect("advance mutation revision");
+        let outcome = publish_snapshot(
+            path,
+            key,
+            before.existing_revision,
+            before.account_revision,
+            7,
+            Some(2),
+            &[1],
+            None,
+        )
+        .await
+        .expect("publish conflict result");
+        assert_eq!(outcome, PublishOutcome::Conflict);
+    }
+
+    #[tokio::test]
+    async fn account_revision_fences_the_first_cold_publisher() {
+        let cache = HeaderCache::at_path(test_path("cold-dirty-fence"));
+        let key = test_key("INBOX");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let before = load_sync_state(path.clone(), key.clone())
+            .await
+            .expect("load empty state");
+        assert!(before.mailbox.is_none());
+        assert_eq!(before.existing_revision, None);
+
+        store_headers(path.clone(), key.clone(), 7, vec![test_row(1)])
+            .await
+            .expect("store partial cold-scan row");
+        advance_account_revision(path.clone(), key.account.clone())
+            .await
+            .expect("mark account dirty");
+
+        let outcome = publish_snapshot(
+            path.clone(),
+            key.clone(),
+            before.existing_revision,
+            before.account_revision,
+            7,
+            Some(2),
+            &[1],
+            None,
+        )
+        .await
+        .expect("publish conflict result");
+        assert_eq!(outcome, PublishOutcome::Conflict);
+        assert!(load_state(path, key).await.expect("load state").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_rolls_back_membership_publication() {
+        let cache = HeaderCache::at_path(test_path("cancel-publication"));
+        let key = test_key("INBOX");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        store_headers(path.clone(), key.clone(), 7, vec![test_row(1), test_row(2)])
+            .await
+            .expect("store headers");
+        publish_snapshot(path.clone(), key.clone(), None, 0, 7, Some(2), &[1], None)
+            .await
+            .expect("publish initial snapshot");
+        let before = load_sync_state(path.clone(), key.clone())
+            .await
+            .expect("load state");
+        let cancel: CancelFn = Arc::new(|| true);
+
+        let result = publish_snapshot(
+            path.clone(),
+            key.clone(),
+            before.existing_revision,
+            before.account_revision,
+            7,
+            Some(3),
+            &[1, 2],
+            Some(cancel),
+        )
+        .await;
+        assert!(matches!(result, Err(CacheError::Cancelled)));
+        assert_eq!(
+            load_membership(path, key).await.expect("load membership"),
+            vec![1]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_rolls_back_after_membership_insertion() {
+        let cache = HeaderCache::at_path(test_path("late-cancel-publication"));
+        let key = test_key("INBOX");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        store_headers(path.clone(), key.clone(), 7, vec![test_row(1), test_row(2)])
+            .await
+            .expect("store headers");
+        publish_snapshot(path.clone(), key.clone(), None, 0, 7, Some(2), &[1], None)
+            .await
+            .expect("publish initial snapshot");
+        let before = load_sync_state(path.clone(), key.clone())
+            .await
+            .expect("load state");
+        let checks = Arc::new(AtomicUsize::new(0));
+        let cancel_checks = Arc::clone(&checks);
+        let cancel: CancelFn = Arc::new(move || cancel_checks.fetch_add(1, Ordering::SeqCst) >= 2);
+
+        let result = publish_snapshot(
+            path.clone(),
+            key.clone(),
+            before.existing_revision,
+            before.account_revision,
+            7,
+            Some(3),
+            &[1, 2],
+            Some(cancel),
+        )
+        .await;
+        assert!(matches!(result, Err(CacheError::Cancelled)));
+        assert!(checks.load(Ordering::SeqCst) >= 3);
+        assert_eq!(
+            load_membership(path, key).await.expect("load membership"),
+            vec![1]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_publication_honors_cancellation() {
+        let cache = HeaderCache::at_path(test_path("empty-cancel-publication"));
+        let key = test_key("INBOX");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let cancel: CancelFn = Arc::new(|| true);
+
+        let result = publish_snapshot(
+            path.clone(),
+            key.clone(),
+            None,
+            0,
+            7,
+            Some(1),
+            &[],
+            Some(cancel),
+        )
+        .await;
+        assert!(matches!(result, Err(CacheError::Cancelled)));
+        assert!(load_state(path, key).await.expect("load state").is_none());
+    }
+
+    #[tokio::test]
+    async fn projection_upgrade_can_replace_an_existing_state_row() {
+        let cache = HeaderCache::at_path(test_path("projection-upgrade"));
+        let key = test_key("INBOX");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        store_headers(path.clone(), key.clone(), 7, vec![test_row(1)])
+            .await
+            .expect("store headers");
+        publish_snapshot(path.clone(), key.clone(), None, 0, 7, Some(2), &[1], None)
+            .await
+            .expect("publish initial snapshot");
+
+        let edit_path = path.clone();
+        let edit_key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&edit_path)?;
+            connection.execute(
+                "UPDATE mailbox_state SET projection_version = 0
+                  WHERE account_key = ?1 AND mailbox = ?2",
+                params![edit_key.account, edit_key.mailbox],
+            )?;
+            CacheResult::Ok(())
+        })
+        .await
+        .expect("join projection edit")
+        .expect("edit projection");
+
+        let stale = load_sync_state(path.clone(), key.clone())
+            .await
+            .expect("load stale state");
+        assert!(stale.mailbox.is_none());
+        assert!(stale.existing_revision.is_some());
+        let outcome = publish_snapshot(
+            path,
+            key,
+            stale.existing_revision,
+            stale.account_revision,
+            7,
+            Some(2),
+            &[1],
+            None,
+        )
+        .await
+        .expect("replace stale projection");
+        assert_eq!(outcome, PublishOutcome::Published);
+    }
+
+    #[tokio::test]
+    async fn schema_contains_only_the_documented_header_projection() {
+        let cache = HeaderCache::at_path(test_path("schema-privacy"));
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let columns = tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&path)?;
+            let mut statement = connection.prepare("PRAGMA table_info(header_rows)")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(CacheError::from)
+        })
+        .await
+        .expect("join schema inspection")
+        .expect("inspect schema");
+
+        assert_eq!(
+            columns,
+            [
+                "account_key",
+                "mailbox",
+                "uid_validity",
+                "uid",
+                "projection_version",
+                "sender_email",
+                "sender_name",
+                "date_unix_ms",
+                "message_id",
+                "list_id",
+                "list_display_name",
+                "has_list_headers",
+                "advertised_one_click",
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_uses_wal_mode() {
+        let path = test_path("wal-mode");
+        let connection = open_connection(&path).expect("open cache");
+        let mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("read journal mode");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+    }
+
+    #[tokio::test]
+    async fn projection_stores_list_identity_and_booleans_without_unsubscribe_tokens() {
+        let cache = HeaderCache::at_path(test_path("token-free-projection"));
+        publish_test_rows(
+            &cache,
+            "INBOX",
+            vec![rank_row(
+                1,
+                "list@example.com",
+                "List Sender",
+                Some(1_000),
+                Some("<message@example.com>"),
+                Some("Friendly List <NEWS.Example.COM>"),
+                true,
+                true,
+            )],
+        )
+        .await;
+
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let stored = tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&path)?;
+            connection
+                .query_row(
+                    "SELECT list_id, list_display_name, has_list_headers,
+                            advertised_one_click
+                       FROM header_rows",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .map_err(CacheError::from)
+        })
+        .await
+        .expect("join projection read")
+        .expect("read projection");
+        assert_eq!(
+            stored,
+            (
+                Some("news.example.com".to_string()),
+                Some("Friendly List".to_string()),
+                1,
+                1,
+            )
+        );
+
+        let path = cache.path.as_ref().expect("test cache path");
+        for candidate in [
+            path.as_ref().clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+        ] {
+            if candidate.exists() {
+                let bytes = std::fs::read(candidate).expect("read cache file");
+                let cache_text = String::from_utf8_lossy(&bytes);
+                assert!(!cache_text.contains("recipient=secret-1"));
+                assert!(!cache_text.contains("mailto:list-1@example.test"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sql_sender_ranking_deduplicates_message_ids_and_pages() {
+        let cache = HeaderCache::at_path(test_path("sender-ranking"));
+        let inbox_rows = vec![
+            rank_row(
+                1,
+                "alpha@example.com",
+                "Alpha",
+                Some(1_000),
+                Some(" <shared@example.com> "),
+                None,
+                false,
+                false,
+            ),
+            rank_row(
+                2,
+                "alpha@example.com",
+                "Alpha",
+                Some(3_000),
+                Some("<alpha-new@example.com>"),
+                None,
+                false,
+                false,
+            ),
+            rank_row(
+                3,
+                "beta@example.com",
+                "Beta",
+                Some(2_000),
+                None,
+                None,
+                false,
+                false,
+            ),
+            rank_row(
+                4,
+                "owner@example.com",
+                "Owner",
+                Some(4_000),
+                None,
+                None,
+                false,
+                false,
+            ),
+        ];
+        let archive_rows = vec![
+            rank_row(
+                99,
+                "alpha@example.com",
+                "Alpha",
+                Some(1_000),
+                Some("<shared@example.com>"),
+                None,
+                false,
+                false,
+            ),
+            rank_row(
+                100,
+                "beta@example.com",
+                "Beta",
+                Some(2_500),
+                Some("   "),
+                None,
+                false,
+                false,
+            ),
+        ];
+        publish_test_rows(&cache, "INBOX", inbox_rows.clone()).await;
+        publish_test_rows(&cache, "Archive", archive_rows.clone()).await;
+
+        let scope = test_scope(&cache, &["INBOX", "Archive"]);
+        let page = query_sender_page(scope.clone(), vec!["owner@example.com".to_string()], 0, 1)
+            .await
+            .expect("query first sender page");
+        assert_eq!(page.total_groups, 2);
+        assert_eq!(page.total_messages, 4);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].address, "alpha@example.com");
+        assert_eq!(page.items[0].count, 2);
+        assert_eq!(page.items[0].sample.mailbox, "INBOX");
+        assert_eq!(page.items[0].sample.uid, 2);
+
+        let reference_rows = inbox_rows
+            .into_iter()
+            .map(|row| ("INBOX".to_string(), row))
+            .chain(
+                archive_rows
+                    .into_iter()
+                    .map(|row| ("Archive".to_string(), row)),
+            )
+            .collect();
+        let own = HashSet::from(["owner@example.com".to_string()]);
+        assert_eq!(page, reference_sender_page(reference_rows, &own, 0, 1));
+
+        let second = query_sender_page(scope, vec!["owner@example.com".to_string()], 1, 10)
+            .await
+            .expect("query second sender page");
+        assert_eq!(second.total_groups, 2);
+        assert_eq!(second.total_messages, 4);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].address, "beta@example.com");
+        assert_eq!(second.items[0].count, 2);
+    }
+
+    #[tokio::test]
+    async fn sql_subscription_and_mailing_list_rankings_use_safe_samples() {
+        let cache = HeaderCache::at_path(test_path("list-ranking"));
+        publish_test_rows(
+            &cache,
+            "INBOX",
+            vec![
+                rank_row(
+                    1,
+                    "news@example.com",
+                    "News",
+                    Some(1_000),
+                    Some("<news-old@example.com>"),
+                    Some("Old Name <NEWS.Example.COM>"),
+                    true,
+                    false,
+                ),
+                rank_row(
+                    2,
+                    "news@example.com",
+                    "News",
+                    Some(3_000),
+                    Some("<news-new@example.com>"),
+                    Some("Current Name <news.example.com>"),
+                    true,
+                    true,
+                ),
+                rank_row(
+                    3,
+                    "third@example.com",
+                    "Third",
+                    Some(2_000),
+                    None,
+                    Some("Current Name <news.example.com>"),
+                    false,
+                    false,
+                ),
+            ],
+        )
+        .await;
+        publish_test_rows(
+            &cache,
+            "Archive",
+            vec![
+                rank_row(
+                    20,
+                    "news@example.com",
+                    "News",
+                    Some(3_000),
+                    Some("<news-new@example.com>"),
+                    Some("Current Name <news.example.com>"),
+                    true,
+                    true,
+                ),
+                rank_row(
+                    21,
+                    "archive@example.com",
+                    "Archive",
+                    Some(4_000),
+                    None,
+                    Some("Newest Name <NEWS.EXAMPLE.COM>"),
+                    false,
+                    false,
+                ),
+            ],
+        )
+        .await;
+        let scope = test_scope(&cache, &["INBOX", "Archive"]);
+
+        let subscriptions = query_subscription_page(scope.clone(), Vec::new(), 0, 10)
+            .await
+            .expect("query subscriptions");
+        assert_eq!(subscriptions.total_messages, 2);
+        assert_eq!(subscriptions.total_groups, 1);
+        let subscription = &subscriptions.items[0];
+        assert_eq!(subscription.address, "news@example.com");
+        assert_eq!(subscription.count, 2);
+        assert!(subscription.advertised_one_click);
+        assert_eq!(subscription.sample.mailbox, "INBOX");
+        assert_eq!(subscription.sample.uid, 2);
+
+        let lists = query_mailing_list_page(scope, 0, 10)
+            .await
+            .expect("query mailing lists");
+        assert_eq!(lists.total_messages, 4);
+        assert_eq!(lists.total_groups, 1);
+        let list = &lists.items[0];
+        assert_eq!(list.list_id, "news.example.com");
+        assert_eq!(list.display_name, "Newest Name");
+        assert_eq!(list.count, 4);
+        assert_eq!(list.sender_count, 3);
+        assert_eq!(
+            list.senders,
+            [
+                "archive@example.com",
+                "news@example.com",
+                "third@example.com"
+            ]
+        );
+        assert_eq!(list.sample.mailbox, "Archive");
+        assert_eq!(list.sample.uid, 21);
+    }
+
+    #[tokio::test]
+    async fn sql_ranking_page_size_is_capped() {
+        let cache = HeaderCache::at_path(test_path("ranking-cap"));
+        let rows = (1..=105)
+            .map(|uid| {
+                rank_row(
+                    uid,
+                    &format!("sender{uid:03}@example.com"),
+                    "",
+                    Some(i64::from(uid)),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+            })
+            .collect();
+        publish_test_rows(&cache, "INBOX", rows).await;
+        let page = query_sender_page(test_scope(&cache, &["INBOX"]), Vec::new(), 0, usize::MAX)
+            .await
+            .expect("query capped sender page");
+        assert_eq!(page.total_groups, 105);
+        assert_eq!(page.items.len(), MAX_RANK_PAGE_SIZE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_directory_and_database_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = test_path("permissions");
+        drop(open_connection(&path).expect("open cache"));
+        let directory_mode = std::fs::metadata(path.parent().expect("cache parent"))
+            .expect("read directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&path)
+            .expect("read cache metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn concurrent_schema_upgrade_is_serialized() {
+        let path = Arc::new(test_path("concurrent-migration"));
+        let seed_path = Arc::clone(&path);
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&seed_path)?;
+            connection.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION - 1)?;
+            CacheResult::Ok(())
+        })
+        .await
+        .expect("join seed migration")
+        .expect("seed old schema version");
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut migrations = Vec::new();
+        for _ in 0..8 {
+            let migration_path = Arc::clone(&path);
+            let migration_barrier = Arc::clone(&barrier);
+            migrations.push(tokio::task::spawn_blocking(move || {
+                migration_barrier.wait();
+                drop(open_connection(&migration_path)?);
+                CacheResult::Ok(())
+            }));
+        }
+        for migration in migrations {
+            migration
+                .await
+                .expect("join concurrent migration")
+                .expect("run concurrent migration");
+        }
+
+        let inspect_path = Arc::clone(&path);
+        let version = tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&inspect_path)?;
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .map_err(CacheError::from)
+        })
+        .await
+        .expect("join version inspection")
+        .expect("inspect schema version");
+        assert_eq!(version, CACHE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v2_token_columns_are_rebuilt_and_checkpointed() {
+        let path = test_path("v2-token-migration");
+        std::fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache parent");
+        let secret = "https://unsubscribe.example.test/private-recipient-token-928374";
+        {
+            let connection = Connection::open(&path).expect("open legacy cache");
+            connection
+                .execute_batch(
+                    "PRAGMA user_version = 2;
+                     CREATE TABLE header_rows (
+                         account_key TEXT NOT NULL,
+                         mailbox TEXT NOT NULL,
+                         uid_validity INTEGER NOT NULL,
+                         uid INTEGER NOT NULL,
+                         projection_version INTEGER NOT NULL,
+                         sender_email TEXT NOT NULL,
+                         sender_name TEXT NOT NULL,
+                         date_unix_ms INTEGER,
+                         message_id TEXT,
+                         list_id TEXT,
+                         list_unsubscribe TEXT,
+                         list_unsubscribe_post TEXT,
+                         PRIMARY KEY (
+                             account_key, mailbox, uid_validity, uid,
+                             projection_version
+                         )
+                     ) WITHOUT ROWID;",
+                )
+                .expect("create legacy schema");
+            connection
+                .execute(
+                    "INSERT INTO header_rows (
+                         account_key, mailbox, uid_validity, uid,
+                         projection_version, sender_email, sender_name,
+                         list_unsubscribe
+                     ) VALUES ('account', 'INBOX', 7, 1, 2,
+                               'sender@example.com', '', ?1)",
+                    params![secret],
+                )
+                .expect("insert legacy token");
+        }
+
+        let connection = open_connection(&path).expect("migrate legacy cache");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, CACHE_SCHEMA_VERSION);
+        let columns = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(header_rows)")
+                .expect("prepare schema query");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query schema");
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect schema")
+        };
+        assert!(!columns.iter().any(|column| column == "list_unsubscribe"));
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "advertised_one_click")
+        );
+        drop(connection);
+
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+        ] {
+            if candidate.exists() {
+                let bytes = std::fs::read(&candidate).expect("read migrated cache file");
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes()),
+                    "legacy unsubscribe token remained in {}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit 216K-message SQLite stress test"]
+    async fn large_mailbox_snapshot_uses_bounded_chunk_writes() {
+        const MESSAGE_COUNT: u32 = 216_000;
+
+        let cache = HeaderCache::at_path(test_path("216k-stress"));
+        let key = test_key("All Mail");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let uids: Vec<u32> = (1..=MESSAGE_COUNT).collect();
+        for chunk in uids.chunks(FETCH_CHUNK_SIZE) {
+            store_headers(
+                path.clone(),
+                key.clone(),
+                7,
+                chunk.iter().copied().map(test_row).collect(),
+            )
+            .await
+            .expect("store header chunk");
+        }
+
+        let outcome = publish_snapshot(
+            path.clone(),
+            key.clone(),
+            None,
+            0,
+            7,
+            Some(MESSAGE_COUNT + 1),
+            &uids,
+            None,
+        )
+        .await
+        .expect("publish large snapshot");
+        assert_eq!(outcome, PublishOutcome::Published);
+        let state = load_state(path.clone(), key.clone())
+            .await
+            .expect("load state")
+            .expect("published state");
+        assert_eq!(state.exists, MESSAGE_COUNT);
+        let page = query_sender_page(
+            RankScope {
+                path,
+                account: key.account,
+                mailboxes: vec![key.mailbox],
+            },
+            Vec::new(),
+            0,
+            10,
+        )
+        .await
+        .expect("query bounded page");
+        assert_eq!(page.total_messages, u64::from(MESSAGE_COUNT));
+        assert_eq!(page.total_groups, u64::from(MESSAGE_COUNT));
+        assert_eq!(page.items.len(), 10);
+    }
+}

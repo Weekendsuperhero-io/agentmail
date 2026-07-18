@@ -1,18 +1,8 @@
-//! In-memory cache for the per-mailbox header scans behind the `rank_*` tools.
+//! Legacy header-scan cache types retained for Rust API compatibility.
 //!
-//! Ranking senders / mailing lists across a whole account re-downloads the
-//! FROM/List-* headers of every message on every call. This cache validates a
-//! mailbox cheaply with STATUS (UIDVALIDITY, UIDNEXT, MESSAGES, and optionally
-//! HIGHESTMODSEQ when CONDSTORE is available) and:
-//!
-//! - **Hit** — reuse rows (identical STATUS triple, or equal HIGHESTMODSEQ)
-//! - **Incremental** — pure appends only; fetch UIDs from the previous UIDNEXT
-//! - **MembershipRefresh** — deletes or mixed changes; `UID SEARCH ALL`, prune
-//!   vanished rows by UID, fetch only missing UIDs (no full header rescan)
-//! - **FullRescan** — cold cache, UIDVALIDITY change, or UIDNEXT regression
-//!
-//! Correctness does not depend on invalidation hooks: every read re-validates
-//! against live mailbox metadata. Hooks merely free known-stale rows sooner.
+//! [`crate::Agentmail`] now uses a private persistent cache with stronger
+//! stable-snapshot validation. These public legacy types remain so the 0.2
+//! Rust API does not break downstream callers.
 
 use hashbrown::{HashMap, HashSet};
 
@@ -84,27 +74,17 @@ impl CacheDecision {
             return Self::FullRescan;
         }
 
-        // CONDSTORE strong hit: equal HIGHESTMODSEQ means no mailbox change.
-        if let (Some(cached_ms), Some(status_ms)) = (cached.highest_modseq, status.highest_modseq)
-            && cached_ms == status_ms
-        {
-            return Self::Hit;
-        }
-
-        let uid_delta = uid_next - cached.uid_next;
         // exists can drop (deletes) — that is MembershipRefresh, not FullRescan.
         if status.exists < cached.exists {
             return Self::MembershipRefresh;
         }
-        let msg_delta = status.exists - cached.exists;
-        match (uid_delta, msg_delta) {
-            (0, 0) => Self::Hit,
-            // Equal positive deltas ⇒ pure appends (no deletions in the cached range).
-            (u, m) if u == m && u > 0 => Self::Incremental {
-                from_uid: cached.uid_next,
-            },
-            // Deletes, mixed arrivals+deletes, or other non-append changes.
-            _ => Self::MembershipRefresh,
+        if uid_next == cached.uid_next && status.exists == cached.exists {
+            Self::Hit
+        } else {
+            // STATUS values alone do not form an atomic snapshot. AgentMail's
+            // production cache proves a tail append with UID SEARCH bracketed
+            // by two identical EXAMINE snapshots before using it incrementally.
+            Self::MembershipRefresh
         }
     }
 }
@@ -235,13 +215,12 @@ mod tests {
     }
 
     #[test]
-    fn equal_deltas_are_incremental_from_cached_uid_next() {
+    fn equal_deltas_require_stable_membership_evidence() {
         let c = meta(1, 100, 99);
-        // 5 new messages, UIDNEXT advanced by 5.
         let s = status(Some(1), Some(105), 104);
         assert_eq!(
             CacheDecision::from_status(Some(&c), &s),
-            CacheDecision::Incremental { from_uid: 100 }
+            CacheDecision::MembershipRefresh
         );
     }
 
@@ -300,11 +279,13 @@ mod tests {
     }
 
     #[test]
-    fn equal_modseq_is_hit_even_if_counts_differ() {
-        // Under CONDSTORE, equal HIGHESTMODSEQ is authoritative.
+    fn equal_modseq_with_count_change_refreshes_membership() {
         let c = meta_ms(1, 100, 99, 50);
         let s = status_ms(Some(1), Some(100), 90, 50);
-        assert_eq!(CacheDecision::from_status(Some(&c), &s), CacheDecision::Hit);
+        assert_eq!(
+            CacheDecision::from_status(Some(&c), &s),
+            CacheDecision::MembershipRefresh
+        );
     }
 
     #[test]

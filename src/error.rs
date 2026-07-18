@@ -29,6 +29,29 @@ pub enum AgentmailError {
     #[error("Message not found: UID {0}")]
     MessageNotFound(u32),
 
+    #[error(
+        "mailbox '{mailbox}' did not provide UIDVALIDITY; refusing a stale-UID-sensitive action"
+    )]
+    UidValidityUnavailable { mailbox: String },
+
+    #[error(
+        "UIDVALIDITY changed for mailbox '{mailbox}': expected {expected}, observed {actual:?}; refresh discovery results before retrying"
+    )]
+    UidValidityChanged {
+        mailbox: String,
+        expected: u32,
+        actual: Option<u32>,
+    },
+
+    #[error("explicit one-click unsubscribe consent is required")]
+    UnsubscribeConsentRequired,
+
+    #[error("invalid unsubscribe policy: {0}")]
+    InvalidUnsubscribePolicy(String),
+
+    #[error("cancelled by client")]
+    Cancelled,
+
     #[error("invalid search query: {0}")]
     InvalidSearch(String),
 
@@ -97,5 +120,6 @@ mod tests {
         assert!(!AgentmailError::Parse("bad".into()).is_connection_error());
         assert!(!AgentmailError::AccountNotFound("a".into()).is_connection_error());
         assert!(!AgentmailError::Credential("nope".into()).is_connection_error());
+        assert!(!AgentmailError::Cancelled.is_connection_error());
     }
 }
