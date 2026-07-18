@@ -1580,6 +1580,21 @@ pub async fn append_draft(
     Ok(())
 }
 
+/// Locate a just-APPENDed message by Message-ID, returning the mailbox
+/// UIDVALIDITY and the matching UID (the highest, should duplicates exist).
+/// Used to recover a new draft's identity, since async-imap does not expose
+/// the UIDPLUS APPENDUID response code.
+pub async fn find_uid_by_message_id(
+    session: &mut ImapSession,
+    mailbox: &str,
+    message_id: &str,
+) -> Result<Option<(u32, u32)>> {
+    let selected = examine(session, mailbox).await?;
+    let uid_validity = require_uid_validity(mailbox, selected.uid_validity)?;
+    let uids = search_by_header(session, "Message-ID", message_id).await?;
+    Ok(uids.into_iter().max().map(|uid| (uid_validity, uid)))
+}
+
 // ---------------------------------------------------------------------------
 // Raw source
 // ---------------------------------------------------------------------------

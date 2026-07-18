@@ -31,7 +31,7 @@ impl AgentMailServer {
     #[tool(
         name = "create_mailbox",
         output_schema = rmcp::handler::server::tool::schema_for_output::<CreateMailboxOutput>().expect("valid create_mailbox output schema"),
-        description = "Create a mailbox on the IMAP server. For a nested mailboxName, use the hierarchy delimiter reported by list_mailboxes (commonly '/').",
+        description = "Create a mailbox on the IMAP server. For a nested mailbox, use the hierarchy delimiter reported by list_mailboxes (commonly '/').",
         annotations(
             title = "Create Mailbox",
             read_only_hint = false,
@@ -43,12 +43,12 @@ impl AgentMailServer {
         &self,
         Parameters(args): Parameters<CreateMailboxArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if args.mailbox_name.trim().is_empty() {
-            return Err(McpError::invalid_params("mailbox_name is required", None));
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
         }
         match self
             .agentmail
-            .create_mailbox(&args.account, &args.mailbox_name)
+            .create_mailbox(&args.account, &args.mailbox)
             .await
         {
             Ok(data) => compact_result(CreateMailboxOutput::from(data)),
@@ -74,7 +74,9 @@ impl AgentMailServer {
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteMessagesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
         if args.uids.is_empty() {
             return Err(McpError::invalid_params(
                 "uids must contain at least one UID",
@@ -93,7 +95,7 @@ impl AgentMailServer {
         match self
             .agentmail
             .delete_messages(
-                &mailbox,
+                &args.mailbox,
                 &args.account,
                 &args.uids,
                 args.expected_uid_validity,
@@ -122,14 +124,16 @@ impl AgentMailServer {
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteBySenderArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
 
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
         match self
             .agentmail
             .delete_by_sender(
-                &mailbox,
+                &args.mailbox,
                 &args.account,
                 args.uid,
                 args.expected_uid_validity,
@@ -161,7 +165,9 @@ impl AgentMailServer {
         &self,
         Parameters(args): Parameters<DownloadAttachmentsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
         let output_dir = args
             .output_dir
             .map(std::path::PathBuf::from)
@@ -170,7 +176,7 @@ impl AgentMailServer {
         match self
             .agentmail
             .download_attachments(
-                &mailbox,
+                &args.mailbox,
                 &args.account,
                 args.uid,
                 args.expected_uid_validity,
@@ -189,7 +195,7 @@ impl AgentMailServer {
     #[tool(
         name = "create_draft",
         output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>().expect("valid create_draft output schema"),
-        description = "Create and save a complete RFC822 draft. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Requires at least one to, cc, or bcc recipient. Subject and body are optional; attachments may reference local file paths.",
+        description = "Create and save a complete RFC822 draft. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Requires at least one to, cc, or bcc recipient. Subject and body are optional; attachments may reference local file paths. Returns the new draft's uid, uidValidity, and resourceUri when the server allows recovering them.",
         annotations(
             title = "Create Draft",
             read_only_hint = false,
@@ -318,14 +324,16 @@ impl AgentMailServer {
         ct: CancellationToken,
         Parameters(args): Parameters<UnsubscribeMessageArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
         match self
             .agentmail
             .unsubscribe_message(
-                &mailbox,
+                &args.mailbox,
                 &args.account,
                 args.uid,
                 UnsubscribeOptions {
@@ -395,7 +403,9 @@ impl AgentMailServer {
         &self,
         Parameters(args): Parameters<AddFlagsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
         if args.flags.is_empty() && args.color.is_none() {
             return Err(McpError::invalid_params(
                 "At least one flag or a color is required",
@@ -421,7 +431,7 @@ impl AgentMailServer {
         match self
             .agentmail
             .add_flags(
-                &mailbox,
+                &args.mailbox,
                 &args.account,
                 args.uid,
                 args.expected_uid_validity,
@@ -438,7 +448,7 @@ impl AgentMailServer {
     #[tool(
         name = "remove_flags",
         output_schema = rmcp::handler::server::tool::schema_for_output::<RemoveFlagsOutput>().expect("valid remove_flags output schema"),
-        description = "Remove flags and/or clear Apple Mail color from a message identified by mailbox, uid, and expectedUidValidity. The update fails before mutation if the mailbox UID epoch changed. Only specified flags are removed; all others remain. Set color=true to clear \\Flagged plus $MailFlagBit keywords. Cannot remove \\Deleted or \\Recent.",
+        description = "Remove flags and/or clear Apple Mail color from a message identified by mailbox, uid, and expectedUidValidity. The update fails before mutation if the mailbox UID epoch changed. Only specified flags are removed; all others remain. Set clearColor=true to clear \\Flagged plus $MailFlagBit keywords. Cannot remove \\Deleted or \\Recent.",
         annotations(
             title = "Remove Flags / Clear Color",
             read_only_hint = false,
@@ -450,10 +460,12 @@ impl AgentMailServer {
         &self,
         Parameters(args): Parameters<RemoveFlagsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
-        if args.flags.is_empty() && !args.color {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        if args.flags.is_empty() && !args.clear_color {
             return Err(McpError::invalid_params(
-                "At least one flag or color=true is required",
+                "At least one flag or clearColor=true is required",
                 None,
             ));
         }
@@ -476,12 +488,12 @@ impl AgentMailServer {
         match self
             .agentmail
             .remove_flags(
-                &mailbox,
+                &args.mailbox,
                 &args.account,
                 args.uid,
                 args.expected_uid_validity,
                 &args.flags,
-                args.color,
+                args.clear_color,
             )
             .await
         {

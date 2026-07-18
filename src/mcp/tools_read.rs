@@ -85,7 +85,7 @@ impl AgentMailServer {
     #[tool(
         name = "check_connection",
         output_schema = rmcp::handler::server::tool::schema_for_output::<CheckConnectionOutput>().expect("valid check_connection output schema"),
-        description = "Test IMAP connectivity for an account. Connects, authenticates, and reports status.",
+        description = "Test IMAP connectivity for an account. Connects, authenticates, and reports the outcome as data: connected=true, or connected=false with the error text — a probe against a configured account never raises a protocol error. An unknown account raises invalid params.",
         annotations(title = "Check Connection", read_only_hint = true)
     )]
     async fn check_connection_tool(
@@ -117,20 +117,22 @@ impl AgentMailServer {
     #[tool(
         name = "get_messages",
         output_schema = rmcp::handler::server::tool::schema_for_output::<GetMessagesOutput>().expect("valid get_messages output schema"),
-        description = "Fetch a metadata-only page of messages from a mailbox, newest-first. Returns account, mailbox, UIDVALIDITY, pagination data, and compact rows with UID, subject, sender, date, flags, size, and a UIDVALIDITY-safe resourceUri. Read resourceUri for markdown content, append /headers for exact headers, or append /source for bounded raw RFC822. Defaults: mailbox=INBOX, offset=0, limit=25 (max 50).",
+        description = "Fetch a metadata-only page of messages from one required mailbox, newest-first. Returns account, mailbox, UIDVALIDITY, pagination data (offset, limit, total, nextOffset), and compact rows with UID, subject, sender, date, flags, size, and a UIDVALIDITY-safe resourceUri. Read resourceUri for markdown content, append /headers for exact headers, or append /source for bounded raw RFC822. Get mailbox names from list_mailboxes. Defaults: offset=0, limit=25 (max 50).",
         annotations(title = "Get Messages", read_only_hint = true)
     )]
     async fn get_messages_tool(
         &self,
         Parameters(args): Parameters<GetMessagesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
         let offset = bounded_offset(args.offset)?;
         let limit = bounded_usize(args.limit, 25, 1, 50, "limit")?;
 
         match self
             .agentmail
-            .get_messages(&mailbox, &args.account, offset, limit, false, false)
+            .get_messages(&args.mailbox, &args.account, offset, limit, false, false)
             .await
         {
             Ok(data) => compact_result(GetMessagesOutput::from(data)),
@@ -141,14 +143,16 @@ impl AgentMailServer {
     #[tool(
         name = "search_messages",
         output_schema = rmcp::handler::server::tool::schema_for_output::<SearchMessagesOutput>().expect("valid search_messages output schema"),
-        description = "Search messages with filters: senderContains, subjectContains, toContains, query (IMAP full-text), read, flagged, headerKey/headerValueContains, since/before (YYYY-MM-DD), and largerThan/smallerThan (bytes). Filters are AND-combined. Returns metadata-only results newest-first with the mailbox UIDVALIDITY and one UIDVALIDITY-safe resourceUri per row; read that resource for content or append /headers or /source. Defaults: mailbox=INBOX, offset=0, limit=25 (max 50).",
+        description = "Search one required mailbox with filters: senderContains, subjectContains, toContains, query (IMAP full-text), read, flagged, headerKey/headerValueContains, since/before (YYYY-MM-DD), and largerThan/smallerThan (bytes). Filters are AND-combined. Returns metadata-only results newest-first with the mailbox UIDVALIDITY, pagination data (offset, limit, total, nextOffset), and one UIDVALIDITY-safe resourceUri per row; read that resource for content or append /headers or /source. Get mailbox names from list_mailboxes. Defaults: offset=0, limit=25 (max 50).",
         annotations(title = "Search Messages", read_only_hint = true)
     )]
     async fn search_messages_tool(
         &self,
         Parameters(args): Parameters<SearchMessagesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mailbox = args.mailbox.unwrap_or_else(|| "INBOX".to_string());
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
         let offset = bounded_offset(args.offset)?;
         let limit = bounded_usize(args.limit, 25, 1, 50, "limit")?;
 
@@ -174,7 +178,7 @@ impl AgentMailServer {
         match self
             .agentmail
             .search_messages(
-                &mailbox,
+                &args.mailbox,
                 &args.account,
                 &criteria,
                 offset,

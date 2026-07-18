@@ -586,6 +586,13 @@ pub struct CreateDraftResponse {
     pub recipients: DraftRecipients,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// UIDVALIDITY of the drafts mailbox when the new draft's identity could
+    /// be recovered (best-effort — async-imap exposes no APPENDUID).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid_validity: Option<u32>,
+    /// UID of the created draft, when recoverable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
 }
 
 /// A downloaded attachment file.

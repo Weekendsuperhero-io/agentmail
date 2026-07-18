@@ -24,7 +24,7 @@ impl AgentMailServer {
                 "Give me a comprehensive overview of my email for account \"{}\". \
                  First, call list_mailboxes with this account to see selectable folders, message totals, and unread counts. \
                  Then use top_senders with mailbox and limit omitted so its account-wide default page of 10 ranks the top senders by volume. \
-                 Finally, show the 10 most recent unread INBOX messages using search_messages with read=false and limit=10. \
+                 Finally, show the 10 most recent unread INBOX messages using search_messages with mailbox=\"INBOX\", read=false, and limit=10. \
                  Search results are metadata-only; read a row's UIDVALIDITY-safe resourceUri only when more content is needed.",
                 params.0.account
             ),
@@ -43,10 +43,10 @@ impl AgentMailServer {
             PromptMessageRole::User,
             format!(
                 "Help me clean up all emails from \"{}\" in account \"{}\". \
-                 First, use search_messages with senderContains in INBOX and limit=5. Results are metadata-only; \
-                 show each returned sender, subject, and date plus totalMatches so I can confirm the exact sender identity. \
+                 First, use search_messages with mailbox=\"INBOX\", senderContains, and limit=5. Results are metadata-only; \
+                 show each returned sender, subject, and date plus the total so I can confirm the exact sender identity. \
                  Wait for confirmation. Then call delete_by_sender using one approved row's uid, the search wrapper's \
-                 uidValidity as expectedUidValidity, mailbox=INBOX, and allMailboxes=true. Explain that deletion \
+                 uidValidity as expectedUidValidity, mailbox=\"INBOX\", and allMailboxes=true. Explain that deletion \
                  matches the sample message's exact address + display name and may differ from the original substring.",
                 params.0.sender, params.0.account
             ),

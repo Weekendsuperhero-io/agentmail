@@ -365,6 +365,7 @@ async fn invalid_params_yields_32602() {
                 "name": "delete_messages",
                 "arguments": {
                     "account": "dummy",
+                    "mailbox": "INBOX",
                     "uids": [],
                     "expectedUidValidity": 1
                 }
@@ -1017,4 +1018,263 @@ async fn prompts_list_has_6_prompts() {
             "prompt `{name}` has no description"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Contract-validation tests: the cleaned-up 0.3.0 tool contract.
+// ---------------------------------------------------------------------------
+
+/// Every paginated tool shares one envelope: `offset`, `limit`, `total`, and
+/// an optional `nextOffset` — no legacy total names.
+#[tokio::test]
+async fn paginated_outputs_share_one_envelope() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    for (name, rows_field) in [
+        ("list_mailboxes", "mailboxes"),
+        ("get_messages", "messages"),
+        ("search_messages", "messages"),
+        ("find_attachments", "messages"),
+        ("top_senders", "senders"),
+        ("top_subscriptions", "lists"),
+        ("top_mailing_lists", "lists"),
+    ] {
+        let output = &find_tool(tools, name)["outputSchema"];
+        let properties = output["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("`{name}` output properties"));
+        for field in ["offset", "limit", "total", "nextOffset", rows_field] {
+            assert!(
+                properties.contains_key(field),
+                "`{name}` output must expose `{field}`: {output:#}"
+            );
+        }
+        for legacy in ["totalMatches", "uniqueSenders", "uniqueLists"] {
+            assert!(
+                !properties.contains_key(legacy),
+                "`{name}` output must not expose legacy `{legacy}`"
+            );
+        }
+        let required: Vec<&str> = output["required"]
+            .as_array()
+            .map(|values| values.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        for field in ["offset", "limit", "total"] {
+            assert!(
+                required.contains(&field),
+                "`{name}` `{field}` must be required: {required:?}"
+            );
+        }
+        assert!(
+            !required.contains(&"nextOffset"),
+            "`{name}` nextOffset is page-dependent and must be optional"
+        );
+    }
+}
+
+/// One mailbox idiom: `mailbox` is optional only where omitting it means
+/// "scan the whole account"; single-mailbox readers and every UID consumer
+/// require it, and nothing defaults to INBOX.
+#[tokio::test]
+async fn mailbox_argument_follows_one_idiom() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    for name in [
+        "get_messages",
+        "search_messages",
+        "delete_messages",
+        "delete_by_sender",
+        "download_attachments",
+        "unsubscribe_message",
+        "add_flags",
+        "remove_flags",
+        "move_message",
+        "create_mailbox",
+    ] {
+        let input = &find_tool(tools, name)["inputSchema"];
+        let required: Vec<&str> = input["required"]
+            .as_array()
+            .map(|values| values.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            required.contains(&"mailbox"),
+            "`{name}` must require mailbox: {required:?}"
+        );
+    }
+
+    for name in [
+        "list_flags",
+        "find_attachments",
+        "top_senders",
+        "top_subscriptions",
+        "top_mailing_lists",
+        "delete_list_id",
+    ] {
+        let input = &find_tool(tools, name)["inputSchema"];
+        assert!(
+            input["properties"]["mailbox"].is_object(),
+            "`{name}` must accept an optional mailbox"
+        );
+        let required: Vec<&str> = input["required"]
+            .as_array()
+            .map(|values| values.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            !required.contains(&"mailbox"),
+            "`{name}` mailbox omission means account-wide and must stay optional"
+        );
+        let description = input["properties"]["mailbox"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            description.contains("Omit"),
+            "`{name}` optional mailbox must document account-wide omission: {description}"
+        );
+    }
+
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("<unnamed>");
+        let description = tool["inputSchema"]["properties"]["mailbox"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !description.contains("Defaults to INBOX"),
+            "`{name}` must not default mailbox to INBOX: {description}"
+        );
+    }
+}
+
+/// `add_flags.color` is a color name; `remove_flags` uses `clearColor: bool`
+/// — the shared `color` key with two meanings is gone.
+#[tokio::test]
+async fn flag_color_arguments_are_typed_consistently() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let add = &find_tool(tools, "add_flags")["inputSchema"];
+    assert!(
+        schema_allows_type(&add["properties"]["color"], "string"),
+        "add_flags color is a color-name string: {add:#}"
+    );
+
+    let remove = &find_tool(tools, "remove_flags")["inputSchema"];
+    let properties = remove["properties"]
+        .as_object()
+        .expect("remove_flags input properties");
+    assert!(
+        !properties.contains_key("color"),
+        "remove_flags renamed `color` to `clearColor`"
+    );
+    assert!(
+        schema_allows_type(&properties["clearColor"], "boolean"),
+        "remove_flags clearColor is a boolean switch: {remove:#}"
+    );
+}
+
+/// `create_mailbox` uses the same `mailbox` argument name as every other tool.
+#[tokio::test]
+async fn create_mailbox_argument_is_named_mailbox() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let input = &find_tool(tools, "create_mailbox")["inputSchema"];
+    let properties = input["properties"]
+        .as_object()
+        .expect("create_mailbox input properties");
+    assert!(
+        properties.contains_key("mailbox") && !properties.contains_key("mailboxName"),
+        "create_mailbox takes `mailbox`, not `mailboxName`: {input:#}"
+    );
+}
+
+/// `create_draft` output advertises the recovered draft identity as optional
+/// nonzero uid/uidValidity plus a resourceUri.
+#[tokio::test]
+async fn create_draft_output_exposes_optional_draft_identity() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let output = &find_tool(tools, "create_draft")["outputSchema"];
+    let properties = output["properties"]
+        .as_object()
+        .expect("create_draft output properties");
+    for field in ["uid", "uidValidity", "resourceUri"] {
+        assert!(
+            properties.contains_key(field),
+            "create_draft output must expose `{field}`: {output:#}"
+        );
+    }
+    let required: Vec<&str> = output["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for field in ["uid", "uidValidity", "resourceUri"] {
+        assert!(
+            !required.contains(&field),
+            "draft identity recovery is best-effort; `{field}` must be optional"
+        );
+    }
+    for field in ["uid", "uidValidity"] {
+        assert_eq!(
+            schema_minimum(&properties[field]),
+            Some(1.0),
+            "create_draft `{field}` must be nonzero when present"
+        );
+    }
+}
+
+/// The probe contract: a configured-but-unreachable account is a data outcome
+/// (`connected: false` + error text), never a protocol error.
+#[tokio::test]
+async fn check_connection_reports_failure_as_data_not_error() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({"name": "check_connection", "arguments": {"account": "dummy"}}),
+        )
+        .await;
+
+    assert!(
+        resp.get("error").is_none(),
+        "connectivity failure must not raise a protocol error: {resp:#}"
+    );
+    let result = &resp["result"];
+    assert_ne!(
+        result["isError"],
+        json!(true),
+        "connectivity failure is a successful probe result: {result:#}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["connected"], json!(false));
+    assert!(
+        structured["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "failed probe must carry the error text: {structured:#}"
+    );
+}
+
+/// The probe's one exception: an unknown account is a parameter error and
+/// raises invalid params.
+#[tokio::test]
+async fn check_connection_unknown_account_is_32602() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({"name": "check_connection", "arguments": {"account": "no-such-account"}}),
+        )
+        .await;
+
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown account should be invalid params: {resp:#}"
+    );
 }

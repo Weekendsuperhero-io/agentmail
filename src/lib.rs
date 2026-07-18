@@ -167,6 +167,11 @@ impl Agentmail {
     }
 
     /// Check IMAP connectivity for an account.
+    ///
+    /// Probe contract: a parameter error (unknown account) is an `Err`, while
+    /// connectivity and auth outcomes are data — `connected: false` plus the
+    /// error text. A probe against a configured account never raises for an
+    /// unreachable or rejecting server.
     pub async fn check_connection(&self, account: &str) -> Result<ConnectionStatus> {
         match self.pool.acquire(account).await {
             Ok(session) => {
@@ -178,6 +183,7 @@ impl Agentmail {
                     server_greeting: None,
                 })
             }
+            Err(e @ AgentmailError::AccountNotFound(_)) => Err(e),
             Err(e) => Ok(ConnectionStatus {
                 account: account.to_string(),
                 connected: false,
@@ -1805,6 +1811,20 @@ impl Agentmail {
         self.invalidate_mailbox_catalog(account);
         append_result?;
         imap_client::sync(session.session()).await?;
+
+        // Best-effort identity recovery: async-imap does not expose UIDPLUS
+        // APPENDUID, so search the drafts mailbox for the Message-ID that
+        // compose_draft generated. A recovery failure leaves the identity
+        // fields unset without failing the successful create.
+        let identity = match draft::extract_message_id(&rfc822) {
+            Some(message_id) => {
+                imap_client::find_uid_by_message_id(session.session(), &drafts_name, &message_id)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            None => None,
+        };
         session.release().await;
 
         let attached_names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
@@ -1820,6 +1840,8 @@ impl Agentmail {
                 bcc: bcc.to_vec(),
             },
             attachments: attached_names,
+            uid_validity: identity.map(|(uid_validity, _)| uid_validity),
+            uid: identity.map(|(_, uid)| uid),
         })
     }
 
@@ -2513,7 +2535,7 @@ fn ranking_sample_is_newer(
     }
 }
 
-fn next_offset(offset: usize, item_count: usize, total: usize) -> Option<usize> {
+pub(crate) fn next_offset(offset: usize, item_count: usize, total: usize) -> Option<usize> {
     let next = offset.saturating_add(item_count);
     (item_count > 0 && next < total).then_some(next)
 }

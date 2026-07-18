@@ -14,6 +14,7 @@ use rmcp::{
 use serde::Serialize;
 
 use super::resources::format_email_uri;
+use crate::next_offset;
 
 const MAX_FALLBACK_CHARS: usize = 8_000;
 const MAX_BREAKDOWN_ROWS: usize = 50;
@@ -316,6 +317,8 @@ pub(super) struct GetMessagesOutput {
     pub(super) offset: usize,
     pub(super) limit: usize,
     pub(super) total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) next_offset: Option<usize>,
     pub(super) messages: Vec<MessageMetadataOutput>,
 }
 
@@ -330,7 +333,7 @@ impl From<crate::GetMessagesResponse> for GetMessagesOutput {
             total,
             messages,
         } = value;
-        let messages = messages
+        let messages: Vec<MessageMetadataOutput> = messages
             .into_iter()
             .map(|message| MessageMetadataOutput::new(message, &account, &mailbox, uid_validity))
             .collect();
@@ -341,6 +344,7 @@ impl From<crate::GetMessagesResponse> for GetMessagesOutput {
             offset,
             limit,
             total,
+            next_offset: next_offset(offset, messages.len(), total),
             messages,
         }
     }
@@ -375,7 +379,9 @@ pub(super) struct SearchMessagesOutput {
     pub(super) uid_validity: u32,
     pub(super) offset: usize,
     pub(super) limit: usize,
-    pub(super) total_matches: usize,
+    pub(super) total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) next_offset: Option<usize>,
     pub(super) messages: Vec<MessageMetadataOutput>,
 }
 
@@ -390,7 +396,7 @@ impl From<crate::SearchMessagesResponse> for SearchMessagesOutput {
             total_matches,
             messages,
         } = value;
-        let messages = messages
+        let messages: Vec<MessageMetadataOutput> = messages
             .into_iter()
             .map(|message| MessageMetadataOutput::new(message, &account, &mailbox, uid_validity))
             .collect();
@@ -400,7 +406,8 @@ impl From<crate::SearchMessagesResponse> for SearchMessagesOutput {
             uid_validity,
             offset,
             limit,
-            total_matches,
+            total: total_matches,
+            next_offset: next_offset(offset, messages.len(), total_matches),
             messages,
         }
     }
@@ -418,7 +425,7 @@ impl WireOutput for SearchMessagesOutput {
         format!(
             "{} of {} matching message(s) from {} at offset {}; UIDVALIDITY {}. Resources: {resources}",
             self.messages.len(),
-            self.total_matches,
+            self.total,
             self.mailbox,
             self.offset,
             self.uid_validity
@@ -686,7 +693,8 @@ pub(super) struct TopSendersOutput {
     pub(super) account: String,
     pub(super) mailbox: String,
     pub(super) total_messages: u32,
-    pub(super) unique_senders: usize,
+    /// Total ranked rows (unique senders) — the pagination universe.
+    pub(super) total: usize,
     pub(super) offset: usize,
     pub(super) limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -713,7 +721,7 @@ impl From<crate::TopSendersResponse> for TopSendersOutput {
             account,
             mailbox: value.mailbox,
             total_messages: value.total_messages,
-            unique_senders: value.unique_senders,
+            total: value.unique_senders,
             offset: value.offset,
             limit: value.limit,
             next_offset: value.next_offset,
@@ -738,7 +746,7 @@ impl WireOutput for TopSendersOutput {
         format!(
             "{} of {} ranked sender(s) at offset {}: {rows}",
             self.senders.len(),
-            self.unique_senders,
+            self.total,
             self.offset
         )
     }
@@ -765,7 +773,8 @@ pub(super) struct TopSubscriptionsOutput {
     pub(super) account: String,
     pub(super) mailbox: String,
     pub(super) total_messages: u32,
-    pub(super) unique_lists: usize,
+    /// Total ranked rows (unique lists) — the pagination universe.
+    pub(super) total: usize,
     pub(super) offset: usize,
     pub(super) limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -793,7 +802,7 @@ impl From<crate::TopSubscriptionsResponse> for TopSubscriptionsOutput {
             account,
             mailbox: value.mailbox,
             total_messages: value.total_messages,
-            unique_lists: value.unique_lists,
+            total: value.unique_lists,
             offset: value.offset,
             limit: value.limit,
             next_offset: value.next_offset,
@@ -818,7 +827,7 @@ impl WireOutput for TopSubscriptionsOutput {
         format!(
             "{} of {} ranked subscription(s) at offset {}: {rows}",
             self.lists.len(),
-            self.unique_lists,
+            self.total,
             self.offset
         )
     }
@@ -846,7 +855,8 @@ pub(super) struct TopMailingListsOutput {
     pub(super) account: String,
     pub(super) mailbox: String,
     pub(super) total_messages: u32,
-    pub(super) unique_lists: usize,
+    /// Total ranked rows (unique lists) — the pagination universe.
+    pub(super) total: usize,
     pub(super) offset: usize,
     pub(super) limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -879,7 +889,7 @@ impl From<crate::TopMailingListsResponse> for TopMailingListsOutput {
             account,
             mailbox: value.mailbox,
             total_messages: value.total_messages,
-            unique_lists: value.unique_lists,
+            total: value.unique_lists,
             offset: value.offset,
             limit: value.limit,
             next_offset: value.next_offset,
@@ -904,7 +914,7 @@ impl WireOutput for TopMailingListsOutput {
         format!(
             "{} of {} ranked mailing list(s) at offset {}: {rows}",
             self.lists.len(),
-            self.unique_lists,
+            self.total,
             self.offset
         )
     }
@@ -1154,25 +1164,55 @@ pub(super) struct CreateDraftOutput {
     pub(super) account: String,
     pub(super) drafts_mailbox: String,
     pub(super) attachment_count: usize,
+    /// UIDVALIDITY of the drafts mailbox, when the server let the new
+    /// draft's identity be recovered after APPEND.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub(super) uid_validity: Option<u32>,
+    /// UID of the created draft, when recoverable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub(super) uid: Option<u32>,
+    /// UIDVALIDITY-safe resource URI of the created draft, when recoverable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resource_uri: Option<String>,
 }
 
 impl From<crate::CreateDraftResponse> for CreateDraftOutput {
     fn from(value: crate::CreateDraftResponse) -> Self {
+        let resource_uri = match (value.uid_validity, value.uid) {
+            (Some(uid_validity), Some(uid)) => Some(message_resource_uri(
+                &value.account,
+                &value.drafts_mailbox,
+                uid_validity,
+                uid,
+            )),
+            _ => None,
+        };
         Self {
             created: value.created,
             account: value.account,
             drafts_mailbox: value.drafts_mailbox,
             attachment_count: value.attachments.len(),
+            uid_validity: value.uid_validity,
+            uid: value.uid,
+            resource_uri,
         }
     }
 }
 
 impl WireOutput for CreateDraftOutput {
     fn text_summary(&self) -> String {
-        format!(
-            "Created draft in {} for {} with {} attachment(s)",
-            self.drafts_mailbox, self.account, self.attachment_count
-        )
+        match &self.resource_uri {
+            Some(resource_uri) => format!(
+                "Created draft in {} for {} with {} attachment(s): {resource_uri}",
+                self.drafts_mailbox, self.account, self.attachment_count
+            ),
+            None => format!(
+                "Created draft in {} for {} with {} attachment(s)",
+                self.drafts_mailbox, self.account, self.attachment_count
+            ),
+        }
     }
 }
 

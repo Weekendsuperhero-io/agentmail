@@ -1,6 +1,15 @@
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart};
 
+/// Extract the generated Message-ID (without angle brackets) from a composed
+/// RFC822 message, for locating the stored copy on the server afterwards.
+pub fn extract_message_id(rfc822: &[u8]) -> Option<String> {
+    mail_parser::MessageParser::default()
+        .parse(rfc822)?
+        .message_id()
+        .map(str::to_string)
+}
+
 /// Parse a string into a lettre Mailbox.
 /// Accepts bare emails ("user@example.com") and full addresses ("Name <user@example.com>").
 fn parse_mailbox(addr: &str) -> crate::Result<Mailbox> {

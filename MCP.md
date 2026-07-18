@@ -8,6 +8,18 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 
 **Supported capabilities:** tools, prompts, resources, completions, tasks (SEP-1686), progress notifications, request cancellation
 
+**Contract conventions:**
+
+- Every paginated result shares one envelope: `offset`, `limit`, `total`
+  (the row universe being paged), and `nextOffset` (present only when
+  another page exists). Domain statistics keep their own names alongside it
+  (e.g. `totalMessages` on `top_*` counts messages scanned, not rows).
+- `mailbox` is optional **only** where omitting it means "scan the whole
+  account" (`list_flags`, `find_attachments`, `top_*`, `delete_list_id`).
+  Everywhere else — single-mailbox readers and every UID consumer — it is
+  required; nothing defaults to INBOX, because a UID and
+  `expectedUidValidity` are only meaningful with the mailbox they came from.
+
 ## Tools (21)
 
 ### Discovery & Connection
@@ -50,6 +62,11 @@ servers are not yet supported end to end.
 { "account", "connected": bool, "error?" }
 ```
 
+Probe contract: connectivity and auth outcomes are **data** — a configured
+but unreachable or rejecting account returns `connected: false` with the
+error text, never a protocol error. The one exception is a parameter error:
+an unknown account raises `-32602`.
+
 **list_capabilities** → `ListCapabilitiesResponse`
 ```json
 { "account", "capabilities": ["IDLE", "MOVE", ...] }
@@ -61,8 +78,8 @@ servers are not yet supported end to end.
 
 | #   | Tool               | Description                                                                                         | Annotations            |
 | --- | ------------------ | --------------------------------------------------------------------------------------------------- | ---------------------- |
-| 5   | `get_messages`     | Paginated metadata discovery, newest-first. Default: INBOX, offset=0, limit=25 (max 50) | `read_only`            |
-| 6   | `search_messages`  | Paginated IMAP metadata search with text, headers, status, date, and size filters.     | `read_only`            |
+| 5   | `get_messages`     | Paginated metadata discovery from one required mailbox, newest-first. Default: offset=0, limit=25 (max 50) | `read_only`            |
+| 6   | `search_messages`  | Paginated IMAP metadata search of one required mailbox with text, headers, status, date, and size filters. | `read_only`            |
 | 7   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only`, `taskable` |
 | 8   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only`, `taskable` |
 | 9   | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only`, `taskable` |
@@ -74,13 +91,13 @@ servers are not yet supported end to end.
 **get_messages**
 ```json
 { "mailbox", "account", "uidValidity", "offset", "limit", "total",
-  "messages": [MessageMetadata] }
+  "nextOffset?", "messages": [MessageMetadata] }
 ```
 
 **search_messages**
 ```json
-{ "mailbox", "account", "uidValidity", "offset", "limit", "totalMatches",
-  "messages": [MessageMetadata] }
+{ "mailbox", "account", "uidValidity", "offset", "limit", "total",
+  "nextOffset?", "messages": [MessageMetadata] }
 ```
 
 Non-ASCII search text is sent with a `CHARSET UTF-8` prefix (accepted by Gmail, Dovecot, Courier, iCloud, and Outlook). Servers that reject UTF-8 search return `-32602`. CR/LF in search text is rejected.
@@ -123,7 +140,7 @@ Mailbox breakdowns are capped at 50 rows and include total/truncation metadata.
 
 **top_senders**
 ```json
-{ "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueSenders",
+{ "mailbox": "INBOX" | "*", "account", "totalMessages", "total",
   "offset", "limit", "nextOffset?",
   "senders": [{
     "address", "displayName", "count", "oldestDate?", "newestDate?",
@@ -132,7 +149,9 @@ Mailbox breakdowns are capped at 50 rows and include total/truncation metadata.
 ```
 
 Grouped by `(email, display name)`; the same address with different display
-names is separate. All three `top_*` tools use `offset`/`limit` pagination with
+names is separate. On all three `top_*` tools, `total` counts the ranked rows
+(unique senders/lists — the pagination universe) while `totalMessages` counts
+messages scanned. All three use `offset`/`limit` pagination with
 a default of 10 and maximum of 100. Account-wide discovery uses one selectable
 `\All` mailbox when available. Otherwise it enumerates storage mailboxes,
 excludes Trash/Junk/Drafts and virtual All/Flagged/Important views, and
@@ -141,7 +160,7 @@ account's own address.
 
 **top_subscriptions**
 ```json
-{ "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueLists",
+{ "mailbox": "INBOX" | "*", "account", "totalMessages", "total",
   "offset", "limit", "nextOffset?",
   "lists": [{
     "address", "displayName", "advertisedOneClick": bool,
@@ -155,7 +174,7 @@ Opaque unsubscribe URLs and recipient tokens are not exposed. Use the nested
 
 **top_mailing_lists**
 ```json
-{ "mailbox": "INBOX" | "*", "account", "totalMessages", "uniqueLists",
+{ "mailbox": "INBOX" | "*", "account", "totalMessages", "total",
   "offset", "limit", "nextOffset?",
   "lists": [{
     "listId": "list-id.example.com",
@@ -201,8 +220,8 @@ override its root; cache errors fall back to live IMAP.
 | 14  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
 | 15  | `move_message`         | IMAP MOVE between mailboxes (COPY+EXPUNGE fallback when MOVE unsupported)             |                                          |
 | 16  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
-| 17  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. |                                          |
-| 18  | `download_attachments` | Extract attachments to disk as `{uid}_{filename}`                                     | `taskable`                               |
+| 17  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. Returns the draft identity when recoverable. |                                          |
+| 18  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
 | 19  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional exact List-Id cleanup defaults off.             | `destructive`, `open_world`, `taskable`  |
 
 **`permanent` flag (delete tools):** default false moves to Trash when a Trash mailbox exists, else permanently deletes. When true, flags `\Deleted` + UID EXPUNGE directly, bypassing Trash — irreversible. Permanent delete requires the server to advertise UIDPLUS; on servers without it the call is refused (plain EXPUNGE would purge unrelated `\Deleted` messages).
@@ -215,8 +234,10 @@ unless `allowPermanentFallback=true` was separately supplied.
 
 `delete_messages` accepts at most 500 explicitly supplied UIDs over MCP. `delete_by_sender`, `delete_list_id`, and unsubscribe matching have no total match limit; they split server mutations into 500-UID wire batches. A `top_*` ranking `limit` never becomes a deletion limit.
 
-UID-based tools never accept a bare UID as durable identity. The following
-arguments are required together with `expectedUidValidity`:
+UID-based tools never accept a bare UID as durable identity, and every UID
+consumer requires the `mailbox` the identity came from (there is no INBOX
+default). The following arguments are required together with
+`expectedUidValidity`:
 
 - `delete_messages`: one or more UIDs discovered in one mailbox epoch.
 - `delete_by_sender`: the `sample.uid` from `top_senders`.
@@ -273,13 +294,17 @@ truncation fields preserve audit completeness.
 
 **create_draft**
 ```json
-{ "created": true, "account", "draftsMailbox", "attachmentCount" }
+{ "created": true, "account", "draftsMailbox", "attachmentCount",
+  "uidValidity?", "uid?", "resourceUri?" }
 ```
 
 The compact result confirms placement without echoing the subject, recipients,
 local input paths, or filenames. `create_draft` composes a complete RFC822
 message with Date and Message-ID and appends it to a selectable Drafts mailbox
-with the `\Draft` flag.
+with the `\Draft` flag. The identity fields are best-effort: async-imap does
+not expose UIDPLUS `APPENDUID`, so the server is asked for the generated
+Message-ID after APPEND; when that recovery succeeds the response carries the
+new draft's nonzero `uid`/`uidValidity` and a UIDVALIDITY-safe `resourceUri`.
 
 **download_attachments**
 ```json
@@ -350,8 +375,8 @@ message ceiling and continues to mutate in 500-UID batches.
 
 | #   | Tool           | Description                                                                          | Annotations |
 | --- | -------------- | ------------------------------------------------------------------------------------ | ----------- |
-| 20  | `add_flags`    | Add flags and/or Apple Mail color (union semantics). Colors: red, orange, yellow, green, blue, purple, gray. | `idempotent` |
-| 21  | `remove_flags` | Remove specific flags and/or clear Apple Mail color. Others preserved.                | `idempotent` |
+| 20  | `add_flags`    | Add flags and/or set Apple Mail `color` (a color-name string; union semantics). Colors: red, orange, yellow, green, blue, purple, gray. | `idempotent` |
+| 21  | `remove_flags` | Remove specific flags and/or clear the Apple Mail color with `clearColor: true`. Others preserved. | `idempotent` |
 
 #### Output Schemas
 
