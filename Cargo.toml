@@ -43,7 +43,11 @@ percent-encoding = "2"
 reqwest = { version = "0.13", features = ["json"] }
 rmcp = { version = "=1.7.0", features = ["server", "macros", "transport-io"] }
 rmcp-macros = "=1.7.0"
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+# Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
+# sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native
+# sqlite — libsqlite3-sys has `links = "sqlite3"`, so exactly one version may
+# exist in any dependency graph. Bump together with the embedder's sqlx.
+rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }
 schemars = { version = "1.2", features = ["chrono04"] }
 keyring-core = "1.0"
 serde = { version = "1", features = ["derive"] }
