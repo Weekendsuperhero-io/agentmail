@@ -76,6 +76,9 @@ struct LoadedState {
     mailbox: Option<StoredState>,
     existing_revision: Option<i64>,
     account_revision: i64,
+    /// Persisted server-quirk flag: HEADER.FIELDS responses filter List-*
+    /// headers, so syncs must fetch full headers (see `account_quirks`).
+    header_fields_filtered: bool,
 }
 
 /// Stable mailbox-local identity for a representative ranking message.
@@ -231,6 +234,38 @@ impl HeaderCache {
 
     fn mark_account_quirky(&self, account_key: &str) {
         self.quirky_accounts.lock().insert(account_key.to_string());
+    }
+
+    /// Remember the quirk in-process AND on disk, so a restart cannot
+    /// silently drop back to the FIELDS fetch mode this server corrupts —
+    /// small post-restart tail syncs would misclassify new bulk mail
+    /// without ever re-tripping the detection threshold. Best-effort: a
+    /// write failure only loses the persistence, not the in-process flag.
+    async fn persist_account_quirky(&self, account_key: &str) {
+        self.mark_account_quirky(account_key);
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let path = Arc::clone(path);
+        let account = account_key.to_string();
+        let write = tokio::task::spawn_blocking(move || -> CacheResult<()> {
+            let connection = open_connection(&path)?;
+            connection.execute(
+                "INSERT INTO account_quirks (account_key, header_fields_filtered)
+                 VALUES (?1, 1)
+                 ON CONFLICT (account_key) DO UPDATE SET header_fields_filtered = 1",
+                params![account],
+            )?;
+            Ok(())
+        })
+        .await;
+        if let Ok(Err(error)) = write {
+            warn!(
+                target: "agentmail",
+                error = %error,
+                "could not persist the HEADER.FIELDS quirk flag"
+            );
+        }
     }
 
     /// Whether scans flagged this account's server as filtering List-*
@@ -534,6 +569,9 @@ impl HeaderCache {
         for _ in 0..2 {
             imap_client::check_cancel(cancel)?;
             let loaded = load_sync_state(Arc::clone(&path), key.clone()).await?;
+            // The persisted quirk survives restarts; the in-process flag
+            // (initialized above) covers cache-path races within a run.
+            full_header_mode |= loaded.header_fields_filtered;
             let state = loaded.mailbox;
             let expected_account_revision = loaded.account_revision;
             let live_status = examine_status(session, &key.mailbox).await?;
@@ -718,7 +756,7 @@ impl HeaderCache {
                     list_id_rows,
                     "HEADER.FIELDS responses omit List-Unsubscribe; refetching full headers for the whole mailbox",
                 );
-                self.mark_account_quirky(&key.account);
+                self.persist_account_quirky(&key.account).await;
                 full_header_mode = true;
                 let members: Vec<u32> = live_uids.clone();
                 for chunk in members.chunks(FETCH_CHUNK_SIZE) {
@@ -983,6 +1021,17 @@ fn open_connection(path: &Path) -> CacheResult<Connection> {
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "foreign_keys", true)?;
     migrate_schema(&mut connection)?;
+    // Lazily ensured outside schema versioning so adding it does not force a
+    // projection rebuild on existing caches: server-behavior quirks observed
+    // by scans (e.g. AOL/Yahoo filtering List-* from HEADER.FIELDS), keyed
+    // like account_state. Persisted so a process restart cannot silently
+    // drop back to a fetch mode the server is known to corrupt.
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_quirks (
+             account_key TEXT NOT NULL PRIMARY KEY,
+             header_fields_filtered INTEGER NOT NULL DEFAULT 0
+         ) WITHOUT ROWID;",
+    )?;
     Ok(connection)
 }
 
@@ -1010,7 +1059,8 @@ fn migrate_schema(connection: &mut Connection) -> CacheResult<()> {
         "DROP TABLE IF EXISTS membership;
          DROP TABLE IF EXISTS header_rows;
          DROP TABLE IF EXISTS mailbox_state;
-         DROP TABLE IF EXISTS account_state;",
+         DROP TABLE IF EXISTS account_state;
+         DROP TABLE IF EXISTS account_quirks;",
     )?;
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS account_state (
@@ -1499,14 +1549,17 @@ async fn load_sync_state(path: Arc<PathBuf>, key: CacheKey) -> CacheResult<Loade
             .query_row(
                 "SELECT COALESCE(a.mutation_revision, 0),
                         m.uid_validity, m.uid_next, m.message_count, m.revision,
-                        m.projection_version, m.account_revision
+                        m.projection_version, m.account_revision,
+                        COALESCE(q.header_fields_filtered, 0)
                    FROM (SELECT 1) AS singleton
                    LEFT JOIN account_state AS a ON a.account_key = ?1
                    LEFT JOIN mailbox_state AS m
-                     ON m.account_key = ?1 AND m.mailbox = ?2",
+                     ON m.account_key = ?1 AND m.mailbox = ?2
+                   LEFT JOIN account_quirks AS q ON q.account_key = ?1",
                 params![key.account, key.mailbox],
                 |row| {
                     let account_revision = row.get(0)?;
+                    let header_fields_filtered = row.get::<_, i64>(7)? != 0;
                     let uid_validity = row.get::<_, Option<i64>>(1)?.map(sql_u32).transpose()?;
                     let existing_revision = row.get::<_, Option<i64>>(4)?;
                     let projection_version = row.get::<_, Option<i64>>(5)?;
@@ -1525,6 +1578,7 @@ async fn load_sync_state(path: Arc<PathBuf>, key: CacheKey) -> CacheResult<Loade
                         mailbox,
                         existing_revision,
                         account_revision,
+                        header_fields_filtered,
                     })
                 },
             )
@@ -2178,6 +2232,31 @@ mod tests {
         .await
         .expect("count rows");
         assert_eq!(covered, 2);
+    }
+
+    #[tokio::test]
+    async fn header_fields_quirk_survives_a_process_restart() {
+        let path_buf = test_path("quirk-persist");
+        let cache = HeaderCache::at_path(path_buf.clone());
+        let key = test_key("INBOX");
+
+        cache.persist_account_quirky(&key.account).await;
+
+        // A fresh instance at the same path models an app restart: the
+        // in-process set is empty, but the persisted flag must load.
+        let restarted = HeaderCache::at_path(path_buf);
+        assert!(
+            !restarted.account_is_quirky(&key.account),
+            "in-process memory does not survive the restart"
+        );
+        let path = Arc::clone(restarted.path.as_ref().expect("test cache path"));
+        let loaded = load_sync_state(path, key)
+            .await
+            .expect("load state after restart");
+        assert!(
+            loaded.header_fields_filtered,
+            "the persisted quirk flag must survive and force full-header syncs"
+        );
     }
 
     #[tokio::test]
