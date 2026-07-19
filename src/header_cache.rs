@@ -233,6 +233,19 @@ impl HeaderCache {
         self.quirky_accounts.lock().insert(account_key.to_string());
     }
 
+    /// Whether scans flagged this account's server as filtering List-*
+    /// headers (see `mark_account_quirky`). Deletion flows use this to
+    /// decide when a zero-result `SEARCH HEADER List-Id` cannot be trusted:
+    /// the same backends that filter the headers cannot match them in SEARCH.
+    pub(crate) fn account_flagged_quirky(
+        &self,
+        account_name: &str,
+        config: &AccountConfig,
+    ) -> bool {
+        let key = CacheKey::new(account_name, config, "");
+        self.account_is_quirky(&key.account)
+    }
+
     fn gate(&self, key: &CacheKey) -> Arc<Mutex<()>> {
         let gate_key = key.gate_key();
         let mut gates = self.gates.lock();
