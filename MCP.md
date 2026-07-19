@@ -152,7 +152,13 @@ Grouped by `(email, display name)`; the same address with different display
 names is separate. On all three `top_*` tools, `total` counts the ranked rows
 (unique senders/lists — the pagination universe) while `totalMessages` counts
 messages scanned. All three use `offset`/`limit` pagination with
-a default of 10 and maximum of 100. Account-wide discovery uses one selectable
+a default of 10 and maximum of 100.
+
+**Windowed providers:** Yahoo/AOL expose only the newest ~10,000 messages of
+a mailbox to IMAP (`EXISTS`, `STATUS`, `UID SEARCH`, and direct `UID FETCH`
+are all capped — see `docs/standards/imap/yahoo-aol-quirks.md`). Rankings
+there cover the visible window; account-wide deletes are unaffected because
+they repeat passes as older mail backfills into view. Account-wide discovery uses one selectable
 `\All` mailbox when available. Otherwise it enumerates storage mailboxes,
 excludes Trash/Junk/Drafts and virtual All/Flagged/Important views, and
 deduplicates by Message-ID across folders. Sender rankings exclude the

@@ -186,6 +186,7 @@ impl ServerHandler for AgentMailServer {
              Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
              top_senders, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
              Ranked tools use live offset pages with a default of 10 and maximum of 100; pages may shift when mail changes. \
+             Some providers (Yahoo/AOL) expose only the newest ~10,000 messages of a mailbox to IMAP — rankings cover that visible window, while account-wide deletes automatically repeat passes as older mail backfills into view. \
              Account-wide discovery uses one selectable All mailbox when available; otherwise it skips Trash, Junk, Spam, Drafts, and virtual aggregate views. Destructive scans never write through aggregate views. \
              Every action that consumes a UID requires the same mailbox and non-zero expectedUidValidity returned during discovery, and fails closed if the mailbox UID epoch changed. \
              Two cleanup workflows: (1) top_senders → delete_by_sender for unwanted personal senders, (2) top_subscriptions → unsubscribe_message for mailing lists. \
