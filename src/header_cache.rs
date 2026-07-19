@@ -20,7 +20,12 @@ use crate::config::AccountConfig;
 use crate::imap_client::{self, CancelFn, ImapSession, ListHeaderRow, ProgressFn};
 use crate::scan_cache::MailboxStatus;
 
-const CACHE_SCHEMA_VERSION: i64 = 3;
+// v4: mailbox_state carries the account mutation revision it was published
+// under, so local mutations (deletes/moves) invalidate snapshot hits even
+// when the (UIDVALIDITY, UIDNEXT, EXISTS) triple is unchanged — Yahoo/AOL
+// pin INBOX EXISTS to a 10,000-message window, so deletes there leave the
+// triple identical and rankings would serve stale counts.
+const CACHE_SCHEMA_VERSION: i64 = 4;
 // v4: rebuilds projections poisoned by HEADER.FIELDS-filtering servers
 // (AOL/Yahoo omit List-Unsubscribe[-Post] → has_list_headers was 0 on every
 // row despite bulk mail being present).
@@ -61,6 +66,9 @@ struct StoredState {
     uid_validity: u32,
     uid_next: Option<u32>,
     exists: u32,
+    /// Account mutation revision this snapshot was published under. A later
+    /// fence bump makes the snapshot stale regardless of the mailbox triple.
+    account_revision: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -460,7 +468,7 @@ impl HeaderCache {
             let live_status = examine_status(session, &key.mailbox).await?;
 
             if let Some(state) = state
-                && is_cache_hit(state, &live_status)
+                && is_cache_hit(state, &live_status, expected_account_revision)
             {
                 let covered = load_covered_count(Arc::clone(&path), key.clone(), state).await?;
                 if covered == u64::from(state.exists) {
@@ -783,11 +791,16 @@ fn same_snapshot(left: &MailboxStatus, right: &MailboxStatus) -> bool {
         && left.exists == right.exists
 }
 
-fn is_cache_hit(state: StoredState, status: &MailboxStatus) -> bool {
+/// Whether a stored snapshot may be served without a resync. Beyond the
+/// mailbox triple, the snapshot must predate no local mutation: Yahoo/AOL pin
+/// INBOX `EXISTS` to a sliding window (older mail backfills the view), so a
+/// delete can leave the triple identical while the ranking data changed.
+fn is_cache_hit(state: StoredState, status: &MailboxStatus, account_revision: i64) -> bool {
     status.uid_validity == Some(state.uid_validity)
         && state.uid_next.is_some()
         && status.uid_next == state.uid_next
         && status.exists == state.exists
+        && state.account_revision == account_revision
 }
 
 fn pure_append_is_proven(
@@ -941,6 +954,7 @@ fn migrate_schema(connection: &mut Connection) -> CacheResult<()> {
              message_count INTEGER NOT NULL,
              revision INTEGER NOT NULL,
              projection_version INTEGER NOT NULL,
+             account_revision INTEGER NOT NULL,
              PRIMARY KEY (account_key, mailbox)
          ) WITHOUT ROWID;
          CREATE TABLE IF NOT EXISTS membership (
@@ -1414,7 +1428,7 @@ async fn load_sync_state(path: Arc<PathBuf>, key: CacheKey) -> CacheResult<Loade
             .query_row(
                 "SELECT COALESCE(a.mutation_revision, 0),
                         m.uid_validity, m.uid_next, m.message_count, m.revision,
-                        m.projection_version
+                        m.projection_version, m.account_revision
                    FROM (SELECT 1) AS singleton
                    LEFT JOIN account_state AS a ON a.account_key = ?1
                    LEFT JOIN mailbox_state AS m
@@ -1431,6 +1445,7 @@ async fn load_sync_state(path: Arc<PathBuf>, key: CacheKey) -> CacheResult<Loade
                                 uid_validity,
                                 uid_next: row.get::<_, Option<i64>>(2)?.map(sql_u32).transpose()?,
                                 exists: sql_u32(row.get::<_, i64>(3)?)?,
+                                account_revision: row.get::<_, Option<i64>>(6)?.unwrap_or_default(),
                             })
                         }
                         _ => None,
@@ -1676,14 +1691,15 @@ async fn publish_snapshot(
         transaction.execute(
             "INSERT INTO mailbox_state (
                  account_key, mailbox, uid_validity, uid_next, message_count,
-                 revision, projection_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 revision, projection_version, account_revision
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (account_key, mailbox) DO UPDATE SET
                  uid_validity = excluded.uid_validity,
                  uid_next = excluded.uid_next,
                  message_count = excluded.message_count,
                  revision = excluded.revision,
-                 projection_version = excluded.projection_version",
+                 projection_version = excluded.projection_version,
+                 account_revision = excluded.account_revision",
             params![
                 key.account,
                 key.mailbox,
@@ -1692,6 +1708,7 @@ async fn publish_snapshot(
                 live_uids.len() as i64,
                 next_revision,
                 HEADER_PROJECTION_VERSION,
+                account_revision,
             ],
         )?;
         transaction.execute(
@@ -1939,6 +1956,7 @@ mod tests {
             uid_validity: 10,
             uid_next: Some(20),
             exists: 3,
+            account_revision: 0,
         };
         let status = MailboxStatus {
             uid_validity: Some(10),
@@ -1946,7 +1964,30 @@ mod tests {
             exists: 3,
             highest_modseq: Some(999),
         };
-        assert!(is_cache_hit(state, &status));
+        assert!(is_cache_hit(state, &status, 0));
+    }
+
+    #[test]
+    fn local_mutation_fence_prevents_a_hit_when_the_triple_is_unchanged() {
+        // Yahoo/AOL windowed INBOX: after a local delete, EXISTS backfills to
+        // the same value and UIDNEXT is unmoved — only the fence detects it.
+        let state = StoredState {
+            uid_validity: 10,
+            uid_next: Some(20),
+            exists: 3,
+            account_revision: 4,
+        };
+        let status = MailboxStatus {
+            uid_validity: Some(10),
+            uid_next: Some(20),
+            exists: 3,
+            highest_modseq: None,
+        };
+        assert!(is_cache_hit(state, &status, 4));
+        assert!(
+            !is_cache_hit(state, &status, 5),
+            "a fence bump after publish must force a membership resync"
+        );
     }
 
     #[test]
@@ -1955,6 +1996,7 @@ mod tests {
             uid_validity: 10,
             uid_next: None,
             exists: 3,
+            account_revision: 0,
         };
         let status = MailboxStatus {
             uid_validity: Some(10),
@@ -1962,7 +2004,7 @@ mod tests {
             exists: 3,
             highest_modseq: None,
         };
-        assert!(!is_cache_hit(state, &status));
+        assert!(!is_cache_hit(state, &status, 0));
     }
 
     #[test]
@@ -1971,6 +2013,7 @@ mod tests {
             uid_validity: 10,
             uid_next: Some(20),
             exists: 3,
+            account_revision: 0,
         };
         let status = MailboxStatus {
             uid_validity: Some(10),
@@ -1987,6 +2030,7 @@ mod tests {
             uid_validity: 10,
             uid_next: Some(20),
             exists: 3,
+            account_revision: 0,
         };
         let status = MailboxStatus {
             uid_validity: Some(10),
@@ -2003,6 +2047,7 @@ mod tests {
             uid_validity: 10,
             uid_next: Some(20),
             exists: 3,
+            account_revision: 0,
         };
         let status = MailboxStatus {
             uid_validity: Some(10),
