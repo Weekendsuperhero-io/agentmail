@@ -21,7 +21,10 @@ use crate::imap_client::{self, CancelFn, ImapSession, ListHeaderRow, ProgressFn}
 use crate::scan_cache::MailboxStatus;
 
 const CACHE_SCHEMA_VERSION: i64 = 3;
-const HEADER_PROJECTION_VERSION: i64 = 3;
+// v4: rebuilds projections poisoned by HEADER.FIELDS-filtering servers
+// (AOL/Yahoo omit List-Unsubscribe[-Post] → has_list_headers was 0 on every
+// row despite bulk mail being present).
+const HEADER_PROJECTION_VERSION: i64 = 4;
 const FETCH_CHUNK_SIZE: usize = 1_000;
 const MAX_STABLE_SEARCH_ATTEMPTS: usize = 3;
 const MAX_RANK_PAGE_SIZE: usize = 100;
@@ -187,6 +190,11 @@ enum PublishOutcome {
 pub(crate) struct HeaderCache {
     path: Option<Arc<PathBuf>>,
     gates: parking_lot::Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// Accounts whose server filters List-Unsubscribe out of HEADER.FIELDS
+    /// responses (AOL/Yahoo). Once detected, syncs for the account go
+    /// straight to full-header fetches. Process-local by design: detection
+    /// is cheap and re-runs after a restart.
+    quirky_accounts: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl Default for HeaderCache {
@@ -194,6 +202,7 @@ impl Default for HeaderCache {
         Self {
             path: default_cache_path().map(Arc::new),
             gates: parking_lot::Mutex::new(HashMap::new()),
+            quirky_accounts: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 }
@@ -204,7 +213,16 @@ impl HeaderCache {
         Self {
             path: Some(Arc::new(path)),
             gates: parking_lot::Mutex::new(HashMap::new()),
+            quirky_accounts: parking_lot::Mutex::new(HashSet::new()),
         }
+    }
+
+    fn account_is_quirky(&self, account_key: &str) -> bool {
+        self.quirky_accounts.lock().contains(account_key)
+    }
+
+    fn mark_account_quirky(&self, account_key: &str) {
+        self.quirky_accounts.lock().insert(account_key.to_string());
     }
 
     fn gate(&self, key: &CacheKey) -> Arc<Mutex<()>> {
@@ -428,6 +446,9 @@ impl HeaderCache {
         cancel: Option<&CancelFn>,
     ) -> std::result::Result<StoredState, CacheSyncError> {
         let started = Instant::now();
+        // Sticky across retries: once a server is known to filter
+        // HEADER.FIELDS, every fetch in this sync uses full headers.
+        let mut full_header_mode = self.account_is_quirky(&key.account);
 
         // One retry resolves a cross-process publisher or a local mutation
         // that wins the compare-and-swap while this scan is in flight.
@@ -559,13 +580,28 @@ impl HeaderCache {
             }
 
             let mut processed = 0usize;
+            let mut list_id_rows = 0usize;
+            let mut unsubscribe_rows = 0usize;
             for chunk in missing.chunks(FETCH_CHUNK_SIZE) {
                 imap_client::check_cancel(cancel)?;
-                let rows =
-                    imap_client::fetch_rank_headers_for_uids(session, chunk, None, cancel).await?;
+                let rows = if full_header_mode {
+                    imap_client::fetch_rank_headers_full_for_uids(session, chunk, None, cancel)
+                        .await?
+                } else {
+                    imap_client::fetch_rank_headers_for_uids(session, chunk, None, cancel).await?
+                };
                 let mut rows = rows;
                 for row in &mut rows {
                     row.uid_validity = Some(snapshot_uid_validity);
+                }
+                if !full_header_mode {
+                    list_id_rows += rows.iter().filter(|row| row.list_id.is_some()).count();
+                    unsubscribe_rows += rows
+                        .iter()
+                        .filter(|row| {
+                            row.list_unsubscribe.is_some() || row.list_unsubscribe_post.is_some()
+                        })
+                        .count();
                 }
                 let returned: HashSet<u32> = rows.iter().map(|row| row.uid).collect();
                 let omitted: HashSet<u32> = chunk
@@ -583,6 +619,48 @@ impl HeaderCache {
                         (reused + processed).min(reused + missing.len()) as u64,
                         (reused + missing.len()) as u64,
                     );
+                }
+            }
+
+            // Server-quirk fallback (AOL/Yahoo): bulk mail is clearly present
+            // (List-Id parsed on many rows) yet not one fetched row carried a
+            // List-Unsubscribe header — the server filtered the pair out of
+            // its HEADER.FIELDS responses. Refetch the whole membership with
+            // full headers so the flags are derived from ground truth, and
+            // remember the account so future syncs skip the wasted pass.
+            // (Detection sees only rows fetched THIS sync; a scan resumed
+            // from an interrupted pre-detection run may need one more full
+            // Membership sync to converge.)
+            if !full_header_mode && imap_client::header_fields_quirk(list_id_rows, unsubscribe_rows)
+            {
+                warn!(
+                    target: "agentmail",
+                    mailbox = key.mailbox,
+                    list_id_rows,
+                    "HEADER.FIELDS responses omit List-Unsubscribe; refetching full headers for the whole mailbox",
+                );
+                self.mark_account_quirky(&key.account);
+                full_header_mode = true;
+                let members: Vec<u32> = live_uids.clone();
+                for chunk in members.chunks(FETCH_CHUNK_SIZE) {
+                    imap_client::check_cancel(cancel)?;
+                    let mut rows =
+                        imap_client::fetch_rank_headers_full_for_uids(session, chunk, None, cancel)
+                            .await?;
+                    for row in &mut rows {
+                        row.uid_validity = Some(snapshot_uid_validity);
+                    }
+                    let returned: HashSet<u32> = rows.iter().map(|row| row.uid).collect();
+                    let omitted: HashSet<u32> = chunk
+                        .iter()
+                        .copied()
+                        .filter(|uid| !returned.contains(uid))
+                        .collect();
+                    if !omitted.is_empty() {
+                        live_uids.retain(|uid| !omitted.contains(uid));
+                    }
+                    store_headers(Arc::clone(&path), key.clone(), snapshot_uid_validity, rows)
+                        .await?;
                 }
             }
 
@@ -655,7 +733,13 @@ async fn stable_uid_search(
         imap_client::check_cancel(cancel)?;
         let before = examine_status(session, mailbox).await?;
         let mut uids = match scope {
-            SearchScope::All => imap_client::search_uids(session, "ALL").await?,
+            // Truncation-guarded: a short/empty result from a MESSAGELIMIT
+            // server is rediscovered in bounded windows instead of being
+            // published as an empty membership.
+            SearchScope::All => {
+                imap_client::search_all_uids_checked(session, before.exists, before.uid_next)
+                    .await?
+            }
             SearchScope::Tail(from_uid) => imap_client::search_uids_from(session, from_uid).await?,
         };
         uids.sort_unstable();

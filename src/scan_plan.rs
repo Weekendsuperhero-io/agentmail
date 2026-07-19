@@ -150,7 +150,9 @@ fn inferred_category(path: &str, delimiter: Option<&str>) -> Option<InferredCate
         "all mail" | "all messages" => Some(InferredCategory::All),
         "draft" | "drafts" => Some(InferredCategory::Drafts),
         "flagged" | "starred" | "important" => Some(InferredCategory::Flagged),
-        "junk" | "junk email" | "spam" | "bulk mail" => Some(InferredCategory::Junk),
+        // "bulk" is AOL/Yahoo's spam folder name; it carries no \Junk
+        // special-use attribute there, so the name is the only signal.
+        "junk" | "junk email" | "spam" | "bulk" | "bulk mail" => Some(InferredCategory::Junk),
         "bin" | "deleted" | "deleted items" | "deleted messages" | "trash" => {
             Some(InferredCategory::Trash)
         }
@@ -255,6 +257,21 @@ mod tests {
             plan.mailboxes,
             ["Archive", "Memos", "Scheduled", "Sent", "Snoozed"]
         );
+    }
+
+    #[test]
+    fn aol_bulk_spam_folder_is_excluded_by_name() {
+        // AOL/Yahoo name their spam folder "Bulk" and (on AOL) advertise no
+        // \Junk role for it, so the name heuristic is the only guard.
+        let entries = [
+            entry("INBOX", &[]),
+            entry("Bulk", &[]),
+            entry("Archive", &["archive"]),
+        ];
+
+        let plan = plan_account_scan(&entries, ScanPurpose::Discovery);
+
+        assert_eq!(plan.mailboxes, ["Archive", "INBOX"]);
     }
 
     #[test]

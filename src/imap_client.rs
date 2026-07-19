@@ -7,7 +7,7 @@ use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::AgentmailError;
 use crate::config::AccountConfig;
@@ -329,6 +329,18 @@ impl ServerCaps {
     pub fn has_condstore(&self) -> bool {
         self.has("CONDSTORE")
     }
+
+    /// RFC 9738 `MESSAGELIMIT=N`: the server caps how many messages one
+    /// command may reference (Yahoo/AOL advertise `MESSAGELIMIT=1000`).
+    /// Commands over the limit may be rejected or silently truncated, so
+    /// membership discovery must window itself accordingly.
+    pub fn message_limit(&self) -> Option<u32> {
+        self.tokens.iter().find_map(|token| {
+            token
+                .strip_prefix("MESSAGELIMIT=")
+                .and_then(|value| value.parse().ok())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -599,8 +611,7 @@ pub async fn fetch_messages(
     }
 
     // Get all UIDs, sort descending (newest first)
-    let uids_raw = imap_timeout(session.uid_search("ALL")).await?;
-    let mut uids: Vec<u32> = uids_raw.into_iter().collect();
+    let mut uids = search_all_uids_checked(session, mb.exists, mb.uid_next).await?;
     uids.sort_unstable_by(|a, b| b.cmp(a));
 
     let start = offset.min(uids.len());
@@ -714,6 +725,71 @@ pub async fn search_uids(session: &mut ImapSession, query: &str) -> Result<Vec<u
     run_uid_search(session, query).await
 }
 
+/// Window size for membership rediscovery when a whole-mailbox
+/// `UID SEARCH ALL` comes back short. Matches Yahoo/AOL's advertised
+/// RFC 9738 `MESSAGELIMIT=1000` — a `UID lo:hi` span of this width can
+/// never reference more messages than the limit.
+const SEARCH_WINDOW: u32 = 1_000;
+
+/// Whole-mailbox UID membership with truncation detection.
+///
+/// async-imap swallows a tagged `NO`/`BAD` on SEARCH (the response stream
+/// just ends), so a server that rejects or truncates an over-limit
+/// `UID SEARCH ALL` (RFC 9738 MESSAGELIMIT — Yahoo/AOL) yields an empty or
+/// short `Ok` rather than an error, which a scan would then publish as a
+/// silently incomplete membership. Guard: compare the result count against
+/// the `EXISTS` value from the SELECT/EXAMINE the caller just performed; on
+/// mismatch, rediscover membership in bounded `UID lo:hi` windows walking up
+/// to UIDNEXT. Returns ascending, deduplicated UIDs.
+pub async fn search_all_uids_checked<T>(
+    session: &mut Session<T>,
+    exists: u32,
+    uid_next: Option<u32>,
+) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    let mut uids = run_uid_search(session, "ALL").await?;
+    uids.sort_unstable();
+    uids.dedup();
+    if uids.len() == exists as usize {
+        return Ok(uids);
+    }
+    let Some(uid_next) = uid_next else {
+        // Without UIDNEXT there is no window upper bound; a count mismatch
+        // may also be a delivery/expunge race, so keep the unwindowed result.
+        warn!(
+            target: "agentmail",
+            expected = exists,
+            got = uids.len(),
+            "UID SEARCH ALL count mismatch and no UIDNEXT to window by; using result as-is",
+        );
+        return Ok(uids);
+    };
+
+    warn!(
+        target: "agentmail",
+        expected = exists,
+        got = uids.len(),
+        "UID SEARCH ALL came back short (server message limit or swallowed NO); rediscovering membership in windows",
+    );
+    let mut windowed: Vec<u32> = Vec::with_capacity(exists as usize);
+    let mut lo: u32 = 1;
+    while lo < uid_next {
+        let hi = lo
+            .saturating_add(SEARCH_WINDOW - 1)
+            .min(uid_next.saturating_sub(1));
+        windowed.extend(run_uid_search(session, &format!("UID {lo}:{hi}")).await?);
+        if hi == u32::MAX {
+            break;
+        }
+        lo = hi + 1;
+    }
+    windowed.sort_unstable();
+    windowed.dedup();
+    Ok(windowed)
+}
+
 /// Return UID membership metadata for compatibility callers that maintain
 /// their own synchronization state.
 ///
@@ -820,10 +896,7 @@ pub async fn fetch_sender_dates(
         trace_live_scan("top_senders", started, 1, 0);
         return Ok(Vec::new());
     }
-    let uids: Vec<u32> = imap_timeout(session.uid_search("ALL"))
-        .await?
-        .into_iter()
-        .collect();
+    let uids = search_all_uids_checked(session, mb.exists, mb.uid_next).await?;
     let fetch_commands = uids.len().div_ceil(1000);
     let results = fetch_sender_dates_for_uids(session, &uids, on_progress, cancel).await?;
     trace_live_scan("top_senders", started, 2 + fetch_commands, results.len());
@@ -976,14 +1049,20 @@ pub async fn fetch_rank_headers(
         trace_live_scan("top_rank_headers", started, 1, 0);
         return Ok(Vec::new());
     }
-    let mut uids: Vec<u32> = imap_timeout(session.uid_search("ALL"))
-        .await?
-        .into_iter()
-        .collect();
+    let mut uids = search_all_uids_checked(session, mb.exists, mb.uid_next).await?;
     check_cancel(cancel)?;
     uids.sort_unstable();
     let fetch_commands = uids.len().div_ceil(1000);
     let mut results = fetch_rank_headers_for_uids(session, &uids, on_progress, cancel).await?;
+    if header_fields_look_filtered(&results) {
+        warn!(
+            target: "agentmail",
+            mailbox,
+            rows = results.len(),
+            "server appears to filter List-Unsubscribe out of HEADER.FIELDS responses; refetching full headers",
+        );
+        results = fetch_rank_headers_full_for_uids(session, &uids, on_progress, cancel).await?;
+    }
     for row in &mut results {
         row.uid_validity = Some(uid_validity);
     }
@@ -996,12 +1075,67 @@ pub async fn fetch_rank_headers(
     Ok(results)
 }
 
+/// Rank-scan header request: exactly the fields the ranking projection
+/// derives from.
+const RANK_HEADER_FIELDS_ITEMS: &str = "(UID BODY.PEEK[HEADER.FIELDS (List-Unsubscribe List-Unsubscribe-Post List-Id FROM DATE Message-ID)])";
+/// Full-header fallback for servers whose HEADER.FIELDS responses filter out
+/// requested fields. Observed on AOL/Yahoo IMAP: `List-Unsubscribe` and
+/// `List-Unsubscribe-Post` are omitted while `List-Id`/`From`/`Date`/
+/// `Message-ID` from the very same request are returned.
+const RANK_HEADER_FULL_ITEMS: &str = "(UID BODY.PEEK[HEADER])";
+
+/// Minimum List-Id-bearing rows before an all-zero unsubscribe count is
+/// treated as server-side filtering rather than a genuinely list-free
+/// mailbox. A false positive only costs one bounded full-header refetch —
+/// the refetched flags are ground truth either way.
+pub(crate) const QUIRK_MIN_LIST_ID_ROWS: usize = 25;
+
+/// Whether a scanned mailbox looks like the server filtered the
+/// List-Unsubscribe pair out of HEADER.FIELDS responses: plenty of rows
+/// carry a List-Id (bulk mail is present), yet not a single row anywhere in
+/// the mailbox has either unsubscribe header.
+pub(crate) fn header_fields_quirk(list_id_rows: usize, unsubscribe_rows: usize) -> bool {
+    list_id_rows >= QUIRK_MIN_LIST_ID_ROWS && unsubscribe_rows == 0
+}
+
+/// Slice convenience for [`header_fields_quirk`].
+pub(crate) fn header_fields_look_filtered(rows: &[ListHeaderRow]) -> bool {
+    let list_id_rows = rows.iter().filter(|row| row.list_id.is_some()).count();
+    let unsubscribe_rows = rows
+        .iter()
+        .filter(|row| row.list_unsubscribe.is_some() || row.list_unsubscribe_post.is_some())
+        .count();
+    header_fields_quirk(list_id_rows, unsubscribe_rows)
+}
+
 /// Fetch the unified immutable ranking-header projection for explicit UIDs in
 /// an already examined or selected mailbox. Every returned UID produces a row,
 /// including malformed or non-list messages.
 pub async fn fetch_rank_headers_for_uids(
     session: &mut ImapSession,
     uids: &[u32],
+    on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
+) -> Result<Vec<ListHeaderRow>> {
+    fetch_rank_header_rows(session, uids, RANK_HEADER_FIELDS_ITEMS, on_progress, cancel).await
+}
+
+/// Like [`fetch_rank_headers_for_uids`], but requests the complete header
+/// block — the fallback for HEADER.FIELDS-filtering servers. Same parsing,
+/// same row shape; only raw bytes on the wire differ.
+pub async fn fetch_rank_headers_full_for_uids(
+    session: &mut ImapSession,
+    uids: &[u32],
+    on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
+) -> Result<Vec<ListHeaderRow>> {
+    fetch_rank_header_rows(session, uids, RANK_HEADER_FULL_ITEMS, on_progress, cancel).await
+}
+
+async fn fetch_rank_header_rows(
+    session: &mut ImapSession,
+    uids: &[u32],
+    items: &str,
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
 ) -> Result<Vec<ListHeaderRow>> {
@@ -1017,12 +1151,7 @@ pub async fn fetch_rank_headers_for_uids(
             .collect::<Vec<_>>()
             .join(",");
 
-        let fetched = timed_uid_fetch_collect(
-            session,
-            &uid_set,
-            "(UID BODY.PEEK[HEADER.FIELDS (List-Unsubscribe List-Unsubscribe-Post List-Id FROM DATE Message-ID)])",
-        )
-        .await?;
+        let fetched = timed_uid_fetch_collect(session, &uid_set, items).await?;
 
         for item in fetched {
             let fetch = item.map_err(AgentmailError::Imap)?;
@@ -1327,8 +1456,7 @@ pub async fn fetch_attachment_uids(
         return Ok((Vec::new(), uid_validity));
     }
 
-    let uids_raw = imap_timeout(session.uid_search("ALL")).await?;
-    let uids: Vec<u32> = uids_raw.into_iter().collect();
+    let uids = search_all_uids_checked(session, mb.exists, mb.uid_next).await?;
     let total = uids.len() as u64;
     let mut attachment_uids = Vec::new();
     let mut completed = 0u64;
@@ -1935,7 +2063,10 @@ fn build_search_query(criteria: &SearchCriteria) -> Result<String> {
 /// Run a UID SEARCH, mapping server rejections of the query itself to
 /// `InvalidSearch` so callers see an actionable error instead of a generic
 /// IMAP failure.
-async fn run_uid_search(session: &mut ImapSession, query: &str) -> Result<Vec<u32>> {
+async fn run_uid_search<T>(session: &mut Session<T>, query: &str) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     match imap_timeout(session.uid_search(query)).await {
         Ok(uids) => Ok(uids.into_iter().collect()),
         Err(AgentmailError::Imap(async_imap::error::Error::Bad(s))) => Err(
@@ -1973,8 +2104,7 @@ pub async fn fetch_flags(
         });
     }
 
-    let uids_raw = imap_timeout(session.uid_search("ALL")).await?;
-    let uids: Vec<u32> = uids_raw.into_iter().collect();
+    let uids = search_all_uids_checked(session, mb.exists, mb.uid_next).await?;
     let total = uids.len() as u64;
     let mut flag_counts: hashbrown::HashMap<String, u32> = hashbrown::HashMap::new();
     let mut color_counts: hashbrown::HashMap<String, u32> = hashbrown::HashMap::new();
@@ -2631,5 +2761,140 @@ mod tests {
         assert!(!caps.has_imap4rev1());
         assert!(caps.has("IMAP4REV2"));
         assert!(caps.has_uidplus());
+    }
+
+    #[test]
+    fn message_limit_parses_rfc9738_capability() {
+        let caps =
+            ServerCaps::from_strings(["IMAP4rev1".to_string(), "MESSAGELIMIT=1000".to_string()]);
+        assert_eq!(caps.message_limit(), Some(1000));
+        assert_eq!(
+            ServerCaps::from_strings(["IDLE".to_string()]).message_limit(),
+            None
+        );
+        assert_eq!(
+            ServerCaps::from_strings(["MESSAGELIMIT=abc".to_string()]).message_limit(),
+            None
+        );
+    }
+
+    fn quirk_row(uid: u32, list_id: Option<&str>, unsubscribe: Option<&str>) -> ListHeaderRow {
+        ListHeaderRow {
+            uid,
+            uid_validity: None,
+            list_unsubscribe: unsubscribe.map(str::to_string),
+            list_unsubscribe_post: None,
+            list_id: list_id.map(str::to_string),
+            sender_email: "sender@example.com".to_string(),
+            sender_name: "Sender".to_string(),
+            date: None,
+            message_id: None,
+        }
+    }
+
+    #[test]
+    fn header_fields_quirk_requires_many_list_ids_and_zero_unsubscribes() {
+        assert!(header_fields_quirk(QUIRK_MIN_LIST_ID_ROWS, 0));
+        assert!(
+            !header_fields_quirk(QUIRK_MIN_LIST_ID_ROWS - 1, 0),
+            "small mailboxes stay below the detection threshold"
+        );
+        assert!(
+            !header_fields_quirk(QUIRK_MIN_LIST_ID_ROWS, 1),
+            "a single unsubscribe header disproves server-side filtering"
+        );
+    }
+
+    #[test]
+    fn filtered_detection_matches_the_aol_shape() {
+        // AOL/Yahoo shape: many List-Id rows, zero List-Unsubscribe anywhere.
+        let filtered: Vec<ListHeaderRow> = (0..QUIRK_MIN_LIST_ID_ROWS as u32)
+            .map(|uid| quirk_row(uid + 1, Some("list.example.com"), None))
+            .collect();
+        assert!(header_fields_look_filtered(&filtered));
+
+        let mut healthy = filtered.clone();
+        healthy[0].list_unsubscribe = Some("<https://example.com/unsub>".to_string());
+        assert!(
+            !header_fields_look_filtered(&healthy),
+            "any surviving unsubscribe header means HEADER.FIELDS works"
+        );
+    }
+
+    /// A server whose `UID SEARCH ALL` is rejected with `NO [LIMIT]` — which
+    /// async-imap swallows into an empty `Ok` — but which answers bounded
+    /// `UID lo:hi` window searches. The AOL/Yahoo RFC 9738 MESSAGELIMIT shape.
+    async fn scripted_message_limit_session()
+    -> (Session<DuplexStream>, tokio::task::JoinHandle<Vec<String>>) {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut command = String::new();
+                let read = reader.read_line(&mut command).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                let tag = command.split_whitespace().next().unwrap().to_string();
+                commands.push(command.clone());
+
+                if command.contains(" LOGIN ") {
+                    writer
+                        .write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else if command.contains("UID SEARCH UID ") {
+                    writer
+                        .write_all(
+                            format!("* SEARCH 2 3 5 8 13\r\n{tag} OK SEARCH completed\r\n")
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    break;
+                } else if command.contains("UID SEARCH ALL") {
+                    // RFC 9738 MESSAGELIMIT rejection; async-imap drops the
+                    // tagged NO and hands the caller an empty result.
+                    writer
+                        .write_all(format!("{tag} NO [LIMIT] Too many messages\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else {
+                    panic!("unexpected IMAP command: {command:?}");
+                }
+            }
+            commands
+        });
+
+        let client = async_imap::Client::new(client_stream);
+        let session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+        (session, server)
+    }
+
+    #[tokio::test]
+    async fn truncated_search_all_falls_back_to_windowed_rediscovery() {
+        let (mut session, server) = scripted_message_limit_session().await;
+
+        let uids = search_all_uids_checked(&mut session, 5, Some(14))
+            .await
+            .expect("windowed rediscovery should succeed");
+
+        assert_eq!(uids, vec![2, 3, 5, 8, 13]);
+        drop(session);
+        let commands = server.await.expect("scripted server should finish");
+        assert!(
+            commands.iter().any(|c| c.contains("UID SEARCH ALL")),
+            "the cheap whole-mailbox search runs first: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("UID SEARCH UID 1:13")),
+            "short result triggers one bounded window up to UIDNEXT: {commands:?}"
+        );
     }
 }
