@@ -2249,14 +2249,14 @@ impl Agentmail {
             Ok(identity) => identity,
             Err(CleanupIdentityError::UnauthenticatedListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup requires the single List-Id to be covered by the same passing DKIM signature as the RFC 8058 headers. Exact-sender fallback was not explicitly enabled."
+                    "Matching-message cleanup was skipped: the sender's DKIM signature does not cover the List-Id header (List-Id is spoofable, so an unauthenticated value must not select an account-wide delete). To clean up anyway: retry with allowSenderFallback=true to delete this exact sender's bulk mail, use delete_list_id with an explicitly chosen listId, or use delete_by_sender."
                         .to_string(),
                 );
                 return Ok(response);
             }
             Err(CleanupIdentityError::NoUsableListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup requires one valid List-Id. Exact-sender fallback was not explicitly enabled."
+                    "Matching-message cleanup was skipped: the message carries no single usable List-Id. To clean up anyway: retry with allowSenderFallback=true to delete this exact sender's bulk mail, or use delete_by_sender."
                         .to_string(),
                 );
                 return Ok(response);
@@ -2609,12 +2609,15 @@ async fn filter_sender_bulk_mail(
             .collect::<Vec<_>>()
             .join(",");
 
-        let fetched = imap_client::timed_uid_fetch_collect_pub(
-            session,
-            &uid_set,
-            "(UID BODY.PEEK[HEADER.FIELDS (FROM List-Unsubscribe List-Unsubscribe-Post)])",
-        )
-        .await?;
+        // Full header block, not HEADER.FIELDS: Yahoo/AOL filter the
+        // List-Unsubscribe pair out of HEADER.FIELDS responses (see
+        // docs/standards/imap/yahoo-aol-quirks.md), which would silently
+        // disqualify every candidate here. Candidate sets are one sender's
+        // mail in one mailbox, so the extra bytes are negligible next to a
+        // wrong bulk-mail classification on a deletion path.
+        let fetched =
+            imap_client::timed_uid_fetch_collect_pub(session, &uid_set, "(UID BODY.PEEK[HEADER])")
+                .await?;
 
         for item in fetched {
             let fetch = item.map_err(AgentmailError::Imap)?;
