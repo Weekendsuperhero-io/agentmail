@@ -1097,6 +1097,7 @@ impl Agentmail {
         list_id: &str,
         mailbox_exists: u32,
         mailbox_uid_next: Option<u32>,
+        mailbox_uid_validity: Option<u32>,
         cancel: Option<&CancelFn>,
     ) -> Result<Vec<u32>> {
         let criteria = SearchCriteria {
@@ -1117,44 +1118,43 @@ impl Agentmail {
             // a restart once the cache has healed), or the persisted
             // projection knows this mailbox holds matches the server search
             // failed to find (restart-proof ground truth).
-            let projected = match normalize_list_id(list_id) {
-                Some(normalized) => match self.pool.account_config(account) {
-                    Some(config) => {
-                        self.header_cache
-                            .cached_list_id_count(account, config, mailbox, &normalized)
-                            .await
-                    }
-                    None => 0,
-                },
-                None => 0,
-            };
-            if projected > 0 || self.list_search_untrusted(account) {
-                if projected > 0 {
-                    tracing::warn!(
-                        target: "agentmail",
-                        mailbox,
-                        projected,
-                        "server List-Id search found nothing the projection knows exists; enumerating the visible mailbox",
-                    );
+            let projected_uids = match (
+                normalize_list_id(list_id),
+                self.pool.account_config(account),
+                mailbox_uid_validity,
+            ) {
+                (Some(normalized), Some(config), Some(uid_validity)) => {
+                    self.header_cache
+                        .cached_list_id_uids(account, config, mailbox, &normalized, uid_validity)
+                        .await
                 }
+                _ => Vec::new(),
+            };
+            if !projected_uids.is_empty() {
+                // Fast path: confirm the projection's own UIDs — orders of
+                // magnitude cheaper than enumerating a 100k-message window.
+                // Fresh on the first drain pass; on later passes these UIDs
+                // are already deleted, confirm to nothing, and fall through
+                // to enumeration so window backfill is still covered.
+                let confirmed =
+                    confirm_exact_list_id(session, &projected_uids, list_id, cancel).await?;
+                if !confirmed.is_empty() {
+                    return Ok(confirmed);
+                }
+            }
+            if !projected_uids.is_empty() || self.list_search_untrusted(account) {
+                tracing::warn!(
+                    target: "agentmail",
+                    mailbox,
+                    projected = projected_uids.len(),
+                    "server List-Id search cannot be trusted here; enumerating the visible mailbox",
+                );
                 candidates =
                     imap_client::search_all_uids_checked(session, mailbox_exists, mailbox_uid_next)
                         .await?;
             }
         }
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-        // IMAP HEADER search is substring-only (and the enumeration fallback
-        // is everything), so confirm the exact List-Id before deleting.
-        Ok(
-            imap_client::fetch_list_ids_for_uids_cancellable(session, &candidates, cancel)
-                .await?
-                .into_iter()
-                .filter(|(_, id)| id.as_deref().is_some_and(|v| list_id_matches(list_id, v)))
-                .map(|(uid, _)| uid)
-                .collect(),
-        )
+        confirm_exact_list_id(session, &candidates, list_id, cancel).await
     }
 
     pub async fn delete_list_id(
@@ -1218,6 +1218,7 @@ impl Agentmail {
                         list_id,
                         mb.exists,
                         mb.uid_next,
+                        mb.uid_validity,
                         cancel,
                     )
                     .await
@@ -2333,6 +2334,7 @@ impl Agentmail {
                                 normalized,
                                 mb.exists,
                                 mb.uid_next,
+                                mb.uid_validity,
                                 cancel,
                             )
                             .await
@@ -2593,6 +2595,29 @@ fn cleanup_policy_allows(options: UnsubscribeOptions, unsubscribe_succeeded: boo
 /// From a set of candidate UIDs, fetch FROM + List-Unsubscribe/Post headers and
 /// return only those that match the exact sender AND have either List-Unsubscribe
 /// or List-Unsubscribe-Post (i.e. bulk/marketing mail).
+/// Confirm which candidate UIDs actually carry the exact List-Id. IMAP HEADER
+/// search is substring-only (and enumeration candidates are everything), so
+/// this fetch is the authority before any deletion; stale UIDs simply do not
+/// come back.
+async fn confirm_exact_list_id(
+    session: &mut imap_client::ImapSession,
+    candidates: &[u32],
+    list_id: &str,
+    cancel: Option<&CancelFn>,
+) -> Result<Vec<u32>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(
+        imap_client::fetch_list_ids_for_uids_cancellable(session, candidates, cancel)
+            .await?
+            .into_iter()
+            .filter(|(_, id)| id.as_deref().is_some_and(|v| list_id_matches(list_id, v)))
+            .map(|(uid, _)| uid)
+            .collect(),
+    )
+}
+
 async fn filter_sender_bulk_mail(
     session: &mut imap_client::ImapSession,
     candidate_uids: &[u32],

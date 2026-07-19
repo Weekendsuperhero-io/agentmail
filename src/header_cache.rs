@@ -251,43 +251,56 @@ impl HeaderCache {
         self.account_is_quirky(&key.account)
     }
 
-    /// How many projected rows in one mailbox carry this normalized List-Id.
-    /// Restart-proof ground truth for deletion flows: when the server's
-    /// `SEARCH HEADER List-Id` returns nothing while the projection knows
-    /// matches exist, the search is blind and the mailbox must be enumerated.
-    /// Returns 0 when the cache is disabled or unreadable.
-    pub(crate) async fn cached_list_id_count(
+    /// The projected UIDs in one mailbox epoch that carry this normalized
+    /// List-Id. Restart-proof ground truth for deletion flows: when the
+    /// server's `SEARCH HEADER List-Id` returns nothing while the projection
+    /// knows matches exist, the search is blind — and these UIDs are a far
+    /// cheaper candidate set than enumerating a 100k-message window. Stale
+    /// entries are harmless (the caller's confirm fetch drops them). Returns
+    /// empty when the cache is disabled or unreadable.
+    pub(crate) async fn cached_list_id_uids(
         &self,
         account_name: &str,
         config: &AccountConfig,
         mailbox: &str,
         normalized_list_id: &str,
-    ) -> usize {
+        uid_validity: u32,
+    ) -> Vec<u32> {
         let Some(path) = self.path.as_ref() else {
-            return 0;
+            return Vec::new();
         };
         let key = CacheKey::new(account_name, config, mailbox);
         let normalized = normalized_list_id.to_string();
         let path = Arc::clone(path);
-        let count = tokio::task::spawn_blocking(move || -> CacheResult<i64> {
+        let uids = tokio::task::spawn_blocking(move || -> CacheResult<Vec<u32>> {
             let connection = open_connection(&path)?;
-            Ok(connection.query_row(
-                "SELECT COUNT(*) FROM header_rows
+            let mut statement = connection.prepare(
+                "SELECT uid FROM header_rows
                   WHERE account_key = ?1 AND mailbox = ?2
-                    AND projection_version = ?3 AND list_id = ?4",
+                    AND projection_version = ?3 AND uid_validity = ?4
+                    AND list_id = ?5
+                  ORDER BY uid",
+            )?;
+            let rows = statement.query_map(
                 params![
                     key.account,
                     key.mailbox,
                     HEADER_PROJECTION_VERSION,
+                    i64::from(uid_validity),
                     normalized
                 ],
-                |row| row.get(0),
-            )?)
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut uids = Vec::new();
+            for row in rows {
+                uids.push(sql_u32(row?)?);
+            }
+            Ok(uids)
         })
         .await;
-        match count {
-            Ok(Ok(count)) => usize::try_from(count).unwrap_or(0),
-            _ => 0,
+        match uids {
+            Ok(Ok(uids)) => uids,
+            _ => Vec::new(),
         }
     }
 
@@ -2190,24 +2203,31 @@ mod tests {
 
         assert_eq!(
             cache
-                .cached_list_id_count("acct", &config, "INBOX", "mylist.example.com")
+                .cached_list_id_uids("acct", &config, "INBOX", "mylist.example.com", 10)
                 .await,
-            1,
-            "the projection knows one INBOX message carries the list"
+            vec![1],
+            "the projection knows which INBOX message carries the list"
         );
-        assert_eq!(
+        assert!(
             cache
-                .cached_list_id_count("acct", &config, "Archive", "mylist.example.com")
-                .await,
-            0,
-            "counts are per mailbox"
+                .cached_list_id_uids("acct", &config, "Archive", "mylist.example.com", 10)
+                .await
+                .is_empty(),
+            "candidates are per mailbox"
         );
-        assert_eq!(
+        assert!(
             cache
-                .cached_list_id_count("acct", &config, "INBOX", "unknown.example.com")
-                .await,
-            0,
-            "unknown lists report zero"
+                .cached_list_id_uids("acct", &config, "INBOX", "mylist.example.com", 11)
+                .await
+                .is_empty(),
+            "a different UIDVALIDITY epoch yields no candidates"
+        );
+        assert!(
+            cache
+                .cached_list_id_uids("acct", &config, "INBOX", "unknown.example.com", 10)
+                .await
+                .is_empty(),
+            "unknown lists yield no candidates"
         );
     }
 

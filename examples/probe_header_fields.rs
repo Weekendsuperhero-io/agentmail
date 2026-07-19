@@ -43,6 +43,13 @@ const VARIANTS: &[(&str, &str)] = &[
         "5. full header block (ground truth)",
         "(UID BODY.PEEK[HEADER])",
     ),
+    (
+        // If the server's filter lives in the HEADER.FIELDS matcher, the
+        // exclusion form may bypass it — that would let scans avoid full
+        // headers on 100k-window mailboxes (exclude only the huge headers).
+        "6. exclusion form (HEADER.FIELDS.NOT of the bulky headers)",
+        "(UID BODY.PEEK[HEADER.FIELDS.NOT (Received DKIM-Signature Authentication-Results Received-SPF X-YMailISG X-MSFBL ARC-Seal ARC-Message-Signature ARC-Authentication-Results)])",
+    ),
 ];
 
 const HEADERS_OF_INTEREST: &[&str] = &[

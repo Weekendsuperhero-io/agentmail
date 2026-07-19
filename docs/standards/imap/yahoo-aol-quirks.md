@@ -19,10 +19,26 @@ List-Unsubscribe-Post List-Id FROM DATE Message-ID)]` returns
 (the same message read via full `BODY.PEEK[HEADER]` shows both, including
 `List-Unsubscribe-Post: List-Unsubscribe=One-Click`).
 
+The full six-variant bisect (`examples/probe_header_fields.rs`, run
+2026-07-19 against a live message) proves the filtering is unconditional
+for every partial-header form: singleton requests, reordered pairs, and
+even `HEADER.FIELDS.NOT` (which never named the header for exclusion) all
+omit `List-Unsubscribe`, while full `BODY.PEEK[HEADER]` returns it. No
+request reshaping helps — only the full block.
+
+Mechanism: FIELDS-family responses are synthesized from the provider's
+parsed metadata index, not sliced from the stored message — visible
+because `From` comes back MIME-decoded in FIELDS responses but raw
+(`=?utf-8?q?...?=`) in the full header. The index does not carry the
+tokenized unsubscribe headers (they embed per-recipient addresses and
+tokens), which also explains why SEARCH cannot match them (quirk #2).
+
 agentmail response: ranking scans detect the inconsistency (many `List-Id`
 rows, zero unsubscribe headers anywhere) and refetch the mailbox with full
 headers; the account is remembered as quirky for the process lifetime
-(`header_cache.rs` quirk detection, `imap_client::header_fields_quirk`).
+(`header_cache.rs` quirk detection, `imap_client::header_fields_quirk`),
+with the persisted projection as the restart-proof signal for deletion
+flows. Full-header fetching is the only viable path on these servers.
 
 ## 2. `SEARCH` cannot match `List-*` headers
 
@@ -54,6 +70,17 @@ STATUS: MESSAGES=10000 (also windowed)
 The window is absolute per session: neither `UID SEARCH` nor direct
 `UID FETCH` reaches below it, and `STATUS` reports the windowed count.
 Only the provider's webmail shows the true mailbox size.
+
+**The bulk-export endpoint widens the window 10×.** `export.imap.aol.com`
+serves the same mailbox (identical `UIDVALIDITY`, continuous `UIDNEXT`)
+with `EXISTS = 100,000` instead of 10,000 — and advertises a
+**byte-identical capability list** (all 22, including `MESSAGELIMIT=1000`;
+probed 2026-07-19 with `examples/probe_capabilities.rs`). The window size
+is therefore per-endpoint serving policy, invisible to CAPABILITY, and
+discoverable only by measurement. The 100k window is still absolute
+(below-window `UID SEARCH`/`UID FETCH` return nothing). Prefer the export
+endpoint for bulk cleanup: ~10× fewer drain passes, same protocol
+behavior, same quirks.
 
 agentmail response: scans can only rank what is visible (documented
 limitation); account-wide deletes repeat select→search→delete passes until
