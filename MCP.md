@@ -331,15 +331,19 @@ Required action identity and consent:
   "confirmOneClick": true,
   "deleteMatching": false,
   "deleteOnUnsubscribeFailure": false,
-  "allowSenderFallback": false,
+  "allowSenderFallback": true,
   "allowPermanentFallback": false,
   "permanent": false
 }
 ```
 
 The first four fields after `mailbox` identify a live-ranked message and record
-explicit RFC 8058 consent. All four cleanup/fallback switches default to
-`false`. List-Id cleanup additionally requires the same passing DKIM signature
+explicit RFC 8058 consent. The destructive switches (`deleteMatching`,
+`deleteOnUnsubscribeFailure`, `allowPermanentFallback`, `permanent`) default
+to `false`. `allowSenderFallback` defaults to `true`: it only activates when
+`deleteMatching` was already requested and no DKIM-authenticated List-Id
+exists, narrowing cleanup to the verified exact sender's bulk mail instead of
+refusing outright. List-Id cleanup requires the same passing DKIM signature
 to cover the single `List-Id` header. `permanent=true` is an explicit
 hard-delete request on standard IMAP; on Gmail it safely moves to Trash because
 in-place EXPUNGE only removes a label. `allowPermanentFallback=true` separately

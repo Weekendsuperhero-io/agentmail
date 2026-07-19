@@ -779,7 +779,6 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
     for field in [
         "deleteMatching",
         "deleteOnUnsubscribeFailure",
-        "allowSenderFallback",
         "allowPermanentFallback",
         "permanent",
     ] {
@@ -789,6 +788,14 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             "{field} must default fail-closed"
         );
     }
+    // The sender fallback only activates when deleteMatching was already
+    // requested and the unsubscribe identity was verified, so it defaults on
+    // — unsigned List-Ids should not need a second round trip to clean up.
+    assert_eq!(
+        schema["properties"]["allowSenderFallback"]["default"],
+        json!(true),
+        "allowSenderFallback defaults on within an already-consented cleanup"
+    );
     assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
 
     let missing = client
@@ -809,6 +816,7 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
                 "name": "unsubscribe_message",
                 "arguments": {
                     "account": "dummy",
+                    "mailbox": "INBOX",
                     "uid": 1,
                     "expectedUidValidity": 1,
                     "confirmOneClick": false
@@ -817,6 +825,30 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
         )
         .await;
     assert_eq!(no_consent["error"]["code"], json!(-32602));
+
+    // Default flags (allowSenderFallback=true, deleteMatching unset) must
+    // clear policy validation: the call proceeds to the network and fails
+    // at connect (-32603), NOT as an invalid policy (-32602).
+    let default_flags = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "unsubscribe_message",
+                "arguments": {
+                    "account": "dummy",
+                    "mailbox": "INBOX",
+                    "uid": 1,
+                    "expectedUidValidity": 1,
+                    "confirmOneClick": true
+                }
+            }),
+        )
+        .await;
+    assert_eq!(
+        default_flags["error"]["code"],
+        json!(-32603),
+        "default flags must pass policy validation and only fail at connect: {default_flags:#}"
+    );
 }
 
 #[tokio::test]

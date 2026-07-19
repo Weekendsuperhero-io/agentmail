@@ -158,10 +158,17 @@ fn rfc5322_header_block(raw_message: &[u8]) -> &[u8] {
 }
 
 /// RFC 8058's `postarg` is exactly one known key/value pair. ABNF string
-/// literals are case-insensitive; surrounding field whitespace is not part of
-/// the value after unfolding.
+/// literals are case-insensitive, and the comparison ignores ALL interior
+/// whitespace, not just the edges: header folding is legal FWS anywhere in a
+/// structured field (unfolding inserts a space, e.g. `List-Unsubscribe=\r\n
+/// One-Click`), and some ESPs pad around the `=`. Token content must still
+/// match exactly, so trailing parameters or extra pairs are rejected.
 pub(crate) fn is_one_click_post_value(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case(ONE_CLICK_POST_VALUE)
+    let compact: String = value
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    compact.eq_ignore_ascii_case(ONE_CLICK_POST_VALUE)
 }
 
 /// Parse a displayable HTTPS URI for discovery. This performs all local RFC
@@ -807,6 +814,17 @@ mod tests {
             "List-Unsubscribe=One-Click&next=https://victim.example"
         ));
         assert!(!is_one_click_post_value("x=1; List-Unsubscribe=One-Click"));
+    }
+
+    #[test]
+    fn postarg_tolerates_folding_and_equals_padding() {
+        // Unfolded fold point after '=': legal FWS in a structured field.
+        assert!(is_one_click_post_value("List-Unsubscribe= One-Click"));
+        // ESP padding around the '='.
+        assert!(is_one_click_post_value("List-Unsubscribe = One-Click"));
+        // Whitespace tolerance must not admit different tokens.
+        assert!(!is_one_click_post_value("List-Unsubscribe=OneClick"));
+        assert!(!is_one_click_post_value("List-Unsubscribe=Two-Click"));
     }
 
     #[test]

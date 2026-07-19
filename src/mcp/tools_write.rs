@@ -309,7 +309,7 @@ impl AgentMailServer {
     #[tool(
         name = "unsubscribe_message",
         output_schema = rmcp::handler::server::tool::schema_for_output::<UnsubscribeMessageOutput>().expect("valid unsubscribe_message output schema"),
-        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally clean up the same List-Id account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. deleteMatching defaults false; cleanup stops after failure and never becomes permanent unless separately authorized.",
+        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally clean up the same List-Id account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. deleteMatching defaults false; when it runs without a DKIM-authenticated List-Id, cleanup falls back to the exact sender's bulk mail (allowSenderFallback defaults true). Cleanup stops after failure and never becomes permanent unless separately authorized.",
         annotations(
             title = "Unsubscribe from Mailing List",
             destructive_hint = true,

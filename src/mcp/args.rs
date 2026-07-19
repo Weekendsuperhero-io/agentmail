@@ -7,6 +7,10 @@ pub(super) fn default_false() -> bool {
     false
 }
 
+pub(super) fn default_true() -> bool {
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Tool argument structs
 // ---------------------------------------------------------------------------
@@ -328,9 +332,9 @@ pub(super) struct UnsubscribeMessageArgs {
         description = "If true, allow cleanup policy evaluation even when DKIM, URL validation, DNS, or the HTTPS POST fails. Cleanup still requires a DKIM-authenticated List-Id or the separate sender fallback. Defaults to false."
     )]
     pub(super) delete_on_unsubscribe_failure: bool,
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     #[schemars(
-        description = "If true and no usable DKIM-authenticated List-Id exists, allow the narrower legacy exact-sender plus list-header cleanup. Defaults to false."
+        description = "When no usable DKIM-authenticated List-Id exists, allow the narrower exact-sender plus list-header cleanup instead. Defaults to true — it only activates when deleteMatching was requested and the unsubscribe identity was already verified. Set false to require the authenticated List-Id path strictly."
     )]
     pub(super) allow_sender_fallback: bool,
     #[serde(default = "default_false")]

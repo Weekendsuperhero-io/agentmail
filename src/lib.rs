@@ -2250,14 +2250,14 @@ impl Agentmail {
             Ok(identity) => identity,
             Err(CleanupIdentityError::UnauthenticatedListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup was skipped: the sender's DKIM signature does not cover the List-Id header (List-Id is spoofable, so an unauthenticated value must not select an account-wide delete). To clean up anyway: retry with allowSenderFallback=true to delete this exact sender's bulk mail, use delete_list_id with an explicitly chosen listId, or use delete_by_sender."
+                    "Matching-message cleanup was skipped: the sender's DKIM signature does not cover the List-Id header (List-Id is spoofable, so an unauthenticated value must not select an account-wide delete), and allowSenderFallback was explicitly disabled. To clean up: re-enable allowSenderFallback to delete this exact sender's bulk mail, use delete_list_id with an explicitly chosen listId, or use delete_by_sender."
                         .to_string(),
                 );
                 return Ok(response);
             }
             Err(CleanupIdentityError::NoUsableListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup was skipped: the message carries no single usable List-Id. To clean up anyway: retry with allowSenderFallback=true to delete this exact sender's bulk mail, or use delete_by_sender."
+                    "Matching-message cleanup was skipped: the message carries no single usable List-Id, and allowSenderFallback was explicitly disabled. To clean up: re-enable allowSenderFallback to delete this exact sender's bulk mail, or use delete_by_sender."
                         .to_string(),
                 );
                 return Ok(response);
@@ -2570,11 +2570,9 @@ fn validate_unsubscribe_options(options: UnsubscribeOptions) -> Result<()> {
             "delete_on_unsubscribe_failure requires delete_matching=true".to_string(),
         ));
     }
-    if options.allow_sender_fallback && !options.delete_matching {
-        return Err(AgentmailError::InvalidUnsubscribePolicy(
-            "allow_sender_fallback requires delete_matching=true".to_string(),
-        ));
-    }
+    // allow_sender_fallback without delete_matching is inert, not invalid:
+    // it defaults to true and is only consulted once cleanup actually runs,
+    // so a plain unsubscribe with default flags must pass validation.
     if options.allow_permanent_fallback && !options.delete_matching {
         return Err(AgentmailError::InvalidUnsubscribePolicy(
             "allow_permanent_fallback requires delete_matching=true".to_string(),
@@ -2861,6 +2859,16 @@ mod tests {
             allow_permanent_fallback: false,
             mode: DeleteMode::TrashFirst,
         }
+    }
+
+    #[test]
+    fn default_wire_flags_pass_policy_validation() {
+        // The MCP default is allowSenderFallback=true with deleteMatching
+        // unset — the fallback is inert without cleanup, so a plain
+        // unsubscribe must not be rejected as a contradictory policy.
+        let mut options = unsubscribe_options();
+        options.allow_sender_fallback = true;
+        assert!(validate_unsubscribe_options(options).is_ok());
     }
 
     #[test]
