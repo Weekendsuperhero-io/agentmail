@@ -1093,6 +1093,7 @@ impl Agentmail {
         &self,
         session: &mut imap_client::ImapSession,
         account: &str,
+        mailbox: &str,
         list_id: &str,
         mailbox_exists: u32,
         mailbox_uid_next: Option<u32>,
@@ -1104,11 +1105,42 @@ impl Agentmail {
             ..Default::default()
         };
         let query = imap_client::build_search_query_pub(&criteria)?;
-        let mut candidates = imap_client::search_uids(session, &query).await?;
-        if candidates.is_empty() && mailbox_exists > 0 && self.list_search_untrusted(account) {
-            candidates =
-                imap_client::search_all_uids_checked(session, mailbox_exists, mailbox_uid_next)
-                    .await?;
+        // A rejected search and an empty one are indistinguishable on servers
+        // whose tagged NO is swallowed by the client library; both fall
+        // through to the trust check below.
+        let mut candidates = imap_client::search_uids(session, &query)
+            .await
+            .unwrap_or_default();
+        if candidates.is_empty() && mailbox_exists > 0 {
+            // Two independent reasons to distrust an empty result: this
+            // process observed the List-header quirk (fast, but unarmed after
+            // a restart once the cache has healed), or the persisted
+            // projection knows this mailbox holds matches the server search
+            // failed to find (restart-proof ground truth).
+            let projected = match normalize_list_id(list_id) {
+                Some(normalized) => match self.pool.account_config(account) {
+                    Some(config) => {
+                        self.header_cache
+                            .cached_list_id_count(account, config, mailbox, &normalized)
+                            .await
+                    }
+                    None => 0,
+                },
+                None => 0,
+            };
+            if projected > 0 || self.list_search_untrusted(account) {
+                if projected > 0 {
+                    tracing::warn!(
+                        target: "agentmail",
+                        mailbox,
+                        projected,
+                        "server List-Id search found nothing the projection knows exists; enumerating the visible mailbox",
+                    );
+                }
+                candidates =
+                    imap_client::search_all_uids_checked(session, mailbox_exists, mailbox_uid_next)
+                        .await?;
+            }
         }
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -1182,6 +1214,7 @@ impl Agentmail {
                     .exact_list_id_uids(
                         session.session(),
                         account,
+                        mbox,
                         list_id,
                         mb.exists,
                         mb.uid_next,
@@ -2296,6 +2329,7 @@ impl Agentmail {
                             .exact_list_id_uids(
                                 session.session(),
                                 account,
+                                mbox,
                                 normalized,
                                 mb.exists,
                                 mb.uid_next,

@@ -237,6 +237,11 @@ impl HeaderCache {
     /// headers (see `mark_account_quirky`). Deletion flows use this to
     /// decide when a zero-result `SEARCH HEADER List-Id` cannot be trusted:
     /// the same backends that filter the headers cannot match them in SEARCH.
+    ///
+    /// Process-local and effectively one-shot: detection happens during the
+    /// healing sync, after which cache hits never re-run it — so a restart
+    /// unarms it. Deletion flows therefore combine it with the persisted
+    /// evidence in [`Self::cached_list_id_count`].
     pub(crate) fn account_flagged_quirky(
         &self,
         account_name: &str,
@@ -244,6 +249,46 @@ impl HeaderCache {
     ) -> bool {
         let key = CacheKey::new(account_name, config, "");
         self.account_is_quirky(&key.account)
+    }
+
+    /// How many projected rows in one mailbox carry this normalized List-Id.
+    /// Restart-proof ground truth for deletion flows: when the server's
+    /// `SEARCH HEADER List-Id` returns nothing while the projection knows
+    /// matches exist, the search is blind and the mailbox must be enumerated.
+    /// Returns 0 when the cache is disabled or unreadable.
+    pub(crate) async fn cached_list_id_count(
+        &self,
+        account_name: &str,
+        config: &AccountConfig,
+        mailbox: &str,
+        normalized_list_id: &str,
+    ) -> usize {
+        let Some(path) = self.path.as_ref() else {
+            return 0;
+        };
+        let key = CacheKey::new(account_name, config, mailbox);
+        let normalized = normalized_list_id.to_string();
+        let path = Arc::clone(path);
+        let count = tokio::task::spawn_blocking(move || -> CacheResult<i64> {
+            let connection = open_connection(&path)?;
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM header_rows
+                  WHERE account_key = ?1 AND mailbox = ?2
+                    AND projection_version = ?3 AND list_id = ?4",
+                params![
+                    key.account,
+                    key.mailbox,
+                    HEADER_PROJECTION_VERSION,
+                    normalized
+                ],
+                |row| row.get(0),
+            )?)
+        })
+        .await;
+        match count {
+            Ok(Ok(count)) => usize::try_from(count).unwrap_or(0),
+            _ => 0,
+        }
     }
 
     fn gate(&self, key: &CacheKey) -> Arc<Mutex<()>> {
@@ -2120,6 +2165,50 @@ mod tests {
         .await
         .expect("count rows");
         assert_eq!(covered, 2);
+    }
+
+    #[tokio::test]
+    async fn cached_list_id_count_reports_projected_matches_per_mailbox() {
+        let cache = HeaderCache::at_path(test_path("list-id-count"));
+        let config = AccountConfig {
+            host: "imap.example.com".to_string(),
+            port: 993,
+            username: "user@example.com".to_string(),
+            password: None,
+            tls: true,
+            max_connections: None,
+        };
+        let key = CacheKey::new("acct", &config, "INBOX");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let mut listed = test_row(1);
+        listed.list_id = Some("<mylist.example.com>".to_string());
+        let mut other = test_row(2);
+        other.list_id = Some("<other.example.com>".to_string());
+        store_headers(path, key, 10, vec![listed, other, test_row(3)])
+            .await
+            .expect("store headers");
+
+        assert_eq!(
+            cache
+                .cached_list_id_count("acct", &config, "INBOX", "mylist.example.com")
+                .await,
+            1,
+            "the projection knows one INBOX message carries the list"
+        );
+        assert_eq!(
+            cache
+                .cached_list_id_count("acct", &config, "Archive", "mylist.example.com")
+                .await,
+            0,
+            "counts are per mailbox"
+        );
+        assert_eq!(
+            cache
+                .cached_list_id_count("acct", &config, "INBOX", "unknown.example.com")
+                .await,
+            0,
+            "unknown lists report zero"
+        );
     }
 
     #[tokio::test]
