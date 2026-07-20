@@ -286,6 +286,51 @@ impl HeaderCache {
         self.account_is_quirky(&key.account)
     }
 
+    /// Whether a mailbox's stored projection shows the HEADER.FIELDS-filter
+    /// poisoning: many rows carry a `List-Id` (bulk mail is clearly present)
+    /// yet not one row has an unsubscribe flag. This happens when a scan built
+    /// the projection in FIELDS mode before the quirk was known (e.g. an
+    /// interrupted cold scan, or a fresh namespace after an account rename) —
+    /// the persisted quirk flag then only steers FUTURE fetches, leaving the
+    /// already-stored rows stuck at `has_list_headers = 0` forever, because
+    /// incremental syncs never re-fetch them. Detecting it from stored state
+    /// (not just this sync's fresh batch) is what triggers the heal.
+    async fn mailbox_projection_poisoned(
+        &self,
+        path: &Arc<PathBuf>,
+        key: &CacheKey,
+        uid_validity: u32,
+    ) -> bool {
+        let path = Arc::clone(path);
+        let key = key.clone();
+        let counts = tokio::task::spawn_blocking(move || -> CacheResult<(i64, i64)> {
+            let connection = open_connection(&path)?;
+            Ok(connection.query_row(
+                "SELECT
+                     COALESCE(SUM(CASE WHEN list_id IS NOT NULL THEN 1 ELSE 0 END), 0),
+                     COALESCE(SUM(has_list_headers), 0)
+                   FROM header_rows
+                  WHERE account_key = ?1 AND mailbox = ?2
+                    AND uid_validity = ?3 AND projection_version = ?4",
+                params![
+                    key.account,
+                    key.mailbox,
+                    i64::from(uid_validity),
+                    HEADER_PROJECTION_VERSION
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?)
+        })
+        .await;
+        match counts {
+            Ok(Ok((with_list_id, with_unsub))) => imap_client::header_fields_quirk(
+                usize::try_from(with_list_id).unwrap_or(0),
+                usize::try_from(with_unsub).unwrap_or(0),
+            ),
+            _ => false,
+        }
+    }
+
     /// The projected UIDs in one mailbox epoch that carry this normalized
     /// List-Id. Restart-proof ground truth for deletion flows: when the
     /// server's `SEARCH HEADER List-Id` returns nothing while the projection
@@ -580,7 +625,17 @@ impl HeaderCache {
                 && is_cache_hit(state, &live_status, expected_account_revision)
             {
                 let covered = load_covered_count(Arc::clone(&path), key.clone(), state).await?;
-                if covered == u64::from(state.exists) {
+                // A complete, unpoisoned snapshot is served as-is. A projection
+                // built in FIELDS mode on a HEADER.FIELDS-filtering server
+                // (interrupted cold scan, or a fresh namespace after an account
+                // rename) is otherwise a permanent cache hit serving
+                // `has_list_headers = 0` — so fall through to the sync, which
+                // heals it with a full-header refetch.
+                if covered == u64::from(state.exists)
+                    && !self
+                        .mailbox_projection_poisoned(&path, key, state.uid_validity)
+                        .await
+                {
                     imap_client::check_cancel(cancel)?;
                     if let Some(progress) = on_progress {
                         progress(state.exists.into(), state.exists.into());
@@ -696,6 +751,13 @@ impl HeaderCache {
                 progress(reused as u64, live_uids.len() as u64);
             }
 
+            // Did we begin in full-header mode because the account was
+            // already flagged quirky? If so, this sync's fresh-batch
+            // detection can't fire (it guards on `!full_header_mode`), so a
+            // projection poisoned by an earlier FIELDS-mode build would never
+            // heal without the stored-state check below.
+            let started_quirky = full_header_mode;
+
             let mut processed = 0usize;
             let mut list_id_rows = 0usize;
             let mut unsubscribe_rows = 0usize;
@@ -740,17 +802,38 @@ impl HeaderCache {
             // (Detection sees only rows fetched THIS sync; a scan resumed
             // from an interrupted pre-detection run may need one more full
             // Membership sync to converge.)
-            if !full_header_mode && imap_client::header_fields_quirk(list_id_rows, unsubscribe_rows)
-            {
+            // Heal a HEADER.FIELDS-filtered projection with a full-header
+            // refetch of the whole membership. Two triggers:
+            //  - fresh detection: this sync fetched many List-Id rows in
+            //    FIELDS mode and saw zero unsubscribe headers; or
+            //  - stored poisoning: the account is already known quirky, but
+            //    the projection on disk was built (partly) in FIELDS mode and
+            //    still shows the List-Id-without-unsubscribe signature —
+            //    incremental syncs alone never re-fetch those rows.
+            let fresh_detection = !full_header_mode
+                && imap_client::header_fields_quirk(list_id_rows, unsubscribe_rows);
+            let stored_poisoned = started_quirky
+                && self
+                    .mailbox_projection_poisoned(&path, key, snapshot_uid_validity)
+                    .await;
+            if fresh_detection || stored_poisoned {
                 warn!(
                     target: "agentmail",
                     mailbox = key.mailbox,
                     list_id_rows,
-                    "HEADER.FIELDS responses omit List-Unsubscribe; refetching full headers for the whole mailbox",
+                    stored_poisoned,
+                    "healing HEADER.FIELDS-filtered projection with a full-header refetch of the whole mailbox",
                 );
                 self.persist_account_quirky(&key.account).await;
                 full_header_mode = true;
+                // Buffer the whole refetch and store it in one shot: a heal
+                // interrupted midway (this server drops long connections) must
+                // leave the projection FULLY poisoned so it re-heals next
+                // time. A partial write would set some `has_list_headers = 1`,
+                // making the poison check read "clean" and stranding the rest
+                // at 0 forever.
                 let members: Vec<u32> = live_uids.clone();
+                let mut healed: Vec<ListHeaderRow> = Vec::with_capacity(members.len());
                 for chunk in members.chunks(FETCH_CHUNK_SIZE) {
                     imap_client::check_cancel(cancel)?;
                     let mut rows =
@@ -760,9 +843,15 @@ impl HeaderCache {
                         row.uid_validity = Some(snapshot_uid_validity);
                     }
                     reconcile_fetch_chunk(&key.mailbox, chunk, &rows, &mut live_uids)?;
-                    store_headers(Arc::clone(&path), key.clone(), snapshot_uid_validity, rows)
-                        .await?;
+                    healed.extend(rows);
                 }
+                store_headers(
+                    Arc::clone(&path),
+                    key.clone(),
+                    snapshot_uid_validity,
+                    healed,
+                )
+                .await?;
             }
 
             imap_client::check_cancel(cancel)?;
@@ -2284,6 +2373,46 @@ mod tests {
         let mut live = vec![1];
         reconcile_fetch_chunk("INBOX", &[], &[], &mut live).expect("empty request is fine");
         assert_eq!(live, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn poisoned_projection_is_detected_from_stored_state() {
+        let cache = HeaderCache::at_path(test_path("poison-detect"));
+        let key = test_key("INBOX");
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+
+        // FIELDS-mode build: many rows carry a List-Id, none an unsubscribe
+        // header — the AOL/Yahoo poisoning signature.
+        let poisoned: Vec<ListHeaderRow> = (0..imap_client::QUIRK_MIN_LIST_ID_ROWS as u32)
+            .map(|uid| {
+                let mut row = test_row(uid + 1);
+                row.list_id = Some("<bulk.example.com>".to_string());
+                row // list_unsubscribe stays None
+            })
+            .collect();
+        store_headers(path.clone(), key.clone(), 10, poisoned)
+            .await
+            .expect("store poisoned rows");
+        assert!(
+            cache.mailbox_projection_poisoned(&path, &key, 10).await,
+            "list-id rows with zero unsubscribe flags read as poisoned"
+        );
+
+        // Healing one row (an unsubscribe header now present) clears it — the
+        // atomic heal guarantees this only happens on a complete refetch.
+        let mut healed = test_row(1);
+        healed.list_id = Some("<bulk.example.com>".to_string());
+        healed.list_unsubscribe = Some("<https://example.com/u>".to_string());
+        store_headers(path.clone(), key.clone(), 10, vec![healed])
+            .await
+            .expect("store one healed row");
+        assert!(
+            !cache.mailbox_projection_poisoned(&path, &key, 10).await,
+            "any surviving unsubscribe flag clears the poison signal"
+        );
+
+        // A different UIDVALIDITY epoch has no rows → not poisoned.
+        assert!(!cache.mailbox_projection_poisoned(&path, &key, 11).await);
     }
 
     #[tokio::test]
