@@ -89,3 +89,52 @@ the entire deep mailbox through the window. `MESSAGELIMIT=1000` (RFC 9738)
 is additionally respected by keeping every FETCH chunk and windowed-search
 span at ≤1,000 messages, with `UID SEARCH ALL` results cross-checked
 against `EXISTS` (`imap_client::search_all_uids_checked`).
+
+### The window IS escapable — but the fix is blocked in the parser
+
+Yahoo's official IMAP docs (senders.yahooinc.com) confirm the window is
+**"Limited Mode," the default**, and that a second **"UID Mode"** —
+activated by `ENABLE UIDONLY` — "opens up the entire mailbox," letting a
+client fetch and operate on **all** messages by UID (with `MESSAGELIMIT`
+still capping results *per command*, paginated via the RFC 9394 `PARTIAL`
+fetch modifier, e.g. `UID FETCH 1:* (…) (PARTIAL -1:-5)`). That would
+eliminate the window entirely for both scans and deletes — no drain passes,
+no rankings-cover-only-the-window caveat.
+
+It is not usable today, blocked three ways in our dependency stack
+(verified against imap-proto 0.16.7 / async-imap 0.11.3 on 2026-07-20):
+
+1. **No `ENABLE` command** — async-imap's `Session` exposes no `enable(...)`
+   (could be sent raw via `run_command`, but see below).
+2. **No `UIDFETCH` response parsing** — in UID Mode the server replies
+   `* <uid> UIDFETCH (...)` (RFC 9586) instead of `* <seq> FETCH (...)`;
+   imap-proto has zero UIDFETCH support, so every fetch would fail to parse.
+3. **No `PARTIAL` fetch-modifier parsing** — the pagination mechanism UID
+   Mode requires is unimplemented.
+
+So Limited Mode + our windowed drain is the **only** workable path on the
+current stack, and it is the correct one. Escaping the window is a
+library-upgrade project (imap-proto UIDFETCH+PARTIAL, then async-imap
+`enable` + UID-mode fetch), tracked as the highest-leverage future
+investment for large Yahoo/AOL mailboxes.
+
+Other confirmed-but-unused capabilities, ranked by leverage:
+
+- **OBJECTID (`EMAILID`/`THREADID`/`MAILBOXID`)** — `EMAILID` is a stable
+  per-message identity that survives moves and UIDVALIDITY changes; a far
+  more durable cache key than `(mailbox, UIDVALIDITY, UID)`, and it detects
+  cross-mailbox moves without refetching. Future cache upgrade.
+- **LIST-STATUS** — `LIST "" "*" RETURN (STATUS (...))` returns every
+  folder's status in one round trip instead of N `STATUS` calls; fewer
+  commands eases the login/command rate limiting. Scan-planning
+  optimization.
+- **XYMHIGHESTMODSEQ** — Yahoo's CONDSTORE `HIGHESTMODSEQ` under a
+  vendor name; a changed value flags new/updated/deleted messages, a more
+  precise freshness signal than `(UIDVALIDITY, UIDNEXT, EXISTS)`.
+- **AUTH=OAUTHBEARER** — Yahoo/AOL's sanctioned auth is OAuth2 (OAUTHBEARER
+  via SASL), app passwords being the legacy path; the strategic auth
+  direction, requiring token storage + refresh.
+
+The RFC 2971 `ID` handshake Yahoo requests (name/version/os) is sent after
+login (`imap_client::send_client_id`); Yahoo uses it for throttling and
+troubleshooting.

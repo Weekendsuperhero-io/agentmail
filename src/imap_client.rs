@@ -319,9 +319,11 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
 /// a server that rejects or lacks it must not fail the connection. Runs under
 /// the ping timeout so a hung `ID` cannot stall a connect.
 async fn send_client_id(session: &mut ImapSession) {
+    // Yahoo/AOL's own IMAP docs ask clients to send name, version, and os.
     let identification = [
         ("name", Some("AgentMail")),
         ("version", Some(env!("CARGO_PKG_VERSION"))),
+        ("os", Some(std::env::consts::OS)),
     ];
     match tokio::time::timeout(PING_TIMEOUT, session.id(identification)).await {
         Ok(Ok(_)) => {}
