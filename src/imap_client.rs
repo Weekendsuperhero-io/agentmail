@@ -337,19 +337,26 @@ where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
     let window = message_limit.clamp(1, MAX_FETCH_CHUNK as u32);
+    // Fixed "newest `window`" partial; pagination shrinks the UID RANGE, not
+    // the partial offset. This is the idiom in Yahoo/AOL's own docs — an
+    // incrementing partial like `-1001:-2000` returns nothing there.
+    let items = format!("(UID) (PARTIAL -1:-{window})");
     let mut all: Vec<u32> = Vec::new();
-    let mut offset: u32 = 1;
+    let mut upper: Option<u32> = None; // None → "1:*" for the first page
     loop {
         check_cancel(cancel)?;
-        let end = offset.saturating_add(window - 1);
-        // Negative PARTIAL ranges count back from the newest message.
-        let items = format!("(UID) (PARTIAL -{offset}:-{end})");
-        let fetched = timed_uid_fetch_collect(session, "1:*", &items).await?;
+        let range = match upper {
+            None => "1:*".to_string(),
+            Some(hi) => format!("1:{hi}"),
+        };
+        let fetched = timed_uid_fetch_collect(session, &range, &items).await?;
         let mut page = 0u32;
+        let mut lowest: Option<u32> = None;
         for item in fetched {
             let fetch = item.map_err(AgentmailError::Imap)?;
             if let Some(uid) = fetch.uid {
                 all.push(uid);
+                lowest = Some(lowest.map_or(uid, |current| current.min(uid)));
                 page += 1;
             }
         }
@@ -360,10 +367,11 @@ where
         if page < window {
             break;
         }
-        offset = match end.checked_add(1) {
-            Some(next) => next,
-            None => break,
-        };
+        // Next page covers UIDs strictly below the lowest one just seen.
+        match lowest {
+            Some(low) if low > 1 => upper = Some(low - 1),
+            _ => break,
+        }
     }
     all.sort_unstable();
     all.dedup();
@@ -3333,11 +3341,14 @@ mod tests {
                         .unwrap();
                 } else if command.contains("UID FETCH") {
                     // Page 0,1: `window` rows (full). Page 2: 1 row (short → stop).
+                    // UIDs descend contiguously so the shrinking range is
+                    // deterministic: page 0 → 100..98, page 1 → 97..95, etc.
                     let rows = if page < 2 { window } else { 1 };
+                    let top = 100 - page * window;
                     let mut body = String::new();
                     for i in 0..rows {
-                        let uid = 100_000 - page * window - i;
-                        body.push_str(&format!("* {uid} UIDFETCH (RFC822.SIZE 10)\r\n"));
+                        let uid = top - i;
+                        body.push_str(&format!("* {uid} UIDFETCH (UID {uid})\r\n"));
                     }
                     body.push_str(&format!("{tag} OK UID FETCH completed\r\n"));
                     writer.write_all(body.as_bytes()).await.unwrap();
@@ -3376,8 +3387,16 @@ mod tests {
             .collect();
         assert_eq!(fetches.len(), 3, "two full pages + one short: {fetches:?}");
         assert!(
-            fetches[0].contains("PARTIAL -1:-3") && fetches[1].contains("PARTIAL -4:-6"),
-            "PARTIAL windows advance newest-to-oldest: {fetches:?}"
+            fetches.iter().all(|c| c.contains("PARTIAL -1:-3")),
+            "the partial stays newest-`window`; pagination shrinks the range: {fetches:?}"
+        );
+        // Page 0 spans 1:*, page 1 covers UIDs below the lowest seen (98-1=97),
+        // page 2 below that (95-1=94).
+        assert!(
+            fetches[0].contains("UID FETCH 1:* ")
+                && fetches[1].contains("UID FETCH 1:97 ")
+                && fetches[2].contains("UID FETCH 1:94 "),
+            "the UID range shrinks below the lowest UID of the prior page: {fetches:?}"
         );
     }
 
@@ -3419,6 +3438,44 @@ mod tests {
                         .iter()
                         .any(|a| matches!(a, imap_proto::AttributeValue::Uid(434894))),
                     "UID attribute present: {attrs:?}"
+                );
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    /// The linchpin shape for full-mailbox ranking: in UID Mode the rank-header
+    /// fetch returns `* <uid> UIDFETCH (UID <uid> BODY[HEADER.FIELDS (…)] {N}…)`.
+    /// If the patched parser choked on a UIDFETCH carrying a body-section
+    /// literal, every header would come back null — no List-Id, so no quirk
+    /// heal and no subscription candidates, silently.
+    #[test]
+    fn uidfetch_with_a_body_section_literal_parses_via_the_patched_imap_proto() {
+        use async_imap::imap_proto::{self, AttributeValue, Response};
+        let headers = "List-Id: <list.example.com>\r\nFrom: a@b.com\r\n\r\n";
+        let line = format!(
+            "* 434894 UIDFETCH (UID 434894 BODY[HEADER.FIELDS (List-Id From)] {{{}}}\r\n{headers})\r\n",
+            headers.len()
+        );
+        let (rest, response) = imap_proto::parser::parse_response(line.as_bytes())
+            .expect("patched imap-proto must parse a UIDFETCH with a body-section literal");
+        assert!(rest.is_empty(), "the whole line is consumed: {rest:?}");
+        match response {
+            Response::Fetch(num, attrs) => {
+                assert_eq!(num, 434894);
+                let mut body = None;
+                for attr in &attrs {
+                    if let AttributeValue::BodySection {
+                        data: Some(bytes), ..
+                    } = attr
+                    {
+                        body = Some(String::from_utf8_lossy(bytes).into_owned());
+                    }
+                }
+                let body = body.expect("the HEADER.FIELDS body section is present");
+                assert!(
+                    body.contains("List-Id: <list.example.com>"),
+                    "the List-Id header survives the UIDFETCH parse: {body:?}"
                 );
             }
             other => panic!("expected Fetch, got {other:?}"),

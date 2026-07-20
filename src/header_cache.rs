@@ -30,7 +30,13 @@ const CACHE_SCHEMA_VERSION: i64 = 5;
 // v4: rebuilds projections poisoned by HEADER.FIELDS-filtering servers
 // (AOL/Yahoo omit List-Unsubscribe[-Post] → has_list_headers was 0 on every
 // row despite bulk mail being present).
-const HEADER_PROJECTION_VERSION: i64 = 4;
+// v5: discards UID-Mode memberships written before the PARTIAL walk fix. The
+// old walk advanced the PARTIAL offset (which Yahoo/AOL cap at one window), so
+// it stored a truncated membership of the newest ~1000 UIDs and every rank came
+// from that sliver. The fixed walk shrinks the UID range instead and covers the
+// whole mailbox; bumping here forces the poisoned single-window memberships to
+// cold-rebuild rather than being served forever as a completeness-passing hit.
+const HEADER_PROJECTION_VERSION: i64 = 5;
 const FETCH_CHUNK_SIZE: usize = 1_000;
 const MAX_STABLE_SEARCH_ATTEMPTS: usize = 3;
 const MAX_RANK_PAGE_SIZE: usize = 100;
@@ -633,7 +639,17 @@ impl HeaderCache {
         let started = Instant::now();
         // Sticky across retries: once a server is known to filter
         // HEADER.FIELDS, every fetch in this sync uses full headers.
-        let mut full_header_mode = self.account_is_quirky(&key.account);
+        //
+        // UID Mode always starts in full-header mode. It is only ever entered on
+        // Yahoo/AOL infrastructure (the UIDONLY advertisers), which strip the
+        // List-Unsubscribe pair from every HEADER.FIELDS response (probe: List-Id
+        // survives, List-Unsubscribe is 0 on every row even where List-Id is
+        // present). So a FIELDS-first pass over this mailbox ALWAYS detects the
+        // quirk and ALWAYS triggers a full-header refetch of the whole mailbox —
+        // two passes over hundreds of thousands of messages. Fetching full
+        // headers up front collapses that to one pass and is the only shape that
+        // recovers the unsubscribe flags `top_subscriptions` ranks on.
+        let mut full_header_mode = self.account_is_quirky(&key.account) || uid_mode.is_some();
 
         // One retry resolves a cross-process publisher or a local mutation
         // that wins the compare-and-swap while this scan is in flight.
@@ -656,22 +672,34 @@ impl HeaderCache {
                 )
             {
                 let covered = load_covered_count(Arc::clone(&path), key.clone(), state).await?;
+                // Completeness yardstick. On a normal server EXISTS is the true
+                // message count; in UID Mode it is only the visible-window count
+                // (e.g. 1000) while the projection covers the whole mailbox, so
+                // EXISTS can never equal `covered` and would force a full re-walk
+                // on every warm call. Compare against the walked membership size
+                // instead.
+                let target = if uid_mode.is_some() {
+                    load_membership_count(Arc::clone(&path), key.clone()).await?
+                } else {
+                    u64::from(state.exists)
+                };
+                let complete = projection_is_complete(uid_mode.is_some(), covered, target);
                 // A complete, unpoisoned snapshot is served as-is. A projection
                 // built in FIELDS mode on a HEADER.FIELDS-filtering server
                 // (interrupted cold scan, or a fresh namespace after an account
                 // rename) is otherwise a permanent cache hit serving
                 // `has_list_headers = 0` — so fall through to the sync, which
                 // heals it with a full-header refetch.
-                if covered == u64::from(state.exists)
+                if complete
                     && !self
                         .mailbox_projection_poisoned(&path, key, state.uid_validity)
                         .await
                 {
                     imap_client::check_cancel(cancel)?;
                     if let Some(progress) = on_progress {
-                        progress(state.exists.into(), state.exists.into());
+                        progress(target, target);
                     }
-                    trace_sync(SyncKind::Hit, started, state.exists as usize, 0, 0);
+                    trace_sync(SyncKind::Hit, started, target as usize, 0, 0);
                     return Ok(state);
                 }
                 // A complete publication always has one marker row per member.
@@ -679,7 +707,7 @@ impl HeaderCache {
                 warn!(
                     target: "agentmail",
                     mailbox = key.mailbox,
-                    expected = state.exists,
+                    expected = target,
                     actual = covered,
                     "header cache snapshot was incomplete; reconciling"
                 );
@@ -1072,6 +1100,21 @@ fn is_cache_hit(
         && status.uid_next == state.uid_next
         && (uid_mode || status.exists == state.exists)
         && state.account_revision == account_revision
+}
+
+/// Whether a projection covers its whole mailbox and can be served without a
+/// resync. `target` is the number of messages that must each own a projected
+/// header row: the walked membership size in UID Mode (EXISTS there is only the
+/// visible-window count and can never equal full coverage), or EXISTS in
+/// Limited Mode. A UID-Mode `target` of 0 means the mailbox was never walked
+/// and must sync rather than serve an empty hit; a Limited-Mode `target` of 0
+/// is a legitimately empty mailbox that hits.
+fn projection_is_complete(uid_mode: bool, covered: u64, target: u64) -> bool {
+    if uid_mode {
+        target > 0 && covered == target
+    } else {
+        covered == target
+    }
 }
 
 fn pure_append_is_proven(
@@ -1826,6 +1869,22 @@ async fn load_covered_count(
     .await?
 }
 
+/// Size of the walked membership set for one mailbox. In UID Mode the mailbox
+/// EXISTS is only the visible-window count, so this — not EXISTS — is the
+/// yardstick for whether the projection covers the whole mailbox.
+async fn load_membership_count(path: Arc<PathBuf>, key: CacheKey) -> CacheResult<u64> {
+    tokio::task::spawn_blocking(move || {
+        let connection = open_connection(&path)?;
+        let count = connection.query_row(
+            "SELECT COUNT(*) FROM membership WHERE account_key = ?1 AND mailbox = ?2",
+            params![key.account, key.mailbox],
+            |row| sql_u64(row.get::<_, i64>(0)?),
+        )?;
+        Ok(count)
+    })
+    .await?
+}
+
 async fn store_headers(
     path: Arc<PathBuf>,
     key: CacheKey,
@@ -2301,6 +2360,42 @@ mod tests {
         assert!(
             !is_cache_hit(state, &status, 0, false),
             "Limited Mode still requires EXISTS to match"
+        );
+    }
+
+    #[test]
+    fn uid_mode_completeness_measures_membership_not_the_window() {
+        // The healed projection covers the whole mailbox (434_894 rows) while
+        // EXAMINE still reports the 1000-message window. Measuring completeness
+        // against EXISTS would never match and re-walk every warm call; against
+        // membership it serves the hit.
+        assert!(
+            projection_is_complete(true, 434_894, 434_894),
+            "full coverage of the walked membership is a complete UID-Mode hit"
+        );
+        assert!(
+            !projection_is_complete(true, 1_000, 434_894),
+            "the truncated single-window projection must reconcile, not hit"
+        );
+        assert!(
+            !projection_is_complete(true, 0, 0),
+            "an unwalked UID-Mode mailbox must sync, not serve an empty hit"
+        );
+    }
+
+    #[test]
+    fn limited_mode_completeness_still_measures_exists() {
+        assert!(
+            projection_is_complete(false, 3, 3),
+            "Limited Mode is complete when every EXISTS message has a row"
+        );
+        assert!(
+            !projection_is_complete(false, 2, 3),
+            "a missing row in Limited Mode reconciles"
+        );
+        assert!(
+            projection_is_complete(false, 0, 0),
+            "a genuinely empty Limited-Mode mailbox is a valid hit"
         );
     }
 
