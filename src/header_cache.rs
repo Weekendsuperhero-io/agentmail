@@ -20,12 +20,13 @@ use crate::config::AccountConfig;
 use crate::imap_client::{self, CancelFn, ImapSession, ListHeaderRow, ProgressFn};
 use crate::scan_cache::MailboxStatus;
 
-// v4: mailbox_state carries the account mutation revision it was published
-// under, so local mutations (deletes/moves) invalidate snapshot hits even
-// when the (UIDVALIDITY, UIDNEXT, EXISTS) triple is unchanged — Yahoo/AOL
-// pin INBOX EXISTS to a 10,000-message window, so deletes there leave the
-// triple identical and rankings would serve stale counts.
-const CACHE_SCHEMA_VERSION: i64 = 4;
+// v5: the cache key dropped the account display name (identity is now
+// host/port/tls/username only), so existing name-keyed rows are orphaned —
+// wipe and rebuild once under the new key. (v4 added mailbox_state's account
+// mutation revision so local deletes/moves invalidate snapshot hits even when
+// Yahoo/AOL's pinned EXISTS window leaves the (UIDVALIDITY, UIDNEXT, EXISTS)
+// triple unchanged.)
+const CACHE_SCHEMA_VERSION: i64 = 5;
 // v4: rebuilds projections poisoned by HEADER.FIELDS-filtering servers
 // (AOL/Yahoo omit List-Unsubscribe[-Post] → has_list_headers was 0 on every
 // row despite bulk mail being present).
@@ -147,13 +148,16 @@ struct CacheKey {
 
 impl CacheKey {
     fn new(account_name: &str, config: &AccountConfig, mailbox: &str) -> Self {
-        // Length prefixes avoid ambiguous separators while keeping the key
-        // inspectable when diagnosing a local cache file.
+        // The cache identity is the SERVER mailbox — host, port, TLS mode, and
+        // login — NOT the user-chosen display name. Renaming an account
+        // (e.g. "Custom" → "Cthrower") points at the same mailbox and must
+        // reuse the same projection, not spin up a fresh (cold, and possibly
+        // FIELDS-poisoned) namespace. Length prefixes avoid ambiguous
+        // separators while keeping the key inspectable in the cache file.
+        let _ = account_name;
         let host = config.host.to_ascii_lowercase();
         let account = format!(
-            "{}:{}|{}:{}|{}|{}|{}:{}",
-            account_name.len(),
-            account_name,
+            "{}:{}|{}|{}|{}:{}",
             host.len(),
             host,
             config.port,
@@ -2373,6 +2377,31 @@ mod tests {
         let mut live = vec![1];
         reconcile_fetch_chunk("INBOX", &[], &[], &mut live).expect("empty request is fine");
         assert_eq!(live, vec![1]);
+    }
+
+    #[test]
+    fn cache_key_ignores_the_account_display_name() {
+        let config = AccountConfig {
+            host: "export.imap.aol.com".to_string(),
+            port: 993,
+            username: "user@verizon.net".to_string(),
+            password: None,
+            tls: true,
+            max_connections: None,
+        };
+        // Renaming the account points at the same mailbox → same projection.
+        let renamed = CacheKey::new("Cthrower", &config, "INBOX");
+        let original = CacheKey::new("Custom", &config, "INBOX");
+        assert_eq!(renamed.account, original.account);
+        // A different login is still a different mailbox.
+        let other = AccountConfig {
+            username: "someone-else@verizon.net".to_string(),
+            ..config.clone()
+        };
+        assert_ne!(
+            CacheKey::new("Custom", &config, "INBOX").account,
+            CacheKey::new("Custom", &other, "INBOX").account
+        );
     }
 
     #[tokio::test]
