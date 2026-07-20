@@ -1,5 +1,12 @@
 [workspace]
 
+# Local imap-proto fork adding RFC 9586 UIDFETCH response parsing (the enabler
+# for Yahoo/AOL UID Mode / ENABLE UIDONLY, which lifts the visible-window
+# limit). Applies to async-imap's transitive imap-proto too. See
+# docs/patches/imap-proto-uidfetch.md; upstream when possible to drop the fork.
+[patch.crates-io]
+imap-proto = { path = "vendor/imap-proto" }
+
 [package]
 name = "agentmail"
 version = "0.3.0"
@@ -23,9 +30,12 @@ name = "agentmail"
 path = "src/main.rs"
 
 [dependencies]
-# IMAP protocol (tokio runtime)
+# IMAP protocol (tokio runtime). `compress` enables RFC 4978 COMPRESS=DEFLATE,
+# negotiated on every connection — a large win on Yahoo/AOL 100k full-header
+# scans. All supported providers advertise COMPRESS=DEFLATE.
 async-imap = { version = "0.11", default-features = false, features = [
-  "runtime-tokio"
+  "runtime-tokio",
+  "compress",
 ] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

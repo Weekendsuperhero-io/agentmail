@@ -1,8 +1,10 @@
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_imap::Session;
+use async_imap::extensions::compress::DeflateStream;
 use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -15,8 +17,15 @@ use crate::error::Result;
 use crate::parser;
 use crate::types::*;
 
-/// The concrete IMAP session type used throughout.
-pub type ImapSession = Session<TlsStream<TcpStream>>;
+/// The concrete IMAP session type used throughout: a TLS stream with RFC 4978
+/// DEFLATE compression negotiated on every connection. `DeflateStream` is
+/// `!Unpin`, so it is wrapped in `Pin<Box<_>>` (which is `Unpin`) to satisfy
+/// async-imap's `Session<T>` bounds. A concrete type — not `dyn` — so it does
+/// not reintroduce the higher-ranked-lifetime conflict with
+/// `with_session_retry`'s op closures. Every supported provider advertises
+/// COMPRESS=DEFLATE; a server lacking it fails the compression handshake at
+/// connect.
+pub type ImapSession = Session<Pin<Box<DeflateStream<TlsStream<TcpStream>>>>>;
 
 /// Callback for reporting progress: `(completed, total)`.
 pub type ProgressFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
@@ -42,6 +51,10 @@ const IMAP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Shorter timeout for keep-alive pings.
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Max UIDs addressed in one FETCH command. Aligned with the common RFC 9738
+/// `MESSAGELIMIT=1000` so a single command never exceeds a MESSAGELIMIT server.
+pub(crate) const MAX_FETCH_CHUNK: usize = 1000;
 
 /// Maximum complete source accepted for one-click DKIM verification. Ranking
 /// never fetches complete messages; this bounds the one action-time exception
@@ -254,6 +267,109 @@ fn is_login_rate_limit(e: &AgentmailError) -> bool {
     )
 }
 
+/// Send the RFC 5161 `ENABLE` command for one or more extensions and return
+/// the capabilities the server confirms in its `* ENABLED …` response.
+///
+/// async-imap exposes no `enable` method, so this is written directly on the
+/// `run_command` / `read_response` primitives. It is the first building block
+/// toward Yahoo/AOL UID Mode (`ENABLE UIDONLY`), which lifts the visible-window
+/// limit — though UID Mode is not usable until the parser handles `UIDFETCH`
+/// responses (imap-proto gap; see docs/standards/imap/yahoo-aol-quirks.md).
+/// Safe to call for CONDSTORE/QRESYNC/UTF8=ACCEPT, which do not change the
+/// response framing.
+pub async fn enable<T>(session: &mut Session<T>, extensions: &str) -> Result<Vec<String>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    use async_imap::imap_proto::{Response, Status};
+
+    let tag = imap_timeout(session.run_command(format!("ENABLE {extensions}"))).await?;
+    let mut enabled: Vec<String> = Vec::new();
+    loop {
+        let response = imap_timeout(session.read_response()).await?;
+        let Some(response) = response else {
+            return Err(AgentmailError::NotConnected);
+        };
+        match response.parsed() {
+            // `* ENABLED <caps>` — imap-proto surfaces it as Capabilities.
+            Response::Capabilities(capabilities) => {
+                enabled.extend(
+                    capabilities
+                        .iter()
+                        .map(|capability| format!("{capability:?}")),
+                );
+            }
+            Response::Done {
+                tag: done,
+                status,
+                information,
+                ..
+            } if done == &tag => {
+                return match status {
+                    Status::Ok => Ok(enabled),
+                    other => Err(AgentmailError::Other(format!(
+                        "ENABLE {extensions} rejected: {other:?} {information:?}"
+                    ))),
+                };
+            }
+            // Unilateral/unsolicited responses may interleave; skip them.
+            _ => {}
+        }
+    }
+}
+
+/// Enumerate EVERY UID in the currently selected mailbox in RFC 9586 UID Mode,
+/// bypassing the Limited-Mode visible window. The caller must have enabled
+/// UIDONLY ([`enable`]) and selected the mailbox.
+///
+/// UID Mode caps each `SEARCH`/`FETCH` at `MESSAGELIMIT` results, so this walks
+/// the mailbox newest-to-oldest in `MESSAGELIMIT`-sized `PARTIAL` windows
+/// (`UID FETCH 1:* (UID) (PARTIAL -lo:-hi)`) until a short page marks the
+/// oldest message. Returns ascending, deduplicated UIDs — the full mailbox,
+/// not just the window.
+pub async fn walk_all_uids_uidmode<T>(
+    session: &mut Session<T>,
+    message_limit: u32,
+    on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
+) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    let window = message_limit.clamp(1, MAX_FETCH_CHUNK as u32);
+    let mut all: Vec<u32> = Vec::new();
+    let mut offset: u32 = 1;
+    loop {
+        check_cancel(cancel)?;
+        let end = offset.saturating_add(window - 1);
+        // Negative PARTIAL ranges count back from the newest message.
+        let items = format!("(UID) (PARTIAL -{offset}:-{end})");
+        let fetched = timed_uid_fetch_collect(session, "1:*", &items).await?;
+        let mut page = 0u32;
+        for item in fetched {
+            let fetch = item.map_err(AgentmailError::Imap)?;
+            if let Some(uid) = fetch.uid {
+                all.push(uid);
+                page += 1;
+            }
+        }
+        if let Some(progress) = on_progress {
+            progress(all.len() as u64, all.len() as u64);
+        }
+        // A short page means we reached the oldest message.
+        if page < window {
+            break;
+        }
+        offset = match end.checked_add(1) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    all.sort_unstable();
+    all.dedup();
+    Ok(all)
+}
+
 /// Connect to an IMAP server over TLS and authenticate, retrying a transient
 /// failure a few times with backoff (fresh connection each attempt).
 pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSession> {
@@ -297,7 +413,7 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
 
     let client = async_imap::Client::new(tls);
     let login_fut = client.login(&config.username, password);
-    let mut session = match tokio::time::timeout(IMAP_TIMEOUT, login_fut).await {
+    let plain = match tokio::time::timeout(IMAP_TIMEOUT, login_fut).await {
         Ok(Ok(session)) => session,
         Ok(Err((err, _client))) => return Err(AgentmailError::Imap(err)),
         Err(_elapsed) => {
@@ -307,6 +423,10 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
             )));
         }
     };
+
+    // Negotiate DEFLATE compression. `compress` runs `COMPRESS DEFLATE` and
+    // wraps the stream; `Box::pin` gives the `Unpin` type the alias requires.
+    let mut session = imap_timeout(plain.compress(Box::pin)).await?;
     send_client_id(&mut session).await;
     Ok(session)
 }
@@ -3076,5 +3196,223 @@ mod tests {
             commands.iter().any(|c| c.contains("UID SEARCH UID 1:13")),
             "short result triggers one bounded window up to UIDNEXT: {commands:?}"
         );
+    }
+
+    /// A scripted server that answers `ENABLE` with an `* ENABLED` echo and a
+    /// tagged OK, for driving the `enable` primitive without a real server.
+    async fn scripted_enable_session(
+        reply: &'static str,
+    ) -> (Session<DuplexStream>, tokio::task::JoinHandle<Vec<String>>) {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = command.split_whitespace().next().unwrap().to_string();
+                commands.push(command.clone());
+                if command.contains(" LOGIN ") {
+                    writer
+                        .write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else if command.contains("ENABLE ") {
+                    writer.write_all(reply.as_bytes()).await.unwrap();
+                    writer
+                        .write_all(format!("{tag} OK ENABLE completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    break;
+                } else {
+                    panic!("unexpected command: {command:?}");
+                }
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+        (session, server)
+    }
+
+    #[tokio::test]
+    async fn enable_confirms_the_server_enabled_response() {
+        let (mut session, server) = scripted_enable_session("* ENABLED UIDONLY\r\n").await;
+
+        let enabled = enable(&mut session, "UIDONLY")
+            .await
+            .expect("ENABLE should succeed on a tagged OK");
+
+        assert_eq!(enabled.len(), 1, "one capability echoed: {enabled:?}");
+        drop(session);
+        let commands = server.await.expect("scripted server should finish");
+        assert!(
+            commands.iter().any(|c| c.contains("ENABLE UIDONLY")),
+            "the ENABLE command reached the server: {commands:?}"
+        );
+    }
+
+    /// A scripted server that answers `UID FETCH` with a UID-Mode `UIDFETCH`
+    /// response (RFC 9586) whose UID data item is omitted — the leading
+    /// number is the UID. Exercises the local imap-proto UIDFETCH patch.
+    async fn scripted_uidfetch_session()
+    -> (Session<DuplexStream>, tokio::task::JoinHandle<Vec<String>>) {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = command.split_whitespace().next().unwrap().to_string();
+                commands.push(command.clone());
+                if command.contains(" LOGIN ") {
+                    writer
+                        .write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else if command.contains("UID FETCH") {
+                    // No `UID` item inside the parens — the 42 IS the UID.
+                    writer
+                        .write_all(
+                            format!(
+                                "* 42 UIDFETCH (RFC822.SIZE 5)\r\n{tag} OK UID FETCH completed\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    break;
+                } else {
+                    panic!("unexpected command: {command:?}");
+                }
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+        (session, server)
+    }
+
+    /// A scripted UID-Mode server that answers PARTIAL windows: two full pages
+    /// of `window` UIDFETCH rows, then a short final page (end of mailbox).
+    async fn scripted_partial_walk_session(
+        window: u32,
+    ) -> (Session<DuplexStream>, tokio::task::JoinHandle<Vec<String>>) {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            let mut page = 0u32;
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = command.split_whitespace().next().unwrap().to_string();
+                commands.push(command.clone());
+                if command.contains(" LOGIN ") {
+                    writer
+                        .write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else if command.contains("UID FETCH") {
+                    // Page 0,1: `window` rows (full). Page 2: 1 row (short → stop).
+                    let rows = if page < 2 { window } else { 1 };
+                    let mut body = String::new();
+                    for i in 0..rows {
+                        let uid = 100_000 - page * window - i;
+                        body.push_str(&format!("* {uid} UIDFETCH (RFC822.SIZE 10)\r\n"));
+                    }
+                    body.push_str(&format!("{tag} OK UID FETCH completed\r\n"));
+                    writer.write_all(body.as_bytes()).await.unwrap();
+                    page += 1;
+                } else {
+                    panic!("unexpected command: {command:?}");
+                }
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+        (session, server)
+    }
+
+    #[tokio::test]
+    async fn walk_all_uids_uidmode_pages_with_partial_until_a_short_page() {
+        let window = 3;
+        let (mut session, server) = scripted_partial_walk_session(window).await;
+
+        let uids = walk_all_uids_uidmode(&mut session, window, None, None)
+            .await
+            .expect("PARTIAL walk should complete");
+
+        // 3 + 3 + 1 = 7 unique UIDs across the two full pages and the short one.
+        assert_eq!(uids.len(), 7, "walk collects every page: {uids:?}");
+        drop(session);
+        let commands = server.await.expect("scripted server should finish");
+        let fetches: Vec<&String> = commands
+            .iter()
+            .filter(|c| c.contains("UID FETCH"))
+            .collect();
+        assert_eq!(fetches.len(), 3, "two full pages + one short: {fetches:?}");
+        assert!(
+            fetches[0].contains("PARTIAL -1:-3") && fetches[1].contains("PARTIAL -4:-6"),
+            "PARTIAL windows advance newest-to-oldest: {fetches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn uidfetch_response_is_parsed_with_synthesized_uid() {
+        let (mut session, server) = scripted_uidfetch_session().await;
+
+        let fetched = timed_uid_fetch_collect(&mut session, "42", "(RFC822.SIZE)")
+            .await
+            .expect("UID FETCH should complete");
+        let uids: Vec<Option<u32>> = fetched
+            .into_iter()
+            .map(|item| item.expect("fetch item").uid)
+            .collect();
+
+        assert_eq!(
+            uids,
+            vec![Some(42)],
+            "the UIDFETCH leading number is surfaced as the message UID"
+        );
+        drop(session);
+        server.await.expect("scripted server should finish");
+    }
+
+    #[tokio::test]
+    async fn enable_with_no_enabled_echo_still_succeeds_on_ok() {
+        // A server may enable nothing (unknown extension) yet still reply OK.
+        let (mut session, server) = scripted_enable_session("").await;
+
+        let enabled = enable(&mut session, "UIDONLY")
+            .await
+            .expect("a tagged OK with no ENABLED line is still success");
+
+        assert!(enabled.is_empty());
+        drop(session);
+        server.await.expect("scripted server should finish");
     }
 }

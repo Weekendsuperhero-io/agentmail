@@ -467,6 +467,46 @@ impl Agentmail {
     /// fetched instead of starting over.
     const SCAN_RESUME_ATTEMPTS: usize = 3;
 
+    /// Enter RFC 9586 UID Mode when the server supports it, so a ranking scan
+    /// sees the WHOLE mailbox instead of the newest-N visible window (Yahoo/AOL
+    /// `UIDONLY`). Returns the per-command page size (`MESSAGELIMIT`) to walk
+    /// by, or `None` for Limited Mode.
+    ///
+    /// A UID-Mode session changes every response to `UIDFETCH` for the rest of
+    /// its life, so callers MUST drop it rather than return it to the shared
+    /// pool (`uid_mode_release`).
+    async fn enter_uid_mode(
+        &self,
+        account: &str,
+        session: &mut imap_client::ImapSession,
+    ) -> Result<Option<u32>> {
+        // UID Mode's whole-mailbox walk only pays off through the cache; with
+        // the cache disabled, the Limited-Mode live fallback (windowed) is the
+        // only working path, so stay in Limited Mode.
+        if !self.header_cache.is_persistent() {
+            return Ok(None);
+        }
+        let caps = self.pool.server_caps(account, session).await?;
+        if !caps.has("UIDONLY") {
+            return Ok(None);
+        }
+        let page = caps
+            .message_limit()
+            .unwrap_or(imap_client::MAX_FETCH_CHUNK as u32);
+        imap_client::enable(session, "UIDONLY").await?;
+        Ok(Some(page))
+    }
+
+    /// Release a ranking-scan session correctly: a Limited-Mode session returns
+    /// to the pool for reuse; a UID-Mode one is dropped (closed), since it must
+    /// never serve a later Limited-Mode operation.
+    async fn uid_mode_release(session: connection::PooledSession, uid_mode: Option<u32>) {
+        if uid_mode.is_none() {
+            session.release().await;
+        }
+        // else: dropped here — the UID-Mode connection closes.
+    }
+
     async fn scan_resume_backoff(
         attempt: usize,
         scan: &str,
@@ -538,6 +578,7 @@ impl Agentmail {
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
         let own = self.own_addresses(account);
         let own_vec: Vec<String> = own.iter().cloned().collect();
+        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
         if let Some(page) = self
             .header_cache
             .top_senders_page(
@@ -545,6 +586,7 @@ impl Agentmail {
                 account,
                 config,
                 &mailboxes,
+                uid_mode,
                 &own_vec,
                 offset,
                 limit,
@@ -553,7 +595,7 @@ impl Agentmail {
             )
             .await?
         {
-            session.release().await;
+            Self::uid_mode_release(session, uid_mode).await;
             let item_count = page.items.len();
             let senders = page
                 .items
@@ -753,6 +795,7 @@ impl Agentmail {
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
         let own = self.own_addresses(account);
         let own_vec: Vec<String> = own.iter().cloned().collect();
+        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
         if let Some(page) = self
             .header_cache
             .top_subscriptions_page(
@@ -760,6 +803,7 @@ impl Agentmail {
                 account,
                 config,
                 &mailboxes,
+                uid_mode,
                 &own_vec,
                 offset,
                 limit,
@@ -768,7 +812,7 @@ impl Agentmail {
             )
             .await?
         {
-            session.release().await;
+            Self::uid_mode_release(session, uid_mode).await;
             let item_count = page.items.len();
             let lists = page
                 .items
@@ -982,6 +1026,7 @@ impl Agentmail {
             .pool
             .account_config(account)
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
+        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
         if let Some(page) = self
             .header_cache
             .top_mailing_lists_page(
@@ -989,6 +1034,7 @@ impl Agentmail {
                 account,
                 config,
                 &mailboxes,
+                uid_mode,
                 offset,
                 limit,
                 on_progress,
@@ -996,7 +1042,7 @@ impl Agentmail {
             )
             .await?
         {
-            session.release().await;
+            Self::uid_mode_release(session, uid_mode).await;
             let item_count = page.items.len();
             let lists = page
                 .items

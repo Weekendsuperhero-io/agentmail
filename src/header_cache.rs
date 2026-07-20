@@ -232,6 +232,13 @@ impl HeaderCache {
         }
     }
 
+    /// Whether a persistent projection is available. UID Mode routes the
+    /// whole-mailbox walk through the cache, so callers only enter it when
+    /// this is true — otherwise the Limited-Mode live fallback stays usable.
+    pub(crate) fn is_persistent(&self) -> bool {
+        self.path.is_some()
+    }
+
     fn account_is_quirky(&self, account_key: &str) -> bool {
         self.quirky_accounts.lock().contains(account_key)
     }
@@ -412,6 +419,7 @@ impl HeaderCache {
         account_name: &str,
         config: &AccountConfig,
         mailboxes: &[String],
+        uid_mode: Option<u32>,
         own_addresses: &[String],
         offset: usize,
         limit: usize,
@@ -424,6 +432,7 @@ impl HeaderCache {
                 account_name,
                 config,
                 mailboxes,
+                uid_mode,
                 on_progress,
                 cancel,
             )
@@ -450,6 +459,7 @@ impl HeaderCache {
         account_name: &str,
         config: &AccountConfig,
         mailboxes: &[String],
+        uid_mode: Option<u32>,
         own_addresses: &[String],
         offset: usize,
         limit: usize,
@@ -462,6 +472,7 @@ impl HeaderCache {
                 account_name,
                 config,
                 mailboxes,
+                uid_mode,
                 on_progress,
                 cancel,
             )
@@ -488,6 +499,7 @@ impl HeaderCache {
         account_name: &str,
         config: &AccountConfig,
         mailboxes: &[String],
+        uid_mode: Option<u32>,
         offset: usize,
         limit: usize,
         on_progress: Option<&ProgressFn>,
@@ -499,6 +511,7 @@ impl HeaderCache {
                 account_name,
                 config,
                 mailboxes,
+                uid_mode,
                 on_progress,
                 cancel,
             )
@@ -521,6 +534,7 @@ impl HeaderCache {
         account_name: &str,
         config: &AccountConfig,
         mailboxes: &[String],
+        uid_mode: Option<u32>,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> crate::Result<Option<RankScope>> {
@@ -540,7 +554,14 @@ impl HeaderCache {
             let gate = self.gate(&key);
             let _guard = gate.lock().await;
             match self
-                .sync_cached(Arc::clone(path), session, &key, on_progress, cancel)
+                .sync_cached(
+                    Arc::clone(path),
+                    session,
+                    &key,
+                    uid_mode,
+                    on_progress,
+                    cancel,
+                )
                 .await
             {
                 Ok(_) => selected.push(key.mailbox),
@@ -605,6 +626,7 @@ impl HeaderCache {
         path: Arc<PathBuf>,
         session: &mut ImapSession,
         key: &CacheKey,
+        uid_mode: Option<u32>,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> std::result::Result<StoredState, CacheSyncError> {
@@ -626,7 +648,12 @@ impl HeaderCache {
             let live_status = examine_status(session, &key.mailbox).await?;
 
             if let Some(state) = state
-                && is_cache_hit(state, &live_status, expected_account_revision)
+                && is_cache_hit(
+                    state,
+                    &live_status,
+                    expected_account_revision,
+                    uid_mode.is_some(),
+                )
             {
                 let covered = load_covered_count(Arc::clone(&path), key.clone(), state).await?;
                 // A complete, unpoisoned snapshot is served as-is. A projection
@@ -686,41 +713,54 @@ impl HeaderCache {
                 _ => None,
             });
 
-            let (snapshot, mut live_uids, sync_kind, snapshot_stable) =
-                if let Some((base, from_uid)) = tail_base {
-                    let (snapshot, tail, tail_stable) = stable_uid_search(
-                        session,
-                        &key.mailbox,
-                        SearchScope::Tail(from_uid),
-                        cancel,
-                    )
-                    .await?;
-                    let membership = load_membership(Arc::clone(&path), key.clone()).await?;
-                    if tail_stable && pure_append_is_proven(base, &snapshot, &membership, &tail) {
-                        let mut combined = membership;
-                        combined.extend(tail);
-                        combined.sort_unstable();
-                        combined.dedup();
-                        (snapshot, combined, SyncKind::Tail, true)
-                    } else {
-                        let (snapshot, membership, stable) =
-                            stable_uid_search(session, &key.mailbox, SearchScope::All, cancel)
-                                .await?;
-                        (snapshot, membership, SyncKind::Membership, stable)
-                    }
+            let (snapshot, mut live_uids, sync_kind, snapshot_stable) = if let Some(message_limit) =
+                uid_mode
+            {
+                // UID Mode: walk the WHOLE mailbox past the visible window
+                // (SEARCH would only see the window). Always a full
+                // membership pass — the header fetch below still skips
+                // already-cached UIDs, so only new headers are fetched.
+                let membership =
+                    imap_client::walk_all_uids_uidmode(session, message_limit, on_progress, cancel)
+                        .await?;
+                let snapshot = examine_status(session, &key.mailbox).await?;
+                let kind = if state.is_none()
+                    || state.is_some_and(|value| value.uid_validity != uid_validity)
+                {
+                    SyncKind::Cold
                 } else {
-                    let kind = if state.is_none()
-                        || state.is_some_and(|value| value.uid_validity != uid_validity)
-                        || regression
-                    {
-                        SyncKind::Cold
-                    } else {
-                        SyncKind::Membership
-                    };
+                    SyncKind::Membership
+                };
+                (snapshot, membership, kind, true)
+            } else if let Some((base, from_uid)) = tail_base {
+                let (snapshot, tail, tail_stable) =
+                    stable_uid_search(session, &key.mailbox, SearchScope::Tail(from_uid), cancel)
+                        .await?;
+                let membership = load_membership(Arc::clone(&path), key.clone()).await?;
+                if tail_stable && pure_append_is_proven(base, &snapshot, &membership, &tail) {
+                    let mut combined = membership;
+                    combined.extend(tail);
+                    combined.sort_unstable();
+                    combined.dedup();
+                    (snapshot, combined, SyncKind::Tail, true)
+                } else {
                     let (snapshot, membership, stable) =
                         stable_uid_search(session, &key.mailbox, SearchScope::All, cancel).await?;
-                    (snapshot, membership, kind, stable)
+                    (snapshot, membership, SyncKind::Membership, stable)
+                }
+            } else {
+                let kind = if state.is_none()
+                    || state.is_some_and(|value| value.uid_validity != uid_validity)
+                    || regression
+                {
+                    SyncKind::Cold
+                } else {
+                    SyncKind::Membership
                 };
+                let (snapshot, membership, stable) =
+                    stable_uid_search(session, &key.mailbox, SearchScope::All, cancel).await?;
+                (snapshot, membership, kind, stable)
+            };
 
             let Some(snapshot_uid_validity) = snapshot.uid_validity else {
                 return Err(CacheError::Invariant(format!(
@@ -1015,11 +1055,22 @@ fn same_snapshot(left: &MailboxStatus, right: &MailboxStatus) -> bool {
 /// mailbox triple, the snapshot must predate no local mutation: Yahoo/AOL pin
 /// INBOX `EXISTS` to a sliding window (older mail backfills the view), so a
 /// delete can leave the triple identical while the ranking data changed.
-fn is_cache_hit(state: StoredState, status: &MailboxStatus, account_revision: i64) -> bool {
+///
+/// In UID Mode the stored `message_count` is the FULL mailbox (from the
+/// PARTIAL walk), while `EXISTS` still reports only the visible window — so
+/// the `EXISTS` comparison is skipped there and freshness rests on
+/// UIDVALIDITY + UIDNEXT + the mutation fence (all of which are full-mailbox
+/// accurate in UID Mode).
+fn is_cache_hit(
+    state: StoredState,
+    status: &MailboxStatus,
+    account_revision: i64,
+    uid_mode: bool,
+) -> bool {
     status.uid_validity == Some(state.uid_validity)
         && state.uid_next.is_some()
         && status.uid_next == state.uid_next
-        && status.exists == state.exists
+        && (uid_mode || status.exists == state.exists)
         && state.account_revision == account_revision
 }
 
@@ -2200,7 +2251,7 @@ mod tests {
             exists: 3,
             highest_modseq: Some(999),
         };
-        assert!(is_cache_hit(state, &status, 0));
+        assert!(is_cache_hit(state, &status, 0, false));
     }
 
     #[test]
@@ -2219,10 +2270,37 @@ mod tests {
             exists: 3,
             highest_modseq: None,
         };
-        assert!(is_cache_hit(state, &status, 4));
+        assert!(is_cache_hit(state, &status, 4, false));
         assert!(
-            !is_cache_hit(state, &status, 5),
+            !is_cache_hit(state, &status, 5, false),
             "a fence bump after publish must force a membership resync"
+        );
+    }
+
+    #[test]
+    fn uid_mode_hit_ignores_the_windowed_exists() {
+        // UID Mode stores the full mailbox count; EXAMINE still reports the
+        // window, so a hit must not require EXISTS to match — only UIDVALIDITY,
+        // UIDNEXT, and the fence.
+        let state = StoredState {
+            uid_validity: 10,
+            uid_next: Some(500),
+            exists: 435_000, // full mailbox, from the PARTIAL walk
+            account_revision: 0,
+        };
+        let status = MailboxStatus {
+            uid_validity: Some(10),
+            uid_next: Some(500),
+            exists: 100_000, // windowed EXAMINE
+            highest_modseq: None,
+        };
+        assert!(
+            is_cache_hit(state, &status, 0, true),
+            "UID Mode hit rests on UIDNEXT + fence, not the windowed EXISTS"
+        );
+        assert!(
+            !is_cache_hit(state, &status, 0, false),
+            "Limited Mode still requires EXISTS to match"
         );
     }
 
@@ -2240,7 +2318,7 @@ mod tests {
             exists: 3,
             highest_modseq: None,
         };
-        assert!(!is_cache_hit(state, &status, 0));
+        assert!(!is_cache_hit(state, &status, 0, false));
     }
 
     #[test]
