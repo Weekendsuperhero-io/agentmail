@@ -90,11 +90,39 @@ where
 }
 
 /// Select a mailbox with timeout. Use this instead of calling `session.select()` directly.
+/// Yahoo/AOL intermittently answer SELECT/EXAMINE with
+/// `NO [SERVERBUG] ... Please try again later`. It is genuinely transient;
+/// honor the server's own advice with short backoff retries before
+/// surfacing the failure.
+const MAILBOX_OPEN_ATTEMPTS: usize = 3;
+
+fn is_transient_server_bug(error: &AgentmailError) -> bool {
+    matches!(
+        error,
+        AgentmailError::Imap(async_imap::error::Error::No(text))
+            if text.to_uppercase().contains("SERVERBUG")
+    )
+}
+
 pub async fn select(
     session: &mut ImapSession,
     mailbox: &str,
 ) -> Result<async_imap::types::Mailbox> {
-    imap_timeout(session.select(mailbox)).await
+    for attempt in 1..=MAILBOX_OPEN_ATTEMPTS {
+        match imap_timeout(session.select(mailbox)).await {
+            Err(error) if is_transient_server_bug(&error) && attempt < MAILBOX_OPEN_ATTEMPTS => {
+                debug!(
+                    target: "agentmail",
+                    mailbox,
+                    attempt,
+                    "transient SERVERBUG opening mailbox; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1_500 * attempt as u64)).await;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the final attempt always returns")
 }
 
 /// Examine a mailbox read-only with timeout. Discovery scans use this instead
@@ -106,7 +134,21 @@ pub async fn examine<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
-    imap_timeout(session.examine(mailbox)).await
+    for attempt in 1..=MAILBOX_OPEN_ATTEMPTS {
+        match imap_timeout(session.examine(mailbox)).await {
+            Err(error) if is_transient_server_bug(&error) && attempt < MAILBOX_OPEN_ATTEMPTS => {
+                debug!(
+                    target: "agentmail",
+                    mailbox,
+                    attempt,
+                    "transient SERVERBUG examining mailbox; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1_500 * attempt as u64)).await;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the final attempt always returns")
 }
 
 /// Require a usable UIDVALIDITY value from a successful SELECT or EXAMINE.
@@ -1906,11 +1948,25 @@ where
         }
     }
     let raw_message = raw_message.ok_or(AgentmailError::MessageNotFound(uid))?;
-    if raw_message.len() != expected_size as usize {
+    // Truncation guard only: FEWER bytes than advertised risks a clipped
+    // body under a DKIM `l=` tag. MORE bytes means the server understates
+    // RFC822.SIZE (Yahoo/AOL consistently deliver a few bytes over — a
+    // line-ending accounting difference); the message is complete and DKIM
+    // verification itself is the cryptographic integrity check.
+    if raw_message.len() < expected_size as usize {
         return Err(AgentmailError::Other(format!(
             "message UID {uid} changed size or returned a partial source during DKIM fetch: expected {expected_size} bytes, received {}",
             raw_message.len()
         )));
+    }
+    if raw_message.len() > expected_size as usize {
+        debug!(
+            target: "agentmail",
+            uid,
+            expected = expected_size,
+            received = raw_message.len(),
+            "server delivered more bytes than its advertised RFC822.SIZE; proceeding"
+        );
     }
     check_cancel(cancel)?;
 

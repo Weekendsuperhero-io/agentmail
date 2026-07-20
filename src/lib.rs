@@ -461,7 +461,55 @@ impl Agentmail {
     /// Sorted by message count descending.
     ///
     /// When `mailbox` is `None`, scans all mailboxes in the account.
+    /// Attempts for a ranking scan whose session died mid-flight (throttling
+    /// servers issue BYE during long cold scans). Progress is chunk-committed
+    /// to the header cache, so a resumed attempt reuses everything already
+    /// fetched instead of starting over.
+    const SCAN_RESUME_ATTEMPTS: usize = 3;
+
+    async fn scan_resume_backoff(
+        attempt: usize,
+        scan: &str,
+        cancel: Option<&CancelFn>,
+    ) -> Result<()> {
+        imap_client::check_cancel(cancel)?;
+        tracing::warn!(
+            target: "agentmail",
+            scan,
+            attempt,
+            "connection dropped during ranking scan; resuming with a fresh session (progress is cached)",
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+        imap_client::check_cancel(cancel)?;
+        Ok(())
+    }
+
     pub async fn top_senders(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        offset: usize,
+        limit: usize,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<TopSendersResponse> {
+        for attempt in 1..=Self::SCAN_RESUME_ATTEMPTS {
+            match self
+                .top_senders_once(mailbox, account, offset, limit, on_progress, cancel)
+                .await
+            {
+                Err(error)
+                    if error.is_connection_error() && attempt < Self::SCAN_RESUME_ATTEMPTS =>
+                {
+                    Self::scan_resume_backoff(attempt, "top_senders", cancel).await?;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the final attempt always returns")
+    }
+
+    async fn top_senders_once(
         &self,
         mailbox: Option<&str>,
         account: &str,
@@ -652,6 +700,31 @@ impl Agentmail {
     ///
     /// When `mailbox` is `None`, scans all mailboxes in the account.
     pub async fn top_subscriptions(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        offset: usize,
+        limit: usize,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<TopSubscriptionsResponse> {
+        for attempt in 1..=Self::SCAN_RESUME_ATTEMPTS {
+            match self
+                .top_subscriptions_once(mailbox, account, offset, limit, on_progress, cancel)
+                .await
+            {
+                Err(error)
+                    if error.is_connection_error() && attempt < Self::SCAN_RESUME_ATTEMPTS =>
+                {
+                    Self::scan_resume_backoff(attempt, "top_subscriptions", cancel).await?;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the final attempt always returns")
+    }
+
+    async fn top_subscriptions_once(
         &self,
         mailbox: Option<&str>,
         account: &str,
@@ -858,6 +931,31 @@ impl Agentmail {
     /// Groups all messages from the same mailing list regardless of sender.
     /// When `mailbox` is `None`, scans all mailboxes (excluding trash/junk/drafts).
     pub async fn top_mailing_lists(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        offset: usize,
+        limit: usize,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<TopMailingListsResponse> {
+        for attempt in 1..=Self::SCAN_RESUME_ATTEMPTS {
+            match self
+                .top_mailing_lists_once(mailbox, account, offset, limit, on_progress, cancel)
+                .await
+            {
+                Err(error)
+                    if error.is_connection_error() && attempt < Self::SCAN_RESUME_ATTEMPTS =>
+                {
+                    Self::scan_resume_backoff(attempt, "top_mailing_lists", cancel).await?;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the final attempt always returns")
+    }
+
+    async fn top_mailing_lists_once(
         &self,
         mailbox: Option<&str>,
         account: &str,
