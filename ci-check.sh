@@ -27,6 +27,11 @@ fi
 echo "==> Building..."
 cargo build --all-features
 
+echo "==> Checking docs..."
+# Mirror the CI doc job so broken intra-doc links (e.g. linking a public item
+# to a private one) fail here instead of in CI.
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
 echo "==> Running tests..."
 if command -v cargo-nextest >/dev/null 2>&1; then
     cargo nextest run --all-features --profile ci

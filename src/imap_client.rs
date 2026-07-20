@@ -3402,6 +3402,29 @@ mod tests {
         server.await.expect("scripted server should finish");
     }
 
+    /// The exact shape AOL returns for a UID-only walk page:
+    /// `* <uid> UIDFETCH (UID <uid>)` with the UID present inside too.
+    #[test]
+    fn uidonly_uidfetch_line_parses_via_the_patched_imap_proto() {
+        use async_imap::imap_proto::{self, Response};
+        let line = b"* 434894 UIDFETCH (UID 434894)\r\n";
+        let (rest, response) = imap_proto::parser::parse_response(line)
+            .expect("patched imap-proto must parse a UID-only UIDFETCH line");
+        assert!(rest.is_empty(), "the whole line is consumed: {rest:?}");
+        match response {
+            Response::Fetch(num, attrs) => {
+                assert_eq!(num, 434894);
+                assert!(
+                    attrs
+                        .iter()
+                        .any(|a| matches!(a, imap_proto::AttributeValue::Uid(434894))),
+                    "UID attribute present: {attrs:?}"
+                );
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn enable_with_no_enabled_echo_still_succeeds_on_ok() {
         // A server may enable nothing (unknown extension) yet still reply OK.

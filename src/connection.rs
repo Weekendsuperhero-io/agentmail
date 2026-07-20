@@ -240,8 +240,8 @@ impl ConnectionPool {
     /// session — first or retry attempt — is dropped, never returned to the
     /// pool. Server rejections, parse errors, etc. are returned as-is (no
     /// retry). This closes the connection-died-*during*-an-op race that the
-    /// idle-TTL eviction can't see. Control flow lives in [`retry_once`], which
-    /// is unit-tested without real sessions.
+    /// idle-TTL eviction can't see. Control flow lives in the `retry_once!`
+    /// macro, which is unit-tested without real sessions.
     pub async fn with_session_retry<T>(
         &self,
         account: &str,
