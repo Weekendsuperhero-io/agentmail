@@ -243,6 +243,17 @@ fn is_retryable_connect_error(e: &AgentmailError) -> bool {
     e.is_connection_error() || matches!(e, AgentmailError::Imap(async_imap::error::Error::No(_)))
 }
 
+/// Yahoo/AOL reject over-eager logins with `NO [LIMIT] LOGIN Rate limit
+/// hit.` — sub-second retries only extend the penalty window, so these get
+/// materially longer spacing than an ordinary transient failure.
+fn is_login_rate_limit(e: &AgentmailError) -> bool {
+    matches!(
+        e,
+        AgentmailError::Imap(async_imap::error::Error::No(text))
+            if text.to_uppercase().contains("RATE LIMIT")
+    )
+}
+
 /// Connect to an IMAP server over TLS and authenticate, retrying a transient
 /// failure a few times with backoff (fresh connection each attempt).
 pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSession> {
@@ -251,13 +262,21 @@ pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSessi
         match connect_once(config, password).await {
             Ok(session) => return Ok(session),
             Err(e) if attempt < MAX_CONNECT_ATTEMPTS && is_retryable_connect_error(&e) => {
+                let wait = if is_login_rate_limit(&e) {
+                    // Respect the rate limiter: sub-second retries only
+                    // extend the penalty window.
+                    Duration::from_secs(5 * attempt as u64)
+                } else {
+                    backoff
+                };
                 debug!(
                     target: "agentmail",
                     attempt,
                     max = MAX_CONNECT_ATTEMPTS,
+                    wait_ms = wait.as_millis() as u64,
                     "transient connect/login failure; retrying after backoff"
                 );
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(wait).await;
                 backoff *= 2;
             }
             Err(e) => return Err(e),
@@ -278,7 +297,7 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
 
     let client = async_imap::Client::new(tls);
     let login_fut = client.login(&config.username, password);
-    let session = match tokio::time::timeout(IMAP_TIMEOUT, login_fut).await {
+    let mut session = match tokio::time::timeout(IMAP_TIMEOUT, login_fut).await {
         Ok(Ok(session)) => session,
         Ok(Err((err, _client))) => return Err(AgentmailError::Imap(err)),
         Err(_elapsed) => {
@@ -288,7 +307,34 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
             )));
         }
     };
+    send_client_id(&mut session).await;
     Ok(session)
+}
+
+/// Identify ourselves via the RFC 2971 `ID` command right after login.
+///
+/// Yahoo/AOL treat unidentified clients less favorably (documented rate
+/// limiting and `[SERVERBUG]` responses; this is why Delta Chat — async-imap's
+/// primary consumer — sends `ID` to Yahoo). Best-effort: `ID` is advisory, so
+/// a server that rejects or lacks it must not fail the connection. Runs under
+/// the ping timeout so a hung `ID` cannot stall a connect.
+async fn send_client_id(session: &mut ImapSession) {
+    let identification = [
+        ("name", Some("AgentMail")),
+        ("version", Some(env!("CARGO_PKG_VERSION"))),
+    ];
+    match tokio::time::timeout(PING_TIMEOUT, session.id(identification)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => debug!(
+            target: "agentmail",
+            error = %error,
+            "server rejected the ID command; continuing without identification"
+        ),
+        Err(_elapsed) => debug!(
+            target: "agentmail",
+            "ID command timed out; continuing without identification"
+        ),
+    }
 }
 
 /// Validate a session is still alive with NOOP.
@@ -1948,24 +1994,26 @@ where
         }
     }
     let raw_message = raw_message.ok_or(AgentmailError::MessageNotFound(uid))?;
-    // Truncation guard only: FEWER bytes than advertised risks a clipped
-    // body under a DKIM `l=` tag. MORE bytes means the server understates
-    // RFC822.SIZE (Yahoo/AOL consistently deliver a few bytes over — a
-    // line-ending accounting difference); the message is complete and DKIM
-    // verification itself is the cryptographic integrity check.
-    if raw_message.len() < expected_size as usize {
-        return Err(AgentmailError::Other(format!(
-            "message UID {uid} changed size or returned a partial source during DKIM fetch: expected {expected_size} bytes, received {}",
-            raw_message.len()
-        )));
-    }
-    if raw_message.len() > expected_size as usize {
+    // Yahoo/AOL's RFC822.SIZE is unreliable metadata — observed deltas run
+    // in BOTH directions (line-ending/charset accounting at ingestion), so a
+    // mismatch is not evidence of truncation. The only case where a clipped
+    // body could still verify is a DKIM signature carrying an `l=`
+    // body-length tag (RFC 6376 §3.5, widely discouraged); refuse the
+    // mismatch then. Otherwise proceed — DKIM verification over the received
+    // bytes is the cryptographic integrity check.
+    if raw_message.len() != expected_size as usize {
+        if dkim_signature_uses_body_length(&raw_message) {
+            return Err(AgentmailError::Other(format!(
+                "message UID {uid} changed size during DKIM fetch (expected {expected_size} bytes, received {}) and a DKIM signature uses an l= body-length tag; refusing the unsafe combination",
+                raw_message.len()
+            )));
+        }
         debug!(
             target: "agentmail",
             uid,
             expected = expected_size,
             received = raw_message.len(),
-            "server delivered more bytes than its advertised RFC822.SIZE; proceeding"
+            "server RFC822.SIZE disagrees with delivered bytes; proceeding — DKIM verification arbitrates integrity"
         );
     }
     check_cancel(cancel)?;
@@ -2230,6 +2278,49 @@ pub async fn timed_uid_fetch_collect_pub(
 /// Public wrapper for `extract_header_value`.
 pub fn extract_header_value_pub(headers: &str, name: &str) -> Option<String> {
     extract_header_value(headers, name)
+}
+
+/// Whether any DKIM-Signature header in the raw message advertises an `l=`
+/// body-length tag (RFC 6376 §3.5). Parsing is tag-precise — each header
+/// value is unfolded and split on `;` — because a naive substring match
+/// would false-positive on base64 `b=` data (whose folded chunks can end in
+/// `l==`). Splitting on `;` is safe: base64 never contains `;`, so a `b=`
+/// value is always a single segment.
+fn dkim_signature_uses_body_length(raw: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw);
+    let mut current: Option<String> = None;
+    let mut values: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            break; // end of the header block
+        }
+        if line.starts_with([' ', '\t']) {
+            if let Some(value) = current.as_mut() {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        if let Some(value) = current.take() {
+            values.push(value);
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("DKIM-Signature")
+        {
+            current = Some(value.trim().to_string());
+        }
+    }
+    values.extend(current);
+
+    values.iter().any(|value| {
+        value.split(';').any(|segment| {
+            // RFC 6376 permits FWS around the '='; tag names are exact.
+            segment
+                .trim()
+                .strip_prefix('l')
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+    })
 }
 
 /// Extract a header value from raw header text by name.
@@ -2817,6 +2908,37 @@ mod tests {
         assert!(!caps.has_imap4rev1());
         assert!(caps.has("IMAP4REV2"));
         assert!(caps.has_uidplus());
+    }
+
+    #[test]
+    fn dkim_body_length_detection_is_tag_precise() {
+        // A real l= tag, plain and with RFC-legal whitespace around '='.
+        assert!(dkim_signature_uses_body_length(
+            b"DKIM-Signature: v=1; a=rsa-sha256; l=1234; b=abc\r\n\r\nbody"
+        ));
+        assert!(dkim_signature_uses_body_length(
+            b"DKIM-Signature: v=1; l = 99; b=xyz\r\n\r\nbody"
+        ));
+        // Folded l= tag on a continuation line.
+        assert!(dkim_signature_uses_body_length(
+            b"DKIM-Signature: v=1; a=rsa-sha256;\r\n\tl=42; b=abc\r\n\r\nbody"
+        ));
+        // Second of two signatures carries the tag.
+        assert!(dkim_signature_uses_body_length(
+            b"DKIM-Signature: v=1; b=a\r\nDKIM-Signature: v=1; l=5; b=c\r\n\r\nbody"
+        ));
+        // Folded base64 b= data ending in `l==` must NOT false-positive.
+        assert!(!dkim_signature_uses_body_length(
+            b"DKIM-Signature: v=1; a=rsa-sha256;\r\n b=abcdefghijk\r\n l==; d=x.test\r\n\r\nbody"
+        ));
+        // `l=` text in the BODY is out of scope.
+        assert!(!dkim_signature_uses_body_length(
+            b"DKIM-Signature: v=1; b=abc\r\n\r\nl=fake in body"
+        ));
+        // Tag names are exact: `length=` is not `l=`.
+        assert!(!dkim_signature_uses_body_length(
+            b"DKIM-Signature: v=1; length=9; b=abc\r\n\r\nbody"
+        ));
     }
 
     #[test]

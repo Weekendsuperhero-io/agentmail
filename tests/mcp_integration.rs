@@ -1262,6 +1262,40 @@ async fn create_draft_output_exposes_optional_draft_identity() {
     }
 }
 
+/// Unknown parameters are rejected with the offending field named, not
+/// silently ignored — an agent passing a removed parameter (e.g. the old
+/// `includeContent`) learns the current contract from the error instead of
+/// wondering why the flag "did nothing".
+#[tokio::test]
+async fn unknown_parameters_are_rejected_not_ignored() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "get_messages",
+                "arguments": {
+                    "account": "dummy",
+                    "mailbox": "INBOX",
+                    "includeContent": true
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown parameter should be invalid params: {resp:#}"
+    );
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("includeContent")),
+        "the error should name the unknown field: {resp:#}"
+    );
+}
+
 /// The probe contract: a configured-but-unreachable account is a data outcome
 /// (`connected: false` + error text), never a protocol error.
 #[tokio::test]

@@ -352,22 +352,46 @@ impl From<crate::GetMessagesResponse> for GetMessagesOutput {
 
 impl WireOutput for GetMessagesOutput {
     fn text_summary(&self) -> String {
-        let resources = self
-            .messages
-            .iter()
-            .take(5)
-            .map(|message| message.resource_uri.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} of {} message(s) from {} at offset {}; UIDVALIDITY {}. Resources: {resources}",
-            self.messages.len(),
-            self.total,
-            self.mailbox,
-            self.offset,
-            self.uid_validity
+        message_rows_summary(
+            &format!(
+                "{} of {} message(s) from {} at offset {}; UIDVALIDITY {}.",
+                self.messages.len(),
+                self.total,
+                self.mailbox,
+                self.offset,
+                self.uid_validity
+            ),
+            &self.messages,
         )
     }
+}
+
+/// Per-row text lines for message listings. Hosts that surface only the text
+/// content block (not `structuredContent`) still need subjects and senders to
+/// be usable — bodies stay behind the resource URIs by policy.
+fn message_rows_summary(header: &str, messages: &[MessageMetadataOutput]) -> String {
+    let mut out = String::from(header);
+    for message in messages {
+        out.push_str(&format!(
+            "\n[{}] {} — {} ({}) {}",
+            message.uid,
+            clip(&message.subject, 70),
+            clip(&message.sender, 40),
+            message.date.as_deref().unwrap_or("no date"),
+            message.resource_uri,
+        ));
+    }
+    out
+}
+
+/// Truncate on a character boundary with an ellipsis marker.
+fn clip(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut clipped: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -415,20 +439,16 @@ impl From<crate::SearchMessagesResponse> for SearchMessagesOutput {
 
 impl WireOutput for SearchMessagesOutput {
     fn text_summary(&self) -> String {
-        let resources = self
-            .messages
-            .iter()
-            .take(5)
-            .map(|message| message.resource_uri.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} of {} matching message(s) from {} at offset {}; UIDVALIDITY {}. Resources: {resources}",
-            self.messages.len(),
-            self.total,
-            self.mailbox,
-            self.offset,
-            self.uid_validity
+        message_rows_summary(
+            &format!(
+                "{} of {} matching message(s) from {} at offset {}; UIDVALIDITY {}.",
+                self.messages.len(),
+                self.total,
+                self.mailbox,
+                self.offset,
+                self.uid_validity
+            ),
+            &self.messages,
         )
     }
 }

@@ -720,15 +720,7 @@ impl HeaderCache {
                         })
                         .count();
                 }
-                let returned: HashSet<u32> = rows.iter().map(|row| row.uid).collect();
-                let omitted: HashSet<u32> = chunk
-                    .iter()
-                    .copied()
-                    .filter(|uid| !returned.contains(uid))
-                    .collect();
-                if !omitted.is_empty() {
-                    live_uids.retain(|uid| !omitted.contains(uid));
-                }
+                reconcile_fetch_chunk(&key.mailbox, chunk, &rows, &mut live_uids)?;
                 store_headers(Arc::clone(&path), key.clone(), snapshot_uid_validity, rows).await?;
                 processed += chunk.len();
                 if let Some(progress) = on_progress {
@@ -767,15 +759,7 @@ impl HeaderCache {
                     for row in &mut rows {
                         row.uid_validity = Some(snapshot_uid_validity);
                     }
-                    let returned: HashSet<u32> = rows.iter().map(|row| row.uid).collect();
-                    let omitted: HashSet<u32> = chunk
-                        .iter()
-                        .copied()
-                        .filter(|uid| !returned.contains(uid))
-                        .collect();
-                    if !omitted.is_empty() {
-                        live_uids.retain(|uid| !omitted.contains(uid));
-                    }
+                    reconcile_fetch_chunk(&key.mailbox, chunk, &rows, &mut live_uids)?;
                     store_headers(Arc::clone(&path), key.clone(), snapshot_uid_validity, rows)
                         .await?;
                 }
@@ -837,6 +821,40 @@ impl HeaderCache {
 enum SearchScope {
     All,
     Tail(u32),
+}
+
+/// Reconcile a header-fetch chunk against the UIDs requested, dropping any
+/// the server omitted from `live_uids`.
+///
+/// A few omissions are normal (a UID expunged between SEARCH and FETCH). But
+/// an **entire** non-empty chunk coming back empty is the signature of a
+/// server rejection that async-imap's FETCH parser swallows into an empty
+/// `Ok` (its `take_while` stops at the tagged `Done` without reading NO/BAD).
+/// Silently pruning a whole chunk would corrupt the projection, so that case
+/// is surfaced as an error instead — the scan's resume loop then retries on a
+/// fresh session.
+fn reconcile_fetch_chunk(
+    mailbox: &str,
+    chunk: &[u32],
+    rows: &[ListHeaderRow],
+    live_uids: &mut Vec<u32>,
+) -> crate::Result<()> {
+    if rows.is_empty() && !chunk.is_empty() {
+        return Err(AgentmailError::Other(format!(
+            "mailbox {mailbox:?} returned no rows for a {}-UID header fetch (likely a swallowed server rejection); aborting to avoid corrupting the cache",
+            chunk.len()
+        )));
+    }
+    let returned: HashSet<u32> = rows.iter().map(|row| row.uid).collect();
+    let omitted: HashSet<u32> = chunk
+        .iter()
+        .copied()
+        .filter(|uid| !returned.contains(uid))
+        .collect();
+    if !omitted.is_empty() {
+        live_uids.retain(|uid| !omitted.contains(uid));
+    }
+    Ok(())
 }
 
 async fn stable_uid_search(
@@ -2232,6 +2250,40 @@ mod tests {
         .await
         .expect("count rows");
         assert_eq!(covered, 2);
+    }
+
+    #[test]
+    fn fetch_chunk_reconcile_prunes_gaps_but_rejects_a_whole_missing_chunk() {
+        let row = |uid| ListHeaderRow {
+            uid,
+            uid_validity: Some(10),
+            list_unsubscribe: None,
+            list_unsubscribe_post: None,
+            list_id: None,
+            sender_email: String::new(),
+            sender_name: String::new(),
+            date: None,
+            message_id: None,
+        };
+
+        // Partial omission (UID 2 expunged between SEARCH and FETCH): prune it.
+        let mut live = vec![1, 2, 3];
+        reconcile_fetch_chunk("INBOX", &[1, 2, 3], &[row(1), row(3)], &mut live)
+            .expect("partial omission reconciles");
+        assert_eq!(live, vec![1, 3]);
+
+        // Whole non-empty chunk empty (swallowed server rejection): error,
+        // and membership is left untouched for the resume path.
+        let mut live = vec![1, 2, 3];
+        let error = reconcile_fetch_chunk("INBOX", &[1, 2, 3], &[], &mut live)
+            .expect_err("a wholly-empty chunk must not silently prune");
+        assert!(error.to_string().contains("swallowed server rejection"));
+        assert_eq!(live, vec![1, 2, 3]);
+
+        // An empty request is a no-op, never an error.
+        let mut live = vec![1];
+        reconcile_fetch_chunk("INBOX", &[], &[], &mut live).expect("empty request is fine");
+        assert_eq!(live, vec![1]);
     }
 
     #[tokio::test]

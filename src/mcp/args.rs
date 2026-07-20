@@ -16,12 +16,12 @@ pub(super) fn default_true() -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "No arguments.")]
 pub(super) struct ListAccountsArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for listing mailboxes.")]
 pub(super) struct ListMailboxesArgs {
     #[schemars(description = "Account name (required).")]
@@ -39,7 +39,7 @@ pub(super) struct ListMailboxesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for checking IMAP connection status.")]
 pub(super) struct CheckConnectionArgs {
     #[schemars(description = "Account name to check connectivity for.")]
@@ -47,7 +47,7 @@ pub(super) struct CheckConnectionArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for listing IMAP server capabilities.")]
 pub(super) struct ListCapabilitiesArgs {
     #[schemars(description = "Account name to query capabilities for.")]
@@ -55,7 +55,7 @@ pub(super) struct ListCapabilitiesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for fetching a paginated chunk of messages.")]
 pub(super) struct GetMessagesArgs {
     #[schemars(description = "Mailbox name (required). Get names from list_mailboxes.")]
@@ -77,7 +77,7 @@ pub(super) struct GetMessagesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for mailbox message search with optional filters.")]
 pub(super) struct SearchMessagesArgs {
     #[schemars(description = "Mailbox name (required). Get names from list_mailboxes.")]
@@ -130,7 +130,7 @@ pub(super) struct SearchMessagesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for listing flags in use.")]
 pub(super) struct ListFlagsArgs {
     #[schemars(description = "Mailbox to scan. Omit to use the account-wide discovery plan.")]
@@ -140,7 +140,7 @@ pub(super) struct ListFlagsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for deleting one or more messages.")]
 pub(super) struct DeleteMessagesArgs {
     #[schemars(
@@ -170,7 +170,7 @@ pub(super) struct DeleteMessagesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(
     description = "Arguments for deleting all messages from the exact sender extracted from a specific message UID."
 )]
@@ -206,7 +206,7 @@ pub(super) struct DeleteBySenderArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for finding messages with attachments.")]
 pub(super) struct FindAttachmentsArgs {
     #[schemars(description = "Mailbox name. Omit to use the account-wide discovery plan.")]
@@ -228,7 +228,7 @@ pub(super) struct FindAttachmentsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for creating a draft message.")]
 pub(super) struct CreateDraftArgs {
     #[schemars(
@@ -258,7 +258,7 @@ pub(super) struct CreateDraftArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(inline, description = "Attachment to attach to a draft.")]
 pub(super) struct DraftAttachmentArg {
     #[schemars(description = "Local filesystem path to the file to attach (required).")]
@@ -276,7 +276,7 @@ pub(super) struct DraftAttachmentArg {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for moving a message between mailboxes.")]
 pub(super) struct MoveMessageArgs {
     #[schemars(description = "Source mailbox name.")]
@@ -300,7 +300,7 @@ pub(super) struct MoveMessageArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for unsubscribe + optional list cleanup.")]
 pub(super) struct UnsubscribeMessageArgs {
     #[schemars(
@@ -350,7 +350,7 @@ pub(super) struct UnsubscribeMessageArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for listing top senders by message count.")]
 pub(super) struct TopSendersArgs {
     #[schemars(description = "Mailbox name. Omit to use the account-wide discovery plan.")]
@@ -372,7 +372,7 @@ pub(super) struct TopSendersArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(
     description = "Arguments for listing top subscriptions (bulk senders) by message count."
 )]
@@ -396,7 +396,7 @@ pub(super) struct TopSubscriptionsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for listing top mailing lists by List-Id header.")]
 pub(super) struct TopMailingListsArgs {
     #[schemars(description = "Mailbox name. Omit to use the account-wide discovery plan.")]
@@ -418,7 +418,7 @@ pub(super) struct TopMailingListsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for deleting all messages with a specific List-Id.")]
 pub(super) struct DeleteListIdArgs {
     #[schemars(
@@ -437,7 +437,7 @@ pub(super) struct DeleteListIdArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for creating a new mailbox on the server.")]
 pub(super) struct CreateMailboxArgs {
     #[schemars(
@@ -451,7 +451,7 @@ pub(super) struct CreateMailboxArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for downloading message attachments to disk.")]
 pub(super) struct DownloadAttachmentsArgs {
     #[schemars(
@@ -474,7 +474,7 @@ pub(super) struct DownloadAttachmentsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(
     description = "Arguments for adding flags and/or setting an Apple Mail color on a message."
 )]
@@ -506,7 +506,7 @@ pub(super) struct AddFlagsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(
     description = "Arguments for removing flags and/or clearing Apple Mail color from a message."
 )]
@@ -543,14 +543,14 @@ pub(super) struct RemoveFlagsArgs {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct InboxSummaryArgs {
     #[schemars(description = "Account name to summarize.")]
     pub(super) account: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct CleanupSenderArgs {
     #[schemars(description = "Account name.")]
     pub(super) account: String,
@@ -559,7 +559,7 @@ pub(super) struct CleanupSenderArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct FindAttachmentsPromptArgs {
     #[schemars(description = "Account name.")]
     pub(super) account: String,
@@ -568,7 +568,7 @@ pub(super) struct FindAttachmentsPromptArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ComposeEmailArgs {
     #[schemars(description = "Account name to send from.")]
     pub(super) account: String,
@@ -579,14 +579,14 @@ pub(super) struct ComposeEmailArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct UnsubscribeCleanupArgs {
     #[schemars(description = "Account name.")]
     pub(super) account: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ListIdCleanupArgs {
     #[schemars(description = "Account name.")]
     pub(super) account: String,
