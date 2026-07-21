@@ -18,7 +18,9 @@ mod scan_plan;
 mod unsubscribe;
 
 pub use config::{AccountConfig, AuthMethod, Config};
-pub use connection::{ConnectionPool, ConnectionStats};
+pub use connection::{
+    ConnectionPool, ConnectionStats, is_login_rate_limited_host, recommended_max_connections,
+};
 pub use error::{AgentmailError, Result};
 pub use imap_client::{CancelFn, ClientIdentity, ProgressFn};
 pub use provider::MailProvider;

@@ -109,6 +109,29 @@ pub struct ConnectionStats {
 /// Most IMAP servers allow 10-15 connections; we stay well under that.
 const MAX_CONCURRENT_PER_ACCOUNT: usize = 3;
 
+/// Whether a host belongs to the AOL/Yahoo family, which rate-limits LOGIN
+/// *velocity*: two logins landing close together trip `[LIMIT] LOGIN Rate
+/// limit hit`. Matches the AOL/Yahoo IMAP hosts and their resellers (e.g.
+/// Verizon, whose mail lives on `imap.aol.com`). Substring match so
+/// `export.imap.aol.com` and `imap.mail.yahoo.com` are both covered.
+pub fn is_login_rate_limited_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host.contains("aol") || host.contains("yahoo")
+}
+
+/// The default per-account connection cap for a host when the account config
+/// doesn't set one. Login-rate-limited providers ([`is_login_rate_limited_host`])
+/// default to a SINGLE held connection: opening a second means a concurrent
+/// LOGIN, which trips the limiter, so all concurrent work should queue on the
+/// one connection instead. Everyone else gets the standard cap of three.
+pub fn recommended_max_connections(host: &str) -> usize {
+    if is_login_rate_limited_host(host) {
+        1
+    } else {
+        MAX_CONCURRENT_PER_ACCOUNT
+    }
+}
+
 /// Don't reuse a pooled session idle longer than this. IMAP servers typically
 /// drop idle connections after ~30 min; past this threshold the cached session
 /// is very likely dead, so reconnecting fresh (~1-2s) beats paying a ~15s
@@ -464,29 +487,27 @@ impl ConnectionPool {
     }
 
     /// Get or create the semaphore for a given account.
-    /// Uses the account's `max_connections` config if set, otherwise the default.
+    /// Uses the account's `max_connections` config if set, otherwise the
+    /// host-aware default (one connection for login-rate-limited providers).
     async fn account_semaphore(&self, account_name: &str) -> Arc<Semaphore> {
+        let limit = self.account_max_connections(account_name);
         let mut sems = self.semaphores.lock().await;
         sems.entry(account_name.to_string())
-            .or_insert_with(|| {
-                let limit = self
-                    .config
-                    .accounts
-                    .get(account_name)
-                    .and_then(|c| c.max_connections)
-                    .unwrap_or(MAX_CONCURRENT_PER_ACCOUNT);
-                Arc::new(Semaphore::new(limit))
-            })
+            .or_insert_with(|| Arc::new(Semaphore::new(limit)))
             .clone()
     }
 
-    /// Get the max connections limit for an account.
+    /// The max concurrent connections for an account: the configured value, or
+    /// else [`recommended_max_connections`] for the account's host (so AOL/Yahoo
+    /// default to a single held connection and all concurrent work queues on it
+    /// rather than opening a second, rate-limited LOGIN).
     fn account_max_connections(&self, account_name: &str) -> usize {
-        self.config
-            .accounts
-            .get(account_name)
-            .and_then(|c| c.max_connections)
-            .unwrap_or(MAX_CONCURRENT_PER_ACCOUNT)
+        match self.config.accounts.get(account_name) {
+            Some(c) => c
+                .max_connections
+                .unwrap_or_else(|| recommended_max_connections(&c.host)),
+            None => MAX_CONCURRENT_PER_ACCOUNT,
+        }
     }
 
     /// Pop one idle session for the account and return it if it is fresh
@@ -798,6 +819,48 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    /// AOL/Yahoo (and Verizon-on-AOL) default to a single held connection so
+    /// concurrent work queues instead of opening a second, rate-limited LOGIN;
+    /// other providers get the standard concurrency. An explicit config value
+    /// always wins over the host default.
+    #[test]
+    fn rate_limited_hosts_default_to_one_connection() {
+        assert!(is_login_rate_limited_host("export.imap.aol.com"));
+        assert!(is_login_rate_limited_host("imap.mail.yahoo.com"));
+        assert!(is_login_rate_limited_host("IMAP.AOL.COM"));
+        assert!(!is_login_rate_limited_host("imap.gmail.com"));
+        assert!(!is_login_rate_limited_host("outlook.office365.com"));
+
+        assert_eq!(recommended_max_connections("export.imap.aol.com"), 1);
+        assert_eq!(recommended_max_connections("imap.mail.yahoo.com"), 1);
+        assert_eq!(
+            recommended_max_connections("imap.gmail.com"),
+            MAX_CONCURRENT_PER_ACCOUNT,
+        );
+
+        // The pool applies the host default when the account sets no explicit
+        // cap, and honors an explicit cap when set.
+        let aol = AccountConfig::new("export.imap.aol.com", "user@verizon.net");
+        let gmail = AccountConfig::new("imap.gmail.com", "user@gmail.com");
+        let aol_pinned =
+            AccountConfig::new("export.imap.aol.com", "user@aol.com").with_max_connections(2);
+        let pool = ConnectionPool::new(Config::from_accounts(vec![
+            ("aol".to_string(), aol),
+            ("gmail".to_string(), gmail),
+            ("aol_pinned".to_string(), aol_pinned),
+        ]));
+        assert_eq!(pool.account_max_connections("aol"), 1);
+        assert_eq!(
+            pool.account_max_connections("gmail"),
+            MAX_CONCURRENT_PER_ACCOUNT,
+        );
+        assert_eq!(
+            pool.account_max_connections("aol_pinned"),
+            2,
+            "an explicit config value overrides the host default",
+        );
+    }
 
     /// A brand-new pool has paid no LOGINs and reused nothing; the snapshot
     /// starts fully zeroed. (The increments themselves need a live connect,

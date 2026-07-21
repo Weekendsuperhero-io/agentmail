@@ -44,7 +44,10 @@ pub struct AccountConfig {
     pub password: Option<Secret>,
     #[serde(default = "default_tls")]
     pub tls: bool,
-    /// Max concurrent IMAP connections for this account (default: 3).
+    /// Max concurrent IMAP connections for this account. When unset, defaults
+    /// per host: 1 for login-rate-limited providers (AOL/Yahoo, so concurrent
+    /// work queues on one held connection instead of opening a second,
+    /// rate-limited LOGIN), 3 otherwise.
     #[serde(default)]
     pub max_connections: Option<usize>,
     /// Authentication method: `"password"` (default) or `"xoauth2"`.
