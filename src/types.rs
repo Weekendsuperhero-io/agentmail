@@ -458,8 +458,74 @@ pub enum DeleteMode {
     Permanent,
 }
 
+/// When matching-message cleanup may run relative to the unsubscribe attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupWhen {
+    /// Only after the one-click POST verifiably succeeded.
+    #[default]
+    AfterSuccess,
+    /// Even when DKIM, URL validation, DNS, or the HTTPS POST failed. Cleanup
+    /// identity requirements (authenticated List-Id or the sender fallback)
+    /// still apply unchanged.
+    Always,
+}
+
+/// Which identity cleanup may match messages by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupIdentityMode {
+    /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
+    ListIdOnly,
+    /// Prefer the authenticated List-Id; when there is none, fall back to the
+    /// exact sender's bulk mail — constrained to the target's own List-Id
+    /// whenever the message carries one, so other lists from the same sender
+    /// are untouched.
+    #[default]
+    ListIdOrSender,
+}
+
+/// How cleanup disposes of matched messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupDeletion {
+    /// Move to Trash; skip cleanup when no Trash mailbox is resolvable.
+    #[default]
+    Trash,
+    /// Move to Trash, but permit an irreversible UID EXPUNGE when Trash is
+    /// unavailable or the MOVE fails. Never used on Gmail, where in-place
+    /// EXPUNGE only removes the current label.
+    TrashThenPermanent,
+    /// Permanently delete (flag `\Deleted` + UID EXPUNGE), bypassing Trash.
+    /// On Gmail this safely routes through Trash instead.
+    Permanent,
+}
+
+/// Matching-message cleanup policy. The three axes are orthogonal; every
+/// combination is meaningful, so no cross-field validation exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CleanupPolicy {
+    pub when: CleanupWhen,
+    pub identity: CleanupIdentityMode,
+    pub deletion: CleanupDeletion,
+}
+
+impl CleanupPolicy {
+    /// The `DeleteMode` this deletion policy requests.
+    pub fn mode(self) -> DeleteMode {
+        match self.deletion {
+            CleanupDeletion::Permanent => DeleteMode::Permanent,
+            CleanupDeletion::Trash | CleanupDeletion::TrashThenPermanent => DeleteMode::TrashFirst,
+        }
+    }
+
+    /// Whether a failed Trash resolution or MOVE may escalate to EXPUNGE.
+    pub fn allow_permanent_fallback(self) -> bool {
+        self.deletion == CleanupDeletion::TrashThenPermanent
+    }
+}
+
 /// Safety policy for an authenticated one-click unsubscribe and optional
-/// matching-message cleanup.
+/// matching-message cleanup. `cleanup: None` means unsubscribe only — the
+/// nested policy exists exactly when cleanup was requested, so contradictory
+/// flag combinations are unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsubscribeOptions {
     /// UIDVALIDITY observed when the sample UID was discovered.
@@ -467,22 +533,8 @@ pub struct UnsubscribeOptions {
     /// Explicit RFC 8058 user consent. Execution refuses `false` rather than
     /// treating a tool annotation as authorization.
     pub confirm_one_click: bool,
-    /// Delete messages belonging to the same List-Id after the POST attempt.
-    /// The List-Id must be covered by the same passing DKIM signature as the
-    /// RFC 8058 action headers; otherwise cleanup requires the separately
-    /// authorized exact-sender fallback.
-    pub delete_matching: bool,
-    /// Permit cleanup after the unsubscribe attempt fails. Defaults should be
-    /// false; this must be a separate explicit decision from cleanup itself.
-    pub delete_on_unsubscribe_failure: bool,
-    /// Permit exact-sender cleanup only when the target has no usable List-Id.
-    pub allow_sender_fallback: bool,
-    /// Permit an irreversible UID EXPUNGE when Trash is unavailable or MOVE
-    /// fails. This is distinct from explicitly requesting `Permanent` mode.
-    /// Gmail never uses in-place EXPUNGE as a permanent fallback because that
-    /// operation only removes the current label.
-    pub allow_permanent_fallback: bool,
-    pub mode: DeleteMode,
+    /// Delete matching messages after the POST attempt, under this policy.
+    pub cleanup: Option<CleanupPolicy>,
 }
 
 /// Response for delete_messages.

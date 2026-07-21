@@ -25,6 +25,8 @@ pub use provider::MailProvider;
 pub use secret::init_service_name;
 pub use types::*;
 
+use tokio::io::{AsyncRead, AsyncWrite};
+
 /// High-level facade for IMAP operations.
 /// Owns the connection pool and configuration.
 pub struct Agentmail {
@@ -1233,9 +1235,9 @@ impl Agentmail {
     /// on a server whose List-* handling is untrusted, enumerate the visible
     /// mailbox and confirm locally — the List-Id confirm fetch works
     /// everywhere because List-Id survives the servers' header filtering.
-    async fn exact_list_id_uids(
+    async fn exact_list_id_uids<T>(
         &self,
-        session: &mut imap_client::ImapSession,
+        session: &mut async_imap::Session<T>,
         account: &str,
         mailbox: &str,
         list_id: &str,
@@ -1243,7 +1245,10 @@ impl Agentmail {
         mailbox_uid_next: Option<u32>,
         mailbox_uid_validity: Option<u32>,
         cancel: Option<&CancelFn>,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Vec<u32>>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+    {
         let criteria = SearchCriteria {
             header: Some(("List-Id".to_string(), list_id.to_string())),
             deleted: Some(false),
@@ -1305,15 +1310,18 @@ impl Agentmail {
     /// only step that differs between the list-id, exact-sender, and
     /// unsubscribe-cleanup deletes — the surrounding drain loop is shared in
     /// [`Self::delete_sweep`]. `mb` is the freshly selected mailbox state.
-    async fn discover_delete_uids(
+    async fn discover_delete_uids<T>(
         &self,
         selector: &DeleteSelector,
-        session: &mut imap_client::ImapSession,
+        session: &mut async_imap::Session<T>,
         account: &str,
         mbox: &str,
         mb: &async_imap::types::Mailbox,
         cancel: Option<&CancelFn>,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Vec<u32>>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+    {
         match selector {
             DeleteSelector::ListId(list_id) => {
                 // `exact_list_id_uids` normalizes internally, so the raw or
@@ -1334,6 +1342,7 @@ impl Agentmail {
                 email,
                 name,
                 bulk_only,
+                list_id,
             } => {
                 let criteria = SearchCriteria {
                     from: Some(email.clone()),
@@ -1348,7 +1357,15 @@ impl Agentmail {
                 if *bulk_only {
                     // Unsubscribe cleanup: only the sender's bulk mail (must
                     // carry a List-Unsubscribe header), never personal replies.
-                    filter_sender_bulk_mail(session, &candidates, email, name, cancel).await
+                    filter_sender_bulk_mail(
+                        session,
+                        &candidates,
+                        email,
+                        name,
+                        list_id.as_deref(),
+                        cancel,
+                    )
+                    .await
                 } else {
                     // delete_by_sender: every message from the exact identity.
                     let fetched =
@@ -1406,9 +1423,9 @@ impl Agentmail {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn delete_sweep_loop(
+    async fn delete_sweep_loop<T>(
         &self,
-        session: &mut imap_client::ImapSession,
+        session: &mut async_imap::Session<T>,
         account: &str,
         selector: &DeleteSelector,
         mailboxes: &[String],
@@ -1417,7 +1434,10 @@ impl Agentmail {
         allow_permanent_fallback: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
-    ) -> Result<DeleteSweepTotals> {
+    ) -> Result<DeleteSweepTotals>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+    {
         let mut totals = DeleteSweepTotals::default();
         let mut cache_dirtied = false;
 
@@ -1514,6 +1534,10 @@ impl Agentmail {
         let trash = self
             .trash_for_mode(mode, account, session.session(), &caps)
             .await;
+        if let Err(error) = Self::require_disposal_path(mode, trash.as_deref(), &caps) {
+            session.release().await;
+            return Err(error);
+        }
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
@@ -1535,7 +1559,7 @@ impl Agentmail {
                 &mailboxes,
                 trash.as_deref(),
                 &caps,
-                true,
+                false,
                 on_progress,
                 cancel,
             )
@@ -1896,6 +1920,10 @@ impl Agentmail {
         let trash = self
             .trash_for_mode(mode, account, session.session(), &caps)
             .await;
+        if let Err(error) = Self::require_disposal_path(mode, trash.as_deref(), &caps) {
+            session.release().await;
+            return Err(error);
+        }
         imap_client::select_with_expected_uid_validity(
             session.session(),
             mailbox,
@@ -1905,11 +1933,14 @@ impl Agentmail {
         if !uids.is_empty() {
             self.fence_header_cache_mutation(account).await;
         }
-        let result = imap_client::bulk_delete_messages(
+        // No silent permanent escalation: a failed Trash MOVE is reported as
+        // failed UIDs, never upgraded to EXPUNGE the caller did not request.
+        let result = imap_client::bulk_delete_messages_with_policy(
             session.session(),
             uids,
             trash.as_deref(),
             &caps,
+            false,
             on_progress,
             cancel,
         )
@@ -1927,59 +1958,55 @@ impl Agentmail {
         })
     }
 
-    /// Delete all messages from an exact sender identified by UID.
+    /// Delete all messages from an exact sender identity (email + display
+    /// name, as returned by `top_senders`/`top_subscriptions` rows).
     ///
-    /// `mailbox` is the mailbox containing the target `uid`.
-    /// When `all_mailboxes` is true, searches and deletes across every
-    /// mailbox in the account (not just the source mailbox).
+    /// `mailbox: None` means the account-wide mutation plan, matching
+    /// `delete_list_id`. Discovery re-finds and confirms the identity live in
+    /// each mailbox, so no sample UID or UIDVALIDITY guard is needed.
     pub async fn delete_by_sender(
         &self,
-        mailbox: &str,
+        mailbox: Option<&str>,
         account: &str,
-        uid: u32,
-        expected_uid_validity: u32,
-        all_mailboxes: bool,
+        email: &str,
+        name: &str,
         mode: DeleteMode,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteBySenderResponse> {
-        Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
+        let email = email.trim();
+        if email.is_empty() {
+            return Err(AgentmailError::Other(
+                "sender email is required (use address from a top_senders/top_subscriptions row)"
+                    .to_string(),
+            ));
+        }
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        imap_client::select_with_expected_uid_validity(
-            session.session(),
-            mailbox,
-            expected_uid_validity,
-        )
-        .await?;
         let trash = self
             .trash_for_mode(mode, account, session.session(), &caps)
             .await;
-        imap_client::select_with_expected_uid_validity(
-            session.session(),
-            mailbox,
-            expected_uid_validity,
-        )
-        .await?;
+        if let Err(error) = Self::require_disposal_path(mode, trash.as_deref(), &caps) {
+            session.release().await;
+            return Err(error);
+        }
 
-        // 1. Fetch the exact sender from the target message
-        let (target_email, target_name) = imap_client::fetch_sender(session.session(), uid).await?;
-
-        let sender_display = if target_name.is_empty() {
-            target_email.clone()
+        let sender_display = if name.is_empty() {
+            email.to_string()
         } else {
-            format!("{} <{}>", target_name, target_email)
+            format!("{name} <{email}>")
         };
 
-        let search_mailboxes = if all_mailboxes {
-            self.account_scan_mailboxes(
-                account,
-                session.session(),
-                scan_plan::ScanPurpose::Mutation,
-            )
-            .await?
-        } else {
-            vec![mailbox.to_string()]
+        let search_mailboxes = match mailbox {
+            Some(mbox) => vec![mbox.to_string()],
+            None => {
+                self.account_scan_mailboxes(
+                    account,
+                    session.session(),
+                    scan_plan::ScanPurpose::Mutation,
+                )
+                .await?
+            }
         };
 
         let totals = self
@@ -1987,25 +2014,22 @@ impl Agentmail {
                 session,
                 account,
                 DeleteSelector::Sender {
-                    email: target_email,
-                    name: target_name,
+                    email: email.to_string(),
+                    name: name.to_string(),
                     bulk_only: false,
+                    list_id: None,
                 },
                 &search_mailboxes,
                 trash.as_deref(),
                 &caps,
-                true,
+                false,
                 on_progress,
                 cancel,
             )
             .await?;
 
         Ok(DeleteBySenderResponse {
-            mailbox: if all_mailboxes {
-                "*".to_string()
-            } else {
-                mailbox.to_string()
-            },
+            mailbox: mailbox.unwrap_or("*").to_string(),
             account: account.to_string(),
             sender: sender_display,
             found: totals.found,
@@ -2339,11 +2363,12 @@ impl Agentmail {
     // -----------------------------------------------------------------
 
     /// Perform a UIDVALIDITY-guarded, DKIM-verified RFC 8058 one-click
-    /// unsubscribe and optionally delete the same normalized List-Id across
-    /// account storage mailboxes.
+    /// unsubscribe and optionally delete matching messages across account
+    /// storage mailboxes.
     ///
-    /// Consent, cleanup-after-failure, sender fallback, and irreversible Trash
-    /// fallback are independent explicit policies in `options`.
+    /// Cleanup runs only when `options.cleanup` is present; its `when`,
+    /// `identity`, and `deletion` axes are orthogonal policies (see
+    /// [`CleanupPolicy`]).
     pub async fn unsubscribe_message(
         &self,
         mailbox: &str,
@@ -2410,12 +2435,12 @@ impl Agentmail {
         response.dkim_verified = response.dkim_domain.is_some();
         response.unsubscribed = attempt.result;
 
-        if !options.delete_matching {
+        let Some(cleanup) = options.cleanup else {
             return Ok(response);
-        }
-        if !cleanup_policy_allows(options, response.unsubscribed.success) {
+        };
+        if !cleanup_policy_allows(cleanup, response.unsubscribed.success) {
             response.cleanup_skipped_reason = Some(
-                "Matching-message cleanup was skipped because the unsubscribe attempt failed and deleteOnUnsubscribeFailure was not explicitly enabled."
+                "Matching-message cleanup was skipped because the unsubscribe attempt failed and cleanup.when was not \"always\"."
                     .to_string(),
             );
             return Ok(response);
@@ -2426,19 +2451,19 @@ impl Agentmail {
             headers.has_single_list_id(),
             response.list_id_authenticated,
             &target_email,
-            options.allow_sender_fallback,
+            cleanup.identity,
         ) {
             Ok(identity) => identity,
             Err(CleanupIdentityError::UnauthenticatedListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup was skipped: the sender's DKIM signature does not cover the List-Id header (List-Id is spoofable, so an unauthenticated value must not select an account-wide delete), and allowSenderFallback was explicitly disabled. To clean up: re-enable allowSenderFallback to delete this exact sender's bulk mail, use delete_list_id with an explicitly chosen listId, or use delete_by_sender."
+                    "Matching-message cleanup was skipped: the sender's DKIM signature does not cover the List-Id header (List-Id is spoofable, so an unauthenticated value must not select an account-wide delete), and cleanup.identity was \"listIdOnly\". To clean up: use cleanup.identity \"listIdOrSender\" to delete this exact sender's bulk mail scoped to this List-Id, use delete_list_id with an explicitly chosen listId, or use delete_by_sender."
                         .to_string(),
                 );
                 return Ok(response);
             }
             Err(CleanupIdentityError::NoUsableListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup was skipped: the message carries no single usable List-Id, and allowSenderFallback was explicitly disabled. To clean up: re-enable allowSenderFallback to delete this exact sender's bulk mail, or use delete_by_sender."
+                    "Matching-message cleanup was skipped: the message carries no single usable List-Id, and cleanup.identity was \"listIdOnly\". To clean up: use cleanup.identity \"listIdOrSender\" to delete this exact sender's bulk mail, or use delete_by_sender."
                         .to_string(),
                 );
                 return Ok(response);
@@ -2451,10 +2476,11 @@ impl Agentmail {
             format!("{} <{}>", target_name, target_email)
         };
 
+        let mode = cleanup.mode();
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self
-            .trash_for_mode(options.mode, account, session.session(), &caps)
+            .trash_for_mode(mode, account, session.session(), &caps)
             .await;
         if caps.is_gmail() && trash.is_none() {
             session.release().await;
@@ -2464,13 +2490,11 @@ impl Agentmail {
             );
             return Ok(response);
         }
-        if options.mode == DeleteMode::TrashFirst
-            && trash.is_none()
-            && !options.allow_permanent_fallback
+        if mode == DeleteMode::TrashFirst && trash.is_none() && !cleanup.allow_permanent_fallback()
         {
             session.release().await;
             response.cleanup_skipped_reason = Some(
-                "Matching-message cleanup was skipped because no Trash mailbox was available and permanent fallback was not explicitly enabled."
+                "Matching-message cleanup was skipped because no Trash mailbox was available and cleanup.deletion did not permit a permanent fallback (\"trashThenPermanent\" or \"permanent\")."
                     .to_string(),
             );
             return Ok(response);
@@ -2483,15 +2507,16 @@ impl Agentmail {
             CleanupIdentity::ListId { normalized, .. } => {
                 DeleteSelector::ListId(normalized.clone())
             }
-            CleanupIdentity::Sender => DeleteSelector::Sender {
+            CleanupIdentity::Sender { list_id } => DeleteSelector::Sender {
                 email: target_email.clone(),
                 name: target_name.clone(),
                 bulk_only: true,
+                list_id: list_id.clone(),
             },
         };
         // A TrashFirst cleanup with no resolvable Trash is already a permanent
         // fallback before the sweep runs; carry that seed into the result.
-        let seeded_trash_fallback = options.mode == DeleteMode::TrashFirst && trash.is_none();
+        let seeded_trash_fallback = mode == DeleteMode::TrashFirst && trash.is_none();
         let totals = self
             .delete_sweep(
                 session,
@@ -2500,7 +2525,7 @@ impl Agentmail {
                 &all_mailboxes,
                 trash.as_deref(),
                 &caps,
-                options.allow_permanent_fallback,
+                cleanup.allow_permanent_fallback(),
                 on_progress,
                 cancel,
             )
@@ -2509,7 +2534,13 @@ impl Agentmail {
 
         let (matched_by, list_id) = match identity {
             CleanupIdentity::ListId { raw, .. } => ("list-id", Some(raw)),
-            CleanupIdentity::Sender => ("exact-sender-fallback", None),
+            // The constrained fallback reports the normalized List-Id it was
+            // scoped to; matched_by distinguishes it from the authenticated
+            // List-Id match.
+            CleanupIdentity::Sender {
+                list_id: Some(normalized),
+            } => ("exact-sender-list-id-fallback", Some(normalized)),
+            CleanupIdentity::Sender { list_id: None } => ("exact-sender-fallback", None),
         };
         let complete = totals.skipped.is_empty() && totals.failed == 0;
         response.matching_messages = Some(MatchingMessagesResult {
@@ -2523,8 +2554,7 @@ impl Agentmail {
             skipped: totals.skipped,
             // Gmail's safe provider-specific interpretation of Permanent is
             // a move to Trash: in-place UID EXPUNGE only removes a label.
-            permanent: (options.mode == DeleteMode::Permanent && !caps.is_gmail())
-                || trash_fallback,
+            permanent: (mode == DeleteMode::Permanent && !caps.is_gmail()) || trash_fallback,
             trash_fallback,
             complete,
         });
@@ -2596,6 +2626,30 @@ impl Agentmail {
             .and_then(|(trash, _)| trash)
     }
 
+    /// Refuse a trash-first delete when no Trash mailbox is resolvable.
+    /// Without this guard the chunked delete silently escalates to
+    /// flag+EXPUNGE (permanent) on UIDPLUS servers while the response still
+    /// reports `permanent: false`. Permanent mode needs no Trash — except on
+    /// Gmail, where an unresolvable Trash breaks both modes because in-place
+    /// EXPUNGE only removes a label.
+    fn require_disposal_path(
+        mode: DeleteMode,
+        trash: Option<&str>,
+        caps: &imap_client::ServerCaps,
+    ) -> Result<()> {
+        if mode == DeleteMode::TrashFirst && trash.is_none() {
+            if caps.is_gmail() {
+                return Err(AgentmailError::Other(
+                    "Gmail Trash could not be resolved; in-place EXPUNGE only removes a label and is not a delete".to_string(),
+                ));
+            }
+            return Err(AgentmailError::Other(
+                "no Trash mailbox could be resolved for a trash-first delete; retry with permanent=true to delete irreversibly".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Invalidate cached layout after a mailbox mutation.
     fn invalidate_mailbox_catalog(&self, account: &str) {
         self.mailbox_catalog.invalidate(account);
@@ -2618,11 +2672,14 @@ enum DeleteSelector {
     /// Messages from an exact sender identity. `bulk_only` restricts to mail
     /// that also carries a List-Unsubscribe header (unsubscribe-cleanup
     /// semantics); otherwise every message from the identity matches
-    /// (delete-by-sender).
+    /// (delete-by-sender). `list_id` further scopes bulk mail to one
+    /// normalized List-Id — the pertinence constraint for the unsubscribe
+    /// sender fallback, so sibling lists from the same sender are untouched.
     Sender {
         email: String,
         name: String,
         bulk_only: bool,
+        list_id: Option<String>,
     },
 }
 
@@ -2639,8 +2696,19 @@ struct DeleteSweepTotals {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CleanupIdentity {
-    ListId { raw: String, normalized: String },
-    Sender,
+    ListId {
+        raw: String,
+        normalized: String,
+    },
+    /// Exact-sender fallback. `list_id` carries the target's single normalized
+    /// List-Id when the message has one that DKIM did not authenticate: the
+    /// sender identity is verified, so conjoining it with that List-Id scopes
+    /// the delete to the one list actually unsubscribed from without trusting
+    /// the (spoofable) List-Id alone. `None` when the message carries no
+    /// usable List-Id at all — sender + bulk-mail is then the only criterion.
+    Sender {
+        list_id: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2654,24 +2722,32 @@ fn select_unsubscribe_cleanup_identity(
     has_single_list_id: bool,
     list_id_authenticated: bool,
     target_email: &str,
-    allow_sender_fallback: bool,
+    identity_mode: CleanupIdentityMode,
 ) -> std::result::Result<CleanupIdentity, CleanupIdentityError> {
     let normalized = has_single_list_id
         .then_some(list_id)
         .flatten()
         .and_then(normalize_list_id);
 
-    match normalized {
-        Some(normalized) if list_id_authenticated => Ok(CleanupIdentity::ListId {
+    match (normalized, list_id_authenticated) {
+        (Some(normalized), true) => Ok(CleanupIdentity::ListId {
             raw: list_id.unwrap_or_default().to_string(),
             normalized,
         }),
-        _ if allow_sender_fallback && !target_email.is_empty() => Ok(CleanupIdentity::Sender),
-        Some(_) => Err(CleanupIdentityError::UnauthenticatedListId),
-        None => Err(CleanupIdentityError::NoUsableListId),
+        (normalized, _)
+            if identity_mode == CleanupIdentityMode::ListIdOrSender && !target_email.is_empty() =>
+        {
+            Ok(CleanupIdentity::Sender {
+                list_id: normalized,
+            })
+        }
+        (Some(_), _) => Err(CleanupIdentityError::UnauthenticatedListId),
+        (None, _) => Err(CleanupIdentityError::NoUsableListId),
     }
 }
 
+/// The two invariant checks. The old cross-field combination rules are gone:
+/// the nested `CleanupPolicy` makes contradictory flag sets unrepresentable.
 fn validate_unsubscribe_options(options: UnsubscribeOptions) -> Result<()> {
     if options.expected_uid_validity == 0 {
         return Err(AgentmailError::InvalidUnsubscribePolicy(
@@ -2682,29 +2758,11 @@ fn validate_unsubscribe_options(options: UnsubscribeOptions) -> Result<()> {
     if !options.confirm_one_click {
         return Err(AgentmailError::UnsubscribeConsentRequired);
     }
-    if options.delete_on_unsubscribe_failure && !options.delete_matching {
-        return Err(AgentmailError::InvalidUnsubscribePolicy(
-            "delete_on_unsubscribe_failure requires delete_matching=true".to_string(),
-        ));
-    }
-    // allow_sender_fallback without delete_matching is inert, not invalid:
-    // it defaults to true and is only consulted once cleanup actually runs,
-    // so a plain unsubscribe with default flags must pass validation.
-    if options.allow_permanent_fallback && !options.delete_matching {
-        return Err(AgentmailError::InvalidUnsubscribePolicy(
-            "allow_permanent_fallback requires delete_matching=true".to_string(),
-        ));
-    }
-    if options.mode == DeleteMode::Permanent && options.allow_permanent_fallback {
-        return Err(AgentmailError::InvalidUnsubscribePolicy(
-            "allow_permanent_fallback is redundant when permanent=true".to_string(),
-        ));
-    }
     Ok(())
 }
 
-fn cleanup_policy_allows(options: UnsubscribeOptions, unsubscribe_succeeded: bool) -> bool {
-    options.delete_matching && (unsubscribe_succeeded || options.delete_on_unsubscribe_failure)
+fn cleanup_policy_allows(cleanup: CleanupPolicy, unsubscribe_succeeded: bool) -> bool {
+    unsubscribe_succeeded || cleanup.when == CleanupWhen::Always
 }
 
 /// From a set of candidate UIDs, fetch FROM + List-Unsubscribe/Post headers and
@@ -2714,12 +2772,15 @@ fn cleanup_policy_allows(options: UnsubscribeOptions, unsubscribe_succeeded: boo
 /// search is substring-only (and enumeration candidates are everything), so
 /// this fetch is the authority before any deletion; stale UIDs simply do not
 /// come back.
-async fn confirm_exact_list_id(
-    session: &mut imap_client::ImapSession,
+async fn confirm_exact_list_id<T>(
+    session: &mut async_imap::Session<T>,
     candidates: &[u32],
     list_id: &str,
     cancel: Option<&CancelFn>,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -2733,13 +2794,17 @@ async fn confirm_exact_list_id(
     )
 }
 
-async fn filter_sender_bulk_mail(
-    session: &mut imap_client::ImapSession,
+async fn filter_sender_bulk_mail<T>(
+    session: &mut async_imap::Session<T>,
     candidate_uids: &[u32],
     target_email: &str,
     target_name: &str,
+    constrain_list_id: Option<&str>,
     cancel: Option<&CancelFn>,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     let mut exact = Vec::new();
     for chunk in candidate_uids.chunks(1000) {
         imap_client::check_cancel(cancel)?;
@@ -2778,6 +2843,12 @@ async fn filter_sender_bulk_mail(
                 continue;
             }
 
+            // Pertinence constraint: when the cleanup identity carries a
+            // List-Id, only that list's mail qualifies.
+            if !row_list_id_matches(&header_str, constrain_list_id) {
+                continue;
+            }
+
             // Must match exact sender
             if let Ok((email, name, _, _)) = parser::parse_sender_date(header_bytes)
                 && email == target_email
@@ -2788,6 +2859,21 @@ async fn filter_sender_bulk_mail(
         }
     }
     Ok(exact)
+}
+
+/// Whether a message's header block satisfies an optional normalized List-Id
+/// constraint. `None` imposes nothing; `Some` requires the header to carry a
+/// List-Id that normalizes to exactly that value — a missing or different
+/// List-Id fails, so a sender-fallback cleanup scoped to one list can never
+/// take a sibling list's mail with it.
+fn row_list_id_matches(header_str: &str, constrain_list_id: Option<&str>) -> bool {
+    let Some(want) = constrain_list_id else {
+        return true;
+    };
+    imap_client::extract_header_value_pub(header_str, "List-Id")
+        .as_deref()
+        .and_then(normalize_list_id)
+        .is_some_and(|normalized| normalized == want)
 }
 
 /// Pick a stable representative when dates are absent or tied. IMAP UIDs are
@@ -2970,22 +3056,35 @@ mod tests {
         UnsubscribeOptions {
             expected_uid_validity: 7,
             confirm_one_click: true,
-            delete_matching: false,
-            delete_on_unsubscribe_failure: false,
-            allow_sender_fallback: false,
-            allow_permanent_fallback: false,
-            mode: DeleteMode::TrashFirst,
+            cleanup: None,
         }
     }
 
     #[test]
-    fn default_wire_flags_pass_policy_validation() {
-        // The MCP default is allowSenderFallback=true with deleteMatching
-        // unset — the fallback is inert without cleanup, so a plain
-        // unsubscribe must not be rejected as a contradictory policy.
-        let mut options = unsubscribe_options();
-        options.allow_sender_fallback = true;
-        assert!(validate_unsubscribe_options(options).is_ok());
+    fn plain_unsubscribe_and_every_cleanup_policy_pass_validation() {
+        // The nested policy makes contradictory combinations unrepresentable,
+        // so validation accepts cleanup: None and every enum combination alike.
+        assert!(validate_unsubscribe_options(unsubscribe_options()).is_ok());
+        for when in [CleanupWhen::AfterSuccess, CleanupWhen::Always] {
+            for identity in [
+                CleanupIdentityMode::ListIdOnly,
+                CleanupIdentityMode::ListIdOrSender,
+            ] {
+                for deletion in [
+                    CleanupDeletion::Trash,
+                    CleanupDeletion::TrashThenPermanent,
+                    CleanupDeletion::Permanent,
+                ] {
+                    let mut options = unsubscribe_options();
+                    options.cleanup = Some(CleanupPolicy {
+                        when,
+                        identity,
+                        deletion,
+                    });
+                    assert!(validate_unsubscribe_options(options).is_ok());
+                }
+            }
+        }
     }
 
     #[test]
@@ -3007,44 +3106,117 @@ mod tests {
 
     #[test]
     fn cleanup_failure_policy_is_explicit() {
-        let mut options = unsubscribe_options();
-        assert!(!cleanup_policy_allows(options, true));
-        assert!(!cleanup_policy_allows(options, false));
+        let after_success = CleanupPolicy::default();
+        assert!(cleanup_policy_allows(after_success, true));
+        assert!(!cleanup_policy_allows(after_success, false));
 
-        options.delete_matching = true;
-        assert!(cleanup_policy_allows(options, true));
-        assert!(!cleanup_policy_allows(options, false));
+        let always = CleanupPolicy {
+            when: CleanupWhen::Always,
+            ..CleanupPolicy::default()
+        };
+        assert!(cleanup_policy_allows(always, true));
+        assert!(cleanup_policy_allows(always, false));
+    }
 
-        options.delete_on_unsubscribe_failure = true;
-        assert!(cleanup_policy_allows(options, false));
+    #[test]
+    fn cleanup_deletion_maps_to_mode_and_fallback() {
+        let policy = |deletion| CleanupPolicy {
+            deletion,
+            ..CleanupPolicy::default()
+        };
+        assert_eq!(
+            policy(CleanupDeletion::Trash).mode(),
+            DeleteMode::TrashFirst
+        );
+        assert!(!policy(CleanupDeletion::Trash).allow_permanent_fallback());
+        assert_eq!(
+            policy(CleanupDeletion::TrashThenPermanent).mode(),
+            DeleteMode::TrashFirst
+        );
+        assert!(policy(CleanupDeletion::TrashThenPermanent).allow_permanent_fallback());
+        assert_eq!(
+            policy(CleanupDeletion::Permanent).mode(),
+            DeleteMode::Permanent
+        );
+        assert!(!policy(CleanupDeletion::Permanent).allow_permanent_fallback());
     }
 
     #[test]
     fn cleanup_identity_requires_dkim_authenticated_list_id() {
         let list_id = Some("Newsletter <news.example.com>");
+        let strict = CleanupIdentityMode::ListIdOnly;
+        let fallback = CleanupIdentityMode::ListIdOrSender;
         assert_eq!(
-            select_unsubscribe_cleanup_identity(list_id, true, true, "sender@example.com", false),
+            select_unsubscribe_cleanup_identity(list_id, true, true, "sender@example.com", strict),
             Ok(CleanupIdentity::ListId {
                 raw: "Newsletter <news.example.com>".to_string(),
                 normalized: "news.example.com".to_string(),
             })
         );
         assert_eq!(
-            select_unsubscribe_cleanup_identity(list_id, true, false, "sender@example.com", false),
+            select_unsubscribe_cleanup_identity(list_id, true, false, "sender@example.com", strict),
             Err(CleanupIdentityError::UnauthenticatedListId)
         );
         assert_eq!(
-            select_unsubscribe_cleanup_identity(list_id, true, false, "sender@example.com", true),
-            Ok(CleanupIdentity::Sender)
-        );
-        assert_eq!(
-            select_unsubscribe_cleanup_identity(list_id, false, true, "sender@example.com", false),
+            select_unsubscribe_cleanup_identity(list_id, false, true, "sender@example.com", strict),
             Err(CleanupIdentityError::NoUsableListId)
         );
         assert_eq!(
-            select_unsubscribe_cleanup_identity(None, false, false, "", true),
+            select_unsubscribe_cleanup_identity(None, false, false, "", fallback),
             Err(CleanupIdentityError::NoUsableListId)
         );
+    }
+
+    #[test]
+    fn sender_fallback_is_scoped_to_the_unauthenticated_list_id() {
+        // The pertinence ladder: an unauthenticated List-Id must not select an
+        // account-wide List-Id delete on its own (spoofable), but conjoined
+        // with the verified sender it scopes the fallback to the one list the
+        // user actually unsubscribed from.
+        let fallback = CleanupIdentityMode::ListIdOrSender;
+        assert_eq!(
+            select_unsubscribe_cleanup_identity(
+                Some("Newsletter <news.example.com>"),
+                true,
+                false,
+                "sender@example.com",
+                fallback
+            ),
+            Ok(CleanupIdentity::Sender {
+                list_id: Some("news.example.com".to_string()),
+            })
+        );
+        // No usable List-Id at all → sender + bulk-mail is the only criterion.
+        assert_eq!(
+            select_unsubscribe_cleanup_identity(None, false, false, "sender@example.com", fallback),
+            Ok(CleanupIdentity::Sender { list_id: None })
+        );
+        // Multiple List-Ids (has_single = false) → ambiguous, no constraint.
+        assert_eq!(
+            select_unsubscribe_cleanup_identity(
+                Some("Newsletter <news.example.com>"),
+                false,
+                false,
+                "sender@example.com",
+                fallback
+            ),
+            Ok(CleanupIdentity::Sender { list_id: None })
+        );
+    }
+
+    #[test]
+    fn row_list_id_constraint_is_exact_and_normalized() {
+        let matching = "List-Id: Newsletter <news.example.com>\r\nFrom: a@b.c\r\n";
+        let sibling = "List-Id: Other <other.example.com>\r\nFrom: a@b.c\r\n";
+        let missing = "From: a@b.c\r\n";
+        // No constraint → everything passes (plain sender fallback).
+        assert!(row_list_id_matches(matching, None));
+        assert!(row_list_id_matches(missing, None));
+        // Constrained → only the exact normalized List-Id passes; sibling
+        // lists and List-Id-free mail from the same sender are protected.
+        assert!(row_list_id_matches(matching, Some("news.example.com")));
+        assert!(!row_list_id_matches(sibling, Some("news.example.com")));
+        assert!(!row_list_id_matches(missing, Some("news.example.com")));
     }
 
     /// Fast test for the early validation error in create_draft.

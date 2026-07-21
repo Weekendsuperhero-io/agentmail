@@ -117,10 +117,13 @@ fn is_transient_server_bug(error: &AgentmailError) -> bool {
     )
 }
 
-pub async fn select(
-    session: &mut ImapSession,
+pub async fn select<T>(
+    session: &mut Session<T>,
     mailbox: &str,
-) -> Result<async_imap::types::Mailbox> {
+) -> Result<async_imap::types::Mailbox>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     for attempt in 1..=MAILBOX_OPEN_ATTEMPTS {
         match imap_timeout(session.select(mailbox)).await {
             Err(error) if is_transient_server_bug(&error) && attempt < MAILBOX_OPEN_ATTEMPTS => {
@@ -939,7 +942,10 @@ pub fn build_search_query_pub(criteria: &SearchCriteria) -> Result<String> {
 
 /// Run a UID SEARCH with a raw query string. Returns matching UIDs.
 /// Caller must have already selected the mailbox.
-pub async fn search_uids(session: &mut ImapSession, query: &str) -> Result<Vec<u32>> {
+pub async fn search_uids<T>(session: &mut Session<T>, query: &str) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     run_uid_search(session, query).await
 }
 
@@ -1141,11 +1147,14 @@ pub async fn fetch_sender(session: &mut ImapSession, uid: u32) -> Result<(String
 
 /// Fetch the parsed sender (email, display_name) for a batch of UIDs.
 /// Returns Vec of (uid, email, display_name). Skips unparseable messages.
-pub async fn fetch_senders_batch(
-    session: &mut ImapSession,
+pub async fn fetch_senders_batch<T>(
+    session: &mut Session<T>,
     uids: &[u32],
     cancel: Option<&CancelFn>,
-) -> Result<Vec<(u32, String, String)>> {
+) -> Result<Vec<(u32, String, String)>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     let mut results = Vec::new();
     for chunk in uids.chunks(1000) {
         check_cancel(cancel)?;
@@ -1428,11 +1437,14 @@ pub async fn fetch_list_ids_for_uids(
 }
 
 /// Cancellable List-Id projection fetch for large cleanup candidate sets.
-pub async fn fetch_list_ids_for_uids_cancellable(
-    session: &mut ImapSession,
+pub async fn fetch_list_ids_for_uids_cancellable<T>(
+    session: &mut Session<T>,
     uids: &[u32],
     cancel: Option<&CancelFn>,
-) -> Result<Vec<(u32, Option<String>)>> {
+) -> Result<Vec<(u32, Option<String>)>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     let mut results = Vec::with_capacity(uids.len());
     for chunk in uids.chunks(1000) {
         check_cancel(cancel)?;
@@ -1638,7 +1650,10 @@ pub async fn remove_flags(session: &mut ImapSession, uid: u32, flags: &[String])
 /// Flush pending server-side state after a mutation (EXPUNGE, EXISTS, etc.).
 /// Issues NOOP which forces the server to send any queued untagged responses,
 /// ensuring the session view is up-to-date before release back to the pool.
-pub async fn sync(session: &mut ImapSession) -> Result<()> {
+pub async fn sync<T>(session: &mut Session<T>) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     imap_timeout(session.noop()).await?;
     Ok(())
 }
@@ -1733,43 +1748,22 @@ pub struct BulkDeleteResult {
     pub trash_fallback: bool,
 }
 
-/// Delete messages by UID, processing in chunks.
-/// If `trash_mailbox` is set, moves there; otherwise flags `\Deleted` and
-/// UID-expunges (permanent). Requires UIDPLUS for any permanent path — see
-/// `flag_and_expunge`. Uses MOVE when available, else COPY+flag+expunge.
-pub async fn bulk_delete_messages(
-    session: &mut ImapSession,
-    uids: &[u32],
-    trash_mailbox: Option<&str>,
-    caps: &ServerCaps,
-    on_progress: Option<&ProgressFn>,
-    cancel: Option<&CancelFn>,
-) -> Result<BulkDeleteResult> {
-    bulk_delete_messages_with_policy(
-        session,
-        uids,
-        trash_mailbox,
-        caps,
-        true,
-        on_progress,
-        cancel,
-    )
-    .await
-}
-
 /// Policy-aware bulk deletion. When `allow_permanent_fallback` is false, a
 /// failed MOVE/COPY-to-Trash remains a failed chunk and can never escalate to
 /// an irreversible UID EXPUNGE. Gmail never permits this fallback regardless
 /// of caller authorization because in-place EXPUNGE has label semantics there.
-pub async fn bulk_delete_messages_with_policy(
-    session: &mut ImapSession,
+pub async fn bulk_delete_messages_with_policy<T>(
+    session: &mut Session<T>,
     uids: &[u32],
     trash_mailbox: Option<&str>,
     caps: &ServerCaps,
     allow_permanent_fallback: bool,
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
-) -> Result<BulkDeleteResult> {
+) -> Result<BulkDeleteResult>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     if trash_mailbox.is_some() && !caps.has_move() && !caps.has_uidplus() {
         return Err(AgentmailError::Other(
             "server supports neither MOVE nor UIDPLUS; refusing an unsafe COPY + plain EXPUNGE Trash emulation"
@@ -1855,12 +1849,15 @@ fn can_fallback_from_trash_to_permanent(caps: &ServerCaps, allow_permanent_fallb
 /// Move a UID set to `destination`, using MOVE when the server advertises it
 /// (RFC 6851) or emulating with COPY + `\Deleted` + UID EXPUNGE otherwise.
 /// The emulation path requires UIDPLUS (callers gate on it).
-async fn move_uids(
-    session: &mut ImapSession,
+async fn move_uids<T>(
+    session: &mut Session<T>,
     uid_set: &str,
     destination: &str,
     caps: &ServerCaps,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     if caps.has_move() {
         imap_timeout(session.uid_mv(uid_set, destination)).await?;
         Ok(())
@@ -1872,10 +1869,13 @@ async fn move_uids(
 
 /// Flag messages as deleted and expunge them (permanent delete). Uses UID
 /// EXPUNGE (RFC 4315) — callers must have confirmed UIDPLUS.
-async fn flag_and_expunge(
-    session: &mut ImapSession,
+async fn flag_and_expunge<T>(
+    session: &mut Session<T>,
     uid_set: &str,
-) -> std::result::Result<(), AgentmailError> {
+) -> std::result::Result<(), AgentmailError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     imap_timeout(async {
         let _: Vec<_> = session
             .uid_store(uid_set, "+FLAGS (\\Deleted)")
@@ -2397,11 +2397,14 @@ fn flag_to_string(flag: &async_imap::types::Flag<'_>) -> String {
 }
 
 /// Public wrapper for `timed_uid_fetch_collect`.
-pub async fn timed_uid_fetch_collect_pub(
-    session: &mut ImapSession,
+pub async fn timed_uid_fetch_collect_pub<T>(
+    session: &mut Session<T>,
     uid_set: &str,
     query: &str,
-) -> Result<Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>> {
+) -> Result<Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     timed_uid_fetch_collect(session, uid_set, query).await
 }
 

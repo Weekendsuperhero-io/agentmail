@@ -1,14 +1,10 @@
 //! Tool and prompt argument structs for the MCP server.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub(super) fn default_false() -> bool {
     false
-}
-
-pub(super) fn default_true() -> bool {
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -172,32 +168,24 @@ pub(super) struct DeleteMessagesArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(
-    description = "Arguments for deleting all messages from the exact sender extracted from a specific message UID."
+    description = "Arguments for deleting all messages from an exact sender identity (email + display name)."
 )]
 pub(super) struct DeleteBySenderArgs {
-    #[schemars(
-        description = "Mailbox containing the sample UID (required), e.g. sample.mailbox from top_senders."
-    )]
-    pub(super) mailbox: String,
     #[schemars(
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
     #[schemars(
-        range(min = 1),
-        description = "UID of a message from the sender to delete. The exact sender (email + display name) is extracted from this message and used to find all other messages from the same sender."
+        description = "The sender's exact email address to match (from a top_senders or top_subscriptions row's address)."
     )]
-    pub(super) uid: u32,
+    pub(super) email: String,
+    #[serde(default)]
     #[schemars(
-        range(min = 1),
-        description = "UIDVALIDITY paired with the sample UID. The action fails if the mailbox UID epoch changed."
+        description = "The sender's exact display name to match (from the row's displayName). Omit or pass \"\" for senders without a display name; matching is exact on both fields."
     )]
-    pub(super) expected_uid_validity: u32,
-    #[serde(default = "default_false")]
-    #[schemars(
-        description = "When true, use the account-wide mutation plan to enumerate selectable storage mailboxes (not just the source mailbox). Defaults to false."
-    )]
-    pub(super) all_mailboxes: bool,
+    pub(super) name: Option<String>,
+    #[schemars(description = "Mailbox to search. Omit to use the account-wide mutation plan.")]
+    pub(super) mailbox: Option<String>,
     #[serde(default = "default_false")]
     #[schemars(
         description = "When true, permanently delete (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
@@ -322,31 +310,75 @@ pub(super) struct UnsubscribeMessageArgs {
         description = "Required explicit user consent for the RFC 8058 HTTPS POST. Must be true; tool annotations are not authorization."
     )]
     pub(super) confirm_one_click: bool,
-    #[serde(default = "default_false")]
     #[schemars(
-        description = "If true, bulk-delete messages with the target's exact normalized List-Id account-wide, but only when the same passing DKIM signature also covers List-Id. Defaults to false."
+        description = "Optional matching-message cleanup. Omit to only unsubscribe. When present, messages matching the verified cleanup identity are deleted account-wide under the nested when/identity/deletion policy."
     )]
-    pub(super) delete_matching: bool,
-    #[serde(default = "default_false")]
+    pub(super) cleanup: Option<UnsubscribeCleanupSpec>,
+}
+
+/// When matching-message cleanup may run relative to the unsubscribe attempt.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) enum CleanupWhenArg {
+    /// Only after the one-click POST verifiably succeeded.
+    #[default]
+    AfterSuccess,
+    /// Even when DKIM, URL validation, DNS, or the HTTPS POST failed.
+    Always,
+}
+
+/// Which identity cleanup may match messages by.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) enum CleanupIdentityArg {
+    /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
+    ListIdOnly,
+    /// Prefer the authenticated List-Id; otherwise fall back to the exact
+    /// sender's bulk mail, scoped to the target's own List-Id when it has one.
+    #[default]
+    ListIdOrSender,
+}
+
+/// How cleanup disposes of matched messages.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) enum CleanupDeletionArg {
+    /// Move to Trash; skip cleanup when no Trash mailbox is resolvable.
+    #[default]
+    Trash,
+    /// Move to Trash, but permit an irreversible UID EXPUNGE when Trash is
+    /// unavailable or the MOVE fails (never on Gmail).
+    TrashThenPermanent,
+    /// Permanently delete, bypassing Trash. Irreversible on standard IMAP; on
+    /// Gmail this safely moves to Trash instead.
+    Permanent,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    inline,
+    description = "Matching-message cleanup policy. The three axes are independent; every combination is valid."
+)]
+pub(super) struct UnsubscribeCleanupSpec {
+    #[serde(default)]
     #[schemars(
-        description = "If true, allow cleanup policy evaluation even when DKIM, URL validation, DNS, or the HTTPS POST fails. Cleanup still requires a DKIM-authenticated List-Id or the separate sender fallback. Defaults to false."
+        description = "When cleanup may run: \"afterSuccess\" (default) only after a verified successful POST, or \"always\" even when the unsubscribe attempt failed."
     )]
-    pub(super) delete_on_unsubscribe_failure: bool,
-    #[serde(default = "default_true")]
+    pub(super) when: CleanupWhenArg,
+    #[serde(default)]
     #[schemars(
-        description = "When no usable DKIM-authenticated List-Id exists, allow the narrower exact-sender plus list-header cleanup instead. Defaults to true — it only activates when deleteMatching was requested and the unsubscribe identity was already verified. Set false to require the authenticated List-Id path strictly."
+        description = "Cleanup identity: \"listIdOrSender\" (default) prefers the DKIM-authenticated List-Id and falls back to the exact sender's bulk mail scoped to the target's List-Id when one exists; \"listIdOnly\" requires the authenticated List-Id strictly."
     )]
-    pub(super) allow_sender_fallback: bool,
-    #[serde(default = "default_false")]
+    pub(super) identity: CleanupIdentityArg,
+    #[serde(default)]
     #[schemars(
-        description = "If true, allow irreversible UID EXPUNGE when Trash is unavailable or moving to Trash fails. Defaults to false. Never used as a Gmail fallback because in-place EXPUNGE only removes a label."
+        description = "Disposal: \"trash\" (default) moves to Trash and skips cleanup when Trash is unavailable; \"trashThenPermanent\" permits an irreversible fallback EXPUNGE; \"permanent\" bypasses Trash outright (on Gmail it still moves to Trash)."
     )]
-    pub(super) allow_permanent_fallback: bool,
-    #[serde(default = "default_false")]
-    #[schemars(
-        description = "When true, request permanent matching-message deletion (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible on standard IMAP. On Gmail this safely moves to Trash because in-place EXPUNGE only removes a label. Defaults to false."
-    )]
-    pub(super) permanent: bool,
+    pub(super) deletion: CleanupDeletionArg,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

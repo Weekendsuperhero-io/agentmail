@@ -8,7 +8,10 @@ use super::wire::{
     RemoveFlagsOutput, UnsubscribeMessageOutput, compact_result,
 };
 use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
-use crate::{DeleteMode, DraftAttachment, UnsubscribeOptions};
+use crate::{
+    CleanupDeletion, CleanupIdentityMode, CleanupPolicy, CleanupWhen, DeleteMode, DraftAttachment,
+    UnsubscribeOptions,
+};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
     handler::server::wrapper::Parameters,
@@ -23,6 +26,25 @@ fn delete_mode(permanent: bool) -> DeleteMode {
         DeleteMode::Permanent
     } else {
         DeleteMode::TrashFirst
+    }
+}
+
+/// Map the wire cleanup spec to the internal policy.
+fn cleanup_policy(spec: UnsubscribeCleanupSpec) -> CleanupPolicy {
+    CleanupPolicy {
+        when: match spec.when {
+            CleanupWhenArg::AfterSuccess => CleanupWhen::AfterSuccess,
+            CleanupWhenArg::Always => CleanupWhen::Always,
+        },
+        identity: match spec.identity {
+            CleanupIdentityArg::ListIdOnly => CleanupIdentityMode::ListIdOnly,
+            CleanupIdentityArg::ListIdOrSender => CleanupIdentityMode::ListIdOrSender,
+        },
+        deletion: match spec.deletion {
+            CleanupDeletionArg::Trash => CleanupDeletion::Trash,
+            CleanupDeletionArg::TrashThenPermanent => CleanupDeletion::TrashThenPermanent,
+            CleanupDeletionArg::Permanent => CleanupDeletion::Permanent,
+        },
     }
 }
 
@@ -113,7 +135,7 @@ impl AgentMailServer {
     #[tool(
         name = "delete_by_sender",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteBySenderOutput>().expect("valid delete_by_sender output schema"),
-        description = "Delete messages from the exact address + display name represented by a sample message. From top_senders sample, pass sample.mailbox as mailbox, sample.uid as uid, and sample.uidValidity as expectedUidValidity; the action fails before mutation if the epoch changed. Set allMailboxes=true to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views. Do not use this for mailing-list cleanup.",
+        description = "Delete all messages from an exact sender identity. Pass the address and displayName exactly as returned by a top_senders or top_subscriptions row; matching is exact on both fields, confirmed live before any deletion. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views. Do not use this for mailing-list cleanup (use delete_list_id or unsubscribe_message cleanup).",
         annotations(title = "Delete by Sender", destructive_hint = true),
         execution(task_support = "optional")
     )]
@@ -124,8 +146,8 @@ impl AgentMailServer {
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteBySenderArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if args.mailbox.trim().is_empty() {
-            return Err(McpError::invalid_params("mailbox is required", None));
+        if args.email.trim().is_empty() {
+            return Err(McpError::invalid_params("email is required", None));
         }
 
         let progress = make_progress_fn(&meta, &client);
@@ -133,11 +155,10 @@ impl AgentMailServer {
         match self
             .agentmail
             .delete_by_sender(
-                &args.mailbox,
+                args.mailbox.as_deref(),
                 &args.account,
-                args.uid,
-                args.expected_uid_validity,
-                args.all_mailboxes,
+                &args.email,
+                args.name.as_deref().unwrap_or_default(),
                 delete_mode(args.permanent),
                 progress.as_ref(),
                 Some(&cancel),
@@ -309,7 +330,7 @@ impl AgentMailServer {
     #[tool(
         name = "unsubscribe_message",
         output_schema = rmcp::handler::server::tool::schema_for_output::<UnsubscribeMessageOutput>().expect("valid unsubscribe_message output schema"),
-        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally clean up the same List-Id account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. deleteMatching defaults false; when it runs without a DKIM-authenticated List-Id, cleanup falls back to the exact sender's bulk mail (allowSenderFallback defaults true). Cleanup stops after failure and never becomes permanent unless separately authorized.",
+        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally delete matching messages account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. Omit cleanup to only unsubscribe. When cleanup is present it deletes by the DKIM-authenticated List-Id, or (identity \"listIdOrSender\", the default) falls back to the exact sender's bulk mail scoped to the target's own List-Id when it carries one; cleanup.when gates running after a failed attempt and cleanup.deletion controls Trash versus permanent disposal.",
         annotations(
             title = "Unsubscribe from Mailing List",
             destructive_hint = true,
@@ -339,11 +360,7 @@ impl AgentMailServer {
                 UnsubscribeOptions {
                     expected_uid_validity: args.expected_uid_validity,
                     confirm_one_click: args.confirm_one_click,
-                    delete_matching: args.delete_matching,
-                    delete_on_unsubscribe_failure: args.delete_on_unsubscribe_failure,
-                    allow_sender_fallback: args.allow_sender_fallback,
-                    allow_permanent_fallback: args.allow_permanent_fallback,
-                    mode: delete_mode(args.permanent),
+                    cleanup: args.cleanup.map(cleanup_policy),
                 },
                 progress.as_ref(),
                 Some(&cancel),

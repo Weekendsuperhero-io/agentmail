@@ -457,9 +457,11 @@ mod tests {
     #[test]
     fn uid_actions_require_nonzero_uid_validity() {
         let tools = AgentMailServer::tool_router().list_all();
+        // delete_by_sender is absent by design: it takes a direct sender
+        // identity (email + name) rather than a sample UID, so it carries no
+        // UIDVALIDITY guard — discovery re-finds and confirms live.
         for name in [
             "delete_messages",
-            "delete_by_sender",
             "download_attachments",
             "move_message",
             "unsubscribe_message",

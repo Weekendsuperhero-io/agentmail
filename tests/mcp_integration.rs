@@ -385,9 +385,11 @@ async fn uid_actions_require_a_nonzero_expected_uidvalidity() {
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
 
+    // delete_by_sender is absent by design: it deletes by a direct sender
+    // identity (email + displayName from a ranking row), not a sample UID, so
+    // it carries no UIDVALIDITY guard — discovery confirms the identity live.
     for name in [
         "delete_messages",
-        "delete_by_sender",
         "move_message",
         "unsubscribe_message",
         "download_attachments",
@@ -734,12 +736,9 @@ async fn delete_tools_expose_permanent_flag() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    for name in [
-        "delete_messages",
-        "delete_by_sender",
-        "delete_list_id",
-        "unsubscribe_message",
-    ] {
+    // unsubscribe_message is absent by design: its disposal policy lives in
+    // the nested cleanup.deletion enum, not a flat permanent boolean.
+    for name in ["delete_messages", "delete_by_sender", "delete_list_id"] {
         let tool = tools
             .iter()
             .find(|t| t["name"].as_str() == Some(name))
@@ -776,26 +775,67 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             "unsubscribe_message should require {field}: {schema:#}"
         );
     }
-    for field in [
+    // Cleanup is a single optional nested policy object — never required, so
+    // omitting it means "unsubscribe only" structurally, not via a boolean.
+    assert!(
+        !required.iter().any(|value| value == "cleanup"),
+        "cleanup must stay optional: {required:?}"
+    );
+    let cleanup = &schema["properties"]["cleanup"];
+    for (axis, values, default) in [
+        ("when", vec!["afterSuccess", "always"], "afterSuccess"),
+        (
+            "identity",
+            vec!["listIdOnly", "listIdOrSender"],
+            "listIdOrSender",
+        ),
+        (
+            "deletion",
+            vec!["trash", "trashThenPermanent", "permanent"],
+            "trash",
+        ),
+    ] {
+        let field = &cleanup["properties"][axis];
+        // schemars emits documented enums as oneOf/[{const}]; accept a plain
+        // enum array too so the pin survives representation changes.
+        let allowed: Vec<&str> = if field["enum"].is_array() {
+            field["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect()
+        } else {
+            field["oneOf"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|variant| variant["const"].as_str())
+                .collect()
+        };
+        assert_eq!(
+            allowed, values,
+            "cleanup.{axis} must expose exactly these policies: {cleanup:#}"
+        );
+        assert_eq!(
+            field["default"],
+            json!(default),
+            "cleanup.{axis} must default to {default}: {field:#}"
+        );
+    }
+    // The old flat booleans are gone — one representation per policy.
+    for legacy in [
         "deleteMatching",
         "deleteOnUnsubscribeFailure",
+        "allowSenderFallback",
         "allowPermanentFallback",
         "permanent",
     ] {
-        assert_eq!(
-            schema["properties"][field]["default"],
-            json!(false),
-            "{field} must default fail-closed"
+        assert!(
+            schema["properties"][legacy].is_null(),
+            "legacy flat flag {legacy} must not survive the cleanup object"
         );
     }
-    // The sender fallback only activates when deleteMatching was already
-    // requested and the unsubscribe identity was verified, so it defaults on
-    // — unsigned List-Ids should not need a second round trip to clean up.
-    assert_eq!(
-        schema["properties"]["allowSenderFallback"]["default"],
-        json!(true),
-        "allowSenderFallback defaults on within an already-consented cleanup"
-    );
     assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
 
     let missing = client
@@ -826,10 +866,9 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
         .await;
     assert_eq!(no_consent["error"]["code"], json!(-32602));
 
-    // Default flags (allowSenderFallback=true, deleteMatching unset) must
-    // clear policy validation: the call proceeds to the network and fails
-    // at connect (-32603), NOT as an invalid policy (-32602).
-    let default_flags = client
+    // An unknown field or a value outside the policy enums inside cleanup is
+    // a schema violation (-32602), not a silently ignored knob.
+    let unknown_cleanup_field = client
         .request(
             "tools/call",
             json!({
@@ -839,16 +878,71 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
                     "mailbox": "INBOX",
                     "uid": 1,
                     "expectedUidValidity": 1,
-                    "confirmOneClick": true
+                    "confirmOneClick": true,
+                    "cleanup": {"deleteMatching": true}
                 }
             }),
         )
         .await;
     assert_eq!(
-        default_flags["error"]["code"],
-        json!(-32603),
-        "default flags must pass policy validation and only fail at connect: {default_flags:#}"
+        unknown_cleanup_field["error"]["code"],
+        json!(-32602),
+        "unknown cleanup fields must be rejected: {unknown_cleanup_field:#}"
     );
+    let bad_cleanup_value = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "unsubscribe_message",
+                "arguments": {
+                    "account": "dummy",
+                    "mailbox": "INBOX",
+                    "uid": 1,
+                    "expectedUidValidity": 1,
+                    "confirmOneClick": true,
+                    "cleanup": {"deletion": "shred"}
+                }
+            }),
+        )
+        .await;
+    assert_eq!(
+        bad_cleanup_value["error"]["code"],
+        json!(-32602),
+        "out-of-enum cleanup values must be rejected: {bad_cleanup_value:#}"
+    );
+
+    // Omitted cleanup and an empty cleanup object (all axes defaulted) both
+    // pass policy validation: the call proceeds to the network and fails at
+    // connect (-32603), NOT as an invalid policy (-32602).
+    for arguments in [
+        json!({
+            "account": "dummy",
+            "mailbox": "INBOX",
+            "uid": 1,
+            "expectedUidValidity": 1,
+            "confirmOneClick": true
+        }),
+        json!({
+            "account": "dummy",
+            "mailbox": "INBOX",
+            "uid": 1,
+            "expectedUidValidity": 1,
+            "confirmOneClick": true,
+            "cleanup": {}
+        }),
+    ] {
+        let accepted = client
+            .request(
+                "tools/call",
+                json!({"name": "unsubscribe_message", "arguments": arguments}),
+            )
+            .await;
+        assert_eq!(
+            accepted["error"]["code"],
+            json!(-32603),
+            "valid policies must only fail at connect: {accepted:#}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1119,7 +1213,6 @@ async fn mailbox_argument_follows_one_idiom() {
         "get_messages",
         "search_messages",
         "delete_messages",
-        "delete_by_sender",
         "download_attachments",
         "unsubscribe_message",
         "add_flags",
@@ -1145,6 +1238,7 @@ async fn mailbox_argument_follows_one_idiom() {
         "top_subscriptions",
         "top_mailing_lists",
         "delete_list_id",
+        "delete_by_sender",
     ] {
         let input = &find_tool(tools, name)["inputSchema"];
         assert!(
