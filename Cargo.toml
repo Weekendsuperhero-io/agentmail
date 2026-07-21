@@ -99,3 +99,6 @@ unnested_or_patterns = "warn"
 [dev-dependencies]
 proptest = "1"
 mail-parser = "0.11"
+# oauth_token example only (loopback PKCE flow to mint an access token).
+sha2 = "0.10"
+rand = "0.8"
