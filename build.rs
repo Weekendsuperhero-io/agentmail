@@ -31,9 +31,13 @@ fn main() {
     // is covered by the HEAD watch itself.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/packed-refs");
-    if let Ok(head) = std::fs::read_to_string(".git/HEAD")
-        && let Some(reference) = head.strip_prefix("ref: ")
+    // A single flat `if let` over a combinator chain: portable to any toolchain
+    // (no `let`-chain, so edition/MSRV-independent) AND not a nested `if`, so it
+    // does not trip clippy's `collapsible_if`.
+    if let Some(reference) = std::fs::read_to_string(".git/HEAD")
+        .ok()
+        .and_then(|head| head.strip_prefix("ref: ").map(|r| r.trim().to_string()))
     {
-        println!("cargo:rerun-if-changed=.git/{}", reference.trim());
+        println!("cargo:rerun-if-changed=.git/{reference}");
     }
 }
