@@ -307,11 +307,11 @@ To pass passwords via environment variables instead of keychain:
 npx @modelcontextprotocol/inspector /path/to/agentmail serve
 ```
 
-Opens a web UI to exercise all 21 tools, 6 prompts, and task calls interactively.
+Opens a web UI to exercise all 23 tools, 6 prompts, and task calls interactively.
 
 ## MCP Tools
 
-21 tools covering account discovery, mailbox management, message reading, search,
+23 tools covering account discovery, mailbox management, message reading, search,
 bulk operations, flag management, and composition. 10 long-running tools support
 optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/tasks)
 (SEP-1686) for asynchronous execution.
@@ -411,7 +411,7 @@ let mail = Agentmail::builder(config)
     .imap_timeout(Duration::from_secs(120))  // per-command timeout (default 90s)
     .login_cooldown(Duration::from_secs(600)) // LOGIN-rate-limit gate (default 300s)
     .max_idle(Duration::from_secs(20 * 60))  // idle-session reuse window (default 5 min)
-    .uid_keepalive(Duration::from_secs(120)) // NOOP the pooled UID-Mode session; one LOGIN per process
+    .keepalive(Duration::from_secs(120))     // NOOP all idle pooled sessions; a few LOGINs per process
     .client_identity(ClientIdentity::new("YourApp", "2.1.0")) // RFC 2971 ID: the app, not the library
     .build();
 ```
@@ -500,7 +500,7 @@ Argument autocompletion (`completion/complete`) is supported for the prompts and
 ```
 agentmail (binary crate: agentmail-mcp)
   ├── serve                → MCP stdio server (tokio + rmcp)
-  │                          21 tools + 6 prompts, tasks, progress notifications
+  │                          23 tools + 6 prompts, tasks, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
   ├── create-mailbox       → CLI
@@ -521,7 +521,7 @@ agentmail (binary crate: agentmail-mcp)
 src/ (library + binary)
   ├── lib.rs          → Public API facade (25+ async methods)
   ├── main.rs         → CLI dispatch (clap), account configuration
-  ├── mcp/            → MCP server: 21 tools, 6 prompts, tasks, resources, completions
+  ├── mcp/            → MCP server: 23 tools, 6 prompts, tasks, resources, completions
   ├── config.rs       → TOML config loading, default account resolution
   ├── credentials.rs  → Password resolution (env → config secret → default keyring)
   ├── connection.rs   → IMAP connection pool (default 3 sessions/account, configurable)

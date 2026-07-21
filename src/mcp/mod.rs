@@ -418,7 +418,7 @@ mod tests {
         let tools = AgentMailServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            21,
+            23,
             "tool count drifted — update docs and tests"
         );
         for tool in &tools {

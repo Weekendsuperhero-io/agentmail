@@ -2028,6 +2028,56 @@ where
 // Move
 // ---------------------------------------------------------------------------
 
+/// Outcome of a chunked bulk move.
+pub struct BulkMoveResult {
+    pub moved: Vec<u32>,
+    pub failed: Vec<u32>,
+}
+
+/// Move messages by UID to `destination`, processing in 500-UID chunks.
+/// Uses MOVE when the server advertises it, else COPY + `\Deleted` +
+/// UID EXPUNGE (which needs UIDPLUS). A failed chunk is reported in `failed`
+/// and never retried here — the caller's drain loop re-discovers survivors.
+pub async fn bulk_move_messages<T>(
+    session: &mut Session<T>,
+    uids: &[u32],
+    destination: &str,
+    caps: &ServerCaps,
+    on_progress: Option<&ProgressFn>,
+    cancel: Option<&CancelFn>,
+) -> Result<BulkMoveResult>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    if !caps.has_move() && !caps.has_uidplus() {
+        return Err(AgentmailError::Other(
+            "server supports neither MOVE nor UIDPLUS; cannot move messages safely".to_string(),
+        ));
+    }
+    let mut moved = Vec::new();
+    let mut failed = Vec::new();
+    let total = uids.len() as u64;
+    for chunk in uids.chunks(500) {
+        check_cancel(cancel)?;
+        let uid_set: String = chunk
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        match move_uids(session, &uid_set, destination, caps).await {
+            Ok(()) => {
+                moved.extend_from_slice(chunk);
+                let _ = imap_timeout(session.noop()).await;
+            }
+            Err(_) => failed.extend_from_slice(chunk),
+        }
+        if let Some(progress) = on_progress {
+            progress((moved.len() + failed.len()) as u64, total);
+        }
+    }
+    Ok(BulkMoveResult { moved, failed })
+}
+
 /// Move a message to another mailbox by UID. Uses MOVE when available, else
 /// COPY + `\Deleted` + UID EXPUNGE (which needs UIDPLUS).
 pub async fn move_message(

@@ -597,6 +597,55 @@ pub struct MoveMessageResponse {
     pub moved: bool,
 }
 
+/// Per-mailbox result of a bulk move (shared by move_list_id and
+/// move_by_sender).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct PerMailboxMoveResult {
+    pub mailbox: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+}
+
+/// Response for move_list_id.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveListIdResponse {
+    /// `*` when the account-wide mutation plan was swept.
+    pub mailbox: String,
+    pub account: String,
+    pub list_id: String,
+    pub destination: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mailboxes: Vec<PerMailboxMoveResult>,
+    /// Mailboxes that could not be selected or searched (skipped during scan).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+}
+
+/// Response for move_by_sender.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveBySenderResponse {
+    /// `*` when the account-wide mutation plan was swept.
+    pub mailbox: String,
+    pub account: String,
+    pub sender: String,
+    pub destination: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mailboxes: Vec<PerMailboxMoveResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+}
+
 /// Response for create_mailbox.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

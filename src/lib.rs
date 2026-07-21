@@ -73,7 +73,7 @@ pub struct AgentmailBuilder {
     login_cooldown: Option<std::time::Duration>,
     imap_timeout: Option<std::time::Duration>,
     max_idle: Option<std::time::Duration>,
-    uid_keepalive: Option<std::time::Duration>,
+    keepalive: Option<std::time::Duration>,
     client_identity: Option<ClientIdentity>,
 }
 
@@ -117,15 +117,17 @@ impl AgentmailBuilder {
         self
     }
 
-    /// Keep idle UID-Mode sessions alive with a background NOOP on this
-    /// interval (floored at 30s), so scans reuse one connection indefinitely —
-    /// one LOGIN per process instead of one per gap in scan traffic. The task
-    /// starts on first pool use and stops when this `Agentmail` is dropped.
-    /// Pair with a `max_idle` longer than the interval (the keepalive
-    /// refreshes the idle stamp on every successful ping, so any interval
-    /// shorter than `max_idle` works).
-    pub fn uid_keepalive(mut self, interval: std::time::Duration) -> Self {
-        self.uid_keepalive = Some(interval);
+    /// Keep every idle pooled session — Limited pool and UID-Mode pool alike —
+    /// alive with a background NOOP on this interval (floored at 30s). The
+    /// process then behaves like a mainstream mail client: a few long-lived
+    /// connections, each LOGINed exactly once, instead of a fresh login per
+    /// gap in traffic. (IMAP requires one LOGIN per TCP connection; keeping
+    /// connections alive is the only way to "log in once".) The task starts
+    /// on first pool use and stops when this `Agentmail` is dropped. Any
+    /// interval shorter than `max_idle` works — the keepalive refreshes the
+    /// idle stamp on every successful ping.
+    pub fn keepalive(mut self, interval: std::time::Duration) -> Self {
+        self.keepalive = Some(interval);
         self
     }
 
@@ -153,8 +155,8 @@ impl AgentmailBuilder {
         if let Some(max_idle) = self.max_idle {
             pool.set_max_idle(max_idle);
         }
-        if let Some(interval) = self.uid_keepalive {
-            pool.set_uid_keepalive(interval);
+        if let Some(interval) = self.keepalive {
+            pool.set_keepalive(interval);
         }
         let header_cache = match self.cache {
             CacheLocation::Auto => header_cache::HeaderCache::default(),
@@ -189,7 +191,7 @@ impl Agentmail {
             login_cooldown: None,
             imap_timeout: None,
             max_idle: None,
-            uid_keepalive: None,
+            keepalive: None,
             client_identity: None,
         }
     }
@@ -1549,25 +1551,25 @@ impl Agentmail {
         }
     }
 
-    /// UID-Mode-aware bulk delete shared by delete-by-list-id, delete-by-sender,
-    /// and unsubscribe cleanup. Enters UID Mode when the server and cache allow,
-    /// so a single pass discovers every match across the whole mailbox (crucial
-    /// for delete-by-sender, which has no projection fast-path); otherwise it
-    /// drains the visible window one backfilled page at a time. Owns `session`
-    /// so it releases correctly — a UID-Mode session is dropped, never pooled.
-    #[allow(clippy::too_many_arguments)]
-    async fn delete_sweep(
+    /// UID-Mode-aware matching sweep shared by the delete flows
+    /// (delete-by-list-id, delete-by-sender, unsubscribe cleanup) and the bulk
+    /// move flows (move-by-list-id, move-by-sender) — `action` picks the fate
+    /// of each discovered batch. Enters UID Mode when the server and cache
+    /// allow, so a single pass discovers every match across the whole mailbox
+    /// (crucial for sender selectors, which have no projection fast-path);
+    /// otherwise it drains the visible window one backfilled page at a time.
+    /// Owns `session` so it releases correctly by UID-Mode mark.
+    async fn matching_sweep(
         &self,
         mut session: connection::PooledSession,
         account: &str,
         selector: DeleteSelector,
         mailboxes: &[String],
-        trash: Option<&str>,
+        action: SweepAction<'_>,
         caps: &imap_client::ServerCaps,
-        allow_permanent_fallback: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
-    ) -> Result<DeleteSweepTotals> {
+    ) -> Result<SweepTotals> {
         // ENABLE UIDONLY may leave the session in an indeterminate state on
         // failure, so on error `session` falls out of scope here and the
         // connection closes rather than returning a half-configured session to
@@ -1579,14 +1581,13 @@ impl Agentmail {
             session.mark_uid_mode();
         }
         let outcome = self
-            .delete_sweep_loop(
+            .matching_sweep_loop(
                 session.session(),
                 account,
                 &selector,
                 mailboxes,
-                trash,
+                action,
                 caps,
-                allow_permanent_fallback,
                 on_progress,
                 cancel,
             )
@@ -1597,27 +1598,26 @@ impl Agentmail {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn delete_sweep_loop<T>(
+    async fn matching_sweep_loop<T>(
         &self,
         session: &mut async_imap::Session<T>,
         account: &str,
         selector: &DeleteSelector,
         mailboxes: &[String],
-        trash: Option<&str>,
+        action: SweepAction<'_>,
         caps: &imap_client::ServerCaps,
-        allow_permanent_fallback: bool,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
-    ) -> Result<DeleteSweepTotals>
+    ) -> Result<SweepTotals>
     where
         T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
     {
-        let mut totals = DeleteSweepTotals::default();
+        let mut totals = SweepTotals::default();
         let mut cache_dirtied = false;
 
         for mbox in mailboxes {
             let mut mailbox_found = 0usize;
-            let mut mailbox_deleted = 0usize;
+            let mut mailbox_affected = 0usize;
             let mut mailbox_failed = 0usize;
             let mut drained = false;
             for _pass in 0..Self::MAX_WINDOW_DRAIN_PASSES {
@@ -1639,7 +1639,7 @@ impl Agentmail {
                 {
                     Ok(uids) => uids,
                     // A discovery failure marks the mailbox skipped (coverage
-                    // incomplete) rather than aborting the account-wide delete —
+                    // incomplete) rather than aborting the account-wide sweep —
                     // but a pending cancellation must still propagate.
                     Err(_) => {
                         imap_client::check_cancel(cancel)?;
@@ -1653,25 +1653,47 @@ impl Agentmail {
                     break;
                 }
                 if !cache_dirtied {
+                    // Both actions change mailbox membership, so the ranking
+                    // projections must resync either way.
                     self.fence_header_cache_mutation(account).await;
                     cache_dirtied = true;
                 }
-                let result = imap_client::bulk_delete_messages_with_policy(
-                    session,
-                    &uids,
-                    trash,
-                    caps,
-                    allow_permanent_fallback,
-                    on_progress,
-                    cancel,
-                )
-                .await?;
+                let (affected, failed) = match action {
+                    SweepAction::Delete {
+                        trash,
+                        allow_permanent_fallback,
+                    } => {
+                        let result = imap_client::bulk_delete_messages_with_policy(
+                            session,
+                            &uids,
+                            trash,
+                            caps,
+                            allow_permanent_fallback,
+                            on_progress,
+                            cancel,
+                        )
+                        .await?;
+                        totals.trash_fallback |= result.trash_fallback;
+                        (result.deleted.len(), result.failed.len())
+                    }
+                    SweepAction::Move { destination } => {
+                        let result = imap_client::bulk_move_messages(
+                            session,
+                            &uids,
+                            destination,
+                            caps,
+                            on_progress,
+                            cancel,
+                        )
+                        .await?;
+                        (result.moved.len(), result.failed.len())
+                    }
+                };
                 imap_client::sync(session).await?;
-                totals.trash_fallback |= result.trash_fallback;
                 mailbox_found += uids.len();
-                mailbox_deleted += result.deleted.len();
-                mailbox_failed += result.failed.len();
-                if result.deleted.is_empty() {
+                mailbox_affected += affected;
+                mailbox_failed += failed;
+                if affected == 0 {
                     drained = true;
                     break;
                 }
@@ -1680,13 +1702,13 @@ impl Agentmail {
                 totals.skipped.push(mbox.clone());
             }
             totals.found += mailbox_found;
-            totals.deleted += mailbox_deleted;
+            totals.affected += mailbox_affected;
             totals.failed += mailbox_failed;
             if mailbox_found > 0 {
-                totals.mailboxes.push(PerMailboxDeleteResult {
+                totals.mailboxes.push(SweepMailboxTally {
                     mailbox: mbox.clone(),
                     found: mailbox_found,
-                    deleted: mailbox_deleted,
+                    affected: mailbox_affected,
                     failed: mailbox_failed,
                 });
             }
@@ -1726,14 +1748,16 @@ impl Agentmail {
         };
 
         let totals = self
-            .delete_sweep(
+            .matching_sweep(
                 session,
                 account,
                 DeleteSelector::ListId(list_id.to_string()),
                 &mailboxes,
-                trash.as_deref(),
+                SweepAction::Delete {
+                    trash: trash.as_deref(),
+                    allow_permanent_fallback: false,
+                },
                 &caps,
-                false,
                 on_progress,
                 cancel,
             )
@@ -1744,9 +1768,9 @@ impl Agentmail {
             account: account.to_string(),
             list_id: list_id.to_string(),
             found: totals.found,
-            deleted: totals.deleted,
+            deleted: totals.affected,
             failed: totals.failed,
-            mailboxes: totals.mailboxes,
+            mailboxes: delete_tallies(totals.mailboxes),
             skipped: totals.skipped,
             permanent: mode == DeleteMode::Permanent,
         })
@@ -2184,7 +2208,7 @@ impl Agentmail {
         };
 
         let totals = self
-            .delete_sweep(
+            .matching_sweep(
                 session,
                 account,
                 DeleteSelector::Sender {
@@ -2194,9 +2218,11 @@ impl Agentmail {
                     list_id: None,
                 },
                 &search_mailboxes,
-                trash.as_deref(),
+                SweepAction::Delete {
+                    trash: trash.as_deref(),
+                    allow_permanent_fallback: false,
+                },
                 &caps,
-                false,
                 on_progress,
                 cancel,
             )
@@ -2207,9 +2233,9 @@ impl Agentmail {
             account: account.to_string(),
             sender: sender_display,
             found: totals.found,
-            deleted: totals.deleted,
+            deleted: totals.affected,
             failed: totals.failed,
-            mailboxes: totals.mailboxes,
+            mailboxes: delete_tallies(totals.mailboxes),
             skipped: totals.skipped,
             permanent: mode == DeleteMode::Permanent,
         })
@@ -2218,6 +2244,171 @@ impl Agentmail {
     // -----------------------------------------------------------------
     // Move
     // -----------------------------------------------------------------
+
+    /// Shared front half of the bulk move flows: validates the destination,
+    /// resolves the mailbox scope (excluding the destination account-wide),
+    /// and runs the matching sweep with a Move action.
+    async fn move_sweep(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        selector: DeleteSelector,
+        destination: &str,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<SweepTotals> {
+        let destination = destination.trim();
+        if destination.is_empty() {
+            return Err(AgentmailError::Other("destination is required".to_string()));
+        }
+        if let Some(mbox) = mailbox
+            && mbox.eq_ignore_ascii_case(destination)
+        {
+            return Err(AgentmailError::Other(
+                "destination equals the source mailbox; nothing to move".to_string(),
+            ));
+        }
+        let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
+        if !caps.has_move() && !caps.has_uidplus() {
+            session.release().await;
+            return Err(AgentmailError::Other(
+                "server supports neither MOVE nor UIDPLUS; cannot move messages safely".to_string(),
+            ));
+        }
+        // Validate the destination exists before any mutation (same check as
+        // move_message).
+        let names = imap_client::list_mailbox_names(session.session()).await?;
+        if !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(destination))
+        {
+            session.release().await;
+            return Err(AgentmailError::Other(format!(
+                "Destination mailbox '{destination}' does not exist"
+            )));
+        }
+        let mailboxes: Vec<String> = match mailbox {
+            Some(mbox) => vec![mbox.to_string()],
+            None => self
+                .account_scan_mailboxes(
+                    account,
+                    session.session(),
+                    scan_plan::ScanPurpose::Mutation,
+                )
+                .await?
+                .into_iter()
+                // Never sweep the destination itself: the just-moved messages
+                // still match the selector and would be "moved" onto
+                // themselves pass after pass.
+                .filter(|mbox| !mbox.eq_ignore_ascii_case(destination))
+                .collect(),
+        };
+        self.matching_sweep(
+            session,
+            account,
+            selector,
+            &mailboxes,
+            SweepAction::Move { destination },
+            &caps,
+            on_progress,
+            cancel,
+        )
+        .await
+    }
+
+    /// Move every message with an exact List-Id to `destination` in one
+    /// operation — e.g. statements or a newsletter into an archive folder.
+    /// `mailbox: None` sweeps the account-wide mutation plan (destination
+    /// excluded). Discovery matches `delete_list_id`: server search, cached
+    /// projection fast-path, and a live exact-List-Id confirm before any move.
+    pub async fn move_list_id(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        list_id: &str,
+        destination: &str,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<MoveListIdResponse> {
+        let totals = self
+            .move_sweep(
+                mailbox,
+                account,
+                DeleteSelector::ListId(list_id.to_string()),
+                destination,
+                on_progress,
+                cancel,
+            )
+            .await?;
+        Ok(MoveListIdResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            list_id: list_id.to_string(),
+            destination: destination.trim().to_string(),
+            found: totals.found,
+            moved: totals.affected,
+            failed: totals.failed,
+            mailboxes: move_tallies(totals.mailboxes),
+            skipped: totals.skipped,
+        })
+    }
+
+    /// Move every message from an exact sender identity (email + display
+    /// name, as returned by ranking rows) to `destination` in one operation.
+    /// `mailbox: None` sweeps the account-wide mutation plan (destination
+    /// excluded). Discovery confirms the identity live, like
+    /// `delete_by_sender`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn move_by_sender(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        email: &str,
+        name: &str,
+        destination: &str,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<MoveBySenderResponse> {
+        let email = email.trim();
+        if email.is_empty() {
+            return Err(AgentmailError::Other(
+                "sender email is required (use address from a top_senders/top_subscriptions row)"
+                    .to_string(),
+            ));
+        }
+        let sender_display = if name.is_empty() {
+            email.to_string()
+        } else {
+            format!("{name} <{email}>")
+        };
+        let totals = self
+            .move_sweep(
+                mailbox,
+                account,
+                DeleteSelector::Sender {
+                    email: email.to_string(),
+                    name: name.to_string(),
+                    bulk_only: false,
+                    list_id: None,
+                },
+                destination,
+                on_progress,
+                cancel,
+            )
+            .await?;
+        Ok(MoveBySenderResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            sender: sender_display,
+            destination: destination.trim().to_string(),
+            found: totals.found,
+            moved: totals.affected,
+            failed: totals.failed,
+            mailboxes: move_tallies(totals.mailboxes),
+            skipped: totals.skipped,
+        })
+    }
 
     /// Move a message to another mailbox.
     pub async fn move_message(
@@ -2692,14 +2883,16 @@ impl Agentmail {
         // fallback before the sweep runs; carry that seed into the result.
         let seeded_trash_fallback = mode == DeleteMode::TrashFirst && trash.is_none();
         let totals = self
-            .delete_sweep(
+            .matching_sweep(
                 session,
                 account,
                 selector,
                 &all_mailboxes,
-                trash.as_deref(),
+                SweepAction::Delete {
+                    trash: trash.as_deref(),
+                    allow_permanent_fallback: cleanup.allow_permanent_fallback(),
+                },
                 &caps,
-                cleanup.allow_permanent_fallback(),
                 on_progress,
                 cancel,
             )
@@ -2722,9 +2915,9 @@ impl Agentmail {
             sender: sender_display,
             list_id,
             found: totals.found,
-            deleted: totals.deleted,
+            deleted: totals.affected,
             failed: totals.failed,
-            mailboxes: totals.mailboxes,
+            mailboxes: delete_tallies(totals.mailboxes),
             skipped: totals.skipped,
             // Gmail's safe provider-specific interpretation of Permanent is
             // a move to Trash: in-place UID EXPUNGE only removes a label.
@@ -2857,15 +3050,63 @@ enum DeleteSelector {
     },
 }
 
-/// Aggregated outcome of a delete sweep across one or more mailboxes.
-#[derive(Debug, Default)]
-struct DeleteSweepTotals {
+/// What a matching sweep does with each discovered batch. Discovery, the
+/// windowed drain loop, UID-Mode entry, and per-mailbox tallying are shared;
+/// only this final action differs.
+#[derive(Debug, Clone, Copy)]
+enum SweepAction<'a> {
+    /// Move to Trash (or expunge, per policy) — the delete flows.
+    Delete {
+        trash: Option<&'a str>,
+        allow_permanent_fallback: bool,
+    },
+    /// Move to an ordinary destination mailbox — the bulk move flows.
+    Move { destination: &'a str },
+}
+
+/// Per-mailbox tally of one sweep. `affected` is "deleted" or "moved"
+/// depending on the action; wrappers map it to their wire field.
+#[derive(Debug)]
+struct SweepMailboxTally {
+    mailbox: String,
     found: usize,
-    deleted: usize,
+    affected: usize,
     failed: usize,
-    mailboxes: Vec<PerMailboxDeleteResult>,
+}
+
+/// Aggregated outcome of a matching sweep across one or more mailboxes.
+#[derive(Debug, Default)]
+struct SweepTotals {
+    found: usize,
+    affected: usize,
+    failed: usize,
+    mailboxes: Vec<SweepMailboxTally>,
     skipped: Vec<String>,
     trash_fallback: bool,
+}
+
+fn delete_tallies(tallies: Vec<SweepMailboxTally>) -> Vec<PerMailboxDeleteResult> {
+    tallies
+        .into_iter()
+        .map(|tally| PerMailboxDeleteResult {
+            mailbox: tally.mailbox,
+            found: tally.found,
+            deleted: tally.affected,
+            failed: tally.failed,
+        })
+        .collect()
+}
+
+fn move_tallies(tallies: Vec<SweepMailboxTally>) -> Vec<PerMailboxMoveResult> {
+    tallies
+        .into_iter()
+        .map(|tally| PerMailboxMoveResult {
+            mailbox: tally.mailbox,
+            found: tally.found,
+            moved: tally.affected,
+            failed: tally.failed,
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3525,6 +3766,8 @@ mod tests {
                     format!("{tag} OK STORE completed\r\n")
                 } else if line.contains("UID EXPUNGE") {
                     format!("* 1 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n")
+                } else if line.contains("UID MOVE") {
+                    format!("* 1 EXPUNGE\r\n{tag} OK MOVE completed\r\n")
                 } else if line.contains("NOOP") {
                     format!("{tag} OK NOOP completed\r\n")
                 } else {
@@ -3576,14 +3819,16 @@ mod tests {
         let mk = Agentmail::new(Config::empty());
         let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
         let totals = mk
-            .delete_sweep_loop(
+            .matching_sweep_loop(
                 &mut session,
                 "test-account",
                 &DeleteSelector::ListId("news.example.com".to_string()),
                 &["INBOX".to_string()],
-                None,
+                SweepAction::Delete {
+                    trash: None,
+                    allow_permanent_fallback: false,
+                },
                 &caps,
-                false,
                 None,
                 None,
             )
@@ -3591,7 +3836,7 @@ mod tests {
             .expect("scripted sweep succeeds");
 
         assert_eq!(totals.found, 1, "only the confirmed List-Id match counts");
-        assert_eq!(totals.deleted, 1);
+        assert_eq!(totals.affected, 1);
         assert_eq!(totals.failed, 0);
         assert!(totals.skipped.is_empty());
         assert_eq!(totals.mailboxes.len(), 1);
@@ -3619,6 +3864,65 @@ mod tests {
         );
     }
 
+    /// End-to-end bulk MOVE sweep: same discovery + confirm as the delete
+    /// sweep, but the batch is moved with UID MOVE (server advertises MOVE)
+    /// instead of being expunged — the move_list_id/move_by_sender data path.
+    #[tokio::test]
+    async fn matching_sweep_moves_confirmed_uids_with_uid_move() {
+        let (mut session, server) = scripted_sweep_session(" 5 7", |tag| {
+            let target = "List-Id: News <news.example.com>\r\n\r\n";
+            let sibling = "List-Id: Other <other.example.com>\r\n\r\n";
+            format!(
+                "* 1 FETCH (UID 5 BODY[HEADER.FIELDS (LIST-ID)] {{{}}}\r\n{target})\r\n* 2 FETCH (UID 7 BODY[HEADER.FIELDS (LIST-ID)] {{{}}}\r\n{sibling})\r\n{tag} OK FETCH completed\r\n",
+                target.len(),
+                sibling.len()
+            )
+        })
+        .await;
+
+        let mk = Agentmail::new(Config::empty());
+        let caps = imap_client::ServerCaps::from_strings(["MOVE".to_string()]);
+        let totals = mk
+            .matching_sweep_loop(
+                &mut session,
+                "test-account",
+                &DeleteSelector::ListId("news.example.com".to_string()),
+                &["INBOX".to_string()],
+                SweepAction::Move {
+                    destination: "Statements",
+                },
+                &caps,
+                None,
+                None,
+            )
+            .await
+            .expect("scripted move sweep succeeds");
+
+        assert_eq!(totals.found, 1);
+        assert_eq!(totals.affected, 1, "the confirmed match is moved");
+        assert_eq!(totals.failed, 0);
+
+        drop(session);
+        let commands = server.await.expect("scripted server finishes");
+        let joined = commands.concat();
+        assert!(
+            joined.contains("UID MOVE 5"),
+            "moves via UID MOVE, exactly the confirmed UID: {commands:?}"
+        );
+        assert!(
+            joined.contains("Statements"),
+            "destination reaches the wire: {commands:?}"
+        );
+        assert!(
+            !joined.contains("EXPUNGE") || !commands.iter().any(|c| c.contains("UID EXPUNGE")),
+            "a move sweep must never expunge: {commands:?}"
+        );
+        assert!(
+            !joined.contains("UID MOVE 5,7"),
+            "the sibling list's UID must stay put: {commands:?}"
+        );
+    }
+
     /// End-to-end sender-fallback sweep with the pertinence constraint: both
     /// candidates are bulk mail from the exact sender, but only the one whose
     /// List-Id matches the constraint is deleted — the sibling list survives.
@@ -3638,7 +3942,7 @@ mod tests {
         let mk = Agentmail::new(Config::empty());
         let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
         let totals = mk
-            .delete_sweep_loop(
+            .matching_sweep_loop(
                 &mut session,
                 "test-account",
                 &DeleteSelector::Sender {
@@ -3648,9 +3952,11 @@ mod tests {
                     list_id: Some("news.example.com".to_string()),
                 },
                 &["INBOX".to_string()],
-                None,
+                SweepAction::Delete {
+                    trash: None,
+                    allow_permanent_fallback: false,
+                },
                 &caps,
-                false,
                 None,
                 None,
             )
@@ -3661,7 +3967,7 @@ mod tests {
             totals.found, 1,
             "only the constrained list's message qualifies"
         );
-        assert_eq!(totals.deleted, 1);
+        assert_eq!(totals.affected, 1);
         assert_eq!(totals.failed, 0);
 
         drop(session);

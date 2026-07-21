@@ -1108,6 +1108,139 @@ impl WireOutput for DeleteListIdOutput {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct PerMailboxMoveOutput {
+    pub(super) mailbox: String,
+    pub(super) found: usize,
+    pub(super) moved: usize,
+    pub(super) failed: usize,
+}
+
+impl From<crate::PerMailboxMoveResult> for PerMailboxMoveOutput {
+    fn from(value: crate::PerMailboxMoveResult) -> Self {
+        Self {
+            mailbox: value.mailbox,
+            found: value.found,
+            moved: value.moved,
+            failed: value.failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MoveListIdOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    pub(super) list_id: String,
+    pub(super) destination: String,
+    pub(super) found: usize,
+    pub(super) moved: usize,
+    pub(super) failed: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) mailboxes: Vec<PerMailboxMoveOutput>,
+    pub(super) mailboxes_total: usize,
+    pub(super) mailboxes_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) skipped: Vec<String>,
+    pub(super) skipped_total: usize,
+    pub(super) skipped_truncated: bool,
+}
+
+impl From<crate::MoveListIdResponse> for MoveListIdOutput {
+    fn from(value: crate::MoveListIdResponse) -> Self {
+        let mailboxes = value
+            .mailboxes
+            .into_iter()
+            .map(PerMailboxMoveOutput::from)
+            .collect();
+        let (mailboxes, mailboxes_total, mailboxes_truncated) = truncate_rows(mailboxes);
+        let (skipped, skipped_total, skipped_truncated) = truncate_rows(value.skipped);
+        Self {
+            account: value.account,
+            mailbox: value.mailbox,
+            list_id: value.list_id,
+            destination: value.destination,
+            found: value.found,
+            moved: value.moved,
+            failed: value.failed,
+            mailboxes,
+            mailboxes_total,
+            mailboxes_truncated,
+            skipped,
+            skipped_total,
+            skipped_truncated,
+        }
+    }
+}
+
+impl WireOutput for MoveListIdOutput {
+    fn text_summary(&self) -> String {
+        format!(
+            "Found {} message(s) for List-Id {}; moved {} to \"{}\", failed {}, skipped {} mailbox(es)",
+            self.found, self.list_id, self.moved, self.destination, self.failed, self.skipped_total
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MoveBySenderOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    pub(super) sender: String,
+    pub(super) destination: String,
+    pub(super) found: usize,
+    pub(super) moved: usize,
+    pub(super) failed: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) mailboxes: Vec<PerMailboxMoveOutput>,
+    pub(super) mailboxes_total: usize,
+    pub(super) mailboxes_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) skipped: Vec<String>,
+    pub(super) skipped_total: usize,
+    pub(super) skipped_truncated: bool,
+}
+
+impl From<crate::MoveBySenderResponse> for MoveBySenderOutput {
+    fn from(value: crate::MoveBySenderResponse) -> Self {
+        let mailboxes = value
+            .mailboxes
+            .into_iter()
+            .map(PerMailboxMoveOutput::from)
+            .collect();
+        let (mailboxes, mailboxes_total, mailboxes_truncated) = truncate_rows(mailboxes);
+        let (skipped, skipped_total, skipped_truncated) = truncate_rows(value.skipped);
+        Self {
+            account: value.account,
+            mailbox: value.mailbox,
+            sender: value.sender,
+            destination: value.destination,
+            found: value.found,
+            moved: value.moved,
+            failed: value.failed,
+            mailboxes,
+            mailboxes_total,
+            mailboxes_truncated,
+            skipped,
+            skipped_total,
+            skipped_truncated,
+        }
+    }
+}
+
+impl WireOutput for MoveBySenderOutput {
+    fn text_summary(&self) -> String {
+        format!(
+            "Found {} message(s) from {}; moved {} to \"{}\", failed {}, skipped {} mailbox(es)",
+            self.found, self.sender, self.moved, self.destination, self.failed, self.skipped_total
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct MoveMessageOutput {
     pub(super) account: String,
     pub(super) mailbox: String,

@@ -43,15 +43,15 @@ pub struct ConnectionPool {
     /// `Agentmail::builder(..).login_cooldown(..)`.
     login_cooldown: Duration,
     /// Reuse-eligibility threshold for idle sessions. Defaults to
-    /// [`MAX_IDLE`]; embedding apps raise it (with `uid_keepalive` or a
+    /// [`MAX_IDLE`]; embedding apps raise it (with `keepalive` or a
     /// provider whose server timeout is known) via
     /// `Agentmail::builder(..).max_idle(..)`.
     max_idle: Duration,
-    /// When set, a background task NOOPs each idle UID-Mode session on this
-    /// interval so it never goes stale — one LOGIN per process instead of one
-    /// per gap in scan traffic. Opt-in via
-    /// `Agentmail::builder(..).uid_keepalive(..)`.
-    uid_keepalive: Option<Duration>,
+    /// When set, a background task NOOPs every idle session (Limited and
+    /// UID-Mode pools) on this interval so none go stale — a few LOGINs per
+    /// process instead of one per gap in traffic. Opt-in via
+    /// `Agentmail::builder(..).keepalive(..)`.
+    keepalive: Option<Duration>,
     /// The running keepalive task, spawned lazily on first pool use (an async
     /// context, so a runtime is guaranteed) and aborted when the pool drops.
     keepalive_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -79,7 +79,7 @@ const MAX_IDLE_UID_MODE: usize = 1;
 
 /// Floor for the configurable keepalive interval: NOOPs more often than this
 /// are pure wire chatter with no liveness benefit.
-const MIN_UID_KEEPALIVE: Duration = Duration::from_secs(30);
+const MIN_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// Whether a session idle for `idle_for` is fresh enough to attempt reuse
 /// against the pool's configured threshold.
@@ -175,7 +175,7 @@ impl ConnectionPool {
             login_cooldowns: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             login_cooldown: LOGIN_RATE_LIMIT_COOLDOWN,
             max_idle: MAX_IDLE,
-            uid_keepalive: None,
+            keepalive: None,
             keepalive_task: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -191,51 +191,59 @@ impl ConnectionPool {
         self.max_idle = max_idle.max(Duration::from_secs(1));
     }
 
-    /// Enable the UID-Mode keepalive on this interval (builder use). Floored
-    /// at [`MIN_UID_KEEPALIVE`].
-    pub(crate) fn set_uid_keepalive(&mut self, interval: Duration) {
-        self.uid_keepalive = Some(interval.max(MIN_UID_KEEPALIVE));
+    /// Enable the idle-session keepalive on this interval (builder use).
+    /// Floored at [`MIN_KEEPALIVE`].
+    pub(crate) fn set_keepalive(&mut self, interval: Duration) {
+        self.keepalive = Some(interval.max(MIN_KEEPALIVE));
     }
 
-    /// Spawn the UID-Mode keepalive task once, if configured. Called from the
-    /// async acquire paths so a Tokio runtime is guaranteed. Each tick pops
-    /// every idle UID-Mode session, NOOPs it OUTSIDE the pool lock (an
-    /// acquiring scan must never wait behind a slow dead-socket ping), and
-    /// returns it with a refreshed idle stamp — so it never crosses the
-    /// `max_idle` threshold and the server never sees it as idle. A failed
-    /// ping drops the session; the next scan reconnects fresh.
-    fn ensure_uid_keepalive(&self) {
-        let Some(interval) = self.uid_keepalive else {
+    /// Spawn the keepalive task once, if configured. Called from the async
+    /// acquire paths so a Tokio runtime is guaranteed. Each tick drains every
+    /// idle session — Limited pool and UID-Mode pool alike — NOOPs each
+    /// OUTSIDE the pool lock (an acquiring caller must never wait behind a
+    /// slow dead-socket ping), and returns survivors with refreshed idle
+    /// stamps, so they never cross the `max_idle` threshold and the server
+    /// never sees them as idle. This is what makes the process behave like a
+    /// mainstream mail client: a few long-lived connections, each LOGINed
+    /// once, instead of a login per gap in traffic. A failed ping drops that
+    /// session; the next acquire reconnects fresh.
+    fn ensure_keepalive(&self) {
+        let Some(interval) = self.keepalive else {
             return;
         };
         let mut slot = self.keepalive_task.lock();
         if slot.is_some() {
             return;
         }
-        let uid_pools = Arc::clone(&self.uid_pools);
+        let stores = [Arc::clone(&self.pools), Arc::clone(&self.uid_pools)];
         *slot = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let accounts: Vec<String> = uid_pools.lock().await.keys().cloned().collect();
-                for account in accounts {
-                    let popped = uid_pools
-                        .lock()
-                        .await
-                        .get_mut(&account)
-                        .and_then(|pool| pool.pop());
-                    let Some(mut idle) = popped else { continue };
-                    if imap_client::ping(&mut idle.session).await.is_ok() {
-                        idle.idle_since = Instant::now();
-                        uid_pools
+                for store in &stores {
+                    let accounts: Vec<String> = store.lock().await.keys().cloned().collect();
+                    for account in accounts {
+                        // Take the whole idle set while locked; ping outside
+                        // the lock; return survivors.
+                        let idle_set = store
                             .lock()
                             .await
-                            .entry(account)
-                            .or_default()
-                            .push(idle);
+                            .get_mut(&account)
+                            .map(std::mem::take)
+                            .unwrap_or_default();
+                        let mut alive = Vec::with_capacity(idle_set.len());
+                        for mut idle in idle_set {
+                            if imap_client::ping(&mut idle.session).await.is_ok() {
+                                idle.idle_since = Instant::now();
+                                alive.push(idle);
+                            }
+                            // else: dead — dropped; the next acquire reconnects.
+                        }
+                        if !alive.is_empty() {
+                            store.lock().await.entry(account).or_default().extend(alive);
+                        }
                     }
-                    // else: dead — dropped here; the next scan reconnects.
                 }
             }
         }));
@@ -315,7 +323,7 @@ impl ConnectionPool {
     /// Acquire a session for the named account.
     /// Blocks if the per-account concurrency limit is reached.
     pub async fn acquire(&self, account_name: &str) -> crate::Result<PooledSession> {
-        self.ensure_uid_keepalive();
+        self.ensure_keepalive();
         let account_config = self
             .config
             .accounts
@@ -402,7 +410,7 @@ impl ConnectionPool {
         &self,
         account_name: &str,
     ) -> crate::Result<Option<PooledSession>> {
-        self.ensure_uid_keepalive();
+        self.ensure_keepalive();
         if !self.config.accounts.contains_key(account_name) {
             return Err(AgentmailError::AccountNotFound(account_name.to_string()));
         }
@@ -588,24 +596,24 @@ mod tests {
     /// The keepalive task spawns once on first pool use when configured, and
     /// never spawns when it is not.
     #[tokio::test]
-    async fn uid_keepalive_spawns_once_and_only_when_configured() {
+    async fn keepalive_spawns_once_and_only_when_configured() {
         let unconfigured = ConnectionPool::new(Config::empty());
-        unconfigured.ensure_uid_keepalive();
+        unconfigured.ensure_keepalive();
         assert!(
             !unconfigured.keepalive_running(),
             "no keepalive without opt-in"
         );
 
         let mut pool = ConnectionPool::new(Config::empty());
-        pool.set_uid_keepalive(Duration::from_secs(1));
+        pool.set_keepalive(Duration::from_secs(1));
         assert!(
-            pool.uid_keepalive == Some(MIN_UID_KEEPALIVE),
-            "sub-floor intervals clamp to MIN_UID_KEEPALIVE"
+            pool.keepalive == Some(MIN_KEEPALIVE),
+            "sub-floor intervals clamp to MIN_KEEPALIVE"
         );
         assert!(!pool.keepalive_running(), "lazy: nothing spawned at build");
-        pool.ensure_uid_keepalive();
+        pool.ensure_keepalive();
         assert!(pool.keepalive_running(), "first use spawns the ticker");
-        pool.ensure_uid_keepalive();
+        pool.ensure_keepalive();
         assert!(
             pool.keepalive_running(),
             "second ensure is a no-op, not a respawn"

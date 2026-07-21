@@ -232,13 +232,13 @@ async fn initialize_reports_capabilities_and_identity() {
 }
 
 #[tokio::test]
-async fn tools_list_has_21_annotated_tools() {
+async fn tools_list_has_23_annotated_tools() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        21,
+        23,
         "tool count drifted — update docs and tests"
     );
 
@@ -1239,6 +1239,8 @@ async fn mailbox_argument_follows_one_idiom() {
         "top_mailing_lists",
         "delete_list_id",
         "delete_by_sender",
+        "move_list_id",
+        "move_by_sender",
     ] {
         let input = &find_tool(tools, name)["inputSchema"];
         assert!(

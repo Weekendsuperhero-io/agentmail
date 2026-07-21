@@ -4,8 +4,9 @@ use super::AgentMailServer;
 use super::args::*;
 use super::wire::{
     AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteBySenderOutput,
-    DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput, MoveMessageOutput,
-    RemoveFlagsOutput, UnsubscribeMessageOutput, compact_result,
+    DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput, MoveBySenderOutput,
+    MoveListIdOutput, MoveMessageOutput, RemoveFlagsOutput, UnsubscribeMessageOutput,
+    compact_result,
 };
 use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
 use crate::{
@@ -401,6 +402,90 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(DeleteListIdOutput::from(data)),
+            Err(e) => Err(to_mcp_error(&e)),
+        }
+    }
+
+    #[tool(
+        name = "move_list_id",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveListIdOutput>().expect("valid move_list_id output schema"),
+        description = "Move all messages with a specific List-Id to a destination mailbox in one operation — e.g. archive a newsletter or statement list without per-message calls. Identifies the list by its exact List-Id value from top_mailing_lists. The destination must already exist (create_mailbox first if needed). Omit mailbox to sweep selectable storage mailboxes account-wide; the destination itself is always excluded, and mutation planning excludes Trash/Junk/Drafts and aggregate views.",
+        annotations(
+            title = "Move Mailing List by List-Id",
+            read_only_hint = false,
+            destructive_hint = false
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn move_list_id_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<MoveListIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.destination.trim().is_empty() {
+            return Err(McpError::invalid_params("destination is required", None));
+        }
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        match self
+            .agentmail
+            .move_list_id(
+                args.mailbox.as_deref(),
+                &args.account,
+                &args.list_id,
+                &args.destination,
+                progress.as_ref(),
+                Some(&cancel),
+            )
+            .await
+        {
+            Ok(data) => compact_result(MoveListIdOutput::from(data)),
+            Err(e) => Err(to_mcp_error(&e)),
+        }
+    }
+
+    #[tool(
+        name = "move_by_sender",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveBySenderOutput>().expect("valid move_by_sender output schema"),
+        description = "Move all messages from an exact sender identity to a destination mailbox in one operation — e.g. file monthly statements from a bank into a folder. Pass the address and displayName exactly as returned by a top_senders or top_subscriptions row; matching is exact on both fields, confirmed live before any move. The destination must already exist. Omit mailbox to sweep selectable storage mailboxes account-wide; the destination itself is always excluded.",
+        annotations(
+            title = "Move by Sender",
+            read_only_hint = false,
+            destructive_hint = false
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn move_by_sender_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<MoveBySenderArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.email.trim().is_empty() {
+            return Err(McpError::invalid_params("email is required", None));
+        }
+        if args.destination.trim().is_empty() {
+            return Err(McpError::invalid_params("destination is required", None));
+        }
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        match self
+            .agentmail
+            .move_by_sender(
+                args.mailbox.as_deref(),
+                &args.account,
+                &args.email,
+                args.name.as_deref().unwrap_or_default(),
+                &args.destination,
+                progress.as_ref(),
+                Some(&cancel),
+            )
+            .await
+        {
+            Ok(data) => compact_result(MoveBySenderOutput::from(data)),
             Err(e) => Err(to_mcp_error(&e)),
         }
     }

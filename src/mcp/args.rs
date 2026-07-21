@@ -470,6 +470,57 @@ pub(super) struct DeleteListIdArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    description = "Arguments for moving all messages with a specific List-Id to another mailbox."
+)]
+pub(super) struct MoveListIdArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(description = "The List-Id header value to match (from top_mailing_lists).")]
+    pub(super) list_id: String,
+    #[schemars(
+        description = "Destination mailbox (required). Must already exist; use create_mailbox first if needed."
+    )]
+    pub(super) destination: String,
+    #[schemars(
+        description = "Mailbox to search. Omit to use the account-wide mutation plan (the destination itself is excluded)."
+    )]
+    pub(super) mailbox: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    description = "Arguments for moving all messages from an exact sender identity to another mailbox."
+)]
+pub(super) struct MoveBySenderArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(
+        description = "The sender's exact email address to match (from a top_senders or top_subscriptions row's address)."
+    )]
+    pub(super) email: String,
+    #[serde(default)]
+    #[schemars(
+        description = "The sender's exact display name to match (from the row's displayName). Omit or pass \"\" for senders without a display name; matching is exact on both fields."
+    )]
+    pub(super) name: Option<String>,
+    #[schemars(
+        description = "Destination mailbox (required). Must already exist; use create_mailbox first if needed."
+    )]
+    pub(super) destination: String,
+    #[schemars(
+        description = "Mailbox to search. Omit to use the account-wide mutation plan (the destination itself is excluded)."
+    )]
+    pub(super) mailbox: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for creating a new mailbox on the server.")]
 pub(super) struct CreateMailboxArgs {
     #[schemars(
