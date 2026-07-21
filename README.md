@@ -399,6 +399,30 @@ The ranking cache defaults to
 `AGENTMAIL_DISABLE_HEADER_CACHE=1` (`true` and `yes` also work) to use live scans
 only. SQLite failures automatically fall back to live IMAP behavior.
 
+Embedding applications configure the same knobs programmatically — explicit
+builder settings override the environment variables:
+
+```rust,no_run
+# use agentmail::{Agentmail, ClientIdentity, Config};
+# use std::time::Duration;
+# let config = Config::empty();
+let mail = Agentmail::builder(config)
+    .cache_dir("/path/to/app/caches")        // or .disable_cache()
+    .imap_timeout(Duration::from_secs(120))  // per-command timeout (default 90s)
+    .login_cooldown(Duration::from_secs(600)) // LOGIN-rate-limit gate (default 300s)
+    .max_idle(Duration::from_secs(20 * 60))  // idle-session reuse window (default 5 min)
+    .uid_keepalive(Duration::from_secs(120)) // NOOP the pooled UID-Mode session; one LOGIN per process
+    .client_identity(ClientIdentity::new("YourApp", "2.1.0")) // RFC 2971 ID: the app, not the library
+    .build();
+```
+
+The RFC 2971 `ID` command is sent at connect with `name`, `version`, `os`, and
+a runtime-detected `os-version` (Yahoo/AOL request all four; their partner
+registration keys on `name`). `ClientIdentity` also carries optional `vendor`
+and `support_url` fields. Values must be truthful (RFC 2971 §3) — and note the
+same section forbids servers from gating service on ID: identity is
+classification and troubleshooting hygiene, not a rate-limit lever.
+
 One-click execution transiently fetches the complete selected message because
 DKIM verification must hash its body. That source is held only for the action
 and is dropped before optional mailbox cleanup; it is never written to the

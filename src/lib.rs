@@ -20,7 +20,7 @@ mod unsubscribe;
 pub use config::{AccountConfig, Config};
 pub use connection::ConnectionPool;
 pub use error::{AgentmailError, Result};
-pub use imap_client::{CancelFn, ProgressFn};
+pub use imap_client::{CancelFn, ClientIdentity, ProgressFn};
 pub use provider::MailProvider;
 pub use secret::init_service_name;
 pub use types::*;
@@ -37,13 +37,160 @@ pub struct Agentmail {
     header_cache: header_cache::HeaderCache,
 }
 
-impl Agentmail {
-    /// Create from an existing config.
-    pub fn new(config: Config) -> Self {
-        Self {
-            pool: ConnectionPool::new(config),
+/// Where the header cache lives — the builder's programmatic answer to the
+/// `AGENTMAIL_CACHE_DIR` / `AGENTMAIL_DISABLE_HEADER_CACHE` environment
+/// variables. An explicit choice overrides both variables.
+#[derive(Debug, Clone, Default)]
+enum CacheLocation {
+    /// Environment-aware default (env override, else the OS cache dir).
+    #[default]
+    Auto,
+    /// No persistence: rankings use the Limited-Mode live fallback and UID
+    /// Mode is never entered.
+    Disabled,
+    /// Persist under this directory (the versioned cache file is created
+    /// inside it).
+    Dir(std::path::PathBuf),
+}
+
+/// Programmatic configuration for embedding [`Agentmail`] in an application —
+/// every knob here works without environment variables, and explicit choices
+/// override the corresponding variables.
+///
+/// ```no_run
+/// # use agentmail::{Agentmail, Config};
+/// # use std::time::Duration;
+/// # let config = Config::empty();
+/// let mail = Agentmail::builder(config)
+///     .cache_dir("/path/to/app/caches")
+///     .imap_timeout(Duration::from_secs(120))
+///     .login_cooldown(Duration::from_secs(600))
+///     .build();
+/// ```
+pub struct AgentmailBuilder {
+    config: Config,
+    cache: CacheLocation,
+    login_cooldown: Option<std::time::Duration>,
+    imap_timeout: Option<std::time::Duration>,
+    max_idle: Option<std::time::Duration>,
+    uid_keepalive: Option<std::time::Duration>,
+    client_identity: Option<ClientIdentity>,
+}
+
+impl AgentmailBuilder {
+    /// Persist the header cache inside this directory (created on first use).
+    /// Overrides `AGENTMAIL_CACHE_DIR` and `AGENTMAIL_DISABLE_HEADER_CACHE`.
+    /// The cache powers UID-Mode full-mailbox ranking; on windowed providers
+    /// (Yahoo/AOL) disabling it limits rankings to the visible window.
+    pub fn cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.cache = CacheLocation::Dir(dir.into());
+        self
+    }
+
+    /// Disable header-cache persistence entirely (see [`Self::cache_dir`] for
+    /// the ranking consequences). Overrides both cache environment variables.
+    pub fn disable_cache(mut self) -> Self {
+        self.cache = CacheLocation::Disabled;
+        self
+    }
+
+    /// How long to refuse new logins for an account after its server answers
+    /// a LOGIN rate limit (default 300s). Floored at 1s.
+    pub fn login_cooldown(mut self, cooldown: std::time::Duration) -> Self {
+        self.login_cooldown = Some(cooldown);
+        self
+    }
+
+    /// Per-command IMAP operation timeout (default 90s; floored at 1s).
+    /// Process-wide: the timeout wraps every command on every session.
+    pub fn imap_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.imap_timeout = Some(timeout);
+        self
+    }
+
+    /// How long an idle pooled session stays eligible for reuse before the
+    /// next acquire reconnects fresh instead (default 5 min; floored at 1s).
+    /// Sessions are liveness-pinged before reuse regardless, so raising this
+    /// only risks a failed ping — worth it on login-rate-limited providers.
+    pub fn max_idle(mut self, max_idle: std::time::Duration) -> Self {
+        self.max_idle = Some(max_idle);
+        self
+    }
+
+    /// Keep idle UID-Mode sessions alive with a background NOOP on this
+    /// interval (floored at 30s), so scans reuse one connection indefinitely —
+    /// one LOGIN per process instead of one per gap in scan traffic. The task
+    /// starts on first pool use and stops when this `Agentmail` is dropped.
+    /// Pair with a `max_idle` longer than the interval (the keepalive
+    /// refreshes the idle stamp on every successful ping, so any interval
+    /// shorter than `max_idle` works).
+    pub fn uid_keepalive(mut self, interval: std::time::Duration) -> Self {
+        self.uid_keepalive = Some(interval);
+        self
+    }
+
+    /// The RFC 2971 `ID` identity sent to servers at connect — the embedding
+    /// application's name/version (and optionally vendor, support URL, OS
+    /// version), replacing the library default. Yahoo/AOL ask clients to
+    /// identify themselves and key partner registration on `name`; RFC 2971
+    /// requires the values be truthful. Process-wide.
+    pub fn client_identity(mut self, identity: ClientIdentity) -> Self {
+        self.client_identity = Some(identity);
+        self
+    }
+
+    pub fn build(self) -> Agentmail {
+        if let Some(timeout) = self.imap_timeout {
+            imap_client::set_imap_timeout(timeout);
+        }
+        if let Some(identity) = self.client_identity {
+            imap_client::set_client_identity(identity);
+        }
+        let mut pool = ConnectionPool::new(self.config);
+        if let Some(cooldown) = self.login_cooldown {
+            pool.set_login_cooldown(cooldown);
+        }
+        if let Some(max_idle) = self.max_idle {
+            pool.set_max_idle(max_idle);
+        }
+        if let Some(interval) = self.uid_keepalive {
+            pool.set_uid_keepalive(interval);
+        }
+        let header_cache = match self.cache {
+            CacheLocation::Auto => header_cache::HeaderCache::default(),
+            CacheLocation::Disabled => header_cache::HeaderCache::disabled(),
+            CacheLocation::Dir(dir) => {
+                header_cache::HeaderCache::at_path(dir.join(header_cache::HeaderCache::FILE_NAME))
+            }
+        };
+        Agentmail {
+            pool,
             mailbox_catalog: mailbox_catalog::MailboxCatalog::default(),
-            header_cache: header_cache::HeaderCache::default(),
+            header_cache,
+        }
+    }
+}
+
+impl Agentmail {
+    /// Create from an existing config with environment-aware defaults.
+    /// Embedding applications that need explicit settings use
+    /// [`Agentmail::builder`] instead.
+    pub fn new(config: Config) -> Self {
+        Self::builder(config).build()
+    }
+
+    /// Start building an [`Agentmail`] with programmatic settings — cache
+    /// location, login-rate-limit cooldown, and IMAP timeout — none of which
+    /// require environment variables.
+    pub fn builder(config: Config) -> AgentmailBuilder {
+        AgentmailBuilder {
+            config,
+            cache: CacheLocation::default(),
+            login_cooldown: None,
+            imap_timeout: None,
+            max_idle: None,
+            uid_keepalive: None,
+            client_identity: None,
         }
     }
 
@@ -475,8 +622,8 @@ impl Agentmail {
     /// by, or `None` for Limited Mode.
     ///
     /// A UID-Mode session changes every response to `UIDFETCH` for the rest of
-    /// its life, so callers MUST drop it rather than return it to the shared
-    /// pool (`uid_mode_release`).
+    /// its life, so callers MUST mark it (`mark_uid_mode`) so release routes it
+    /// to the UID-Mode store, never the Limited pool.
     async fn enter_uid_mode(
         &self,
         account: &str,
@@ -499,14 +646,39 @@ impl Agentmail {
         Ok(Some(page))
     }
 
-    /// Release a ranking-scan session correctly: a Limited-Mode session returns
-    /// to the pool for reuse; a UID-Mode one is dropped (closed), since it must
-    /// never serve a later Limited-Mode operation.
-    async fn uid_mode_release(session: connection::PooledSession, uid_mode: Option<u32>) {
-        if uid_mode.is_none() {
-            session.release().await;
+    /// Acquire a session for a UID-Mode-capable scan, preferring an idle
+    /// pooled UID-Mode session — `ENABLE UIDONLY` is sticky for a connection's
+    /// life, so reuse skips a whole LOGIN + ENABLE. On rate-limited providers
+    /// (AOL/Yahoo `[LIMIT] LOGIN`) this is the difference between one login
+    /// per process and one per tool call. Falls back to a normal acquire plus
+    /// [`Self::enter_uid_mode`].
+    async fn acquire_uid_scan(
+        &self,
+        account: &str,
+    ) -> Result<(connection::PooledSession, Option<u32>)> {
+        if self.header_cache.is_persistent()
+            && let Some(caps) = self.pool.cached_caps(account)
+            && caps.has("UIDONLY")
+            && let Some(session) = self.pool.try_acquire_uid_mode(account).await?
+        {
+            let page = caps
+                .message_limit()
+                .unwrap_or(imap_client::MAX_FETCH_CHUNK as u32);
+            return Ok((session, Some(page)));
         }
-        // else: dropped here — the UID-Mode connection closes.
+        let mut session = self.pool.acquire(account).await?;
+        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
+        if uid_mode.is_some() {
+            session.mark_uid_mode();
+        }
+        Ok((session, uid_mode))
+    }
+
+    /// Release a scan session: `PooledSession::release` routes a marked
+    /// UID-Mode session to the UID-Mode store and a Limited-Mode one to the
+    /// shared pool. Kept as a named helper so scan call sites read explicitly.
+    async fn uid_mode_release(session: connection::PooledSession, _uid_mode: Option<u32>) {
+        session.release().await;
     }
 
     async fn scan_resume_backoff(
@@ -560,7 +732,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopSendersResponse> {
-        let mut session = self.pool.acquire(account).await?;
+        let (mut session, uid_mode) = self.acquire_uid_scan(account).await?;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
@@ -580,7 +752,6 @@ impl Agentmail {
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
         let own = self.own_addresses(account);
         let own_vec: Vec<String> = own.iter().cloned().collect();
-        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
         if let Some(page) = self
             .header_cache
             .top_senders_page(
@@ -777,7 +948,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopSubscriptionsResponse> {
-        let mut session = self.pool.acquire(account).await?;
+        let (mut session, uid_mode) = self.acquire_uid_scan(account).await?;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
@@ -797,7 +968,6 @@ impl Agentmail {
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
         let own = self.own_addresses(account);
         let own_vec: Vec<String> = own.iter().cloned().collect();
-        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
         if let Some(page) = self
             .header_cache
             .top_subscriptions_page(
@@ -1010,7 +1180,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopMailingListsResponse> {
-        let mut session = self.pool.acquire(account).await?;
+        let (mut session, uid_mode) = self.acquire_uid_scan(account).await?;
 
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
@@ -1028,7 +1198,6 @@ impl Agentmail {
             .pool
             .account_config(account)
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
-        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
         if let Some(page) = self
             .header_cache
             .top_mailing_lists_page(
@@ -1404,6 +1573,11 @@ impl Agentmail {
         // connection closes rather than returning a half-configured session to
         // the pool.
         let uid_mode = self.enter_uid_mode(account, session.session()).await?;
+        if uid_mode.is_some() {
+            // Route release to the UID-Mode store so the next ranking scan or
+            // sweep reuses this connection instead of paying another LOGIN.
+            session.mark_uid_mode();
+        }
         let outcome = self
             .delete_sweep_loop(
                 session.session(),
@@ -1417,7 +1591,7 @@ impl Agentmail {
                 cancel,
             )
             .await;
-        // A Limited-Mode session returns to the pool; a UID-Mode one is dropped.
+        // Release routes by the UID-Mode mark: UID store or the Limited pool.
         Self::uid_mode_release(session, uid_mode).await;
         outcome
     }
@@ -3270,6 +3444,42 @@ mod tests {
         assert!(
             msg.contains("Account") || msg.contains("not found"),
             "expected account lookup error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn builder_cache_choices_control_persistence() {
+        let disabled = Agentmail::builder(Config::empty()).disable_cache().build();
+        assert!(
+            !disabled.header_cache.is_persistent(),
+            "disable_cache() must turn off persistence regardless of env"
+        );
+
+        let dir = std::env::temp_dir().join("agentmail-builder-test");
+        let explicit = Agentmail::builder(Config::empty()).cache_dir(&dir).build();
+        assert!(
+            explicit.header_cache.is_persistent(),
+            "cache_dir() must enable persistence at the given directory"
+        );
+    }
+
+    #[test]
+    fn builder_login_cooldown_reaches_the_pool_gate() {
+        let mail = Agentmail::builder(Config::empty())
+            .login_cooldown(std::time::Duration::from_secs(100))
+            .build();
+        mail.pool.note_login_rate_limit("aol");
+        let remaining = mail
+            .pool
+            .login_cooldown_remaining("aol")
+            .expect("cooldown armed");
+        assert!(
+            remaining <= std::time::Duration::from_secs(100),
+            "custom cooldown caps the gate: {remaining:?}"
+        );
+        assert!(
+            remaining > std::time::Duration::from_secs(95),
+            "custom cooldown is actually applied (not the 300s default): {remaining:?}"
         );
     }
 

@@ -229,14 +229,30 @@ impl Default for HeaderCache {
 }
 
 impl HeaderCache {
-    #[cfg(test)]
-    fn at_path(path: PathBuf) -> Self {
+    /// A cache persisted at exactly this SQLite file path. Used by the
+    /// embedding builder (`Agentmail::builder(..).cache_dir(..)`) and tests;
+    /// unlike [`Default`], environment variables are not consulted.
+    pub(crate) fn at_path(path: PathBuf) -> Self {
         Self {
             path: Some(Arc::new(path)),
             gates: parking_lot::Mutex::new(HashMap::new()),
             quirky_accounts: parking_lot::Mutex::new(HashSet::new()),
         }
     }
+
+    /// A disabled cache: nothing persists, `is_persistent()` is false, and UID
+    /// Mode is never entered (the Limited-Mode live fallback stays in use).
+    pub(crate) fn disabled() -> Self {
+        Self {
+            path: None,
+            gates: parking_lot::Mutex::new(HashMap::new()),
+            quirky_accounts: parking_lot::Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// The versioned cache file name, shared by [`Default`] (under the env or
+    /// OS cache root) and the builder's explicit directory.
+    pub(crate) const FILE_NAME: &'static str = "header-cache-v1.sqlite3";
 
     /// Whether a persistent projection is available. UID Mode routes the
     /// whole-mailbox walk through the cache, so callers only enter it when
@@ -1209,7 +1225,7 @@ fn default_cache_path() -> Option<PathBuf> {
     let root = std::env::var_os("AGENTMAIL_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(dirs::cache_dir)?;
-    Some(root.join("agentmail").join("header-cache-v1.sqlite3"))
+    Some(root.join("agentmail").join(HeaderCache::FILE_NAME))
 }
 
 fn open_connection(path: &Path) -> CacheResult<Connection> {

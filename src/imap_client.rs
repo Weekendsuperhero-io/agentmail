@@ -47,7 +47,31 @@ pub(crate) fn check_cancel(cancel: Option<&CancelFn>) -> Result<()> {
 type RawFetchItems = Vec<(u32, Option<u32>, Vec<String>, Vec<u8>)>;
 
 /// Default timeout for IMAP operations (connect, login, fetch, etc.).
-const IMAP_TIMEOUT: Duration = Duration::from_secs(90);
+/// Overridable process-wide via [`set_imap_timeout`] (embedding apps).
+const DEFAULT_IMAP_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Process-wide IMAP operation timeout override, in milliseconds; 0 = unset
+/// (use the default). Process-wide because the timeout wraps every command in
+/// every session — an embedding app configures it once at startup via
+/// `Agentmail::builder(..).imap_timeout(..)`. Last write wins.
+static IMAP_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the process-wide IMAP operation timeout (floored at 1s so a zero or
+/// sub-second value cannot make every command instantly fail).
+pub fn set_imap_timeout(timeout: Duration) {
+    IMAP_TIMEOUT_MS.store(
+        timeout.as_millis().max(1_000) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The effective IMAP operation timeout: the configured override or the default.
+pub(crate) fn imap_timeout_duration() -> Duration {
+    match IMAP_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => DEFAULT_IMAP_TIMEOUT,
+        ms => Duration::from_millis(ms),
+    }
+}
 
 /// Shorter timeout for keep-alive pings.
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -76,12 +100,13 @@ where
     F: std::future::Future<Output = std::result::Result<T, E>>,
     E: Into<AgentmailError>,
 {
-    match tokio::time::timeout(IMAP_TIMEOUT, future).await {
+    let limit = imap_timeout_duration();
+    match tokio::time::timeout(limit, future).await {
         Ok(Ok(val)) => Ok(val),
         Ok(Err(e)) => Err(e.into()),
         Err(_elapsed) => Err(AgentmailError::Other(format!(
             "IMAP operation timed out after {}s",
-            IMAP_TIMEOUT.as_secs()
+            limit.as_secs()
         ))),
     }
 }
@@ -262,7 +287,7 @@ fn is_retryable_connect_error(e: &AgentmailError) -> bool {
 /// Yahoo/AOL reject over-eager logins with `NO [LIMIT] LOGIN Rate limit
 /// hit.` — sub-second retries only extend the penalty window, so these get
 /// materially longer spacing than an ordinary transient failure.
-fn is_login_rate_limit(e: &AgentmailError) -> bool {
+pub(crate) fn is_login_rate_limit(e: &AgentmailError) -> bool {
     matches!(
         e,
         AgentmailError::Imap(async_imap::error::Error::No(text))
@@ -388,22 +413,23 @@ pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSessi
     for attempt in 1..=MAX_CONNECT_ATTEMPTS {
         match connect_once(config, password).await {
             Ok(session) => return Ok(session),
-            Err(e) if attempt < MAX_CONNECT_ATTEMPTS && is_retryable_connect_error(&e) => {
-                let wait = if is_login_rate_limit(&e) {
-                    // Respect the rate limiter: sub-second retries only
-                    // extend the penalty window.
-                    Duration::from_secs(5 * attempt as u64)
-                } else {
-                    backoff
-                };
+            // A LOGIN rate limit is never retried here: every attempt IS
+            // another LOGIN, so in-process retries only extend the server's
+            // penalty window. The pool records a per-account cooldown instead
+            // and fast-fails new connects until it lifts.
+            Err(e)
+                if attempt < MAX_CONNECT_ATTEMPTS
+                    && is_retryable_connect_error(&e)
+                    && !is_login_rate_limit(&e) =>
+            {
                 debug!(
                     target: "agentmail",
                     attempt,
                     max = MAX_CONNECT_ATTEMPTS,
-                    wait_ms = wait.as_millis() as u64,
+                    wait_ms = backoff.as_millis() as u64,
                     "transient connect/login failure; retrying after backoff"
                 );
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(backoff).await;
                 backoff *= 2;
             }
             Err(e) => return Err(e),
@@ -424,13 +450,14 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
 
     let client = async_imap::Client::new(tls);
     let login_fut = client.login(&config.username, password);
-    let plain = match tokio::time::timeout(IMAP_TIMEOUT, login_fut).await {
+    let login_limit = imap_timeout_duration();
+    let plain = match tokio::time::timeout(login_limit, login_fut).await {
         Ok(Ok(session)) => session,
         Ok(Err((err, _client))) => return Err(AgentmailError::Imap(err)),
         Err(_elapsed) => {
             return Err(AgentmailError::Other(format!(
                 "IMAP login timed out after {}s",
-                IMAP_TIMEOUT.as_secs()
+                login_limit.as_secs()
             )));
         }
     };
@@ -449,13 +476,118 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
 /// primary consumer — sends `ID` to Yahoo). Best-effort: `ID` is advisory, so
 /// a server that rejects or lacks it must not fail the connection. Runs under
 /// the ping timeout so a hung `ID` cannot stall a connect.
-async fn send_client_id(session: &mut ImapSession) {
-    // Yahoo/AOL's own IMAP docs ask clients to send name, version, and os.
-    let identification = [
-        ("name", Some("AgentMail")),
-        ("version", Some(env!("CARGO_PKG_VERSION"))),
-        ("os", Some(std::env::consts::OS)),
+/// RFC 2971 client identity sent with the `ID` command. Defaults to the
+/// library's own name/version; embedding applications override it via
+/// `Agentmail::builder(..).client_identity(..)` so the server sees the actual
+/// program the user runs — Yahoo/AOL key partner registration on `name`.
+///
+/// RFC 2971 §3 requires truthful values, and servers are forbidden from
+/// gating service on ID — this is classification and troubleshooting
+/// hygiene, not a rate-limit lever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientIdentity {
+    /// Program name — the partner name or approval-process ID on Yahoo/AOL.
+    pub name: String,
+    /// Program version.
+    pub version: String,
+    /// Vendor of the client (optional RFC 2971 field).
+    pub vendor: Option<String>,
+    /// Support URL (optional RFC 2971 field).
+    pub support_url: Option<String>,
+    /// Operating-system version. `None` = detect at runtime (RFC 2971 §3.3
+    /// prefers runtime detection).
+    pub os_version: Option<String>,
+}
+
+impl ClientIdentity {
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            vendor: None,
+            support_url: None,
+            os_version: None,
+        }
+    }
+}
+
+impl Default for ClientIdentity {
+    fn default() -> Self {
+        Self::new("AgentMail", env!("CARGO_PKG_VERSION"))
+    }
+}
+
+/// Process-wide identity override (last write wins, like the IMAP timeout):
+/// the ID command is sent from inside `connect`, which has no per-call config
+/// context, and one embedding app has one identity.
+static CLIENT_IDENTITY: parking_lot::RwLock<Option<ClientIdentity>> =
+    parking_lot::RwLock::new(None);
+
+/// Set the process-wide RFC 2971 client identity (builder use).
+pub fn set_client_identity(identity: ClientIdentity) {
+    *CLIENT_IDENTITY.write() = Some(identity);
+}
+
+/// Runtime OS version, detected once: `sw_vers -productVersion` on macOS,
+/// `uname -r` elsewhere. Best-effort — `None` when detection fails.
+fn runtime_os_version() -> Option<&'static str> {
+    static OS_VERSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    OS_VERSION
+        .get_or_init(|| {
+            let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+                ("sw_vers", &["-productVersion"])
+            } else {
+                ("uname", &["-r"])
+            };
+            let output = std::process::Command::new(program)
+                .args(args)
+                .output()
+                .ok()?;
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (!version.is_empty()).then_some(version)
+        })
+        .as_deref()
+}
+
+/// The ID field/value pairs for an identity. RFC 2971 §3.3 caps values at
+/// 1024 octets and forbids duplicate fields; both hold by construction here
+/// (all six fields are distinct, values are clamped).
+fn identity_pairs(identity: &ClientIdentity, os_version: Option<&str>) -> Vec<(String, String)> {
+    fn clamp(value: &str) -> String {
+        // 1024-octet cap on a char boundary.
+        let mut end = value.len().min(1024);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end].to_string()
+    }
+    let mut pairs = vec![
+        ("name".to_string(), clamp(&identity.name)),
+        ("version".to_string(), clamp(&identity.version)),
+        ("os".to_string(), std::env::consts::OS.to_string()),
     ];
+    if let Some(os_version) = identity.os_version.as_deref().or(os_version) {
+        pairs.push(("os-version".to_string(), clamp(os_version)));
+    }
+    if let Some(vendor) = identity.vendor.as_deref() {
+        pairs.push(("vendor".to_string(), clamp(vendor)));
+    }
+    if let Some(url) = identity.support_url.as_deref() {
+        pairs.push(("support-url".to_string(), clamp(url)));
+    }
+    pairs
+}
+
+async fn send_client_id(session: &mut ImapSession) {
+    // Yahoo/AOL's own IMAP docs ask clients to send name, version, os, and
+    // os-version; the embedding app's identity takes precedence over the
+    // library default so the server sees the actual program in use.
+    let identity = CLIENT_IDENTITY.read().clone().unwrap_or_default();
+    let pairs = identity_pairs(&identity, runtime_os_version());
+    let identification: Vec<(&str, Option<&str>)> = pairs
+        .iter()
+        .map(|(field, value)| (field.as_str(), Some(value.as_str())))
+        .collect();
     match tokio::time::timeout(PING_TIMEOUT, session.id(identification)).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => debug!(
@@ -3483,6 +3615,72 @@ mod tests {
             }
             other => panic!("expected Fetch, got {other:?}"),
         }
+    }
+
+    /// RFC 2971 §3.3 discipline for the ID command: required fields present,
+    /// optional fields only when set, no duplicate field names, values capped
+    /// at 1024 octets, and the app identity replaces the library default.
+    #[test]
+    fn client_identity_pairs_follow_rfc2971() {
+        let default_pairs = identity_pairs(&ClientIdentity::default(), Some("14.5"));
+        let field = |pairs: &[(String, String)], name: &str| {
+            pairs
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(field(&default_pairs, "name").as_deref(), Some("AgentMail"));
+        assert_eq!(
+            field(&default_pairs, "os").as_deref(),
+            Some(std::env::consts::OS)
+        );
+        assert_eq!(
+            field(&default_pairs, "os-version").as_deref(),
+            Some("14.5"),
+            "runtime OS version flows into the Yahoo-requested os-version field"
+        );
+        assert!(field(&default_pairs, "vendor").is_none());
+
+        let mut app = ClientIdentity::new("Agent Dev", "2.1.0");
+        app.vendor = Some("Weekendsuperhero".to_string());
+        app.support_url = Some("https://example.com/support".to_string());
+        app.os_version = Some("15.0".to_string());
+        // Explicit os_version wins over runtime detection.
+        let app_pairs = identity_pairs(&app, Some("14.5"));
+        assert_eq!(field(&app_pairs, "name").as_deref(), Some("Agent Dev"));
+        assert_eq!(field(&app_pairs, "version").as_deref(), Some("2.1.0"));
+        assert_eq!(field(&app_pairs, "os-version").as_deref(), Some("15.0"));
+        assert_eq!(
+            field(&app_pairs, "vendor").as_deref(),
+            Some("Weekendsuperhero")
+        );
+
+        // No duplicate fields (RFC 2971 MUST NOT), and ≤ 30 pairs.
+        let mut names: Vec<&str> = app_pairs.iter().map(|(f, _)| f.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), app_pairs.len(), "no duplicate ID fields");
+        assert!(app_pairs.len() <= 30);
+
+        // Values clamp at 1024 octets on a char boundary.
+        let oversized = identity_pairs(&ClientIdentity::new("é".repeat(600), "1"), None);
+        let name_value = field(&oversized, "name").unwrap();
+        assert!(name_value.len() <= 1024);
+        assert!(name_value.is_char_boundary(name_value.len()));
+    }
+
+    #[test]
+    fn imap_timeout_override_applies_and_floors() {
+        // Process-global knob: run the whole sequence in one test and restore
+        // the default at the end so parallel tests never see a short timeout.
+        set_imap_timeout(Duration::from_secs(120));
+        assert_eq!(imap_timeout_duration(), Duration::from_secs(120));
+        // Sub-second values floor to 1s rather than making every command
+        // instantly fail.
+        set_imap_timeout(Duration::from_millis(10));
+        assert_eq!(imap_timeout_duration(), Duration::from_secs(1));
+        set_imap_timeout(DEFAULT_IMAP_TIMEOUT);
+        assert_eq!(imap_timeout_duration(), DEFAULT_IMAP_TIMEOUT);
     }
 
     #[tokio::test]
