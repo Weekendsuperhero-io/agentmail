@@ -5,6 +5,14 @@ use mail_parser::{MessageParser, MimeHeaders};
 use crate::content;
 use crate::types::{AttachmentInfo, MessageInfo};
 
+/// Decode the Subject from a raw header block (RFC 2047 encoded-words
+/// included). `None` when the block has no non-empty subject.
+pub(crate) fn parse_subject(header: &[u8]) -> Option<String> {
+    let parsed = MessageParser::default().parse(header)?;
+    let subject = parsed.subject()?.trim();
+    (!subject.is_empty()).then(|| subject.to_string())
+}
+
 /// Parse raw RFC822 bytes into a MessageInfo.
 pub fn parse_rfc822(
     raw: &[u8],

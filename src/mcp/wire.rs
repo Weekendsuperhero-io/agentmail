@@ -63,6 +63,23 @@ fn truncate_fallback(value: String) -> String {
     truncated
 }
 
+/// Short quoted subject fragment for ranking text summaries, empty when the
+/// sample had no subject. Keeps the 5-row summary line bounded.
+fn subject_snippet(subject: Option<&str>) -> String {
+    match subject {
+        Some(subject) => {
+            let snippet: String = subject.chars().take(40).collect();
+            let ellipsis = if subject.chars().count() > 40 {
+                "…"
+            } else {
+                ""
+            };
+            format!(" \"{snippet}{ellipsis}\"")
+        }
+        None => String::new(),
+    }
+}
+
 fn truncate_rows<T>(mut rows: Vec<T>) -> (Vec<T>, usize, bool) {
     let total = rows.len();
     rows.truncate(MAX_BREAKDOWN_ROWS);
@@ -776,6 +793,11 @@ pub(super) struct SubscriptionRankOutput {
     pub(super) display_name: String,
     pub(super) advertised_one_click: bool,
     pub(super) count: u32,
+    /// Decoded Subject of the newest (sample) message — what this
+    /// subscription's mail actually looks like. Absent when the sample could
+    /// not be fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) oldest_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -810,6 +832,7 @@ impl From<crate::TopSubscriptionsResponse> for TopSubscriptionsOutput {
                     display_name: list.display_name,
                     advertised_one_click: list.advertised_one_click,
                     count: list.count,
+                    subject: list.subject,
                     oldest_date: list.oldest_date.map(|date| date.to_rfc3339()),
                     newest_date: list.newest_date.map(|date| date.to_rfc3339()),
                     sample: MessageSampleOutput::new(&account, list.sample),
@@ -834,8 +857,12 @@ impl WireOutput for TopSubscriptionsOutput {
             .take(5)
             .map(|list| {
                 format!(
-                    "{}={} oneClick={} ({})",
-                    list.address, list.count, list.advertised_one_click, list.sample.resource_uri
+                    "{}={} oneClick={}{} ({})",
+                    list.address,
+                    list.count,
+                    list.advertised_one_click,
+                    subject_snippet(list.subject.as_deref()),
+                    list.sample.resource_uri
                 )
             })
             .collect::<Vec<_>>()
@@ -858,6 +885,10 @@ pub(super) struct MailingListRankOutput {
     pub(super) senders: Vec<String>,
     pub(super) sender_count: usize,
     pub(super) count: u32,
+    /// Decoded Subject of the newest (sample) message — what this list's mail
+    /// actually looks like. Absent when the sample could not be fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) oldest_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -897,6 +928,7 @@ impl From<crate::TopMailingListsResponse> for TopMailingListsOutput {
                         .collect(),
                     sender_count: list.sender_count,
                     count: list.count,
+                    subject: list.subject,
                     oldest_date: list.oldest_date.map(|date| date.to_rfc3339()),
                     newest_date: list.newest_date.map(|date| date.to_rfc3339()),
                     sample: MessageSampleOutput::new(&account, list.sample),
@@ -921,8 +953,11 @@ impl WireOutput for TopMailingListsOutput {
             .take(5)
             .map(|list| {
                 format!(
-                    "{}={} ({})",
-                    list.list_id, list.count, list.sample.resource_uri
+                    "{}={}{} ({})",
+                    list.list_id,
+                    list.count,
+                    subject_snippet(list.subject.as_deref()),
+                    list.sample.resource_uri
                 )
             })
             .collect::<Vec<_>>()

@@ -200,6 +200,10 @@ pub struct ListSummary {
     pub advertised_one_click: bool,
     /// Newest message that can be safely passed to unsubscribe_message.
     pub sample: MailboxMessageIdentity,
+    /// Decoded Subject of the sample message, fetched live at page time so a
+    /// caller can see WHAT the subscription is before acting. Never persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     /// Number of messages from this sender with List-Unsubscribe.
     pub count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,6 +402,10 @@ pub struct ListIdSummary {
     pub count: u32,
     /// Newest message that can be safely inspected.
     pub sample: MailboxMessageIdentity,
+    /// Decoded Subject of the sample message, fetched live at page time so a
+    /// caller can see WHAT the list is before acting on it. Never persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_date: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]

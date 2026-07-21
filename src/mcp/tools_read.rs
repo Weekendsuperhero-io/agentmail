@@ -299,7 +299,7 @@ impl AgentMailServer {
     #[tool(
         name = "top_subscriptions",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopSubscriptionsOutput>().expect("valid top_subscriptions output schema"),
-        description = "List bulk/marketing subscriptions by message count. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Rows are grouped by exact address + display name and sorted by advertised one-click syntax, then count. Each has a nested sample {mailbox, uidValidity, uid, resourceUri}; map it to unsubscribe_message mailbox, expectedUidValidity, and uid. advertisedOneClick is syntactic only—the action re-fetches exact headers and verifies DKIM. Live offset pagination defaults to 10 rows (max 100).",
+        description = "List bulk/marketing subscriptions by message count. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Rows are grouped by exact address + display name and sorted by advertised one-click syntax, then count. Each has a nested sample {mailbox, uidValidity, uid, resourceUri} and, when available, the sample message's decoded subject — what this subscription's mail actually looks like; map the sample to unsubscribe_message mailbox, expectedUidValidity, and uid. advertisedOneClick is syntactic only—the action re-fetches exact headers and verifies DKIM. Live offset pagination defaults to 10 rows (max 100).",
         annotations(title = "Top Subscriptions", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -335,7 +335,7 @@ impl AgentMailServer {
     #[tool(
         name = "top_mailing_lists",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopMailingListsOutput>().expect("valid top_mailing_lists output schema"),
-        description = "List mailing lists by normalized List-Id (RFC 2919), highest volume first, including List-Id-only messages and grouping across senders. Each row includes a bounded sender preview, senderCount, and a UIDVALIDITY-safe nested sample for inspection. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Live offset pagination defaults to 10 rows (max 100). Use delete_list_id with an approved listId to remove matching messages.",
+        description = "List mailing lists by normalized List-Id (RFC 2919), highest volume first, including List-Id-only messages and grouping across senders. Each row includes a bounded sender preview, senderCount, a UIDVALIDITY-safe nested sample for inspection, and, when available, the sample message's decoded subject — what this list's mail actually looks like. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Live offset pagination defaults to 10 rows (max 100). Use delete_list_id with an approved listId to remove matching messages.",
         annotations(title = "Top Mailing Lists", read_only_hint = true),
         execution(task_support = "optional")
     )]

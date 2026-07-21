@@ -170,13 +170,17 @@ account's own address.
   "offset", "limit", "nextOffset?",
   "lists": [{
     "address", "displayName", "advertisedOneClick": bool,
-    "count", "oldestDate?", "newestDate?", "sample": MessageIdentity
+    "count", "subject?", "oldestDate?", "newestDate?",
+    "sample": MessageIdentity
   }] }
 ```
 Sorted: advertised one-click senders first, then by count. `advertisedOneClick`
 checks exact local RFC 2369/8058 syntax; it does not claim DKIM success.
 Opaque unsubscribe URLs and recipient tokens are not exposed. Use the nested
-`sample` identity for a later `unsubscribe_message` call.
+`sample` identity for a later `unsubscribe_message` call. `subject` is the
+sample message's decoded Subject, fetched live for the returned page only and
+never persisted in the ranking cache; it is absent when the sample could not
+be fetched.
 
 **top_mailing_lists**
 ```json
@@ -185,14 +189,18 @@ Opaque unsubscribe URLs and recipient tokens are not exposed. Use the nested
   "lists": [{
     "listId": "list-id.example.com",
     "displayName": "Example List", "senders": ["noreply@example.com"],
-    "senderCount", "count", "oldestDate?", "newestDate?",
+    "senderCount", "count", "subject?", "oldestDate?", "newestDate?",
     "sample": MessageIdentity
   }] }
 ```
 
 Grouped by List-Id header; the same list with different senders is one entry.
 `senders` is a preview of at most five values and `senderCount` reports the
-complete count.
+complete count. `subject` is the sample message's decoded Subject (fetched
+live per page, never cached), so a caller can see what the list actually is
+before deleting or moving it. `top_senders` intentionally has no subject —
+one sender spans many lists and subject families, so a single sample would
+mislead.
 
 ```json
 MessageIdentity = { "mailbox", "uidValidity", "uid", "resourceUri" }

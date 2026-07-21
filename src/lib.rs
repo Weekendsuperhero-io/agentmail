@@ -986,9 +986,8 @@ impl Agentmail {
             )
             .await?
         {
-            Self::uid_mode_release(session, uid_mode).await;
             let item_count = page.items.len();
-            let lists = page
+            let mut lists: Vec<ListSummary> = page
                 .items
                 .into_iter()
                 .map(|row| ListSummary {
@@ -1005,11 +1004,21 @@ impl Agentmail {
                         uid_validity: row.sample.uid_validity,
                         uid: row.sample.uid,
                     },
+                    subject: None,
                     count: u32::try_from(row.count).unwrap_or(u32::MAX),
                     oldest_date: row.oldest_date,
                     newest_date: row.newest_date,
                 })
                 .collect();
+            let samples: Vec<MailboxMessageIdentity> =
+                lists.iter().map(|row| row.sample.clone()).collect();
+            let subjects = sample_subjects(session.session(), &samples, cancel).await;
+            for row in &mut lists {
+                row.subject = subjects
+                    .get(&(row.sample.mailbox.clone(), row.sample.uid))
+                    .cloned();
+            }
+            Self::uid_mode_release(session, uid_mode).await;
             let unique_lists = usize::try_from(page.total_groups).unwrap_or(usize::MAX);
             return Ok(TopSubscriptionsResponse {
                 mailbox: mailbox.unwrap_or("*").to_string(),
@@ -1067,6 +1076,7 @@ impl Agentmail {
                         uid_validity,
                         uid: row.uid,
                     },
+                    subject: None,
                     count: 0,
                     oldest_date: None,
                     newest_date: None,
@@ -1115,7 +1125,6 @@ impl Agentmail {
         }
 
         imap_client::check_cancel(cancel)?;
-        session.release().await;
 
         let mut lists: Vec<ListSummary> = map.into_values().collect();
         // One-click senders first, then by message count
@@ -1129,8 +1138,20 @@ impl Agentmail {
 
         let unique_lists = lists.len();
         let total_messages = lists.iter().map(|l| l.count).sum::<u32>();
-        let lists: Vec<_> = lists.into_iter().skip(offset).take(limit).collect();
+        let mut lists: Vec<_> = lists.into_iter().skip(offset).take(limit).collect();
         let item_count = lists.len();
+
+        // Subjects only for the page actually returned, on the session still
+        // held; released after so the enrichment reuses the same connection.
+        let samples: Vec<MailboxMessageIdentity> =
+            lists.iter().map(|row| row.sample.clone()).collect();
+        let subjects = sample_subjects(session.session(), &samples, cancel).await;
+        for row in &mut lists {
+            row.subject = subjects
+                .get(&(row.sample.mailbox.clone(), row.sample.uid))
+                .cloned();
+        }
+        session.release().await;
 
         Ok(TopSubscriptionsResponse {
             mailbox: mailbox.unwrap_or("*").to_string(),
@@ -1215,9 +1236,8 @@ impl Agentmail {
             )
             .await?
         {
-            Self::uid_mode_release(session, uid_mode).await;
             let item_count = page.items.len();
-            let lists = page
+            let mut lists: Vec<ListIdSummary> = page
                 .items
                 .into_iter()
                 .map(|row| ListIdSummary {
@@ -1231,10 +1251,20 @@ impl Agentmail {
                         uid_validity: row.sample.uid_validity,
                         uid: row.sample.uid,
                     },
+                    subject: None,
                     oldest_date: row.oldest_date,
                     newest_date: row.newest_date,
                 })
                 .collect();
+            let samples: Vec<MailboxMessageIdentity> =
+                lists.iter().map(|row| row.sample.clone()).collect();
+            let subjects = sample_subjects(session.session(), &samples, cancel).await;
+            for row in &mut lists {
+                row.subject = subjects
+                    .get(&(row.sample.mailbox.clone(), row.sample.uid))
+                    .cloned();
+            }
+            Self::uid_mode_release(session, uid_mode).await;
             let unique_lists = usize::try_from(page.total_groups).unwrap_or(usize::MAX);
             return Ok(TopMailingListsResponse {
                 mailbox: mailbox.unwrap_or("*").to_string(),
@@ -1334,7 +1364,6 @@ impl Agentmail {
         }
 
         imap_client::check_cancel(cancel)?;
-        session.release().await;
 
         let mut lists: Vec<ListIdSummary> = map
             .into_iter()
@@ -1354,6 +1383,7 @@ impl Agentmail {
                         uid_validity: entry.sample_uid_validity,
                         uid: entry.sample_uid,
                     },
+                    subject: None,
                     oldest_date: entry.oldest_date,
                     newest_date: entry.newest_date,
                 }
@@ -1367,8 +1397,20 @@ impl Agentmail {
 
         let unique_lists = lists.len();
         let total_messages = lists.iter().map(|l| l.count).sum::<u32>();
-        let lists: Vec<_> = lists.into_iter().skip(offset).take(limit).collect();
+        let mut lists: Vec<_> = lists.into_iter().skip(offset).take(limit).collect();
         let item_count = lists.len();
+
+        // Subjects only for the page actually returned, on the session still
+        // held; released after so the enrichment reuses the same connection.
+        let samples: Vec<MailboxMessageIdentity> =
+            lists.iter().map(|row| row.sample.clone()).collect();
+        let subjects = sample_subjects(session.session(), &samples, cancel).await;
+        for row in &mut lists {
+            row.subject = subjects
+                .get(&(row.sample.mailbox.clone(), row.sample.uid))
+                .cloned();
+        }
+        session.release().await;
 
         Ok(TopMailingListsResponse {
             mailbox: mailbox.unwrap_or("*").to_string(),
@@ -3295,6 +3337,63 @@ where
     Ok(exact)
 }
 
+/// Fetch the decoded Subject of each ranking sample so a page can say WHAT a
+/// list or subscription actually is ("Your July statement is ready") instead
+/// of only who sent it. One EXAMINE plus one bounded UID FETCH per distinct
+/// sample mailbox, on the session the ranking already holds — never more than
+/// a page's worth of UIDs. Best-effort by design: a stale sample, a fetch
+/// failure, or a missing Subject header simply yields no entry, and the row
+/// ships without a subject. Subjects are returned transiently and never
+/// persisted (the ranking cache deliberately stores no subjects).
+async fn sample_subjects<T>(
+    session: &mut async_imap::Session<T>,
+    samples: &[MailboxMessageIdentity],
+    cancel: Option<&CancelFn>,
+) -> hashbrown::HashMap<(String, u32), String>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let mut by_mailbox: hashbrown::HashMap<&str, Vec<u32>> = hashbrown::HashMap::new();
+    for sample in samples {
+        by_mailbox
+            .entry(sample.mailbox.as_str())
+            .or_default()
+            .push(sample.uid);
+    }
+
+    let mut subjects = hashbrown::HashMap::new();
+    for (mailbox, uids) in by_mailbox {
+        if imap_client::check_cancel(cancel).is_err() {
+            break;
+        }
+        if imap_client::examine(session, mailbox).await.is_err() {
+            continue;
+        }
+        let uid_set: String = uids
+            .iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let Ok(fetched) = imap_client::timed_uid_fetch_collect_pub(
+            session,
+            &uid_set,
+            "(UID BODY.PEEK[HEADER.FIELDS (Subject)])",
+        )
+        .await
+        else {
+            continue;
+        };
+        for item in fetched {
+            let Ok(fetch) = item else { continue };
+            let Some(uid) = fetch.uid else { continue };
+            if let Some(subject) = fetch.header().and_then(parser::parse_subject) {
+                subjects.insert((mailbox.to_string(), uid), subject);
+            }
+        }
+    }
+    subjects
+}
+
 /// Whether a message's header block satisfies an optional normalized List-Id
 /// constraint. `None` imposes nothing; `Some` requires the header to carry a
 /// List-Id that normalizes to exactly that value — a missing or different
@@ -3880,6 +3979,99 @@ mod tests {
             commands.iter().filter(|c| c.contains("SELECT")).count(),
             2,
             "drain loop re-selects once and stops on the empty pass: {commands:?}"
+        );
+    }
+
+    /// Ranking pages enrich each row with its sample's decoded Subject: one
+    /// EXAMINE + one UID FETCH per mailbox, RFC 2047 encoded-words decoded,
+    /// and a stale sample (no FETCH row) simply yields no subject.
+    #[tokio::test]
+    async fn sample_subjects_fetches_and_decodes_per_mailbox() {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = line.split_whitespace().next().unwrap().to_string();
+                commands.push(line.clone());
+                let reply = if line.contains(" LOGIN ") {
+                    format!("{tag} OK LOGIN completed\r\n")
+                } else if line.contains("EXAMINE") {
+                    format!(
+                        "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] UIDs valid\r\n* OK [UIDNEXT 100] next\r\n{tag} OK [READ-ONLY] EXAMINE completed\r\n"
+                    )
+                } else if line.contains("UID FETCH") {
+                    // UID 5: plain subject. UID 7: RFC 2047 encoded ("Résumé").
+                    // UID 9 (requested) has no row — a stale sample.
+                    let plain = "Subject: Your July statement is ready\r\n\r\n";
+                    let encoded = "Subject: =?UTF-8?B?UsOpc3Vtw6k=?=\r\n\r\n";
+                    format!(
+                        "* 1 FETCH (UID 5 BODY[HEADER.FIELDS (SUBJECT)] {{{}}}\r\n{plain})\r\n* 2 FETCH (UID 7 BODY[HEADER.FIELDS (SUBJECT)] {{{}}}\r\n{encoded})\r\n{tag} OK FETCH completed\r\n",
+                        plain.len(),
+                        encoded.len()
+                    )
+                } else {
+                    panic!("unexpected command: {line:?}");
+                };
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let mut session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+
+        let samples = vec![
+            MailboxMessageIdentity {
+                mailbox: "INBOX".to_string(),
+                uid_validity: 9,
+                uid: 5,
+            },
+            MailboxMessageIdentity {
+                mailbox: "INBOX".to_string(),
+                uid_validity: 9,
+                uid: 7,
+            },
+            MailboxMessageIdentity {
+                mailbox: "INBOX".to_string(),
+                uid_validity: 9,
+                uid: 9,
+            },
+        ];
+        let subjects = sample_subjects(&mut session, &samples, None).await;
+
+        assert_eq!(
+            subjects.get(&("INBOX".to_string(), 5)).map(String::as_str),
+            Some("Your July statement is ready")
+        );
+        assert_eq!(
+            subjects.get(&("INBOX".to_string(), 7)).map(String::as_str),
+            Some("Résumé"),
+            "RFC 2047 encoded-words are decoded"
+        );
+        assert!(
+            !subjects.contains_key(&("INBOX".to_string(), 9)),
+            "a stale sample yields no subject instead of an error"
+        );
+
+        drop(session);
+        let commands = server.await.expect("scripted server finishes");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.contains("UID FETCH"))
+                .count(),
+            1,
+            "one bounded fetch per mailbox covers the whole page: {commands:?}"
         );
     }
 
