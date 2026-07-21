@@ -18,7 +18,7 @@ mod scan_plan;
 mod unsubscribe;
 
 pub use config::{AccountConfig, AuthMethod, Config};
-pub use connection::ConnectionPool;
+pub use connection::{ConnectionPool, ConnectionStats};
 pub use error::{AgentmailError, Result};
 pub use imap_client::{CancelFn, ClientIdentity, ProgressFn};
 pub use provider::MailProvider;
@@ -205,6 +205,13 @@ impl Agentmail {
     /// List all configured account names.
     pub fn account_names(&self) -> Vec<String> {
         self.pool.account_names()
+    }
+
+    /// Snapshot the connection-lifecycle counters — the evidence for whether
+    /// connections are being held and reused rather than re-LOGINed per call.
+    /// See [`connection::ConnectionStats`].
+    pub fn connection_stats(&self) -> connection::ConnectionStats {
+        self.pool.connection_stats()
     }
 
     /// Get config for a specific account.

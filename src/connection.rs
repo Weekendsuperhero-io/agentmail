@@ -1,5 +1,6 @@
 use hashbrown::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -66,6 +67,42 @@ pub struct ConnectionPool {
     /// The running keepalive task, spawned lazily on first pool use (an async
     /// context, so a runtime is guaranteed) and aborted when the pool drops.
     keepalive_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Lifetime connection-lifecycle counters (observability). Shared with the
+    /// keepalive task. See [`ConnectionStats`].
+    stats: Arc<PoolStats>,
+}
+
+/// Internal atomic counters behind [`ConnectionStats`]. Updated on every
+/// acquire and keepalive tick regardless of log level (plain atomics, not
+/// `tracing` macros that compile out in release), so "are we actually holding
+/// the connections we open?" is answerable by reading numbers, not just logs.
+#[derive(Debug, Default)]
+struct PoolStats {
+    fresh_logins: AtomicU64,
+    idle_reuses: AtomicU64,
+    keepalive_pings: AtomicU64,
+    keepalive_drops: AtomicU64,
+}
+
+/// A snapshot of the pool's connection-lifecycle counters — the direct
+/// evidence for whether connections are being held and reused.
+///
+/// `fresh_logins` counts accepted LOGINs (the expensive, rate-limited event);
+/// `idle_reuses` counts pooled-session hits that skipped a LOGIN entirely. In a
+/// healthy long-lived process `fresh_logins` stays near the number of accounts
+/// while `idle_reuses` climbs with traffic. If instead `fresh_logins` rises
+/// with *every* operation and `idle_reuses` stays at zero, connections are NOT
+/// being held — each call is paying a fresh LOGIN.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct ConnectionStats {
+    /// Accepted fresh LOGINs (each is one rate-limit strike on AOL/Yahoo).
+    pub fresh_logins: u64,
+    /// Pooled-session reuses that skipped a LOGIN.
+    pub idle_reuses: u64,
+    /// Keepalive NOOPs that kept a held idle session alive.
+    pub keepalive_pings: u64,
+    /// Idle sessions dropped by keepalive after a failed NOOP.
+    pub keepalive_drops: u64,
 }
 
 /// Max concurrent IMAP operations per account.
@@ -245,6 +282,19 @@ impl ConnectionPool {
             max_idle: MAX_IDLE,
             keepalive: None,
             keepalive_task: Arc::new(parking_lot::Mutex::new(None)),
+            stats: Arc::new(PoolStats::default()),
+        }
+    }
+
+    /// Snapshot the connection-lifecycle counters. This is the evidence for
+    /// "are we holding the connections we open?": compare `fresh_logins`
+    /// (LOGINs paid) against `idle_reuses` (LOGINs skipped by reuse).
+    pub fn connection_stats(&self) -> ConnectionStats {
+        ConnectionStats {
+            fresh_logins: self.stats.fresh_logins.load(Ordering::Relaxed),
+            idle_reuses: self.stats.idle_reuses.load(Ordering::Relaxed),
+            keepalive_pings: self.stats.keepalive_pings.load(Ordering::Relaxed),
+            keepalive_drops: self.stats.keepalive_drops.load(Ordering::Relaxed),
         }
     }
 
@@ -296,6 +346,7 @@ impl ConnectionPool {
             return;
         }
         let stores = [Arc::clone(&self.pools), Arc::clone(&self.uid_pools)];
+        let stats = Arc::clone(&self.stats);
         *slot = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -317,10 +368,22 @@ impl ConnectionPool {
                             if imap_client::ping(&mut idle.session).await.is_ok() {
                                 idle.idle_since = Instant::now();
                                 alive.push(idle);
+                                stats.keepalive_pings.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                // dead — dropped; the next acquire reconnects.
+                                stats.keepalive_drops.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(
+                                    account = %account,
+                                    "keepalive: dropped a dead idle session; next acquire reconnects",
+                                );
                             }
-                            // else: dead — dropped; the next acquire reconnects.
                         }
                         if !alive.is_empty() {
+                            tracing::debug!(
+                                account = %account,
+                                held = alive.len(),
+                                "keepalive: kept idle session(s) alive",
+                            );
                             store.lock().await.entry(account).or_default().extend(alive);
                         }
                     }
@@ -476,6 +539,13 @@ impl ConnectionPool {
         // is very likely dead, so we skip the ~15s dead-`NOOP` ping and
         // reconnect straight away.
         if let Some(session) = self.try_reuse_idle(account_name).await {
+            let reuses = self.stats.idle_reuses.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::debug!(
+                account = %account_name,
+                idle_reuses = reuses,
+                fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
+                "reused a held IMAP session (no LOGIN)",
+            );
             return Ok(PooledSession {
                 session: Some(session),
                 account_name: account_name.to_string(),
@@ -506,6 +576,13 @@ impl ConnectionPool {
         // Re-check under the guard: a concurrent release may have pooled a
         // session while we queued...
         if let Some(session) = self.try_reuse_idle(account_name).await {
+            let reuses = self.stats.idle_reuses.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::debug!(
+                account = %account_name,
+                idle_reuses = reuses,
+                fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
+                "reused a held IMAP session (no LOGIN)",
+            );
             return Ok(PooledSession {
                 session: Some(session),
                 account_name: account_name.to_string(),
@@ -529,6 +606,18 @@ impl ConnectionPool {
             Ok(session) => {
                 // A fresh LOGIN was accepted — the LIMIT episode is over.
                 self.note_login_success(account_name);
+                // info!, not debug!: fresh LOGINs are the rare, expensive,
+                // rate-limited event and must stay visible in release builds
+                // (where debug! compiles out). Steady state is a handful of
+                // these per process; a fresh line per operation means the pool
+                // is NOT holding connections.
+                let logins = self.stats.fresh_logins.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::info!(
+                    account = %account_name,
+                    fresh_logins = logins,
+                    idle_reuses = self.stats.idle_reuses.load(Ordering::Relaxed),
+                    "opened a fresh IMAP connection (LOGIN); later ops should reuse it",
+                );
                 session
             }
             Err(error) => {
@@ -709,6 +798,23 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    /// A brand-new pool has paid no LOGINs and reused nothing; the snapshot
+    /// starts fully zeroed. (The increments themselves need a live connect,
+    /// which has no test seam — the `pool_holds` example is that integration
+    /// proof; this locks the accessor contract and the zeroed baseline.)
+    #[test]
+    fn connection_stats_start_zeroed() {
+        let pool = ConnectionPool::new(Config::empty());
+        let s = pool.connection_stats();
+        assert_eq!(s.fresh_logins, 0);
+        assert_eq!(s.idle_reuses, 0);
+        assert_eq!(s.keepalive_pings, 0);
+        assert_eq!(s.keepalive_drops, 0);
+        // The snapshot must serialize (it's read by the example / diagnostics).
+        let json = serde_json::to_string(&s).expect("ConnectionStats serializes");
+        assert!(json.contains("fresh_logins") && json.contains("idle_reuses"));
+    }
 
     /// A just-released session is reusable; one idle past `MAX_IDLE` is evicted
     /// (reconnect fresh instead of pinging a likely-dead connection).
