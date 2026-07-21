@@ -1301,6 +1301,205 @@ impl Agentmail {
         confirm_exact_list_id(session, &candidates, list_id, cancel).await
     }
 
+    /// Discover the UIDs to delete in `mbox` for one sweep pass. This is the
+    /// only step that differs between the list-id, exact-sender, and
+    /// unsubscribe-cleanup deletes — the surrounding drain loop is shared in
+    /// [`Self::delete_sweep`]. `mb` is the freshly selected mailbox state.
+    async fn discover_delete_uids(
+        &self,
+        selector: &DeleteSelector,
+        session: &mut imap_client::ImapSession,
+        account: &str,
+        mbox: &str,
+        mb: &async_imap::types::Mailbox,
+        cancel: Option<&CancelFn>,
+    ) -> Result<Vec<u32>> {
+        match selector {
+            DeleteSelector::ListId(list_id) => {
+                // `exact_list_id_uids` normalizes internally, so the raw or
+                // normalized value is equivalent here.
+                self.exact_list_id_uids(
+                    session,
+                    account,
+                    mbox,
+                    list_id,
+                    mb.exists,
+                    mb.uid_next,
+                    mb.uid_validity,
+                    cancel,
+                )
+                .await
+            }
+            DeleteSelector::Sender {
+                email,
+                name,
+                bulk_only,
+            } => {
+                let criteria = SearchCriteria {
+                    from: Some(email.clone()),
+                    deleted: Some(false),
+                    ..Default::default()
+                };
+                let query = imap_client::build_search_query_pub(&criteria)?;
+                let candidates = imap_client::search_uids(session, &query).await?;
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
+                }
+                if *bulk_only {
+                    // Unsubscribe cleanup: only the sender's bulk mail (must
+                    // carry a List-Unsubscribe header), never personal replies.
+                    filter_sender_bulk_mail(session, &candidates, email, name, cancel).await
+                } else {
+                    // delete_by_sender: every message from the exact identity.
+                    let fetched =
+                        imap_client::fetch_senders_batch(session, &candidates, cancel).await?;
+                    Ok(fetched
+                        .into_iter()
+                        .filter(|(_uid, e, n)| e == email && n == name)
+                        .map(|(uid, _, _)| uid)
+                        .collect())
+                }
+            }
+        }
+    }
+
+    /// UID-Mode-aware bulk delete shared by delete-by-list-id, delete-by-sender,
+    /// and unsubscribe cleanup. Enters UID Mode when the server and cache allow,
+    /// so a single pass discovers every match across the whole mailbox (crucial
+    /// for delete-by-sender, which has no projection fast-path); otherwise it
+    /// drains the visible window one backfilled page at a time. Owns `session`
+    /// so it releases correctly — a UID-Mode session is dropped, never pooled.
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_sweep(
+        &self,
+        mut session: connection::PooledSession,
+        account: &str,
+        selector: DeleteSelector,
+        mailboxes: &[String],
+        trash: Option<&str>,
+        caps: &imap_client::ServerCaps,
+        allow_permanent_fallback: bool,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<DeleteSweepTotals> {
+        // ENABLE UIDONLY may leave the session in an indeterminate state on
+        // failure, so on error `session` falls out of scope here and the
+        // connection closes rather than returning a half-configured session to
+        // the pool.
+        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
+        let outcome = self
+            .delete_sweep_loop(
+                session.session(),
+                account,
+                &selector,
+                mailboxes,
+                trash,
+                caps,
+                allow_permanent_fallback,
+                on_progress,
+                cancel,
+            )
+            .await;
+        // A Limited-Mode session returns to the pool; a UID-Mode one is dropped.
+        Self::uid_mode_release(session, uid_mode).await;
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_sweep_loop(
+        &self,
+        session: &mut imap_client::ImapSession,
+        account: &str,
+        selector: &DeleteSelector,
+        mailboxes: &[String],
+        trash: Option<&str>,
+        caps: &imap_client::ServerCaps,
+        allow_permanent_fallback: bool,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<DeleteSweepTotals> {
+        let mut totals = DeleteSweepTotals::default();
+        let mut cache_dirtied = false;
+
+        for mbox in mailboxes {
+            let mut mailbox_found = 0usize;
+            let mut mailbox_deleted = 0usize;
+            let mut mailbox_failed = 0usize;
+            let mut drained = false;
+            for _pass in 0..Self::MAX_WINDOW_DRAIN_PASSES {
+                imap_client::check_cancel(cancel)?;
+                // Re-select each pass so a windowed server's freshly backfilled
+                // messages become visible (a no-op once in UID Mode, where the
+                // whole mailbox is already visible).
+                let mb = match imap_client::select(session, mbox).await {
+                    Ok(mb) => mb,
+                    Err(_) => {
+                        totals.skipped.push(mbox.clone());
+                        drained = true;
+                        break;
+                    }
+                };
+                let uids = match self
+                    .discover_delete_uids(selector, session, account, mbox, &mb, cancel)
+                    .await
+                {
+                    Ok(uids) => uids,
+                    // A discovery failure marks the mailbox skipped (coverage
+                    // incomplete) rather than aborting the account-wide delete —
+                    // but a pending cancellation must still propagate.
+                    Err(_) => {
+                        imap_client::check_cancel(cancel)?;
+                        totals.skipped.push(mbox.clone());
+                        drained = true;
+                        break;
+                    }
+                };
+                if uids.is_empty() {
+                    drained = true;
+                    break;
+                }
+                if !cache_dirtied {
+                    self.fence_header_cache_mutation(account).await;
+                    cache_dirtied = true;
+                }
+                let result = imap_client::bulk_delete_messages_with_policy(
+                    session,
+                    &uids,
+                    trash,
+                    caps,
+                    allow_permanent_fallback,
+                    on_progress,
+                    cancel,
+                )
+                .await?;
+                imap_client::sync(session).await?;
+                totals.trash_fallback |= result.trash_fallback;
+                mailbox_found += uids.len();
+                mailbox_deleted += result.deleted.len();
+                mailbox_failed += result.failed.len();
+                if result.deleted.is_empty() {
+                    drained = true;
+                    break;
+                }
+            }
+            if !drained {
+                totals.skipped.push(mbox.clone());
+            }
+            totals.found += mailbox_found;
+            totals.deleted += mailbox_deleted;
+            totals.failed += mailbox_failed;
+            if mailbox_found > 0 {
+                totals.mailboxes.push(PerMailboxDeleteResult {
+                    mailbox: mbox.clone(),
+                    found: mailbox_found,
+                    deleted: mailbox_deleted,
+                    failed: mailbox_failed,
+                });
+            }
+        }
+        Ok(totals)
+    }
+
     pub async fn delete_list_id(
         &self,
         mailbox: Option<&str>,
@@ -1328,108 +1527,29 @@ impl Agentmail {
             }
         };
 
-        let mut total_found = 0usize;
-        let mut total_deleted = 0usize;
-        let mut total_failed = 0usize;
-        let mut per_mailbox = Vec::new();
-        let mut skipped = Vec::new();
-        let mut cache_dirtied = false;
-
-        for mbox in &mailboxes {
-            let mut mailbox_found = 0usize;
-            let mut mailbox_deleted = 0usize;
-            let mut mailbox_failed = 0usize;
-            let mut drained = false;
-            for _pass in 0..Self::MAX_WINDOW_DRAIN_PASSES {
-                imap_client::check_cancel(cancel)?;
-                // Re-select each pass so a windowed server's freshly
-                // backfilled messages become visible.
-                let mb = match imap_client::select(session.session(), mbox).await {
-                    Ok(mb) => mb,
-                    Err(_) => {
-                        skipped.push(mbox.clone());
-                        drained = true;
-                        break;
-                    }
-                };
-                // A discovery failure marks the mailbox skipped (coverage
-                // incomplete) rather than aborting the account-wide delete.
-                let uids = match self
-                    .exact_list_id_uids(
-                        session.session(),
-                        account,
-                        mbox,
-                        list_id,
-                        mb.exists,
-                        mb.uid_next,
-                        mb.uid_validity,
-                        cancel,
-                    )
-                    .await
-                {
-                    Ok(uids) => uids,
-                    Err(_) => {
-                        skipped.push(mbox.clone());
-                        drained = true;
-                        break;
-                    }
-                };
-                if uids.is_empty() {
-                    drained = true;
-                    break;
-                }
-
-                if !cache_dirtied {
-                    self.fence_header_cache_mutation(account).await;
-                    cache_dirtied = true;
-                }
-                let result = imap_client::bulk_delete_messages(
-                    session.session(),
-                    &uids,
-                    trash.as_deref(),
-                    &caps,
-                    on_progress,
-                    cancel,
-                )
-                .await?;
-                imap_client::sync(session.session()).await?;
-
-                mailbox_found += uids.len();
-                mailbox_deleted += result.deleted.len();
-                mailbox_failed += result.failed.len();
-                if result.deleted.is_empty() {
-                    drained = true;
-                    break;
-                }
-            }
-            if !drained {
-                skipped.push(mbox.clone());
-            }
-
-            total_found += mailbox_found;
-            total_deleted += mailbox_deleted;
-            total_failed += mailbox_failed;
-            if mailbox_found > 0 {
-                per_mailbox.push(PerMailboxDeleteResult {
-                    mailbox: mbox.clone(),
-                    found: mailbox_found,
-                    deleted: mailbox_deleted,
-                    failed: mailbox_failed,
-                });
-            }
-        }
-
-        session.release().await;
+        let totals = self
+            .delete_sweep(
+                session,
+                account,
+                DeleteSelector::ListId(list_id.to_string()),
+                &mailboxes,
+                trash.as_deref(),
+                &caps,
+                true,
+                on_progress,
+                cancel,
+            )
+            .await?;
 
         Ok(DeleteListIdResponse {
             mailbox: mailbox.unwrap_or("*").to_string(),
             account: account.to_string(),
             list_id: list_id.to_string(),
-            found: total_found,
-            deleted: total_deleted,
-            failed: total_failed,
-            mailboxes: per_mailbox,
-            skipped,
+            found: totals.found,
+            deleted: totals.deleted,
+            failed: totals.failed,
+            mailboxes: totals.mailboxes,
+            skipped: totals.skipped,
             permanent: mode == DeleteMode::Permanent,
         })
     }
@@ -1862,106 +1982,23 @@ impl Agentmail {
             vec![mailbox.to_string()]
         };
 
-        let mut total_found = 0usize;
-        let mut total_deleted = 0usize;
-        let mut total_failed = 0usize;
-        let mut per_mailbox = Vec::new();
-        let mut skipped = Vec::new();
-        let mut cache_dirtied = false;
-
-        for mbox in &search_mailboxes {
-            let mut mailbox_found = 0usize;
-            let mut mailbox_deleted = 0usize;
-            let mut mailbox_failed = 0usize;
-            let mut drained = false;
-            for _pass in 0..Self::MAX_WINDOW_DRAIN_PASSES {
-                imap_client::check_cancel(cancel)?;
-                // Re-select each pass so a windowed server's freshly
-                // backfilled messages become visible.
-                if imap_client::select(session.session(), mbox).await.is_err() {
-                    skipped.push(mbox.clone());
-                    drained = true;
-                    break;
-                }
-
-                // Server-side FROM search (substring) to get candidates
-                let criteria = SearchCriteria {
-                    from: Some(target_email.clone()),
-                    deleted: Some(false),
-                    ..Default::default()
-                };
-                let query = imap_client::build_search_query_pub(&criteria)?;
-                let candidate_uids = match imap_client::search_uids(session.session(), &query).await
-                {
-                    Ok(uids) => uids,
-                    Err(_) => {
-                        skipped.push(mbox.clone());
-                        drained = true;
-                        break;
-                    }
-                };
-
-                if candidate_uids.is_empty() {
-                    drained = true;
-                    break;
-                }
-
-                // Fetch FROM for all candidates and filter for exact match
-                let candidates =
-                    imap_client::fetch_senders_batch(session.session(), &candidate_uids, cancel)
-                        .await?;
-                let exact_uids: Vec<u32> = candidates
-                    .into_iter()
-                    .filter(|(_uid, email, name)| email == &target_email && name == &target_name)
-                    .map(|(uid, _, _)| uid)
-                    .collect();
-
-                if exact_uids.is_empty() {
-                    drained = true;
-                    break;
-                }
-
-                if !cache_dirtied {
-                    self.fence_header_cache_mutation(account).await;
-                    cache_dirtied = true;
-                }
-                let result = imap_client::bulk_delete_messages(
-                    session.session(),
-                    &exact_uids,
-                    trash.as_deref(),
-                    &caps,
-                    on_progress,
-                    cancel,
-                )
-                .await?;
-                imap_client::sync(session.session()).await?;
-
-                mailbox_found += exact_uids.len();
-                mailbox_deleted += result.deleted.len();
-                mailbox_failed += result.failed.len();
-                if result.deleted.is_empty() {
-                    drained = true;
-                    break;
-                }
-            }
-            if !drained {
-                skipped.push(mbox.clone());
-            }
-
-            total_found += mailbox_found;
-            total_deleted += mailbox_deleted;
-            total_failed += mailbox_failed;
-            if mailbox_found > 0 {
-                per_mailbox.push(PerMailboxDeleteResult {
-                    mailbox: mbox.clone(),
-                    found: mailbox_found,
-                    deleted: mailbox_deleted,
-                    failed: mailbox_failed,
-                });
-            }
-        }
-
-        session.release().await;
+        let totals = self
+            .delete_sweep(
+                session,
+                account,
+                DeleteSelector::Sender {
+                    email: target_email,
+                    name: target_name,
+                    bulk_only: false,
+                },
+                &search_mailboxes,
+                trash.as_deref(),
+                &caps,
+                true,
+                on_progress,
+                cancel,
+            )
+            .await?;
 
         Ok(DeleteBySenderResponse {
             mailbox: if all_mailboxes {
@@ -1971,11 +2008,11 @@ impl Agentmail {
             },
             account: account.to_string(),
             sender: sender_display,
-            found: total_found,
-            deleted: total_deleted,
-            failed: total_failed,
-            mailboxes: per_mailbox,
-            skipped,
+            found: totals.found,
+            deleted: totals.deleted,
+            failed: totals.failed,
+            mailboxes: totals.mailboxes,
+            skipped: totals.skipped,
             permanent: mode == DeleteMode::Permanent,
         })
     }
@@ -2442,142 +2479,48 @@ impl Agentmail {
         let all_mailboxes = self
             .account_scan_mailboxes(account, session.session(), scan_plan::ScanPurpose::Mutation)
             .await?;
-        let mut total_found = 0usize;
-        let mut total_deleted = 0usize;
-        let mut total_failed = 0usize;
-        let mut per_mailbox = Vec::new();
-        let mut skipped = Vec::new();
-        let mut cache_dirtied = false;
-        let mut trash_fallback = options.mode == DeleteMode::TrashFirst && trash.is_none();
-
-        for mbox in &all_mailboxes {
-            let mut mailbox_found = 0usize;
-            let mut mailbox_deleted = 0usize;
-            let mut mailbox_failed = 0usize;
-            let mut drained = false;
-            for _pass in 0..Self::MAX_WINDOW_DRAIN_PASSES {
-                imap_client::check_cancel(cancel)?;
-                // Re-select each pass so a windowed server's freshly
-                // backfilled messages become visible.
-                let mb = match imap_client::select(session.session(), mbox).await {
-                    Ok(mb) => mb,
-                    Err(_) => {
-                        skipped.push(mbox.clone());
-                        drained = true;
-                        break;
-                    }
-                };
-
-                let exact_uids = match &identity {
-                    CleanupIdentity::ListId { normalized, .. } => {
-                        match self
-                            .exact_list_id_uids(
-                                session.session(),
-                                account,
-                                mbox,
-                                normalized,
-                                mb.exists,
-                                mb.uid_next,
-                                mb.uid_validity,
-                                cancel,
-                            )
-                            .await
-                        {
-                            Ok(uids) => uids,
-                            Err(_) => {
-                                skipped.push(mbox.clone());
-                                drained = true;
-                                break;
-                            }
-                        }
-                    }
-                    CleanupIdentity::Sender => {
-                        let criteria = SearchCriteria {
-                            from: Some(target_email.clone()),
-                            deleted: Some(false),
-                            ..Default::default()
-                        };
-                        let query = imap_client::build_search_query_pub(&criteria)?;
-                        let candidates =
-                            match imap_client::search_uids(session.session(), &query).await {
-                                Ok(uids) => uids,
-                                Err(_) => {
-                                    skipped.push(mbox.clone());
-                                    drained = true;
-                                    break;
-                                }
-                            };
-                        filter_sender_bulk_mail(
-                            session.session(),
-                            &candidates,
-                            &target_email,
-                            &target_name,
-                            cancel,
-                        )
-                        .await?
-                    }
-                };
-
-                if exact_uids.is_empty() {
-                    drained = true;
-                    break;
-                }
-                if !cache_dirtied {
-                    self.fence_header_cache_mutation(account).await;
-                    cache_dirtied = true;
-                }
-
-                let result = imap_client::bulk_delete_messages_with_policy(
-                    session.session(),
-                    &exact_uids,
-                    trash.as_deref(),
-                    &caps,
-                    options.allow_permanent_fallback,
-                    on_progress,
-                    cancel,
-                )
-                .await?;
-                imap_client::sync(session.session()).await?;
-                trash_fallback |= result.trash_fallback;
-                mailbox_found += exact_uids.len();
-                mailbox_deleted += result.deleted.len();
-                mailbox_failed += result.failed.len();
-                if result.deleted.is_empty() {
-                    drained = true;
-                    break;
-                }
+        let selector = match &identity {
+            CleanupIdentity::ListId { normalized, .. } => {
+                DeleteSelector::ListId(normalized.clone())
             }
-            if !drained {
-                skipped.push(mbox.clone());
-            }
-
-            total_found += mailbox_found;
-            total_deleted += mailbox_deleted;
-            total_failed += mailbox_failed;
-            if mailbox_found > 0 {
-                per_mailbox.push(PerMailboxDeleteResult {
-                    mailbox: mbox.clone(),
-                    found: mailbox_found,
-                    deleted: mailbox_deleted,
-                    failed: mailbox_failed,
-                });
-            }
-        }
+            CleanupIdentity::Sender => DeleteSelector::Sender {
+                email: target_email.clone(),
+                name: target_name.clone(),
+                bulk_only: true,
+            },
+        };
+        // A TrashFirst cleanup with no resolvable Trash is already a permanent
+        // fallback before the sweep runs; carry that seed into the result.
+        let seeded_trash_fallback = options.mode == DeleteMode::TrashFirst && trash.is_none();
+        let totals = self
+            .delete_sweep(
+                session,
+                account,
+                selector,
+                &all_mailboxes,
+                trash.as_deref(),
+                &caps,
+                options.allow_permanent_fallback,
+                on_progress,
+                cancel,
+            )
+            .await?;
+        let trash_fallback = totals.trash_fallback || seeded_trash_fallback;
 
         let (matched_by, list_id) = match identity {
             CleanupIdentity::ListId { raw, .. } => ("list-id", Some(raw)),
             CleanupIdentity::Sender => ("exact-sender-fallback", None),
         };
-        let complete = skipped.is_empty() && total_failed == 0;
+        let complete = totals.skipped.is_empty() && totals.failed == 0;
         response.matching_messages = Some(MatchingMessagesResult {
             matched_by: matched_by.to_string(),
             sender: sender_display,
             list_id,
-            found: total_found,
-            deleted: total_deleted,
-            failed: total_failed,
-            mailboxes: per_mailbox,
-            skipped,
+            found: totals.found,
+            deleted: totals.deleted,
+            failed: totals.failed,
+            mailboxes: totals.mailboxes,
+            skipped: totals.skipped,
             // Gmail's safe provider-specific interpretation of Permanent is
             // a move to Trash: in-place UID EXPUNGE only removes a label.
             permanent: (options.mode == DeleteMode::Permanent && !caps.is_gmail())
@@ -2585,7 +2528,6 @@ impl Agentmail {
             trash_fallback,
             complete,
         });
-        session.release().await;
         Ok(response)
     }
 
@@ -2663,6 +2605,37 @@ impl Agentmail {
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
+
+/// What a delete sweep matches. The discovery predicate is the only thing that
+/// differs across the list-id, exact-sender, and unsubscribe-cleanup deletes;
+/// everything else (windowed draining, chunked expunge, per-mailbox tallying,
+/// UID-Mode entry) is shared in `delete_sweep`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeleteSelector {
+    /// Messages whose List-Id matches (exact). `exact_list_id_uids` normalizes
+    /// internally, so the raw header value is accepted here.
+    ListId(String),
+    /// Messages from an exact sender identity. `bulk_only` restricts to mail
+    /// that also carries a List-Unsubscribe header (unsubscribe-cleanup
+    /// semantics); otherwise every message from the identity matches
+    /// (delete-by-sender).
+    Sender {
+        email: String,
+        name: String,
+        bulk_only: bool,
+    },
+}
+
+/// Aggregated outcome of a delete sweep across one or more mailboxes.
+#[derive(Debug, Default)]
+struct DeleteSweepTotals {
+    found: usize,
+    deleted: usize,
+    failed: usize,
+    mailboxes: Vec<PerMailboxDeleteResult>,
+    skipped: Vec<String>,
+    trash_fallback: bool,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum CleanupIdentity {
