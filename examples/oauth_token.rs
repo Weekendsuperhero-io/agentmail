@@ -11,15 +11,19 @@
 //!       cargo run --example oauth_token
 //!   (Gmail endpoints + scope https://mail.google.com/ are the defaults.)
 //!
-//! Yahoo / AOL (mail scope needs an approved app; Yahoo lacks PKCE):
+//! Yahoo / AOL (mail scope needs an approved app; no PKCE; secret required —
+//! these are confidential clients, so the secret goes via HTTP Basic auth).
+//! Use the login host that matches the MAILBOX: api.login.yahoo.com for
+//! @yahoo.com, api.login.aol.com for @aol.com / @verizon.net.
 //!     OAUTH_CLIENT_ID=... OAUTH_CLIENT_SECRET=... OAUTH_NO_PKCE=1 \
-//!       OAUTH_AUTH_URL=https://api.login.yahoo.com/oauth2/request_auth \
-//!       OAUTH_TOKEN_URL=https://api.login.yahoo.com/oauth2/get_token \
+//!       OAUTH_AUTH_URL=https://api.login.aol.com/oauth2/request_auth \
+//!       OAUTH_TOKEN_URL=https://api.login.aol.com/oauth2/get_token \
 //!       OAUTH_SCOPE=mail-w \
 //!       cargo run --example oauth_token
+//!   (Yahoo mailbox → swap both hosts to api.login.yahoo.com.)
 //!
-//! The client secret is optional (pure-PKCE public clients); when present it
-//! is sent via HTTP Basic auth, which both Google and Yahoo accept.
+//! The client secret is optional only for pure-PKCE public clients (Gmail);
+//! when present it is sent via HTTP Basic auth, which Google/Yahoo/AOL accept.
 
 use std::io::Write as _;
 use std::time::Duration;
@@ -71,9 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         q.append_pair("redirect_uri", &redirect_uri);
         q.append_pair("scope", &scope);
         q.append_pair("state", &state);
-        // Google returns a refresh_token only with these; harmless elsewhere.
-        q.append_pair("access_type", "offline");
-        q.append_pair("prompt", "consent");
+        // `access_type=offline` + `prompt=consent` are Google conventions that
+        // force a refresh_token; Yahoo/AOL return one by default and may reject
+        // the unknown params, so only send them for Google (or OAUTH_OFFLINE=1).
+        if auth_url.contains("google") || env("OAUTH_OFFLINE").is_some() {
+            q.append_pair("access_type", "offline");
+            q.append_pair("prompt", "consent");
+        }
         if use_pkce {
             q.append_pair("code_challenge", &challenge);
             q.append_pair("code_challenge_method", "S256");
