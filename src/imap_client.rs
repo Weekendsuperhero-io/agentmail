@@ -1015,7 +1015,7 @@ pub async fn fetch_messages(
     include_headers: bool,
 ) -> Result<(Vec<MessageInfo>, u32, u32)> {
     let started = std::time::Instant::now();
-    let mb = imap_timeout(session.select(mailbox)).await?;
+    let mb = examine(session, mailbox).await?;
     let uid_validity = require_uid_validity(mailbox, mb.uid_validity)?;
     let total = mb.exists;
 
@@ -1089,7 +1089,7 @@ pub async fn search_messages(
     include_headers: bool,
 ) -> Result<(Vec<MessageInfo>, u32, u32)> {
     let started = std::time::Instant::now();
-    let selected = imap_timeout(session.select(mailbox)).await?;
+    let selected = examine(session, mailbox).await?;
     let uid_validity = require_uid_validity(mailbox, selected.uid_validity)?;
 
     let query = build_search_query(criteria)?;
@@ -1315,7 +1315,7 @@ pub async fn fetch_sender_dates(
     cancel: Option<&CancelFn>,
 ) -> Result<Vec<crate::scan_cache::SenderRow>> {
     let started = std::time::Instant::now();
-    let mb = imap_timeout(session.select(mailbox)).await?;
+    let mb = examine(session, mailbox).await?;
     if mb.exists == 0 {
         trace_live_scan("top_senders", started, 1, 0);
         return Ok(Vec::new());
@@ -1883,7 +1883,7 @@ pub async fn fetch_attachment_uids(
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
 ) -> Result<(Vec<AttachmentUid>, u32)> {
-    let mb = imap_timeout(session.select(mailbox)).await?;
+    let mb = examine(session, mailbox).await?;
     let uid_validity = require_uid_validity(mailbox, mb.uid_validity)?;
     if mb.exists == 0 {
         return Ok((Vec::new(), uid_validity));
@@ -2580,7 +2580,7 @@ pub async fn fetch_flags(
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
 ) -> Result<FlagScanResult> {
-    let mb = imap_timeout(session.select(mailbox)).await?;
+    let mb = examine(session, mailbox).await?;
     if mb.exists == 0 {
         return Ok(FlagScanResult {
             flags: Vec::new(),
