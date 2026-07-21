@@ -676,6 +676,36 @@ impl Agentmail {
         Ok((session, uid_mode))
     }
 
+    /// Fetch page-sample subjects and prune the samples the server no longer
+    /// has (fetch succeeded, row absent — the deleted-message signal). The
+    /// pruned rows drop out of the projection AND membership together, so the
+    /// very next ranking call auto-advances each group to its next-newest
+    /// sample instead of re-serving a dead UID.
+    async fn page_sample_subjects(
+        &self,
+        session: &mut imap_client::ImapSession,
+        account: &str,
+        samples: &[MailboxMessageIdentity],
+        cancel: Option<&CancelFn>,
+    ) -> hashbrown::HashMap<(String, u32), String> {
+        let SampleSubjects { subjects, missing } = sample_subjects(session, samples, cancel).await;
+        if !missing.is_empty() {
+            tracing::debug!(
+                target: "agentmail",
+                pruned = missing.len(),
+                "pruning ranking samples the server no longer has"
+            );
+            if let Some(config) = self.pool.account_config(account) {
+                for (mailbox, uid) in &missing {
+                    self.header_cache
+                        .prune_uid(account, config, mailbox, *uid)
+                        .await;
+                }
+            }
+        }
+        subjects
+    }
+
     /// Release a scan session: `PooledSession::release` routes a marked
     /// UID-Mode session to the UID-Mode store and a Limited-Mode one to the
     /// shared pool. Kept as a named helper so scan call sites read explicitly.
@@ -1012,7 +1042,9 @@ impl Agentmail {
                 .collect();
             let samples: Vec<MailboxMessageIdentity> =
                 lists.iter().map(|row| row.sample.clone()).collect();
-            let subjects = sample_subjects(session.session(), &samples, cancel).await;
+            let subjects = self
+                .page_sample_subjects(session.session(), account, &samples, cancel)
+                .await;
             for row in &mut lists {
                 row.subject = subjects
                     .get(&(row.sample.mailbox.clone(), row.sample.uid))
@@ -1145,7 +1177,9 @@ impl Agentmail {
         // held; released after so the enrichment reuses the same connection.
         let samples: Vec<MailboxMessageIdentity> =
             lists.iter().map(|row| row.sample.clone()).collect();
-        let subjects = sample_subjects(session.session(), &samples, cancel).await;
+        let subjects = self
+            .page_sample_subjects(session.session(), account, &samples, cancel)
+            .await;
         for row in &mut lists {
             row.subject = subjects
                 .get(&(row.sample.mailbox.clone(), row.sample.uid))
@@ -1258,7 +1292,9 @@ impl Agentmail {
                 .collect();
             let samples: Vec<MailboxMessageIdentity> =
                 lists.iter().map(|row| row.sample.clone()).collect();
-            let subjects = sample_subjects(session.session(), &samples, cancel).await;
+            let subjects = self
+                .page_sample_subjects(session.session(), account, &samples, cancel)
+                .await;
             for row in &mut lists {
                 row.subject = subjects
                     .get(&(row.sample.mailbox.clone(), row.sample.uid))
@@ -1404,7 +1440,9 @@ impl Agentmail {
         // held; released after so the enrichment reuses the same connection.
         let samples: Vec<MailboxMessageIdentity> =
             lists.iter().map(|row| row.sample.clone()).collect();
-        let subjects = sample_subjects(session.session(), &samples, cancel).await;
+        let subjects = self
+            .page_sample_subjects(session.session(), account, &samples, cancel)
+            .await;
         for row in &mut lists {
             row.subject = subjects
                 .get(&(row.sample.mailbox.clone(), row.sample.uid))
@@ -3337,6 +3375,18 @@ where
     Ok(exact)
 }
 
+/// Outcome of a page-sample Subject fetch.
+struct SampleSubjects {
+    /// Decoded Subject per (mailbox, uid) that the server returned a row for.
+    subjects: hashbrown::HashMap<(String, u32), String>,
+    /// Samples whose mailbox FETCH **succeeded** yet returned no row for the
+    /// UID — the strongest available deleted-message signal on providers
+    /// where external deletions are otherwise invisible (Yahoo/AOL advance
+    /// neither UIDNEXT nor a trustworthy EXISTS). Never populated from a
+    /// failed EXAMINE or FETCH: an outage must not masquerade as deletion.
+    missing: Vec<(String, u32)>,
+}
+
 /// Fetch the decoded Subject of each ranking sample so a page can say WHAT a
 /// list or subscription actually is ("Your July statement is ready") instead
 /// of only who sent it. One EXAMINE plus one bounded UID FETCH per distinct
@@ -3349,7 +3399,7 @@ async fn sample_subjects<T>(
     session: &mut async_imap::Session<T>,
     samples: &[MailboxMessageIdentity],
     cancel: Option<&CancelFn>,
-) -> hashbrown::HashMap<(String, u32), String>
+) -> SampleSubjects
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
@@ -3362,6 +3412,7 @@ where
     }
 
     let mut subjects = hashbrown::HashMap::new();
+    let mut missing = Vec::new();
     for (mailbox, uids) in by_mailbox {
         if imap_client::check_cancel(cancel).is_err() {
             break;
@@ -3383,15 +3434,24 @@ where
         else {
             continue;
         };
+        // Which requested UIDs the server acknowledged with a row at all —
+        // a row with no Subject header still proves the message is alive.
+        let mut returned: hashbrown::HashSet<u32> = hashbrown::HashSet::new();
         for item in fetched {
             let Ok(fetch) = item else { continue };
             let Some(uid) = fetch.uid else { continue };
+            returned.insert(uid);
             if let Some(subject) = fetch.header().and_then(parser::parse_subject) {
                 subjects.insert((mailbox.to_string(), uid), subject);
             }
         }
+        missing.extend(
+            uids.iter()
+                .filter(|uid| !returned.contains(*uid))
+                .map(|uid| (mailbox.to_string(), *uid)),
+        );
     }
-    subjects
+    SampleSubjects { subjects, missing }
 }
 
 /// Whether a message's header block satisfies an optional normalized List-Id
@@ -4047,7 +4107,8 @@ mod tests {
                 uid: 9,
             },
         ];
-        let subjects = sample_subjects(&mut session, &samples, None).await;
+        let SampleSubjects { subjects, missing } =
+            sample_subjects(&mut session, &samples, None).await;
 
         assert_eq!(
             subjects.get(&("INBOX".to_string(), 5)).map(String::as_str),
@@ -4061,6 +4122,12 @@ mod tests {
         assert!(
             !subjects.contains_key(&("INBOX".to_string(), 9)),
             "a stale sample yields no subject instead of an error"
+        );
+        assert_eq!(
+            missing,
+            vec![("INBOX".to_string(), 9)],
+            "a UID absent from a SUCCESSFUL fetch is reported as deleted so \
+             the caller can prune it; live UIDs are not"
         );
 
         drop(session);

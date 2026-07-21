@@ -33,15 +33,26 @@ pub struct ConnectionPool {
     /// suffices (a server upgraded mid-process only changes which command
     /// variant we pick — harmless).
     caps: Arc<parking_lot::Mutex<HashMap<String, Arc<imap_client::ServerCaps>>>>,
-    /// Per-account instant until which NEW logins are refused after the server
-    /// answered `[LIMIT] LOGIN Rate limit hit.` — every further attempt is
-    /// another LOGIN strike that extends the server-side penalty, so the pool
-    /// fast-fails instead. Idle pooled sessions keep working (reuse ≠ LOGIN).
-    login_cooldowns: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
-    /// How long each armed cooldown lasts. Defaults to
+    /// Per-account login-rate-limit state ([`LoginCooldown`]): while armed,
+    /// NEW logins are refused (every further attempt is another LOGIN strike
+    /// that extends the server-side penalty); idle pooled sessions keep
+    /// working (reuse ≠ LOGIN). Consecutive LIMITs escalate the window;
+    /// expired entries are kept as the consecutiveness memory and cleared
+    /// only by a successful fresh login.
+    login_cooldowns: Arc<parking_lot::Mutex<HashMap<String, LoginCooldown>>>,
+    /// BASE cooldown for the first LIMIT of an episode; consecutive LIMITs
+    /// double it up to [`LOGIN_RATE_LIMIT_COOLDOWN_CAP`]. Defaults to
     /// [`LOGIN_RATE_LIMIT_COOLDOWN`]; embedding apps tune it via
     /// `Agentmail::builder(..).login_cooldown(..)`.
     login_cooldown: Duration,
+    /// Per-account connect singleflight: at most one task per account runs
+    /// `imap_client::connect` (a LOGIN) at a time; queued waiters re-check
+    /// the idle pool and the cooldown gate before attempting their own —
+    /// serialized — connect. The entry lock is tokio's because it is held
+    /// across the connect await; the OUTER map lock is parking_lot precisely
+    /// so the denied `await_holding_lock` lint mechanically forbids holding
+    /// the map guard across the entry lock's `.lock().await`.
+    connect_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Reuse-eligibility threshold for idle sessions. Defaults to
     /// [`MAX_IDLE`]; embedding apps raise it (with `keepalive` or a
     /// provider whose server timeout is known) via
@@ -87,9 +98,65 @@ fn idle_is_fresh(idle_for: Duration, max_idle: Duration) -> bool {
     idle_for < max_idle
 }
 
+/// Ceiling for the escalating login cooldown. One hour outlasts observed
+/// AOL/Yahoo LOGIN penalty windows; doubling past it would only strand a
+/// recovered account.
+const LOGIN_RATE_LIMIT_COOLDOWN_CAP: Duration = Duration::from_secs(3600);
+
+/// Per-account login-rate-limit state: when the gate lifts and how many
+/// consecutive LIMITs led here. Strikes drive the escalating cooldown —
+/// expired entries are deliberately KEPT in the map, because a lapsed entry
+/// is the memory that decides whether the next LIMIT counts as consecutive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LoginCooldown {
+    /// New LOGINs are refused until this instant.
+    until: Instant,
+    /// Consecutive LIMIT strikes; 1 = first (or lapsed-episode) LIMIT.
+    strikes: u32,
+}
+
 /// Time left on a login cooldown that ends at `until`, `None` once it lifted.
 fn cooldown_remaining(until: Instant, now: Instant) -> Option<Duration> {
     (until > now).then(|| until - now)
+}
+
+/// Cooldown applied at the given strike count: the base doubled per extra
+/// strike, capped. The cap honors an over-cap builder base rather than
+/// silently shrinking it. Defensive on `strikes == 0` (treated as 1) and
+/// overflow-safe via exponent clamp plus saturating multiply.
+fn cooldown_after_strikes(base: Duration, strikes: u32) -> Duration {
+    let cap = LOGIN_RATE_LIMIT_COOLDOWN_CAP.max(base);
+    let factor = 1u32 << strikes.max(1).saturating_sub(1).min(31);
+    base.saturating_mul(factor).min(cap)
+}
+
+/// State after one more LIMIT at `now`. Consecutive = the new LIMIT lands
+/// before the previous cooldown's expiry plus a grace window of 2× its
+/// length — covering both a LIMIT while still armed and one shortly after
+/// expiry (the "server penalty outlasts our cooldown" case, where each
+/// expiry's single probing LOGIN gets re-LIMITed). At or past the window
+/// boundary the episode has lapsed and the account starts over at strike 1.
+fn next_cooldown(prev: Option<LoginCooldown>, base: Duration, now: Instant) -> LoginCooldown {
+    let strikes = match prev {
+        Some(prev)
+            if now < prev.until + cooldown_after_strikes(base, prev.strikes).saturating_mul(2) =>
+        {
+            prev.strikes.saturating_add(1)
+        }
+        _ => 1,
+    };
+    LoginCooldown {
+        until: now + cooldown_after_strikes(base, strikes),
+        strikes,
+    }
+}
+
+/// The strike-aware fast-fail error for a gated account.
+fn cooldown_error(account_name: &str, remaining: Duration, strikes: u32) -> AgentmailError {
+    AgentmailError::Other(format!(
+        "{account_name}: the server rate-limited LOGIN; refusing new connections for another {}s (strike {strikes}; the cooldown doubles up to 60m while LIMITs continue — pooled sessions keep working). Retry after the pause.",
+        remaining.as_secs().max(1)
+    ))
 }
 
 /// Drive one acquire→run→release cycle, retrying **once** with a freshly
@@ -174,10 +241,23 @@ impl ConnectionPool {
             caps: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             login_cooldowns: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             login_cooldown: LOGIN_RATE_LIMIT_COOLDOWN,
+            connect_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             max_idle: MAX_IDLE,
             keepalive: None,
             keepalive_task: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Get or create the connect-singleflight lock for an account. Sync; the
+    /// map guard is scoped to this fn — callers await the returned entry
+    /// lock only after this guard has dropped.
+    fn account_connect_lock(&self, account_name: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.connect_locks
+                .lock()
+                .entry(account_name.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     /// Override how long the login-rate-limit cooldown lasts (builder use).
@@ -255,19 +335,45 @@ impl ConnectionPool {
         self.keepalive_task.lock().is_some()
     }
 
-    /// Record that the server rate-limited a LOGIN for this account: refuse
-    /// new connections until the cooldown lifts.
+    /// Record that the server rate-limited a LOGIN for this account: arm the
+    /// cooldown, or escalate it when this LIMIT is consecutive with the
+    /// previous episode.
     pub(crate) fn note_login_rate_limit(&self, account_name: &str) {
-        self.login_cooldowns.lock().insert(
-            account_name.to_string(),
-            Instant::now() + self.login_cooldown,
+        let mut cooldowns = self.login_cooldowns.lock();
+        let prev = cooldowns.get(account_name).copied();
+        let next = next_cooldown(prev, self.login_cooldown, Instant::now());
+        cooldowns.insert(account_name.to_string(), next);
+        drop(cooldowns);
+        tracing::warn!(
+            target: "agentmail",
+            account = account_name,
+            strikes = next.strikes,
+            cooldown_s = cooldown_after_strikes(self.login_cooldown, next.strikes).as_secs(),
+            "LOGIN rate limited; escalating cooldown"
         );
     }
 
+    /// A successful fresh LOGIN ends the LIMIT episode: clear the account's
+    /// strike history. Fresh connects only — idle reuse proves nothing about
+    /// the LOGIN gate.
+    pub(crate) fn note_login_success(&self, account_name: &str) {
+        self.login_cooldowns.lock().remove(account_name);
+    }
+
     /// Time left before this account may attempt a fresh LOGIN again.
+    /// (Production reads go through [`Self::login_cooldown_status`] for the
+    /// strike count; this simpler view serves the tests.)
+    #[cfg(test)]
     pub(crate) fn login_cooldown_remaining(&self, account_name: &str) -> Option<Duration> {
-        let until = *self.login_cooldowns.lock().get(account_name)?;
-        cooldown_remaining(until, Instant::now())
+        self.login_cooldown_status(account_name)
+            .map(|(remaining, _)| remaining)
+    }
+
+    /// Remaining gate time plus the strike count that produced it, for the
+    /// strike-aware fast-fail message. `None` once the gate has lifted.
+    pub(crate) fn login_cooldown_status(&self, account_name: &str) -> Option<(Duration, u32)> {
+        let state = *self.login_cooldowns.lock().get(account_name)?;
+        cooldown_remaining(state.until, Instant::now()).map(|remaining| (remaining, state.strikes))
     }
 
     /// Get the server capabilities for an account, fetching once and caching.
@@ -320,8 +426,34 @@ impl ConnectionPool {
             .unwrap_or(MAX_CONCURRENT_PER_ACCOUNT)
     }
 
+    /// Pop one idle session for the account and return it if it is fresh
+    /// enough to reuse AND still answers a NOOP; a stale or dead candidate is
+    /// dropped (connection closes) and `None` is returned. The pool lock is
+    /// held only for the pop — never across the ping.
+    async fn try_reuse_idle(&self, account_name: &str) -> Option<ImapSession> {
+        let maybe_idle = {
+            let mut pools = self.pools.lock().await;
+            pools.get_mut(account_name).and_then(|pool| pool.pop())
+        }; // lock released here — before any network I/O
+        let idle = maybe_idle?;
+        let mut session = idle.session;
+        if idle_is_fresh(idle.idle_since.elapsed(), self.max_idle)
+            && imap_client::ping(&mut session).await.is_ok()
+        {
+            return Some(session);
+        }
+        // too old or stale → `session` drops here (connection closes)
+        None
+    }
+
     /// Acquire a session for the named account.
     /// Blocks if the per-account concurrency limit is reached.
+    ///
+    /// Fresh connects are SINGLEFLIGHTED per account: at most one task runs
+    /// `imap_client::connect` (a LOGIN) at a time. Queued waiters re-check
+    /// the idle pool and the login-cooldown gate once the winner finishes —
+    /// a LIMITed winner arms the gate before releasing the guard, so every
+    /// waiter fast-fails without burning another LOGIN.
     pub async fn acquire(&self, account_name: &str) -> crate::Result<PooledSession> {
         self.ensure_keepalive();
         let account_config = self
@@ -339,51 +471,66 @@ impl ConnectionPool {
             .await
             .map_err(|_| AgentmailError::Other("concurrency semaphore closed".to_string()))?;
 
-        // Pop a candidate idle session while holding the lock briefly
-        let maybe_idle = {
-            let mut pools = self.pools.lock().await;
-            pools.get_mut(account_name).and_then(|pool| pool.pop())
-        }; // lock released here — before any network I/O
-
-        // Reuse it only if it hasn't been idle long enough for the server to
-        // have dropped it AND it still answers a NOOP. Otherwise drop it and
-        // reconnect fresh below. The age check is what keeps AgentMail working
-        // after a long idle: a session idle past MAX_IDLE is very likely dead,
-        // so we skip the ~15s dead-`NOOP` ping and reconnect straight away.
-        if let Some(idle) = maybe_idle {
-            let mut session = idle.session;
-            if idle_is_fresh(idle.idle_since.elapsed(), self.max_idle)
-                && imap_client::ping(&mut session).await.is_ok()
-            {
-                return Ok(PooledSession {
-                    session: Some(session),
-                    account_name: account_name.to_string(),
-                    pool: Arc::clone(&self.pools),
-                    uid_pool: Arc::clone(&self.uid_pools),
-                    uid_mode: false,
-                    max_connections: max_conn,
-                    _permit: permit,
-                });
-            }
-            // too old or stale → `session` drops here (connection closes)
+        // Fast path: reuse an idle session. The age check is what keeps
+        // AgentMail working after a long idle: a session idle past `max_idle`
+        // is very likely dead, so we skip the ~15s dead-`NOOP` ping and
+        // reconnect straight away.
+        if let Some(session) = self.try_reuse_idle(account_name).await {
+            return Ok(PooledSession {
+                session: Some(session),
+                account_name: account_name.to_string(),
+                pool: Arc::clone(&self.pools),
+                uid_pool: Arc::clone(&self.uid_pools),
+                uid_mode: false,
+                max_connections: max_conn,
+                _permit: permit,
+            });
         }
-        // No reusable session — create fresh
+        // No reusable session — a fresh connect is needed.
 
-        // Login-rate-limit gate: only fresh connections LOGIN, so only they
-        // are refused during the cooldown; the idle-reuse path above stays
-        // available. Fast-failing here is what stops a retrying caller from
-        // extending the server-side penalty window.
-        if let Some(remaining) = self.login_cooldown_remaining(account_name) {
-            return Err(AgentmailError::Other(format!(
-                "{account_name}: the server rate-limited LOGIN; refusing new connections for another {}s so the penalty can clear (pooled sessions keep working). Retry after the pause.",
-                remaining.as_secs().max(1)
-            )));
+        // Login-rate-limit gate, checked BEFORE queueing on the connect lock:
+        // only fresh connections LOGIN, so only they are refused during the
+        // cooldown (idle reuse above stays available), and an armed-gate
+        // caller fast-fails instead of waiting behind an in-flight connect.
+        if let Some((remaining, strikes)) = self.login_cooldown_status(account_name) {
+            return Err(cooldown_error(account_name, remaining, strikes));
         }
 
-        // Create new connection
+        // Connect singleflight: serialize fresh LOGINs per account. The
+        // tokio guard is deliberately held across the connect await (allowed;
+        // parking_lot guards are not) and spans connect's internal transient
+        // retries — those are LOGINs too.
+        let connect_lock = self.account_connect_lock(account_name);
+        let _connect_guard = connect_lock.lock().await;
+
+        // Re-check under the guard: a concurrent release may have pooled a
+        // session while we queued...
+        if let Some(session) = self.try_reuse_idle(account_name).await {
+            return Ok(PooledSession {
+                session: Some(session),
+                account_name: account_name.to_string(),
+                pool: Arc::clone(&self.pools),
+                uid_pool: Arc::clone(&self.uid_pools),
+                uid_mode: false,
+                max_connections: max_conn,
+                _permit: permit,
+            });
+        }
+        // ...and a LIMITed winner armed the gate before releasing the guard —
+        // this is the check that stops queued waiters from burning LOGINs.
+        if let Some((remaining, strikes)) = self.login_cooldown_status(account_name) {
+            return Err(cooldown_error(account_name, remaining, strikes));
+        }
+
+        // Create new connection (password fetched only after the gate, so
+        // fast-failing waiters never touch the keychain).
         let password = crate::credentials::get_password(account_name, account_config).await?;
         let session = match imap_client::connect(account_config, &password).await {
-            Ok(session) => session,
+            Ok(session) => {
+                // A fresh LOGIN was accepted — the LIMIT episode is over.
+                self.note_login_success(account_name);
+                session
+            }
             Err(error) => {
                 if imap_client::is_login_rate_limit(&error) {
                     self.note_login_rate_limit(account_name);
@@ -660,6 +807,198 @@ mod tests {
         assert!(
             pool.login_cooldown_remaining("gmail").is_none(),
             "other accounts keep connecting"
+        );
+    }
+
+    #[test]
+    fn cooldown_after_strikes_doubles_and_caps() {
+        let base = Duration::from_secs(300);
+        assert_eq!(cooldown_after_strikes(base, 1), Duration::from_secs(300));
+        assert_eq!(cooldown_after_strikes(base, 2), Duration::from_secs(600));
+        assert_eq!(cooldown_after_strikes(base, 3), Duration::from_secs(1200));
+        assert_eq!(cooldown_after_strikes(base, 4), Duration::from_secs(2400));
+        assert_eq!(cooldown_after_strikes(base, 5), Duration::from_secs(3600));
+        assert_eq!(
+            cooldown_after_strikes(base, 6),
+            Duration::from_secs(3600),
+            "cap holds"
+        );
+        assert_eq!(
+            cooldown_after_strikes(base, 30),
+            Duration::from_secs(3600),
+            "large strike counts stay capped (overflow-safe)"
+        );
+        // A tiny base walks the ladder further before the cap.
+        assert_eq!(
+            cooldown_after_strikes(Duration::from_secs(1), 12),
+            Duration::from_secs(2048)
+        );
+        assert_eq!(
+            cooldown_after_strikes(Duration::from_secs(1), 13),
+            Duration::from_secs(3600)
+        );
+        // An over-cap builder base is honored, not shrunk.
+        let big = Duration::from_secs(7200);
+        assert_eq!(cooldown_after_strikes(big, 1), big);
+        assert_eq!(cooldown_after_strikes(big, 2), big);
+        // Defensive cases: strike 0 behaves as 1; u32::MAX does not panic.
+        assert_eq!(cooldown_after_strikes(base, 0), base);
+        assert_eq!(
+            cooldown_after_strikes(base, u32::MAX),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn next_cooldown_first_limit_is_strike_one() {
+        let base = Duration::from_secs(300);
+        let now = Instant::now();
+        let state = next_cooldown(None, base, now);
+        assert_eq!(state.strikes, 1);
+        assert_eq!(state.until, now + base);
+    }
+
+    #[test]
+    fn next_cooldown_relimit_within_window_escalates() {
+        let base = Duration::from_secs(300);
+        let t0 = Instant::now();
+        let first = next_cooldown(None, base, t0);
+        // Re-LIMIT while still armed → strike 2.
+        let while_armed = next_cooldown(Some(first), base, t0 + Duration::from_secs(100));
+        assert_eq!(while_armed.strikes, 2);
+        // Re-LIMIT shortly AFTER expiry but inside the 2× grace window — the
+        // "server penalty outlasts our cooldown" probe case — also escalates.
+        let after_expiry = first.until + Duration::from_secs(599);
+        let probed = next_cooldown(Some(first), base, after_expiry);
+        assert_eq!(probed.strikes, 2);
+        assert_eq!(probed.until, after_expiry + Duration::from_secs(600));
+    }
+
+    #[test]
+    fn next_cooldown_relimit_at_or_after_window_starts_over() {
+        let base = Duration::from_secs(300);
+        let t0 = Instant::now();
+        let third = LoginCooldown {
+            until: t0 + Duration::from_secs(1200),
+            strikes: 3,
+        };
+        // Applied cooldown at strike 3 is 1200s → grace boundary is
+        // until + 2400s. At the boundary the episode has lapsed.
+        let boundary = third.until + Duration::from_secs(2400);
+        assert_eq!(next_cooldown(Some(third), base, boundary).strikes, 1);
+        assert_eq!(
+            next_cooldown(Some(third), base, boundary + Duration::from_secs(3600)).strikes,
+            1
+        );
+    }
+
+    #[test]
+    fn next_cooldown_walks_the_escalation_ladder() {
+        let base = Duration::from_secs(300);
+        let mut now = Instant::now();
+        let mut state: Option<LoginCooldown> = None;
+        let mut applied = Vec::new();
+        for _ in 0..6 {
+            let next = next_cooldown(state, base, now);
+            applied.push((next.until - now).as_secs());
+            // The next probe fires just after this cooldown expires — the
+            // exact leak pattern observed live.
+            now = next.until + Duration::from_secs(1);
+            state = Some(next);
+        }
+        assert_eq!(applied, vec![300, 600, 1200, 2400, 3600, 3600]);
+    }
+
+    /// Pool-level escalation: consecutive LIMITs raise the strike count and
+    /// the window; a successful fresh login resets the episode.
+    #[test]
+    fn login_rate_limit_gate_escalates_and_success_resets() {
+        let pool = ConnectionPool::new(Config::empty());
+        pool.note_login_rate_limit("aol");
+        pool.note_login_rate_limit("aol");
+        let (remaining, strikes) = pool
+            .login_cooldown_status("aol")
+            .expect("gate armed after consecutive LIMITs");
+        assert_eq!(strikes, 2);
+        assert!(
+            remaining > LOGIN_RATE_LIMIT_COOLDOWN,
+            "strike 2 outlasts the base cooldown: {remaining:?}"
+        );
+        assert!(
+            pool.login_cooldown_status("gmail").is_none(),
+            "escalation is per-account"
+        );
+
+        pool.note_login_success("aol");
+        assert!(
+            pool.login_cooldown_status("aol").is_none(),
+            "a successful fresh login ends the episode"
+        );
+        pool.note_login_rate_limit("aol");
+        let (remaining, strikes) = pool.login_cooldown_status("aol").expect("re-armed");
+        assert_eq!(strikes, 1, "post-success LIMIT starts a new episode");
+        assert!(remaining <= LOGIN_RATE_LIMIT_COOLDOWN);
+    }
+
+    #[test]
+    fn cooldown_error_mentions_remaining_and_strike() {
+        let error = cooldown_error("aol", Duration::from_secs(600), 2);
+        let text = error.to_string();
+        assert!(text.contains("rate-limited LOGIN"), "{text}");
+        assert!(text.contains("600s"), "{text}");
+        assert!(text.contains("strike 2"), "{text}");
+        assert!(
+            !error.is_connection_error(),
+            "the gate error must not trigger connection-retry loops"
+        );
+    }
+
+    /// The singleflight primitive: one lock per account, shared across
+    /// lookups, exclusive while held.
+    #[tokio::test]
+    async fn connect_lock_is_per_account_and_exclusive() {
+        let pool = ConnectionPool::new(Config::empty());
+        let a1 = pool.account_connect_lock("a");
+        let a2 = pool.account_connect_lock("a");
+        let b = pool.account_connect_lock("b");
+        assert!(Arc::ptr_eq(&a1, &a2), "same account shares one lock");
+        assert!(!Arc::ptr_eq(&a1, &b), "accounts are independent");
+
+        let guard = a1.lock().await;
+        assert!(
+            a2.try_lock().is_err(),
+            "the connect lock is exclusive while a connect is in flight"
+        );
+        assert!(b.try_lock().is_ok(), "other accounts are not serialized");
+        drop(guard);
+        assert!(a2.try_lock().is_ok(), "released after the winner finishes");
+    }
+
+    /// An armed gate fast-fails acquire before any network or keychain I/O:
+    /// the inline account points at a closed local port, so any regression to
+    /// actual connecting would surface as a distinctly different error.
+    #[tokio::test]
+    async fn armed_gate_fast_fails_acquire_before_any_network_io() {
+        let config = Config::from_accounts(vec![(
+            "aol".to_string(),
+            crate::config::AccountConfig {
+                host: "127.0.0.1".to_string(),
+                port: 1, // closed port — a real connect attempt would error differently
+                username: "user@example.com".to_string(),
+                password: Some(crate::secret::Secret::new_raw("unused")),
+                tls: true,
+                max_connections: None,
+            },
+        )]);
+        let pool = ConnectionPool::new(config);
+        pool.note_login_rate_limit("aol");
+        let Err(error) = pool.acquire("aol").await else {
+            panic!("armed gate must refuse fresh connects");
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains("rate-limited LOGIN") && text.contains("strike 1"),
+            "fast-fail carries the strike-aware cooldown message: {text}"
         );
     }
 

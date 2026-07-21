@@ -26,7 +26,9 @@ pub enum AgentmailError {
     #[error("Mailbox not found: {0}")]
     MailboxNotFound(String),
 
-    #[error("Message not found: UID {0}")]
+    #[error(
+        "Message not found: UID {0} (the message no longer exists on the server; if this UID came from a ranking sample, re-run the ranking for a fresh sample instead of retrying this one)"
+    )]
     MessageNotFound(u32),
 
     #[error(
