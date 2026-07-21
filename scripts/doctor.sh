@@ -81,6 +81,11 @@ fi
 
 echo ""
 echo "== runtime fingerprints (check inside the running app) =="
+info "AUTHORITATIVE tool count: the app's backend panel / gateway catalog."
+info "  The ACP agent-side registry ('tools.mcp_tool registered N tools' log"
+info "  lines) is pinned at SESSION CREATION time — a resumed session replays"
+info "  its old tool surface AND its old conversation (stale UIDs included)."
+info "  After any backend upgrade: start a FRESH agent session."
 info "initialize/serverInfo.version ends with '(<sha>)' — must equal the clone SHA above; absent = pre-fingerprint build"
 info "log line 'agentmail MCP server starting' carries version+build on every backend spawn"
 info "gateway registers 23 Agentmail tools (move_list_id + move_by_sender present); 21 = stale build"
