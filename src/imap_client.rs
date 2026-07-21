@@ -486,7 +486,7 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
     let connector = tokio_native_tls::TlsConnector::from(connector);
     let tls = imap_timeout(connector.connect(&config.host, tcp)).await?;
 
-    let client = async_imap::Client::new(tls);
+    let mut client = async_imap::Client::new(tls);
     let auth_limit = imap_timeout_duration();
     let plain = match config.auth {
         crate::config::AuthMethod::Password => {
@@ -502,8 +502,19 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
             }
         }
         crate::config::AuthMethod::Xoauth2 => {
+            // Consume the server greeting BEFORE AUTHENTICATE. async-imap's
+            // SASL handshake (unlike LOGIN's loop) does not skip leading
+            // untagged responses: it would read the unread `* OK …` greeting
+            // as the auth result and then block forever waiting for a tagged
+            // completion while the server blocks waiting for our SASL response
+            // — a deadlock that surfaces only as a timeout (LOGIN tolerates
+            // the greeting, so this bites XOAUTH2 alone). Best-effort: on a
+            // read failure, fall through and let `authenticate` report it.
+            let _greeting = tokio::time::timeout(auth_limit, client.read_response()).await;
             // `password` carries the OAuth ACCESS TOKEN under this method.
-            let authenticator = Xoauth2Authenticator::new(&config.username, password);
+            // Trim it: a token pasted into config or emitted by a helper often
+            // carries trailing whitespace, which would corrupt the SASL string.
+            let authenticator = Xoauth2Authenticator::new(&config.username, password.trim());
             match tokio::time::timeout(auth_limit, client.authenticate("XOAUTH2", authenticator))
                 .await
             {
@@ -3795,16 +3806,23 @@ mod tests {
         );
     }
 
-    /// End-to-end XOAUTH2 over a scripted duplex: async-imap sends
-    /// AUTHENTICATE XOAUTH2, answers the `+ ` continuation with our
-    /// base64-encoded SASL string, and yields a session on the tagged OK.
+    /// End-to-end XOAUTH2 over a scripted duplex that sends a real IMAP
+    /// GREETING first (as every server does): the connect path must consume
+    /// the greeting before AUTHENTICATE, or the handshake mis-reads it as the
+    /// auth result and deadlocks — the exact Gmail hang this reproduces.
     #[tokio::test]
-    async fn xoauth2_authenticate_handshake_over_scripted_session() {
+    async fn xoauth2_greeting_then_authenticate_handshake() {
         use base64::Engine;
         let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
         let server = tokio::spawn(async move {
             let (reader, mut writer) = tokio::io::split(server_stream);
             let mut reader = BufReader::new(reader);
+
+            // Unsolicited greeting, unread by Client::new — the crux.
+            writer
+                .write_all(b"* OK [CAPABILITY IMAP4rev1 AUTH=XOAUTH2] ready\r\n")
+                .await
+                .unwrap();
 
             let mut command = String::new();
             reader.read_line(&mut command).await.unwrap();
@@ -3822,7 +3840,9 @@ mod tests {
                 .expect("client sends base64");
             assert_eq!(
                 String::from_utf8_lossy(&decoded),
-                "user=you@gmail.com\x01auth=Bearer ya29.token-123\x01\x01"
+                "user=you@gmail.com\x01auth=Bearer ya29.token-123\x01\x01",
+                "process() must be invoked and produce the SASL string — proof \
+                 the greeting was consumed and did not swallow the continuation"
             );
             writer
                 .write_all(format!("{tag} OK AUTHENTICATE completed\r\n").as_bytes())
@@ -3830,15 +3850,21 @@ mod tests {
                 .unwrap();
         });
 
-        let client = async_imap::Client::new(client_stream);
-        let session = client
-            .authenticate(
-                "XOAUTH2",
-                Xoauth2Authenticator::new("you@gmail.com", "ya29.token-123"),
-            )
-            .await
-            .map_err(|(error, _)| error)
-            .expect("scripted XOAUTH2 handshake succeeds");
+        // Mirror connect_once's XOAUTH2 arm: read the greeting, then auth.
+        let mut client = async_imap::Client::new(client_stream);
+        let handshake = tokio::time::timeout(Duration::from_secs(10), async {
+            client.read_response().await.expect("greeting read");
+            client
+                .authenticate(
+                    "XOAUTH2",
+                    Xoauth2Authenticator::new("you@gmail.com", "ya29.token-123"),
+                )
+                .await
+                .map_err(|(error, _)| error)
+        })
+        .await
+        .expect("handshake must not deadlock after consuming the greeting");
+        let session = handshake.expect("scripted XOAUTH2 handshake succeeds");
         drop(session);
         server.await.expect("scripted server finishes");
     }
