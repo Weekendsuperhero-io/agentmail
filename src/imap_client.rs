@@ -3520,6 +3520,92 @@ mod tests {
         );
     }
 
+    /// Born-UID end to end at the session level: a connection that `ENABLE
+    /// UIDONLY`s at "connect" then serves an ordinary UID read on the SAME
+    /// socket — no re-login, no Limited↔UID switch. Exercises the real read
+    /// helper (`timed_uid_fetch_collect`) so the UIDFETCH response parses on the
+    /// path every reader uses, and asserts ENABLE precedes the read.
+    #[tokio::test]
+    async fn born_uid_session_then_serves_a_uid_fetch() {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = command.split_whitespace().next().unwrap().to_string();
+                commands.push(command.clone());
+                if command.contains(" LOGIN ") {
+                    writer
+                        .write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else if command.contains("ENABLE ") {
+                    writer.write_all(b"* ENABLED UIDONLY\r\n").await.unwrap();
+                    writer
+                        .write_all(format!("{tag} OK ENABLE completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else if command.contains("UID FETCH") {
+                    writer
+                        .write_all(
+                            format!(
+                                "* 42 UIDFETCH (UID 42 RFC822.SIZE 5)\r\n{tag} OK UID FETCH completed\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    break;
+                } else {
+                    panic!("unexpected command: {command:?}");
+                }
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let mut session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+
+        // Born-UID: enter UID Mode at connect …
+        let enabled = enable(&mut session, "UIDONLY")
+            .await
+            .expect("ENABLE UIDONLY should succeed");
+        assert_eq!(enabled.len(), 1, "server confirmed UIDONLY: {enabled:?}");
+        // … then an ordinary read on the SAME connection parses the UIDFETCH.
+        let fetched = timed_uid_fetch_collect(&mut session, "42", "(UID RFC822.SIZE)")
+            .await
+            .expect("uid_fetch should succeed on a UID-Mode session");
+        let uids: Vec<u32> = fetched
+            .into_iter()
+            .filter_map(|row| row.ok())
+            .filter_map(|f| f.uid)
+            .collect();
+        assert_eq!(uids, vec![42], "the UIDFETCH row parses on the read path");
+
+        drop(session);
+        let commands = server.await.expect("scripted server should finish");
+        let enable_pos = commands
+            .iter()
+            .position(|c| c.contains("ENABLE UIDONLY"))
+            .expect("ENABLE was sent");
+        let fetch_pos = commands
+            .iter()
+            .position(|c| c.contains("UID FETCH"))
+            .expect("UID FETCH was sent");
+        assert!(
+            enable_pos < fetch_pos,
+            "ENABLE UIDONLY precedes the read on the same connection: {commands:?}"
+        );
+    }
+
     /// A scripted server that answers `UID FETCH` with a UID-Mode `UIDFETCH`
     /// response (RFC 9586) whose UID data item is omitted — the leading
     /// number is the UID. Exercises the local imap-proto UIDFETCH patch.

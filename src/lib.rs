@@ -77,6 +77,7 @@ pub struct AgentmailBuilder {
     max_idle: Option<std::time::Duration>,
     keepalive: Option<std::time::Duration>,
     client_identity: Option<ClientIdentity>,
+    uidonly: Option<bool>,
 }
 
 impl AgentmailBuilder {
@@ -143,6 +144,21 @@ impl AgentmailBuilder {
         self
     }
 
+    /// Force born-UID-Mode on or off, overriding the default (on whenever the
+    /// header cache is persistent). When on, every fresh connection for a
+    /// UIDONLY-capable account (Yahoo/AOL) enters RFC 9586 UID Mode at connect,
+    /// so a single held connection serves rankings, reads, and sweeps with no
+    /// mid-life Limited↔UID switch — each switch is another LOGIN on
+    /// rate-limited providers. Off keeps the classic two-pool behavior (UID
+    /// Mode entered lazily per scan). Non-UIDONLY servers (Gmail/Outlook) never
+    /// advertise the capability and are unaffected either way. Turning it on
+    /// without a persistent cache makes each ranking re-walk the full mailbox
+    /// (correct, but unamortized), so the default ties it to cache persistence.
+    pub fn uidonly(mut self, enabled: bool) -> Self {
+        self.uidonly = Some(enabled);
+        self
+    }
+
     pub fn build(self) -> Agentmail {
         if let Some(timeout) = self.imap_timeout {
             imap_client::set_imap_timeout(timeout);
@@ -167,6 +183,10 @@ impl AgentmailBuilder {
                 header_cache::HeaderCache::at_path(dir.join(header_cache::HeaderCache::FILE_NAME))
             }
         };
+        // Born-UID-Mode defaults to on exactly when the cache can amortize the
+        // full-mailbox UID walk; disabling the cache keeps the windowed
+        // Limited-Mode path unchanged. An explicit `.uidonly(..)` overrides.
+        pool.set_uidonly(self.uidonly.unwrap_or_else(|| header_cache.is_persistent()));
         Agentmail {
             pool,
             mailbox_catalog: mailbox_catalog::MailboxCatalog::default(),
@@ -195,6 +215,7 @@ impl Agentmail {
             max_idle: None,
             keepalive: None,
             client_identity: None,
+            uidonly: None,
         }
     }
 
@@ -667,22 +688,40 @@ impl Agentmail {
         &self,
         account: &str,
     ) -> Result<(connection::PooledSession, Option<u32>)> {
+        // Reuse an idle UID-Mode session (skips both LOGIN and ENABLE UIDONLY).
         if self.header_cache.is_persistent()
             && let Some(caps) = self.pool.cached_caps(account)
             && caps.has("UIDONLY")
             && let Some(session) = self.pool.try_acquire_uid_mode(account).await?
         {
-            let page = caps
-                .message_limit()
-                .unwrap_or(imap_client::MAX_FETCH_CHUNK as u32);
-            return Ok((session, Some(page)));
+            return Ok((session, Some(Self::uid_page_size(&caps))));
         }
         let mut session = self.pool.acquire(account).await?;
+        // Born-UID accounts come back already in UID Mode — no ENABLE, no
+        // Limited↔UID switch (that switch is another LOGIN on Yahoo/AOL). A
+        // UID-Mode connection always does the full MESSAGELIMIT walk, the
+        // correct enumeration once UIDONLY is on.
+        if session.is_uid_mode() {
+            let page = self
+                .pool
+                .cached_caps(account)
+                .map_or(imap_client::MAX_FETCH_CHUNK as u32, |caps| {
+                    Self::uid_page_size(&caps)
+                });
+            return Ok((session, Some(page)));
+        }
         let uid_mode = self.enter_uid_mode(account, session.session()).await?;
         if uid_mode.is_some() {
             session.mark_uid_mode();
         }
         Ok((session, uid_mode))
+    }
+
+    /// The per-command page size for a UID-Mode walk: the server's advertised
+    /// `MESSAGELIMIT` (RFC 9738), or the default fetch chunk when unbounded.
+    fn uid_page_size(caps: &imap_client::ServerCaps) -> u32 {
+        caps.message_limit()
+            .unwrap_or(imap_client::MAX_FETCH_CHUNK as u32)
     }
 
     /// Fetch page-sample subjects and prune the samples the server no longer
@@ -3889,6 +3928,63 @@ mod tests {
         assert!(
             explicit.header_cache.is_persistent(),
             "cache_dir() must enable persistence at the given directory"
+        );
+    }
+
+    /// Born-UID-Mode defaults to on exactly when the cache is persistent (so the
+    /// full-mailbox UID walk is amortized), and `.uidonly(..)` overrides either
+    /// way. This is the gate that keeps the no-cache path in classic Limited
+    /// Mode while letting cached rankings/reads share one UID-Mode connection.
+    #[test]
+    fn born_uid_gate_follows_cache_persistence_and_override() {
+        let dir = std::env::temp_dir().join("agentmail-uidonly-gate-test");
+
+        // Default: tracks cache persistence.
+        let cached = Agentmail::builder(Config::empty()).cache_dir(&dir).build();
+        assert!(
+            cached.pool.uidonly_enabled(),
+            "persistent cache defaults born-UID on"
+        );
+        let no_cache = Agentmail::builder(Config::empty()).disable_cache().build();
+        assert!(
+            !no_cache.pool.uidonly_enabled(),
+            "no cache defaults born-UID off (windowed Limited path unchanged)"
+        );
+
+        // Explicit override wins in both directions.
+        let forced_off = Agentmail::builder(Config::empty())
+            .cache_dir(&dir)
+            .uidonly(false)
+            .build();
+        assert!(
+            !forced_off.pool.uidonly_enabled(),
+            ".uidonly(false) overrides a persistent cache"
+        );
+        let forced_on = Agentmail::builder(Config::empty())
+            .disable_cache()
+            .uidonly(true)
+            .build();
+        assert!(
+            forced_on.pool.uidonly_enabled(),
+            ".uidonly(true) overrides a disabled cache"
+        );
+    }
+
+    /// The UID-Mode page size is the server's advertised MESSAGELIMIT, or the
+    /// default fetch chunk when the server sets no limit.
+    #[test]
+    fn uid_page_size_uses_messagelimit_else_chunk() {
+        let limited = imap_client::ServerCaps::from_strings([
+            "UIDONLY".to_string(),
+            "MESSAGELIMIT=250".to_string(),
+        ]);
+        assert_eq!(Agentmail::uid_page_size(&limited), 250);
+
+        let unbounded = imap_client::ServerCaps::from_strings(["UIDONLY".to_string()]);
+        assert_eq!(
+            Agentmail::uid_page_size(&unbounded),
+            imap_client::MAX_FETCH_CHUNK as u32,
+            "no MESSAGELIMIT falls back to the default fetch chunk"
         );
     }
 

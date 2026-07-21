@@ -70,6 +70,16 @@ pub struct ConnectionPool {
     /// Lifetime connection-lifecycle counters (observability). Shared with the
     /// keepalive task. See [`ConnectionStats`].
     stats: Arc<PoolStats>,
+    /// Born-UID-Mode: when set, every fresh connection for a UIDONLY-capable
+    /// account (`ENABLE UIDONLY`, RFC 9586) enters UID Mode at connect and stays
+    /// there for its whole life. One held connection then serves rankings,
+    /// reads, and sweeps alike — with NO mid-life Limited↔UID switch, and each
+    /// switch is another LOGIN on rate-limited providers (Yahoo/AOL). Set from
+    /// header-cache persistence at build time: the full-mailbox UID walk only
+    /// pays off with a cache to amortize it, and leaving this off keeps the
+    /// windowed Limited-Mode path unchanged. Non-UIDONLY servers (Gmail/Outlook)
+    /// are unaffected — they never advertise the capability.
+    uidonly_born: bool,
 }
 
 /// Internal atomic counters behind [`ConnectionStats`]. Updated on every
@@ -306,7 +316,22 @@ impl ConnectionPool {
             keepalive: None,
             keepalive_task: Arc::new(parking_lot::Mutex::new(None)),
             stats: Arc::new(PoolStats::default()),
+            uidonly_born: false,
         }
+    }
+
+    /// Enable born-UID-Mode (see [`ConnectionPool::uidonly_born`]). Builder use:
+    /// resolved from header-cache persistence, overridable via
+    /// `Agentmail::builder(..).uidonly(..)`.
+    pub(crate) fn set_uidonly(&mut self, enabled: bool) {
+        self.uidonly_born = enabled;
+    }
+
+    /// Whether born-UID-Mode is enabled (test observability for the build-time
+    /// cache-persistence gate).
+    #[cfg(test)]
+    pub(crate) fn uidonly_enabled(&self) -> bool {
+        self.uidonly_born
     }
 
     /// Snapshot the connection-lifecycle counters. This is the evidence for
@@ -510,24 +535,74 @@ impl ConnectionPool {
         }
     }
 
-    /// Pop one idle session for the account and return it if it is fresh
-    /// enough to reuse AND still answers a NOOP; a stale or dead candidate is
-    /// dropped (connection closes) and `None` is returned. The pool lock is
-    /// held only for the pop — never across the ping.
-    async fn try_reuse_idle(&self, account_name: &str) -> Option<ImapSession> {
-        let maybe_idle = {
-            let mut pools = self.pools.lock().await;
-            pools.get_mut(account_name).and_then(|pool| pool.pop())
-        }; // lock released here — before any network I/O
-        let idle = maybe_idle?;
-        let mut session = idle.session;
-        if idle_is_fresh(idle.idle_since.elapsed(), self.max_idle)
-            && imap_client::ping(&mut session).await.is_ok()
-        {
-            return Some(session);
+    /// Pop one reusable idle session for the account, PREFERRING the UID-Mode
+    /// store: a UIDONLY session serves ordinary operations too — every command
+    /// AgentMail issues is UID-based — so reusing it avoids opening (and
+    /// re-LOGINing) a second connection just for a non-scan op. Returns the
+    /// session and whether it is UID-Mode, so `release` routes it back to the
+    /// right store. Stale/dead candidates are dropped (connection closes) and
+    /// the next store is tried. The pool lock is held only for each pop — never
+    /// across the liveness ping.
+    async fn pop_idle_any(&self, account_name: &str) -> Option<(ImapSession, bool)> {
+        for (store, uid_mode) in [(&self.uid_pools, true), (&self.pools, false)] {
+            let maybe_idle = {
+                let mut pools = store.lock().await;
+                pools.get_mut(account_name).and_then(|pool| pool.pop())
+            }; // lock released here — before any network I/O
+            if let Some(idle) = maybe_idle {
+                let mut session = idle.session;
+                if idle_is_fresh(idle.idle_since.elapsed(), self.max_idle)
+                    && imap_client::ping(&mut session).await.is_ok()
+                {
+                    return Some((session, uid_mode));
+                }
+                // too old or stale → `session` drops here (connection closes);
+                // fall through and try the other store.
+            }
         }
-        // too old or stale → `session` drops here (connection closes)
         None
+    }
+
+    /// For a UIDONLY-capable account (and when born-UID-Mode is enabled),
+    /// `ENABLE UIDONLY` on this fresh connection so it is UID-Mode for its whole
+    /// life. Best-effort: any hiccup (capability probe or ENABLE failure) leaves
+    /// the session in Limited Mode, which still works — the ranking path enters
+    /// UID Mode on demand. Returns whether the session ended up in UID Mode.
+    async fn maybe_enable_uidonly(&self, account_name: &str, session: &mut ImapSession) -> bool {
+        if !self.uidonly_born {
+            return false;
+        }
+        let caps = match self.server_caps(account_name, session).await {
+            Ok(caps) => caps,
+            Err(error) => {
+                tracing::debug!(
+                    account = %account_name,
+                    %error,
+                    "UIDONLY: capability probe failed on connect; staying in Limited Mode",
+                );
+                return false;
+            }
+        };
+        if !caps.has("UIDONLY") {
+            return false;
+        }
+        match imap_client::enable(session, "UIDONLY").await {
+            Ok(_) => {
+                tracing::debug!(
+                    account = %account_name,
+                    "born UID-Mode: ENABLE UIDONLY on connect (one connection serves every op)",
+                );
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    account = %account_name,
+                    %error,
+                    "UIDONLY: ENABLE failed on connect; staying in Limited Mode",
+                );
+                false
+            }
+        }
     }
 
     /// Acquire a session for the named account.
@@ -559,12 +634,13 @@ impl ConnectionPool {
         // AgentMail working after a long idle: a session idle past `max_idle`
         // is very likely dead, so we skip the ~15s dead-`NOOP` ping and
         // reconnect straight away.
-        if let Some(session) = self.try_reuse_idle(account_name).await {
+        if let Some((session, uid_mode)) = self.pop_idle_any(account_name).await {
             let reuses = self.stats.idle_reuses.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 account = %account_name,
                 idle_reuses = reuses,
                 fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
+                uid_mode,
                 "reused a held IMAP session (no LOGIN)",
             );
             return Ok(PooledSession {
@@ -572,7 +648,7 @@ impl ConnectionPool {
                 account_name: account_name.to_string(),
                 pool: Arc::clone(&self.pools),
                 uid_pool: Arc::clone(&self.uid_pools),
-                uid_mode: false,
+                uid_mode,
                 max_connections: max_conn,
                 _permit: permit,
             });
@@ -596,12 +672,13 @@ impl ConnectionPool {
 
         // Re-check under the guard: a concurrent release may have pooled a
         // session while we queued...
-        if let Some(session) = self.try_reuse_idle(account_name).await {
+        if let Some((session, uid_mode)) = self.pop_idle_any(account_name).await {
             let reuses = self.stats.idle_reuses.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 account = %account_name,
                 idle_reuses = reuses,
                 fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
+                uid_mode,
                 "reused a held IMAP session (no LOGIN)",
             );
             return Ok(PooledSession {
@@ -609,7 +686,7 @@ impl ConnectionPool {
                 account_name: account_name.to_string(),
                 pool: Arc::clone(&self.pools),
                 uid_pool: Arc::clone(&self.uid_pools),
-                uid_mode: false,
+                uid_mode,
                 max_connections: max_conn,
                 _permit: permit,
             });
@@ -623,7 +700,7 @@ impl ConnectionPool {
         // Create new connection (password fetched only after the gate, so
         // fast-failing waiters never touch the keychain).
         let password = crate::credentials::get_password(account_name, account_config).await?;
-        let session = match imap_client::connect(account_config, &password).await {
+        let mut session = match imap_client::connect(account_config, &password).await {
             Ok(session) => {
                 // A fresh LOGIN was accepted — the LIMIT episode is over.
                 self.note_login_success(account_name);
@@ -648,13 +725,16 @@ impl ConnectionPool {
                 return Err(error);
             }
         };
+        // Born-UID-Mode: for a UIDONLY-capable account, enter UID Mode now so
+        // this one connection serves every op with no later Limited↔UID switch.
+        let uid_mode = self.maybe_enable_uidonly(account_name, &mut session).await;
 
         Ok(PooledSession {
             session: Some(session),
             account_name: account_name.to_string(),
             pool: Arc::clone(&self.pools),
             uid_pool: Arc::clone(&self.uid_pools),
-            uid_mode: false,
+            uid_mode,
             max_connections: max_conn,
             _permit: permit,
         })
@@ -766,6 +846,15 @@ impl PooledSession {
         self.session.as_mut().expect("session already consumed")
     }
 
+    /// Whether this session is in RFC 9586 UID Mode (`ENABLE UIDONLY` — born at
+    /// connect for UIDONLY-capable accounts, or promoted by a scan). A UID-Mode
+    /// session serves any operation (every AgentMail command is UID-based); the
+    /// flag exists so `release` routes it to the UID store and so a scan skips a
+    /// redundant `ENABLE`.
+    pub fn is_uid_mode(&self) -> bool {
+        self.uid_mode
+    }
+
     /// Mark this connection as UID-Mode (after a successful `ENABLE UIDONLY`).
     /// From here on `release` returns it to the UID-Mode store, never the
     /// Limited pool.
@@ -860,6 +949,18 @@ mod tests {
             2,
             "an explicit config value overrides the host default",
         );
+    }
+
+    /// Born-UID-Mode is off by default (safe: classic two-pool behavior) and
+    /// flips with the builder-resolved setter.
+    #[test]
+    fn uidonly_flag_defaults_off_and_sets() {
+        let mut pool = ConnectionPool::new(Config::empty());
+        assert!(!pool.uidonly_enabled(), "default is Limited-Mode-first");
+        pool.set_uidonly(true);
+        assert!(pool.uidonly_enabled());
+        pool.set_uidonly(false);
+        assert!(!pool.uidonly_enabled());
     }
 
     /// A brand-new pool has paid no LOGINs and reused nothing; the snapshot
