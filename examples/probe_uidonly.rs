@@ -159,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         password: Some(Secret::new_raw(&pass)),
         tls: true,
         max_connections: None,
+        auth: agentmail::AuthMethod::Password,
     };
 
     // connect() negotiates DEFLATE and sends ID — reaching here proves both.

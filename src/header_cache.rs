@@ -2696,6 +2696,7 @@ mod tests {
             password: None,
             tls: true,
             max_connections: None,
+            auth: crate::config::AuthMethod::Password,
         };
         // Renaming the account points at the same mailbox → same projection.
         let renamed = CacheKey::new("Cthrower", &config, "INBOX");
@@ -2787,6 +2788,7 @@ mod tests {
             password: None,
             tls: true,
             max_connections: None,
+            auth: crate::config::AuthMethod::Password,
         };
         let key = CacheKey::new("acct", &config, "INBOX");
         let path = Arc::clone(cache.path.as_ref().expect("test cache path"));

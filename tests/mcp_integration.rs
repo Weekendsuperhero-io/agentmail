@@ -32,6 +32,7 @@ impl McpClient {
                 password: Some(Secret::new_raw("unused")),
                 tls: true,
                 max_connections: None,
+                auth: agentmail::AuthMethod::Password,
             },
         )]);
         tokio::spawn(async move {

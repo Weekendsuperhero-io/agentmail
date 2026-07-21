@@ -406,6 +406,44 @@ where
     Ok(all)
 }
 
+/// SASL XOAUTH2 authenticator (Gmail, Outlook, Yahoo/AOL): the initial
+/// response is `user=<user>\x01auth=Bearer <token>\x01\x01` (async-imap
+/// base64-encodes it). A server that rejects the token replies with a
+/// base64 JSON error challenge; per the XOAUTH2 spec the client answers
+/// with an EMPTY response so the tagged `NO` surfaces — returning the
+/// credentials again would stall the exchange.
+struct Xoauth2Authenticator<'a> {
+    user: &'a str,
+    access_token: &'a str,
+    responded: bool,
+}
+
+impl<'a> Xoauth2Authenticator<'a> {
+    fn new(user: &'a str, access_token: &'a str) -> Self {
+        Self {
+            user,
+            access_token,
+            responded: false,
+        }
+    }
+}
+
+impl async_imap::Authenticator for Xoauth2Authenticator<'_> {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+        if self.responded {
+            // Error challenge → empty response → server sends the tagged NO.
+            return String::new();
+        }
+        self.responded = true;
+        format!(
+            "user={}\x01auth=Bearer {}\x01\x01",
+            self.user, self.access_token
+        )
+    }
+}
+
 /// Connect to an IMAP server over TLS and authenticate, retrying a transient
 /// failure a few times with backoff (fresh connection each attempt).
 pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSession> {
@@ -449,16 +487,35 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
     let tls = imap_timeout(connector.connect(&config.host, tcp)).await?;
 
     let client = async_imap::Client::new(tls);
-    let login_fut = client.login(&config.username, password);
-    let login_limit = imap_timeout_duration();
-    let plain = match tokio::time::timeout(login_limit, login_fut).await {
-        Ok(Ok(session)) => session,
-        Ok(Err((err, _client))) => return Err(AgentmailError::Imap(err)),
-        Err(_elapsed) => {
-            return Err(AgentmailError::Other(format!(
-                "IMAP login timed out after {}s",
-                login_limit.as_secs()
-            )));
+    let auth_limit = imap_timeout_duration();
+    let plain = match config.auth {
+        crate::config::AuthMethod::Password => {
+            match tokio::time::timeout(auth_limit, client.login(&config.username, password)).await {
+                Ok(Ok(session)) => session,
+                Ok(Err((err, _client))) => return Err(AgentmailError::Imap(err)),
+                Err(_elapsed) => {
+                    return Err(AgentmailError::Other(format!(
+                        "IMAP login timed out after {}s",
+                        auth_limit.as_secs()
+                    )));
+                }
+            }
+        }
+        crate::config::AuthMethod::Xoauth2 => {
+            // `password` carries the OAuth ACCESS TOKEN under this method.
+            let authenticator = Xoauth2Authenticator::new(&config.username, password);
+            match tokio::time::timeout(auth_limit, client.authenticate("XOAUTH2", authenticator))
+                .await
+            {
+                Ok(Ok(session)) => session,
+                Ok(Err((err, _client))) => return Err(AgentmailError::Imap(err)),
+                Err(_elapsed) => {
+                    return Err(AgentmailError::Other(format!(
+                        "IMAP XOAUTH2 authentication timed out after {}s",
+                        auth_limit.as_secs()
+                    )));
+                }
+            }
         }
     };
 
@@ -3717,6 +3774,73 @@ mod tests {
         let name_value = field(&oversized, "name").unwrap();
         assert!(name_value.len() <= 1024);
         assert!(name_value.is_char_boundary(name_value.len()));
+    }
+
+    /// The XOAUTH2 SASL shape (Gmail/Yahoo/AOL/Outlook all share it): the
+    /// initial response carries user + Bearer token with \x01 separators, and
+    /// any FOLLOW-UP challenge (the server's base64 JSON error) is answered
+    /// with an empty response so the tagged NO can surface.
+    #[test]
+    fn xoauth2_initial_response_and_error_challenge_shape() {
+        let mut auth = Xoauth2Authenticator::new("you@gmail.com", "ya29.token-123");
+        use async_imap::Authenticator;
+        assert_eq!(
+            auth.process(b""),
+            "user=you@gmail.com\x01auth=Bearer ya29.token-123\x01\x01"
+        );
+        assert_eq!(
+            auth.process(br#"{"status":"400","schemes":"Bearer"}"#),
+            "",
+            "an error challenge is answered with an empty response, never the credentials again"
+        );
+    }
+
+    /// End-to-end XOAUTH2 over a scripted duplex: async-imap sends
+    /// AUTHENTICATE XOAUTH2, answers the `+ ` continuation with our
+    /// base64-encoded SASL string, and yields a session on the tagged OK.
+    #[tokio::test]
+    async fn xoauth2_authenticate_handshake_over_scripted_session() {
+        use base64::Engine;
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert!(
+                command.contains("AUTHENTICATE XOAUTH2"),
+                "client opens with the XOAUTH2 mechanism: {command:?}"
+            );
+            let tag = command.split_whitespace().next().unwrap().to_string();
+            writer.write_all(b"+ \r\n").await.unwrap();
+
+            let mut sasl_b64 = String::new();
+            reader.read_line(&mut sasl_b64).await.unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(sasl_b64.trim())
+                .expect("client sends base64");
+            assert_eq!(
+                String::from_utf8_lossy(&decoded),
+                "user=you@gmail.com\x01auth=Bearer ya29.token-123\x01\x01"
+            );
+            writer
+                .write_all(format!("{tag} OK AUTHENTICATE completed\r\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let client = async_imap::Client::new(client_stream);
+        let session = client
+            .authenticate(
+                "XOAUTH2",
+                Xoauth2Authenticator::new("you@gmail.com", "ya29.token-123"),
+            )
+            .await
+            .map_err(|(error, _)| error)
+            .expect("scripted XOAUTH2 handshake succeeds");
+        drop(session);
+        server.await.expect("scripted server finishes");
     }
 
     #[test]

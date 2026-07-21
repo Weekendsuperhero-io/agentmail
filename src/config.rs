@@ -13,6 +13,23 @@ pub struct Config {
     pub accounts: HashMap<String, AccountConfig>,
 }
 
+/// How the account authenticates to the IMAP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    /// Plain `LOGIN` with the resolved password (app password on providers
+    /// that require one). The default.
+    #[default]
+    Password,
+    /// SASL `AUTHENTICATE XOAUTH2` with an OAuth 2.0 access token. The
+    /// `password` secret then yields the ACCESS TOKEN, not a password — use
+    /// `password.cmd` pointing at a token helper (or the embedding app's
+    /// credential injection) so refresh happens outside agentmail. Tokens
+    /// expire (~1h); a stale token fails auth exactly like a bad password
+    /// and the caller re-resolves the secret on the next connect.
+    Xoauth2,
+}
+
 /// Configuration for a single IMAP account.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountConfig {
@@ -21,7 +38,8 @@ pub struct AccountConfig {
     pub port: u16,
     pub username: String,
     /// Password secret: `password.raw = "..."`, `password.cmd = "..."`,
-    /// or `password.keyring = "..."`. Legacy `password = "..."` is also accepted.
+    /// or `password.keyring = "..."`. Legacy `password = "..."` is also
+    /// accepted. Under `auth = "xoauth2"` this yields the OAuth access token.
     #[serde(default, deserialize_with = "deserialize_password_opt")]
     pub password: Option<Secret>,
     #[serde(default = "default_tls")]
@@ -29,6 +47,9 @@ pub struct AccountConfig {
     /// Max concurrent IMAP connections for this account (default: 3).
     #[serde(default)]
     pub max_connections: Option<usize>,
+    /// Authentication method: `"password"` (default) or `"xoauth2"`.
+    #[serde(default)]
+    pub auth: AuthMethod,
 }
 
 impl AccountConfig {
@@ -44,6 +65,7 @@ impl AccountConfig {
             password,
             tls: true,
             max_connections: None,
+            auth: AuthMethod::Password,
         }
     }
 
@@ -56,6 +78,12 @@ impl AccountConfig {
     /// Set max concurrent IMAP connections.
     pub fn with_max_connections(mut self, n: usize) -> Self {
         self.max_connections = Some(n);
+        self
+    }
+
+    /// Set the authentication method (default: password `LOGIN`).
+    pub fn with_auth(mut self, auth: AuthMethod) -> Self {
+        self.auth = auth;
         self
     }
 }
@@ -166,5 +194,46 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("agentmail")
             .join("config.toml")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `auth` parses from TOML, defaults to password, and rejects unknown
+    /// methods — the config contract for XOAUTH2 accounts.
+    #[test]
+    fn auth_method_parses_defaults_and_rejects_unknowns() {
+        let toml = r#"
+            [accounts.gmail]
+            host = "imap.gmail.com"
+            username = "you@gmail.com"
+            auth = "xoauth2"
+            password.cmd = "oauth-helper --email you@gmail.com"
+
+            [accounts.legacy]
+            host = "imap.example.com"
+            username = "you@example.com"
+            password.raw = "app-password"
+        "#;
+        let config: Config = ::toml::from_str(toml).expect("valid config");
+        assert_eq!(config.accounts["gmail"].auth, AuthMethod::Xoauth2);
+        assert_eq!(
+            config.accounts["legacy"].auth,
+            AuthMethod::Password,
+            "auth defaults to password when omitted"
+        );
+
+        let bad = r#"
+            [accounts.bad]
+            host = "imap.example.com"
+            username = "you@example.com"
+            auth = "oauth1"
+        "#;
+        assert!(
+            ::toml::from_str::<Config>(bad).is_err(),
+            "unknown auth methods must be rejected, not silently ignored"
+        );
     }
 }

@@ -988,6 +988,7 @@ mod tests {
                 password: Some(crate::secret::Secret::new_raw("unused")),
                 tls: true,
                 max_connections: None,
+                auth: crate::config::AuthMethod::Password,
             },
         )]);
         let pool = ConnectionPool::new(config);

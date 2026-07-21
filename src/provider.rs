@@ -75,6 +75,7 @@ impl MailProvider {
             password,
             tls: true,
             max_connections: None,
+            auth: crate::config::AuthMethod::Password,
         }
     }
 }

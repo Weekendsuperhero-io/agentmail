@@ -17,7 +17,7 @@ mod mailbox_catalog;
 mod scan_plan;
 mod unsubscribe;
 
-pub use config::{AccountConfig, Config};
+pub use config::{AccountConfig, AuthMethod, Config};
 pub use connection::ConnectionPool;
 pub use error::{AgentmailError, Result};
 pub use imap_client::{CancelFn, ClientIdentity, ProgressFn};
@@ -3614,6 +3614,7 @@ mod tests {
                 password: None,
                 tls: true,
                 max_connections: None,
+                auth: crate::config::AuthMethod::Password,
             },
         )]);
         let mk = Agentmail::new(cfg);

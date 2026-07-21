@@ -193,6 +193,59 @@ agentmail check-connection --account gmail
 agentmail list-mailboxes --account gmail
 ```
 
+### OAuth 2.0 (XOAUTH2)
+
+Set `auth = "xoauth2"` on an account and the `password` secret is treated as
+the **OAuth access token** (SASL `AUTHENTICATE XOAUTH2` instead of `LOGIN`):
+
+```toml
+[accounts.gmail]
+host = "imap.gmail.com"
+username = "you@gmail.com"
+auth = "xoauth2"
+# The secret must yield a CURRENT access token. Tokens expire (~1h), so use
+# a command that refreshes (any OAuth token helper works), not a raw string:
+password.cmd = "oauth-helper --provider google --email you@gmail.com"
+```
+
+agentmail deliberately does not run the interactive consent flow or token
+refresh itself — the token source (`password.cmd`, the embedding app, or the
+`AGENTMAIL_PASSWORD_<ACCOUNT>` env override) owns that. A stale token fails
+authentication like a bad password; the secret is re-resolved on the next
+connect, so a refreshing helper self-heals.
+
+Why XOAUTH2: providers throttle password `LOGIN` aggressively (it is their
+anti-bruteforce surface — AOL/Yahoo's `[LIMIT] LOGIN Rate limit hit.` lives
+there); a bearer token is not guessable-credential material and is the
+sanctioned integration path. It is not a substitute for connection reuse —
+`AUTHENTICATE` still runs once per connection, so the keepalive/pooling
+economy matters just as much.
+
+**Quick manual test (Gmail, no code):** open the
+[Google OAuth Playground](https://developers.google.com/oauthplayground),
+authorize the scope `https://mail.google.com/`, exchange for tokens, copy the
+access token, then:
+
+```toml
+auth = "xoauth2"
+password.raw = "<paste access token>"   # valid ~1h; fine for a smoke test
+```
+
+```bash
+agentmail check-connection --account gmail
+```
+
+Provider documentation:
+
+| Provider | XOAUTH2 / IMAP protocol | OAuth flow & scopes |
+| --- | --- | --- |
+| Gmail | [XOAUTH2 mechanism + IMAP example](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol) | [OAuth for native apps](https://developers.google.com/identity/protocols/oauth2/native-app); scope `https://mail.google.com/`; token endpoint `https://oauth2.googleapis.com/token` |
+| Yahoo Mail | [Yahoo mail integration developer docs](https://senders.yahooinc.com/developer/documentation) (XOAUTH2 + IMAP ID + UID Mode) | [Yahoo OAuth 2.0 guide](https://developer.yahoo.com/oauth2/guide/); auth `https://api.login.yahoo.com/oauth2/request_auth`, token `https://api.login.yahoo.com/oauth2/get_token`. **Mail scopes require an approved registered app** (partner process) |
+| AOL Mail | Same infrastructure and docs as Yahoo (`imap.aol.com`) | AOL identity endpoints mirror Yahoo at `api.login.aol.com`; same approval requirement |
+
+(URLs are the canonical entry points; providers occasionally move pages —
+search the page title if one 404s.)
+
 ### Gmail setup
 
 Gmail requires an [App Password](https://myaccount.google.com/apppasswords) (not your regular Google account password). Generate one, then:
