@@ -29,6 +29,7 @@ jobs:
       issues: write
       pull-requests: write
     uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-review.yml@main
+    max-commit-messages: 300
     with:
       runs-on: ubuntu-latest
       # House rules appended to each agent's prompt, per lens.
