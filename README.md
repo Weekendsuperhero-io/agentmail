@@ -367,10 +367,12 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - `top_senders`, `top_subscriptions`, and `top_mailing_lists` share a persistent, live-validated UID/header cache. Each invocation uses `EXAMINE` before reuse. An unchanged `UIDVALIDITY`/`UIDNEXT`/message-count tuple is a hit; a proven append fetches only new UIDs; deletions and mixed changes reconcile UID membership while reusing unchanged header rows. A changed or missing `UIDVALIDITY` prevents unsafe UID reuse. If discovery enumerates folders, results dedupe by Message-ID and exclude your own address.
 - Every discovery result that can lead to a UID action carries the complete
   `(mailbox, uidValidity, uid)` identity and a canonical `resourceUri`.
-  `delete_messages`, `delete_by_sender`, `move_message`,
-  `download_attachments`, `add_flags`, `remove_flags`, and
-  `unsubscribe_message` require `expectedUidValidity` and refuse the action if
-  a live `EXAMINE` observes another UID epoch.
+  `delete_messages`, `move_message`, `download_attachments`, `add_flags`,
+  `remove_flags`, and `unsubscribe_message` require `expectedUidValidity` and
+  refuse the action if a live `EXAMINE` observes another UID epoch.
+  `delete_by_sender` instead takes the exact sender identity (`email` +
+  `name`, from a ranking row) and confirms it live in each mailbox, so it
+  carries no sample UID or epoch guard.
 - `top_subscriptions` returns a nested `sample` identity, not an unsubscribe
   URL or raw list-action header. `unsubscribe_message` additionally requires
   explicit `confirmOneClick=true`. Its `advertisedOneClick` field describes
@@ -378,7 +380,7 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   locally verifies a passing DKIM signature that covers both list headers.
 - The action-time DKIM source fetch is preceded by `RFC822.SIZE`, capped at 64 MiB, and fetched with a bounded IMAP partial. This per-source safety bound does not limit matching-message cleanup counts.
 - RFC 8058 requests accept exactly one parsed HTTPS URI, reject credentials, fragments, HTTP alternatives, private/link-local/loopback destinations, mixed public/private DNS answers, proxies, retries, and redirects, and require a direct 2xx response. The resolved public addresses are pinned for the request.
-- `deleteMatching`, `deleteOnUnsubscribeFailure`, `allowSenderFallback`, and `allowPermanentFallback` all default to false. Opt-in cleanup matches the normalized RFC 2919 List-Id only when the same passing DKIM signature also covered that single List-Id; sender matching is an explicit fallback only. A failed unsubscribe never triggers cleanup unless separately authorized.
+- Matching-message cleanup is one optional `cleanup {when, identity, deletion}` object; omitting it means unsubscribe only. Defaults are fail-safe: `when: "afterSuccess"` (a failed unsubscribe never triggers cleanup unless `"always"` is explicit), `deletion: "trash"` (never permanent unless `"trashThenPermanent"` or `"permanent"` is explicit). Cleanup matches the normalized RFC 2919 List-Id only when the same passing DKIM signature covered that single List-Id; otherwise `identity: "listIdOrSender"` (default) falls back to the exact sender's bulk mail, scoped to the target's own List-Id whenever the message carries one so sibling lists from the same sender are untouched.
 - Account-wide destructive operations use a separate mutation plan: they enumerate selectable storage mailboxes and never issue writes through `\All`, `\Flagged`, or `\Important` aggregate views. An explicitly supplied mailbox is always honored.
 - `delete_by_sender`, `delete_list_id`, and unsubscribe matching have no total-message ceiling; server mutations are split into 500-UID wire batches. Only the MCP `delete_messages` tool limits an explicitly supplied UID array to 500 per call.
 - `search_messages` supports date range (`since`/`before`, YYYY-MM-DD) and size (`larger_than`/`smaller_than`, bytes) for "older than" / "bigger than" cleanup, plus AND-combined case-insensitive substring text filters. `delete_list_id` matches the List-Id exactly (not as a substring).

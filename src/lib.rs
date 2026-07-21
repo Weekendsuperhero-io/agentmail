@@ -3272,4 +3272,198 @@ mod tests {
             "expected account lookup error, got: {msg}"
         );
     }
+
+    /// A scripted IMAP server for driving `delete_sweep_loop` over a duplex
+    /// stream. Dispatches on command substrings and scripts two drain passes:
+    /// the first SELECT/SEARCH finds messages, the second finds none. Returns
+    /// every received command line for shape assertions.
+    fn scripted_sweep_server(
+        server_stream: tokio::io::DuplexStream,
+        first_search: &'static str,
+        fetch_reply: fn(&str) -> String,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            let mut selects = 0u32;
+            let mut searches = 0u32;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = line.split_whitespace().next().unwrap().to_string();
+                commands.push(line.clone());
+                let reply = if line.contains(" LOGIN ") {
+                    format!("{tag} OK LOGIN completed\r\n")
+                } else if line.contains("SELECT") {
+                    selects += 1;
+                    // Pass 2 re-selects and sees the emptied mailbox.
+                    let exists = if selects == 1 { 2 } else { 0 };
+                    format!(
+                        "* {exists} EXISTS\r\n* OK [UIDVALIDITY 9] UIDs valid\r\n* OK [UIDNEXT 100] next\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+                    )
+                } else if line.contains("UID SEARCH") {
+                    searches += 1;
+                    let hits = if searches == 1 { first_search } else { "" };
+                    format!("* SEARCH{hits}\r\n{tag} OK SEARCH completed\r\n")
+                } else if line.contains("UID FETCH") {
+                    fetch_reply(&tag)
+                } else if line.contains("UID STORE") {
+                    format!("{tag} OK STORE completed\r\n")
+                } else if line.contains("UID EXPUNGE") {
+                    format!("* 1 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n")
+                } else if line.contains("NOOP") {
+                    format!("{tag} OK NOOP completed\r\n")
+                } else {
+                    panic!("unexpected command: {line:?}");
+                };
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+            commands
+        })
+    }
+
+    async fn scripted_sweep_session(
+        first_search: &'static str,
+        fetch_reply: fn(&str) -> String,
+    ) -> (
+        async_imap::Session<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = scripted_sweep_server(server_stream, first_search, fetch_reply);
+        let client = async_imap::Client::new(client_stream);
+        let session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+        (session, server)
+    }
+
+    /// End-to-end List-Id sweep against a scripted server: discovery searches,
+    /// the confirm fetch keeps only exact-List-Id matches, the delete issues
+    /// UID STORE + UID EXPUNGE (UIDPLUS, no Trash), and the second drain pass
+    /// finds nothing and terminates.
+    #[tokio::test]
+    async fn delete_sweep_list_id_confirms_deletes_and_drains() {
+        let (mut session, server) = scripted_sweep_session(" 5 7", |tag| {
+            // Confirm fetch: UID 5 carries the exact List-Id, UID 7 a sibling
+            // list — only 5 may be deleted.
+            let target = "List-Id: News <news.example.com>\r\n\r\n";
+            let sibling = "List-Id: Other <other.example.com>\r\n\r\n";
+            format!(
+                "* 1 FETCH (UID 5 BODY[HEADER.FIELDS (LIST-ID)] {{{}}}\r\n{target})\r\n* 2 FETCH (UID 7 BODY[HEADER.FIELDS (LIST-ID)] {{{}}}\r\n{sibling})\r\n{tag} OK FETCH completed\r\n",
+                target.len(),
+                sibling.len()
+            )
+        })
+        .await;
+
+        let mk = Agentmail::new(Config::empty());
+        let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
+        let totals = mk
+            .delete_sweep_loop(
+                &mut session,
+                "test-account",
+                &DeleteSelector::ListId("news.example.com".to_string()),
+                &["INBOX".to_string()],
+                None,
+                &caps,
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("scripted sweep succeeds");
+
+        assert_eq!(totals.found, 1, "only the confirmed List-Id match counts");
+        assert_eq!(totals.deleted, 1);
+        assert_eq!(totals.failed, 0);
+        assert!(totals.skipped.is_empty());
+        assert_eq!(totals.mailboxes.len(), 1);
+        assert_eq!(totals.mailboxes[0].mailbox, "INBOX");
+
+        drop(session);
+        let commands = server.await.expect("scripted server finishes");
+        let joined = commands.concat();
+        assert!(
+            joined.contains("UID STORE 5 +FLAGS (\\Deleted)"),
+            "deletes exactly the confirmed UID: {commands:?}"
+        );
+        assert!(
+            joined.contains("UID EXPUNGE 5"),
+            "expunges via targeted UIDPLUS: {commands:?}"
+        );
+        assert!(
+            !joined.contains("UID STORE 5,7") && !joined.contains("UID EXPUNGE 5,7"),
+            "the sibling-list UID must never reach the delete: {commands:?}"
+        );
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("SELECT")).count(),
+            2,
+            "drain loop re-selects once and stops on the empty pass: {commands:?}"
+        );
+    }
+
+    /// End-to-end sender-fallback sweep with the pertinence constraint: both
+    /// candidates are bulk mail from the exact sender, but only the one whose
+    /// List-Id matches the constraint is deleted — the sibling list survives.
+    #[tokio::test]
+    async fn delete_sweep_sender_fallback_is_scoped_to_the_constrained_list_id() {
+        let (mut session, server) = scripted_sweep_session(" 11 12", |tag| {
+            let matching = "From: News <sender@example.com>\r\nList-Unsubscribe: <https://x.example/u>\r\nList-Id: News <news.example.com>\r\n\r\n";
+            let sibling = "From: News <sender@example.com>\r\nList-Unsubscribe: <https://x.example/u>\r\nList-Id: Other <other.example.com>\r\n\r\n";
+            format!(
+                "* 1 FETCH (UID 11 BODY[HEADER] {{{}}}\r\n{matching})\r\n* 2 FETCH (UID 12 BODY[HEADER] {{{}}}\r\n{sibling})\r\n{tag} OK FETCH completed\r\n",
+                matching.len(),
+                sibling.len()
+            )
+        })
+        .await;
+
+        let mk = Agentmail::new(Config::empty());
+        let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
+        let totals = mk
+            .delete_sweep_loop(
+                &mut session,
+                "test-account",
+                &DeleteSelector::Sender {
+                    email: "sender@example.com".to_string(),
+                    name: "News".to_string(),
+                    bulk_only: true,
+                    list_id: Some("news.example.com".to_string()),
+                },
+                &["INBOX".to_string()],
+                None,
+                &caps,
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("scripted sweep succeeds");
+
+        assert_eq!(
+            totals.found, 1,
+            "only the constrained list's message qualifies"
+        );
+        assert_eq!(totals.deleted, 1);
+        assert_eq!(totals.failed, 0);
+
+        drop(session);
+        let commands = server.await.expect("scripted server finishes");
+        let joined = commands.concat();
+        assert!(
+            joined.contains("UID STORE 11 +FLAGS (\\Deleted)"),
+            "deletes only the constrained match: {commands:?}"
+        );
+        assert!(
+            !joined.contains("UID STORE 11,12"),
+            "the sibling list's UID 12 must survive the sweep: {commands:?}"
+        );
+    }
 }
