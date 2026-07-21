@@ -364,6 +364,35 @@ impl HeaderCache {
         }
     }
 
+    /// Remove one message's projection row and membership marker — the
+    /// self-heal for a stale ranking sample. The server said the UID no
+    /// longer exists, but external deletions on Yahoo/AOL advance neither
+    /// UIDNEXT nor a trustworthy EXISTS, so the cache cannot notice them on
+    /// its own. Both tables are pruned together so the covered==membership
+    /// completeness yardstick stays intact and the next ranking call simply
+    /// picks a different sample. Best-effort — a cache failure only defers
+    /// the heal to the next full resync.
+    pub(crate) async fn prune_uid(
+        &self,
+        account_name: &str,
+        config: &AccountConfig,
+        mailbox: &str,
+        uid: u32,
+    ) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let key = CacheKey::new(account_name, config, mailbox);
+        if let Err(error) = prune_uid_row(Arc::clone(path), key, uid).await {
+            debug!(
+                target: "agentmail",
+                error = %error,
+                uid,
+                "failed to prune a stale cache row; the next resync heals it"
+            );
+        }
+    }
+
     /// The projected UIDs in one mailbox epoch that carry this normalized
     /// List-Id. Restart-proof ground truth for deletion flows: when the
     /// server's `SEARCH HEADER List-Id` returns nothing while the projection
@@ -1885,6 +1914,25 @@ async fn load_covered_count(
     .await?
 }
 
+/// Delete one UID's projection row and membership marker atomically enough
+/// for the completeness yardstick: both statements run on one connection, and
+/// a covered row is only ever removed together with its membership.
+async fn prune_uid_row(path: Arc<PathBuf>, key: CacheKey, uid: u32) -> CacheResult<()> {
+    tokio::task::spawn_blocking(move || {
+        let connection = open_connection(&path)?;
+        connection.execute(
+            "DELETE FROM header_rows WHERE account_key = ?1 AND mailbox = ?2 AND uid = ?3",
+            params![key.account, key.mailbox, i64::from(uid)],
+        )?;
+        connection.execute(
+            "DELETE FROM membership WHERE account_key = ?1 AND mailbox = ?2 AND uid = ?3",
+            params![key.account, key.mailbox, i64::from(uid)],
+        )?;
+        Ok(())
+    })
+    .await?
+}
+
 /// Size of the walked membership set for one mailbox. In UID Mode the mailbox
 /// EXISTS is only the visible-window count, so this — not EXISTS — is the
 /// yardstick for whether the projection covers the whole mailbox.
@@ -2304,6 +2352,66 @@ mod tests {
         std::env::temp_dir()
             .join(format!("agentmail-cache-test-{}", uuid::Uuid::new_v4()))
             .join(format!("{name}.sqlite3"))
+    }
+
+    /// Pruning a stale ranking sample removes the projection row AND its
+    /// membership marker together, so the covered==membership completeness
+    /// yardstick still hits and the survivor is the only remaining sample.
+    #[tokio::test]
+    async fn prune_uid_removes_row_and_membership_together() {
+        let cache = HeaderCache::at_path(test_path("prune-stale-sample"));
+        publish_test_rows(
+            &cache,
+            "INBOX",
+            vec![
+                rank_row(
+                    1,
+                    "gone@example.com",
+                    "Gone",
+                    Some(1_000),
+                    Some("<m1@example.com>"),
+                    Some("List <l.example.com>"),
+                    true,
+                    false,
+                ),
+                rank_row(
+                    2,
+                    "alive@example.com",
+                    "Alive",
+                    Some(2_000),
+                    Some("<m2@example.com>"),
+                    None,
+                    false,
+                    false,
+                ),
+            ],
+        )
+        .await;
+
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        prune_uid_row(Arc::clone(&path), test_key("INBOX"), 1)
+            .await
+            .expect("prune succeeds");
+
+        let (rows, members, survivor) = tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&path)?;
+            let rows: i64 =
+                connection.query_row("SELECT COUNT(*) FROM header_rows", [], |row| row.get(0))?;
+            let members: i64 =
+                connection.query_row("SELECT COUNT(*) FROM membership", [], |row| row.get(0))?;
+            let survivor: i64 =
+                connection.query_row("SELECT uid FROM header_rows", [], |row| row.get(0))?;
+            Ok::<_, CacheError>((rows, members, survivor))
+        })
+        .await
+        .expect("join")
+        .expect("query");
+        assert_eq!(rows, 1, "only the stale row is removed");
+        assert_eq!(
+            members, 1,
+            "membership pruned with the row — completeness stays covered==members"
+        );
+        assert_eq!(survivor, 2);
     }
 
     #[test]

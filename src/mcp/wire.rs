@@ -146,7 +146,6 @@ pub(super) struct MailboxOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) delimiter: Option<String>,
     pub(super) no_inferiors: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) roles: Vec<String>,
 }
 
@@ -513,9 +512,7 @@ pub(super) struct ListFlagsOutput {
     pub(super) mailbox: String,
     pub(super) total_flags: usize,
     pub(super) flags: Vec<FlagCountOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) colors: Vec<ColorCountOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) per_mailbox: Vec<MailboxFlagBreakdownOutput>,
     pub(super) per_mailbox_total: usize,
     pub(super) per_mailbox_truncated: bool,
@@ -596,7 +593,6 @@ pub(super) struct FindAttachmentsOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) next_offset: Option<usize>,
     pub(super) messages: Vec<AttachmentHitOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) per_mailbox: Vec<MailboxAttachmentCountOutput>,
     pub(super) per_mailbox_total: usize,
     pub(super) per_mailbox_truncated: bool,
@@ -1003,11 +999,9 @@ pub(super) struct DeleteBySenderOutput {
     pub(super) found: usize,
     pub(super) deleted: usize,
     pub(super) failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) mailboxes: Vec<PerMailboxDeleteOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) skipped: Vec<String>,
     pub(super) skipped_total: usize,
     pub(super) skipped_truncated: bool,
@@ -1059,11 +1053,9 @@ pub(super) struct DeleteListIdOutput {
     pub(super) found: usize,
     pub(super) deleted: usize,
     pub(super) failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) mailboxes: Vec<PerMailboxDeleteOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) skipped: Vec<String>,
     pub(super) skipped_total: usize,
     pub(super) skipped_truncated: bool,
@@ -1137,11 +1129,9 @@ pub(super) struct MoveListIdOutput {
     pub(super) found: usize,
     pub(super) moved: usize,
     pub(super) failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) mailboxes: Vec<PerMailboxMoveOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) skipped: Vec<String>,
     pub(super) skipped_total: usize,
     pub(super) skipped_truncated: bool,
@@ -1193,11 +1183,9 @@ pub(super) struct MoveBySenderOutput {
     pub(super) found: usize,
     pub(super) moved: usize,
     pub(super) failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) mailboxes: Vec<PerMailboxMoveOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) skipped: Vec<String>,
     pub(super) skipped_total: usize,
     pub(super) skipped_truncated: bool,
@@ -1463,7 +1451,6 @@ pub(super) struct MatchingMessagesOutput {
     pub(super) mailboxes: Vec<PerMailboxDeleteOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) skipped: Vec<String>,
     pub(super) skipped_total: usize,
     pub(super) skipped_truncated: bool,

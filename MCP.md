@@ -281,9 +281,9 @@ identity.
 { "mailbox": "INBOX" | "*", "account",
   "sender": "Display Name <email>",
   "found", "deleted", "failed",
-  "mailboxes?": [{ "mailbox", "found", "deleted", "failed" }],
+  "mailboxes": [{ "mailbox", "found", "deleted", "failed" }],
   "mailboxesTotal", "mailboxesTruncated",
-  "skipped?": [], "skippedTotal", "skippedTruncated", "permanent": bool }
+  "skipped": [], "skippedTotal", "skippedTruncated", "permanent": bool }
 ```
 
 Mailbox and skipped breakdowns are capped at 50 rows; their total and
@@ -294,9 +294,9 @@ truncation fields preserve audit completeness.
 { "mailbox": "INBOX" | "*", "account",
   "listId": "list-id.example.com",
   "found", "deleted", "failed",
-  "mailboxes?": [{ "mailbox", "found", "deleted", "failed" }],
+  "mailboxes": [{ "mailbox", "found", "deleted", "failed" }],
   "mailboxesTotal", "mailboxesTruncated",
-  "skipped?": ["mailbox"], "skippedTotal", "skippedTruncated",
+  "skipped": ["mailbox"], "skippedTotal", "skippedTruncated",
   "permanent": bool }
 ```
 `mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched; policy-excluded special-use views are not reported as errors.
@@ -306,9 +306,9 @@ truncation fields preserve audit completeness.
 { "mailbox": "INBOX" | "*", "account",
   "listId": "list-id.example.com", "destination": "Statements",
   "found", "moved", "failed",
-  "mailboxes?": [{ "mailbox", "found", "moved", "failed" }],
+  "mailboxes": [{ "mailbox", "found", "moved", "failed" }],
   "mailboxesTotal", "mailboxesTruncated",
-  "skipped?": ["mailbox"], "skippedTotal", "skippedTruncated" }
+  "skipped": ["mailbox"], "skippedTotal", "skippedTruncated" }
 ```
 
 **move_by_sender**
@@ -316,9 +316,9 @@ truncation fields preserve audit completeness.
 { "mailbox": "INBOX" | "*", "account",
   "sender": "Display Name <email>", "destination": "Statements",
   "found", "moved", "failed",
-  "mailboxes?": [{ "mailbox", "found", "moved", "failed" }],
+  "mailboxes": [{ "mailbox", "found", "moved", "failed" }],
   "mailboxesTotal", "mailboxesTruncated",
-  "skipped?": [], "skippedTotal", "skippedTruncated" }
+  "skipped": [], "skippedTotal", "skippedTruncated" }
 ```
 
 **move_message**

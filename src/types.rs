@@ -12,7 +12,6 @@ pub struct AccountInfo {
     pub name: String,
     pub host: String,
     pub username: String,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_default: bool,
 }
 
@@ -32,10 +31,10 @@ pub struct MailboxInfo {
     /// Full IMAP path including hierarchy
     pub path: String,
     /// `true` when the mailbox cannot be SELECTed (virtual container only).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub no_select: bool,
     /// `true` when no child mailboxes exist or can be created.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub no_inferiors: bool,
     /// First recognized special-use role, retained for API compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,7 +42,7 @@ pub struct MailboxInfo {
     /// All recognized registered IMAP special-use roles. The current set is
     /// "all", "archive", "drafts", "flagged", "important", "junk",
     /// "memos", "scheduled", "sent", "snoozed", and "trash".
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub roles: Vec<String>,
 }
 
@@ -112,19 +111,19 @@ pub struct MessageInfo {
     pub message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(default)]
     pub references: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(default)]
     pub bcc: Vec<String>,
 
     // MIME structure
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(default)]
     pub attachments: Vec<AttachmentInfo>,
 
     // All headers (raw original values)
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    #[serde(default)]
     #[schemars(with = "std::collections::HashMap<String, Vec<String>>")]
     pub headers: HashMap<String, Vec<String>>,
 }
@@ -286,9 +285,7 @@ pub struct ListFlagsResponse {
     pub account: String,
     pub total_flags: usize,
     pub flags: Vec<FlagCount>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub colors: Vec<ColorCount>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub per_mailbox: Vec<MailboxFlagBreakdown>,
 }
 
@@ -330,7 +327,6 @@ pub struct FindAttachmentsResponse {
     pub offset: usize,
     pub limit: usize,
     pub messages: Vec<AttachmentMessage>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub per_mailbox: Vec<MailboxAttachmentCount>,
 }
 
@@ -433,13 +429,10 @@ pub struct DeleteListIdResponse {
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mailboxes: Vec<PerMailboxDeleteResult>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
     /// True when the caller requested a permanent delete (Trash bypassed on
     /// standard IMAP; Gmail safely routes the request through Trash).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub permanent: bool,
 }
 
@@ -547,11 +540,9 @@ pub struct DeleteMessagesResponse {
     pub failed: usize,
     /// True when configured trash mailbox was unavailable and deletion
     /// fell back to flag+expunge (permanent delete).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub trash_fallback: bool,
     /// True when the caller requested a permanent delete (Trash bypassed on
     /// standard IMAP; Gmail safely routes the request through Trash).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub permanent: bool,
 }
 
@@ -576,13 +567,10 @@ pub struct DeleteBySenderResponse {
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     /// Mailboxes that could not be selected or searched (skipped during scan).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
     /// True when the caller requested a permanent delete (Trash bypassed).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub permanent: bool,
 }
 
@@ -621,10 +609,8 @@ pub struct MoveListIdResponse {
     pub found: usize,
     pub moved: usize,
     pub failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mailboxes: Vec<PerMailboxMoveResult>,
     /// Mailboxes that could not be selected or searched (skipped during scan).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
 }
 
@@ -640,9 +626,7 @@ pub struct MoveBySenderResponse {
     pub found: usize,
     pub moved: usize,
     pub failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mailboxes: Vec<PerMailboxMoveResult>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
 }
 
@@ -654,7 +638,6 @@ pub struct CreateMailboxResponse {
     pub mailbox: String,
     pub created: bool,
     /// True when mailbox already existed (CREATE was skipped).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub already_exists: bool,
 }
 
@@ -685,7 +668,7 @@ pub struct CreateDraftResponse {
     pub drafts_mailbox: String,
     pub subject: String,
     pub recipients: DraftRecipients,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub attachments: Vec<String>,
     /// UIDVALIDITY of the drafts mailbox when the new draft's identity could
     /// be recovered (best-effort — async-imap exposes no APPENDUID).
@@ -758,16 +741,13 @@ pub struct MatchingMessagesResult {
     pub failed: usize,
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     /// Mailboxes that could not be selected or searched (skipped during scan).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
     /// True when cleanup actually used UID EXPUNGE rather than Trash. Gmail's
     /// safe provider-specific permanent request remains false here because it
     /// moves to Trash.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub permanent: bool,
     /// True when a failed or unavailable Trash path used an explicitly
     /// authorized permanent fallback.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub trash_fallback: bool,
     /// False when any mailbox was skipped or any matching UID failed.
     pub complete: bool,

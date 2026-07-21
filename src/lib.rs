@@ -2752,14 +2752,33 @@ impl Agentmail {
         // Bind the numeric UID to the exact epoch returned by discovery, then
         // fetch the complete message transiently for local DKIM verification.
         let mut session = self.pool.acquire(account).await?;
-        let target = imap_client::fetch_unsubscribe_target(
+        let target = match imap_client::fetch_unsubscribe_target(
             session.session(),
             mailbox,
             uid,
             options.expected_uid_validity,
             cancel,
         )
-        .await?;
+        .await
+        {
+            Ok(target) => target,
+            Err(error) => {
+                if matches!(error, AgentmailError::MessageNotFound(_)) {
+                    // The ranking sample went stale — deleted by another
+                    // client, which Yahoo/AOL never surface (UIDNEXT
+                    // unchanged, EXISTS untrustworthy). Prune the row so the
+                    // next ranking call offers a live sample, and hand back
+                    // the healthy session (the server answered cleanly).
+                    if let Some(config) = self.pool.account_config(account) {
+                        self.header_cache
+                            .prune_uid(account, config, mailbox, uid)
+                            .await;
+                    }
+                    session.release().await;
+                }
+                return Err(error);
+            }
+        };
         let headers = unsubscribe::parse_list_headers(&target.raw_message);
         let (target_email, target_name, _, _) =
             parser::parse_sender_date(&target.raw_message).unwrap_or_default();

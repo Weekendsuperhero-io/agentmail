@@ -183,10 +183,12 @@ impl ServerHandler for AgentMailServer {
              list_mailboxes requires one account and returns selectable mailboxes only, paginated with a default of 100. \
              get_messages and search_messages return metadata only, newest-first, with the mailbox UIDVALIDITY and a UIDVALIDITY-safe resourceUri for each row. \
              Read resourceUri for markdown content; append /headers for exact headers, /source for bounded raw RFC822, /info for JSON metadata with the attachment inventory, or /attachments/{index} for one attachment blob. \
-             Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
+             Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, move_list_id, move_by_sender, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
+             Bulk filing: move_list_id and move_by_sender move every match to an existing destination mailbox in one call (e.g. statements into a folder) — never loop move_message per UID for that. \
              top_senders, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
              Ranked tools use live offset pages with a default of 10 and maximum of 100; pages may shift when mail changes. \
-             Some providers (Yahoo/AOL) expose only the newest ~10,000 messages of a mailbox to IMAP — rankings cover that visible window, while account-wide deletes automatically repeat passes as older mail backfills into view. \
+             On providers with a visible-window limit (Yahoo/AOL), rankings and account-wide delete/move sweeps cover the ENTIRE mailbox via RFC 9586 UID Mode when a persistent cache is available; without it, sweeps repeat passes as older mail backfills into view. \
+             If an action reports Message not found for a ranking sample, the message was deleted since the scan — re-run the ranking for a fresh sample instead of retrying the same UID. \
              Account-wide discovery uses one selectable All mailbox when available; otherwise it skips Trash, Junk, Spam, Drafts, and virtual aggregate views. Destructive scans never write through aggregate views. \
              Every action that consumes a UID requires the same mailbox and non-zero expectedUidValidity returned during discovery, and fails closed if the mailbox UID epoch changed. \
              Two cleanup workflows: (1) top_senders → delete_by_sender for unwanted personal senders, (2) top_subscriptions → unsubscribe_message for mailing lists. \
@@ -195,7 +197,7 @@ impl ServerHandler for AgentMailServer {
              top_senders groups by (email, display name) — same email with different display names are separate entries. \
              Ranking rows include a nested sample {mailbox, uidValidity, uid, resourceUri}; map those fields to mailbox, expectedUidValidity, and uid for a later action. \
              top_subscriptions advertisedOneClick is syntactic only; unsubscribe_message re-fetches exact headers and verifies DKIM. \
-             unsubscribe_message requires explicit confirmOneClick=true. deleteMatching defaults false, requires the exact normalized List-Id to be covered by the same passing DKIM signature, stops after a failed POST by default, and never silently escalates a Trash failure to permanent deletion. \
+             unsubscribe_message requires explicit confirmOneClick=true. Optional matching-message cleanup is the nested cleanup {when, identity, deletion} object (omit it to only unsubscribe); it prefers the DKIM-authenticated List-Id, stops after a failed POST unless when=\"always\", and never silently escalates a Trash failure to permanent deletion unless deletion=\"trashThenPermanent\". \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
              find_attachments returns mailbox-safe {mailbox, uidValidity, uid, date, resourceUri} hits; pass that identity to download_attachments. \
              Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), plus /headers (exact headers), /source (bounded raw RFC822), /info (JSON metadata: subject, sender, date, flags, size, attachment inventory), and /attachments/{index} (one attachment as a blob with its own content type, 4 MiB limit). Percent-encode account and mailbox, including '/' in mailbox names as %2F. \
@@ -388,6 +390,52 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Output schemas mark every non-Option field `required`, and strict MCP
+    /// hosts validate `structuredContent` against them — so a field that is
+    /// omitted when empty/false (`skip_serializing_if` on a `Vec`, `bool`, or
+    /// map) makes the tool result fail validation exactly when the value is
+    /// boring (observed live: `roles` on list_mailboxes for a role-less
+    /// mailbox, `skipped` on unsubscribe_message). Output types must always
+    /// serialize such fields; only `Option` fields (not required in the
+    /// schema) may be skipped.
+    #[test]
+    fn output_types_never_skip_required_fields() {
+        for (file, source) in [
+            ("src/types.rs", include_str!("../types.rs")),
+            ("src/mcp/wire.rs", include_str!("wire.rs")),
+        ] {
+            for skipper in ["Vec::is_empty", "Not::not", "HashMap::is_empty", "is_empty"] {
+                let needle = format!("skip_serializing_if = \"{skipper}");
+                let hits = source.lines().filter(|line| line.contains(&needle)).count();
+                assert_eq!(
+                    hits, 0,
+                    "{file} skips a schema-required field via {skipper}; strict hosts reject the structuredContent"
+                );
+            }
+        }
+    }
+
+    /// The concrete case the gateway rejected: a mailbox with no special-use
+    /// role must still serialize `roles: []` because the output schema
+    /// requires the key.
+    #[test]
+    fn empty_collections_and_false_flags_serialize_explicitly() {
+        let mailbox = serde_json::to_value(wire::MailboxOutput {
+            name: "SavedIMs".to_string(),
+            total_messages: 0,
+            unseen_messages: 0,
+            delimiter: Some("/".to_string()),
+            no_inferiors: false,
+            roles: Vec::new(),
+        })
+        .expect("serialize");
+        assert_eq!(
+            mailbox["roles"],
+            serde_json::json!([]),
+            "role-less mailboxes must still carry roles: {mailbox}"
+        );
+    }
 
     /// Walk a schema JSON tree asserting no `$ref`/`$defs` keys — several MCP
     /// hosts (Gemini CLI, n8n, some gateways) reject or drop referenced
