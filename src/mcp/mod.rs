@@ -176,7 +176,14 @@ impl ServerHandler for AgentMailServer {
         )
         // Without this the server announces itself as "rmcp" — rmcp's
         // Implementation::from_build_env() bakes in its own crate name.
-        .with_server_info(Implementation::new("agentmail", env!("CARGO_PKG_VERSION")))
+        // Version carries the build SHA so `initialize` responses and logs
+        // identify the exact running build — deploy skew (an app compiled
+        // from a stale agentmail checkout) becomes visible instead of being
+        // inferred from behavioral fingerprints.
+        .with_server_info(Implementation::new(
+            "agentmail",
+            concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENTMAIL_BUILD_SHA"), ")"),
+        ))
         .with_instructions(
             "AgentMail is a full-featured IMAP email client. \
              Start with list_accounts to discover configured accounts. \
@@ -340,6 +347,15 @@ pub async fn serve_on<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
+    // One self-identifying line per server start: the exact build serving
+    // this process, so log forensics never have to infer the version from
+    // behavior again.
+    tracing::info!(
+        target: "agentmail",
+        version = env!("CARGO_PKG_VERSION"),
+        build = env!("AGENTMAIL_BUILD_SHA"),
+        "agentmail MCP server starting"
+    );
     let server = AgentMailServer::new(mk);
     let service = server.serve(transport).await.inspect_err(|e| {
         eprintln!("agentmail: server error: {}", e);

@@ -216,9 +216,16 @@ async fn initialize_reports_capabilities_and_identity() {
         Some("agentmail"),
         "server must announce itself as agentmail, not rmcp"
     );
-    assert_eq!(
-        init["serverInfo"]["version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION"))
+    let version = init["serverInfo"]["version"]
+        .as_str()
+        .expect("serverInfo version");
+    assert!(
+        version.starts_with(env!("CARGO_PKG_VERSION")),
+        "version leads with the crate version: {version}"
+    );
+    assert!(
+        version.contains('(') && version.ends_with(')'),
+        "version carries the build SHA fingerprint so deploy skew is visible: {version}"
     );
     assert!(
         init["instructions"].as_str().is_some_and(|s| !s.is_empty()),

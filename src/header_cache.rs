@@ -749,13 +749,24 @@ impl HeaderCache {
                 }
                 // A complete publication always has one marker row per member.
                 // Treat a mismatch as recoverable cache damage and reconcile.
-                warn!(
-                    target: "agentmail",
-                    mailbox = key.mailbox,
-                    expected = target,
-                    actual = covered,
-                    "header cache snapshot was incomplete; reconciling"
-                );
+                // The 0/0 case is not damage: an EMPTY mailbox in UID Mode has
+                // no membership to verify against, so it re-syncs (one cheap
+                // walk of nothing) every call — routine, not warn-worthy.
+                if covered == target {
+                    debug!(
+                        target: "agentmail",
+                        mailbox = key.mailbox,
+                        "empty UID-Mode mailbox re-verified (no membership to hit against)"
+                    );
+                } else {
+                    warn!(
+                        target: "agentmail",
+                        mailbox = key.mailbox,
+                        expected = target,
+                        actual = covered,
+                        "header cache snapshot was incomplete; reconciling"
+                    );
+                }
             }
 
             let Some(uid_validity) = live_status.uid_validity else {
