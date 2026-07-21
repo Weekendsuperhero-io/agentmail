@@ -255,4 +255,35 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["weird.xyz123"]);
     }
+
+    #[test]
+    fn extract_message_id_reads_the_header_and_none_when_absent() {
+        // Present: the angle brackets are stripped (needed to locate the stored
+        // copy on the server after APPEND).
+        let with = b"Message-ID: <abc123@host.example>\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(
+            extract_message_id(with).as_deref(),
+            Some("abc123@host.example")
+        );
+
+        // Absent: no Message-ID header → None.
+        let without = b"Subject: no id here\r\n\r\nbody";
+        assert_eq!(extract_message_id(without), None);
+
+        // Round-trip: the id compose_draft generates is recoverable.
+        let raw = compose_draft(
+            "s",
+            "b",
+            &["a@b.c".to_string()],
+            &[],
+            &[],
+            Some("me@example.com"),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            extract_message_id(&raw).is_some(),
+            "a composed draft's generated Message-ID must be extractable"
+        );
+    }
 }

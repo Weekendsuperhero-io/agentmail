@@ -4148,6 +4148,117 @@ mod tests {
         );
     }
 
+    /// The windowed-drain loop's reason to exist: on a server whose visible
+    /// window backfills after each delete, the loop must re-select and keep
+    /// deleting across MULTIPLE productive passes, aggregating the found/
+    /// affected counts, then terminate on the first empty pass. Here passes 1
+    /// and 2 each surface one fresh matching UID (5, then 6); pass 3 is empty.
+    #[tokio::test]
+    async fn matching_sweep_loop_drains_a_windowed_mailbox_across_passes() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        // One fresh matching UID per productive pass; None (=> empty) ends it.
+        let uid_for_pass = [5u32, 6u32];
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            let mut selects = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = line.split_whitespace().next().unwrap().to_string();
+                commands.push(line.clone());
+                let reply = if line.contains(" LOGIN ") {
+                    format!("{tag} OK LOGIN completed\r\n")
+                } else if line.contains("SELECT") {
+                    selects += 1;
+                    // A message stays visible while any pass still has one to
+                    // surface (models the window backfilling); then empties.
+                    let exists = if selects <= uid_for_pass.len() { 1 } else { 0 };
+                    format!(
+                        "* {exists} EXISTS\r\n* OK [UIDVALIDITY 9] v\r\n* OK [UIDNEXT 100] n\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+                    )
+                } else if line.contains("UID SEARCH") {
+                    let hits = uid_for_pass
+                        .get(selects.saturating_sub(1))
+                        .map(|u| format!(" {u}"))
+                        .unwrap_or_default();
+                    format!("* SEARCH{hits}\r\n{tag} OK SEARCH completed\r\n")
+                } else if line.contains("UID FETCH") {
+                    // Confirm the current pass's UID carries the target List-Id.
+                    let uid = uid_for_pass[selects.saturating_sub(1)];
+                    let target = "List-Id: News <news.example.com>\r\n\r\n";
+                    format!(
+                        "* 1 FETCH (UID {uid} BODY[HEADER.FIELDS (LIST-ID)] {{{}}}\r\n{target})\r\n{tag} OK FETCH completed\r\n",
+                        target.len()
+                    )
+                } else if line.contains("UID STORE") {
+                    format!("{tag} OK STORE completed\r\n")
+                } else if line.contains("UID EXPUNGE") {
+                    format!("* 1 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n")
+                } else if line.contains("NOOP") {
+                    format!("{tag} OK NOOP completed\r\n")
+                } else {
+                    panic!("unexpected command: {line:?}");
+                };
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let mut session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+
+        let mk = Agentmail::new(Config::empty());
+        let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
+        let totals = mk
+            .matching_sweep_loop(
+                &mut session,
+                "test-account",
+                &DeleteSelector::ListId("news.example.com".to_string()),
+                &["INBOX".to_string()],
+                SweepAction::Delete {
+                    trash: None,
+                    allow_permanent_fallback: false,
+                },
+                &caps,
+                None,
+                None,
+            )
+            .await
+            .expect("multi-pass windowed sweep succeeds");
+
+        // Counts aggregate across both productive passes.
+        assert_eq!(totals.found, 2, "one match per productive pass, summed");
+        assert_eq!(totals.affected, 2, "both deletes counted across passes");
+        assert_eq!(totals.failed, 0);
+        assert!(
+            totals.skipped.is_empty(),
+            "the mailbox drained; it must not be reported skipped"
+        );
+        assert_eq!(totals.mailboxes.len(), 1);
+        assert_eq!(totals.mailboxes[0].found, 2);
+
+        drop(session);
+        let commands = server.await.expect("scripted server finishes");
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("SELECT")).count(),
+            3,
+            "two productive passes + one empty terminating pass: {commands:?}"
+        );
+        let joined = commands.concat();
+        assert!(
+            joined.contains("UID EXPUNGE 5") && joined.contains("UID EXPUNGE 6"),
+            "each window's fresh UID is expunged in its own pass: {commands:?}"
+        );
+    }
+
     /// Ranking pages enrich each row with its sample's decoded Subject: one
     /// EXAMINE + one UID FETCH per mailbox, RFC 2047 encoded-words decoded,
     /// and a stale sample (no FETCH row) simply yields no subject.

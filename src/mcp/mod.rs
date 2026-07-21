@@ -1,6 +1,7 @@
 //! MCP server: tools, prompts, and tasks over stdio or in-process transports.
 
 mod args;
+mod file_access;
 mod prompts;
 mod resources;
 mod tasks;
@@ -144,6 +145,9 @@ pub(super) fn bounded_offset(value: Option<u64>) -> Result<usize, McpError> {
 pub struct AgentMailServer {
     agentmail: Arc<crate::Agentmail>,
     task_manager: Arc<parking_lot::Mutex<TaskManager>>,
+    /// Sandbox for LLM-supplied filesystem paths (attachment reads, download
+    /// writes). See [`file_access::FileAccessPolicy`].
+    file_access: file_access::FileAccessPolicy,
 }
 
 impl AgentMailServer {
@@ -151,6 +155,7 @@ impl AgentMailServer {
         Self {
             agentmail: Arc::new(agentmail),
             task_manager: Arc::new(parking_lot::Mutex::new(TaskManager::new())),
+            file_access: file_access::FileAccessPolicy::from_env(),
         }
     }
 

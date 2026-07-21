@@ -190,10 +190,14 @@ impl AgentMailServer {
         if args.mailbox.trim().is_empty() {
             return Err(McpError::invalid_params("mailbox is required", None));
         }
-        let output_dir = args
-            .output_dir
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        // Confine the LLM-supplied output directory to the file sandbox: a
+        // prompt-injection payload must not be able to write attacker bytes
+        // into a sensitive directory (e.g. ~/.ssh). Absolute/`..` escapes are
+        // rejected; the default lands in the sandbox root.
+        let output_dir = match self.file_access.confine_dir(args.output_dir.as_deref()) {
+            Ok(dir) => dir,
+            Err(reason) => return Err(McpError::invalid_params(reason, None)),
+        };
 
         match self
             .agentmail
@@ -238,7 +242,20 @@ impl AgentMailServer {
         // Load attachments (best-effort per file; surface first error clearly)
         let mut loaded: Vec<DraftAttachment> = Vec::with_capacity(args.attachments.len());
         for (i, a) in args.attachments.iter().enumerate() {
-            let data = match tokio::fs::read(&a.path).await {
+            // Confine the LLM-supplied attachment path to the file sandbox: an
+            // untrusted model (prompt-injected via email) must not be able to
+            // attach — and thereby exfiltrate through the saved draft — a
+            // sensitive local file such as ~/.ssh/id_rsa or /etc/passwd.
+            let safe_path = match self.file_access.confine_read(&a.path) {
+                Ok(path) => path,
+                Err(reason) => {
+                    return Err(McpError::invalid_params(
+                        format!("attachment #{}: {reason}", i + 1),
+                        None,
+                    ));
+                }
+            };
+            let data = match tokio::fs::read(&safe_path).await {
                 Ok(d) => d,
                 Err(e) => {
                     return Err(McpError::invalid_params(
@@ -650,4 +667,23 @@ fn guess_content_type(filename: &str) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guess_content_type;
+
+    #[test]
+    fn guess_content_type_maps_known_extensions_and_falls_back() {
+        assert_eq!(guess_content_type("report.pdf"), "application/pdf");
+        assert_eq!(guess_content_type("photo.PNG"), "image/png"); // case-insensitive
+        assert_eq!(guess_content_type("notes.txt"), "text/plain");
+        assert_eq!(guess_content_type("forward.eml"), "message/rfc822");
+        // Unknown and extension-less both fall back to the generic binary type.
+        assert_eq!(
+            guess_content_type("mystery.xyz123"),
+            "application/octet-stream"
+        );
+        assert_eq!(guess_content_type("README"), "application/octet-stream");
+    }
 }
