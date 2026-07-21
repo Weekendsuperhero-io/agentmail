@@ -43,6 +43,21 @@ where
     Ok(result)
 }
 
+/// Convert an operational failure into an `isError` tool RESULT, not a JSON-RPC
+/// protocol error.
+///
+/// Tool-execution failures — a UID that no longer exists, a missing mailbox, an
+/// IMAP rejection, a consent-required stop — are outcomes the LLM should SEE
+/// and react to (e.g. re-run a ranking when a sampled UID went stale), so per
+/// the MCP spec they belong in the result with `isError: true`. Returning them
+/// as protocol errors (`McpError`) instead made the gateway classify a single
+/// bad call as `BackendConnectionFailed` — i.e. report the whole AgentMail
+/// backend as down. Protocol errors stay reserved for malformed requests, which
+/// the tool handlers validate up front before the operation runs.
+pub(super) fn tool_error_result(e: &crate::AgentmailError) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(e.to_string())])
+}
+
 /// Build the canonical body-resource URI for a UID-valid message identity.
 pub(super) fn message_resource_uri(
     account: &str,
@@ -1671,6 +1686,24 @@ impl WireOutput for RemoveFlagsOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale-UID (or any operational) failure is an `isError` tool RESULT, so
+    /// the gateway forwards it to the agent instead of classifying it as
+    /// `BackendConnectionFailed`, and the actionable message reaches the LLM.
+    #[test]
+    fn tool_error_result_is_an_iserror_result_carrying_the_message() {
+        let result = tool_error_result(&crate::AgentmailError::MessageNotFound(434755));
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "operational failures must be isError results, not protocol errors"
+        );
+        let json = serde_json::to_string(&result).expect("result serializes");
+        assert!(
+            json.contains("434755") && json.contains("re-run the ranking"),
+            "the actionable message reaches the caller: {json}"
+        );
+    }
 
     fn assert_ref_free<T: JsonSchema>() {
         let schema = serde_json::to_string(&rmcp::schemars::schema_for!(T)).unwrap();

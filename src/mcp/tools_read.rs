@@ -6,8 +6,9 @@ use super::wire::{
     CheckConnectionOutput, FindAttachmentsOutput, GetMessagesOutput, ListAccountsOutput,
     ListCapabilitiesOutput, ListFlagsOutput, ListMailboxesOutput, SearchMessagesOutput,
     TopMailingListsOutput, TopSendersOutput, TopSubscriptionsOutput, compact_result,
+    tool_error_result,
 };
-use super::{bounded_offset, bounded_usize, make_cancel_fn, make_progress_fn, to_mcp_error};
+use super::{bounded_offset, bounded_usize, make_cancel_fn, make_progress_fn};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
     handler::server::wrapper::Parameters,
@@ -47,7 +48,7 @@ impl AgentMailServer {
     ) -> Result<CallToolResult, McpError> {
         match self.agentmail.list_accounts().await {
             Ok(data) => compact_result(ListAccountsOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -78,7 +79,7 @@ impl AgentMailServer {
                 limit,
                 total,
             )),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -94,7 +95,7 @@ impl AgentMailServer {
     ) -> Result<CallToolResult, McpError> {
         match self.agentmail.check_connection(&args.account).await {
             Ok(data) => compact_result(CheckConnectionOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -110,7 +111,7 @@ impl AgentMailServer {
     ) -> Result<CallToolResult, McpError> {
         match self.agentmail.list_capabilities(&args.account).await {
             Ok(data) => compact_result(ListCapabilitiesOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -136,7 +137,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(GetMessagesOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -189,7 +190,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(SearchMessagesOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -220,7 +221,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(ListFlagsOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -256,7 +257,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(FindAttachmentsOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -292,7 +293,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(TopSendersOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -328,7 +329,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(TopSubscriptionsOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -364,7 +365,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(TopMailingListsOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 }

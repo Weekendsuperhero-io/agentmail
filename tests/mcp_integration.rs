@@ -872,7 +872,19 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             }),
         )
         .await;
-    assert_eq!(no_consent["error"]["code"], json!(-32602));
+    // Consent-required is an operational STOP on a well-formed request, so it is
+    // an isError RESULT the agent can act on (re-call with confirmOneClick:
+    // true) — not a protocol error, which the gateway would read as the whole
+    // backend failing.
+    assert!(
+        no_consent.get("error").is_none(),
+        "consent-required must not be a protocol error: {no_consent:#}"
+    );
+    assert_eq!(
+        no_consent["result"]["isError"].as_bool(),
+        Some(true),
+        "consent-required must be an isError result: {no_consent:#}"
+    );
 
     // An unknown field or a value outside the policy enums inside cleanup is
     // a schema violation (-32602), not a silently ignored knob.
@@ -921,7 +933,7 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
 
     // Omitted cleanup and an empty cleanup object (all axes defaulted) both
     // pass policy validation: the call proceeds to the network and fails at
-    // connect (-32603), NOT as an invalid policy (-32602).
+    // connect as an isError RESULT, NOT rejected as an invalid policy (-32602).
     for arguments in [
         json!({
             "account": "dummy",
@@ -945,10 +957,17 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
                 json!({"name": "unsubscribe_message", "arguments": arguments}),
             )
             .await;
+        // The connect failure is an operational isError RESULT — not a -32602
+        // policy rejection, and not a protocol error the gateway would misread
+        // as the whole backend being down.
+        assert!(
+            accepted.get("error").is_none(),
+            "a connect failure is an operational result, not a protocol error: {accepted:#}"
+        );
         assert_eq!(
-            accepted["error"]["code"],
-            json!(-32603),
-            "valid policies must only fail at connect: {accepted:#}"
+            accepted["result"]["isError"].as_bool(),
+            Some(true),
+            "valid policies proceed to the network and fail there as an isError result: {accepted:#}"
         );
     }
 }
@@ -1433,7 +1452,7 @@ async fn check_connection_reports_failure_as_data_not_error() {
 /// The probe's one exception: an unknown account is a parameter error and
 /// raises invalid params.
 #[tokio::test]
-async fn check_connection_unknown_account_is_32602() {
+async fn check_connection_unknown_account_is_an_iserror_result() {
     let mut client = McpClient::start().await;
     let resp = client
         .request(
@@ -1442,9 +1461,24 @@ async fn check_connection_unknown_account_is_32602() {
         )
         .await;
 
+    // An operational failure (the account doesn't exist) is a tool RESULT with
+    // isError: true — NOT a JSON-RPC protocol error. The gateway classifies a
+    // protocol error from a tool call as `BackendConnectionFailed` (the whole
+    // backend "down"), so a bad account name must not present that way; the
+    // agent should see the message and retry with a valid account.
+    assert!(
+        resp.get("error").is_none(),
+        "operational failure must not be a protocol error: {resp:#}"
+    );
+    let result = &resp["result"];
     assert_eq!(
-        resp["error"]["code"].as_i64(),
-        Some(-32602),
-        "unknown account should be invalid params: {resp:#}"
+        result["isError"].as_bool(),
+        Some(true),
+        "unknown account must be an isError result: {result:#}"
+    );
+    let text = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("Account not found"),
+        "the error message reaches the caller: {result:#}"
     );
 }

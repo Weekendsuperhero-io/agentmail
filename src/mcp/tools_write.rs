@@ -6,9 +6,9 @@ use super::wire::{
     AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteBySenderOutput,
     DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput, MoveBySenderOutput,
     MoveListIdOutput, MoveMessageOutput, RemoveFlagsOutput, UnsubscribeMessageOutput,
-    compact_result,
+    compact_result, tool_error_result,
 };
-use super::{make_cancel_fn, make_progress_fn, to_mcp_error};
+use super::{make_cancel_fn, make_progress_fn};
 use crate::{
     CleanupDeletion, CleanupIdentityMode, CleanupPolicy, CleanupWhen, DeleteMode, DraftAttachment,
     UnsubscribeOptions,
@@ -75,7 +75,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(CreateMailboxOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -129,7 +129,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(DeleteMessagesOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -167,7 +167,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(DeleteBySenderOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -214,7 +214,7 @@ impl AgentMailServer {
                 data,
                 args.expected_uid_validity,
             )),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -304,7 +304,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(CreateDraftOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -341,7 +341,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(MoveMessageOutput::new(data, args.expected_uid_validity)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -386,7 +386,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(UnsubscribeMessageOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -419,7 +419,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(DeleteListIdOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -459,7 +459,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(MoveListIdOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -503,7 +503,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(MoveBySenderOutput::from(data)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -560,7 +560,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(AddFlagsOutput::new(data, args.expected_uid_validity)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
@@ -617,7 +617,7 @@ impl AgentMailServer {
             .await
         {
             Ok(data) => compact_result(RemoveFlagsOutput::new(data, args.expected_uid_validity)),
-            Err(e) => Err(to_mcp_error(&e)),
+            Err(e) => Ok(tool_error_result(&e)),
         }
     }
 }
