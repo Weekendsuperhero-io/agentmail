@@ -22,8 +22,18 @@ fn main() {
         "cargo:rustc-env=AGENTMAIL_BUILD_SHA={sha}{}",
         if dirty { "-dirty" } else { "" }
     );
-    // Recompile when the checkout moves so a rebuilt app can't silently keep
-    // an old SHA baked in.
+    // Recompile when the checkout moves so a rebuilt app can't silently keep an
+    // old SHA baked in. `.git/HEAD` catches branch switches, but a NEW COMMIT on
+    // the current branch only rewrites that branch's ref FILE — and a watch on
+    // the `.git/refs` DIRECTORY does not fire on a file-content change — so
+    // resolve HEAD to its ref file and watch that directly. `packed-refs` covers
+    // a packed (loose-file-absent) ref; a detached HEAD has no `ref:` line and
+    // is covered by the HEAD watch itself.
     println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD")
+        && let Some(reference) = head.strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=.git/{}", reference.trim());
+    }
 }

@@ -2,7 +2,10 @@ name: Update PR Description
 
 on:
   pull_request:
-    types: [opened, edited]
+    # synchronize = new commits pushed, so a PR opted in via the trigger phrase
+    # keeps its description current as commits land (the reusable workflow no-ops
+    # when the phrase is absent).
+    types: [opened, edited, synchronize]
 
 jobs:
   update-pr:
@@ -11,7 +14,7 @@ jobs:
       pull-requests: write
     uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-description.yml@main
     with:
-      trigger-phrase: "@AgentMuse  pr-title"
+      trigger-phrase: "@AgentMuse pr-title"
       # Send full commit message bodies (not just `--oneline` subjects) so
       # the LLM has access to multi-paragraph commit rationale when composing
       # the PR description. See platform-tools commit 1aeab33.
