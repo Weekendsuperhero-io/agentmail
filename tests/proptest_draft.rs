@@ -75,6 +75,11 @@ proptest! {
                 attachments.len(),
                 "number of attachments in output did not match input"
             );
+
+            // RFC 5322 required headers — Date (lettre auto) and Message-ID
+            // (explicit via message_id(None)) must always be present.
+            prop_assert!(msg.date().is_some(), "missing Date header");
+            prop_assert!(msg.message_id().is_some(), "missing Message-ID header");
         }
     }
 

@@ -56,23 +56,27 @@ enum CliCommand {
         #[arg(long)]
         mailbox: Option<String>,
     },
-    /// Rank senders by message count (omit --mailbox to scan all mailboxes)
-    RankSenders {
+    /// Top senders by message count (omit --mailbox to scan all mailboxes)
+    TopSenders {
         #[arg(long)]
         account: String,
         #[arg(long)]
         mailbox: Option<String>,
-        #[arg(long)]
-        limit: Option<usize>,
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        #[arg(long, default_value = "10")]
+        limit: usize,
     },
-    /// Rank bulk-mail senders by List-Unsubscribe-Post presence, then count (omit --mailbox to scan all)
-    RankUnsubscribe {
+    /// Top bulk-mail senders by List-Unsubscribe-Post presence, then count (omit --mailbox to scan all)
+    TopSubscriptions {
         #[arg(long)]
         account: String,
         #[arg(long)]
         mailbox: Option<String>,
-        #[arg(long)]
-        limit: Option<usize>,
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        #[arg(long, default_value = "10")]
+        limit: usize,
     },
     /// Find messages with attachments (omit --mailbox to scan all mailboxes)
     FindAttachments {
@@ -93,6 +97,8 @@ enum CliCommand {
         mailbox: String,
         #[arg(long)]
         uid: u32,
+        #[arg(long)]
+        expected_uid_validity: u32,
         #[arg(long, default_value = ".")]
         output_dir: String,
     },
@@ -121,6 +127,8 @@ enum CliCommand {
         mailbox: String,
         #[arg(long, num_args = 1..)]
         uids: Vec<u32>,
+        #[arg(long)]
+        expected_uid_validity: u32,
         #[arg(long, default_value = "false")]
         include_content: bool,
     },
@@ -132,6 +140,8 @@ enum CliCommand {
         mailbox: String,
         #[arg(long)]
         uid: u32,
+        #[arg(long)]
+        expected_uid_validity: u32,
         /// Flags to add (e.g. "\\Seen")
         #[arg(long)]
         flags: Vec<String>,
@@ -159,8 +169,10 @@ enum CliCommand {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing — logs to stderr so MCP JSON-RPC on stdout is unaffected.
+    // ANSI only when stderr is a terminal: MCP hosts capture stderr to log files.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
@@ -231,7 +243,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CliCommand::Configure { provider } => configure_account(provider.as_deref()).await,
         CliCommand::ListFlags { account, mailbox } => {
             let mk = agentmail::Agentmail::from_default_config()?;
-            let value = mk.list_flags(mailbox.as_deref(), &account, None).await?;
+            let value = mk
+                .list_flags(mailbox.as_deref(), &account, None, None)
+                .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -239,11 +253,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             account,
             mailbox,
             uid,
+            expected_uid_validity,
             output_dir,
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .download_attachments(&mailbox, &account, uid, std::path::Path::new(&output_dir))
+                .download_attachments(
+                    &mailbox,
+                    &account,
+                    uid,
+                    expected_uid_validity,
+                    std::path::Path::new(&output_dir),
+                )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -256,31 +277,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .find_attachments(mailbox.as_deref(), &account, offset, limit, None)
+                .find_attachments(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        CliCommand::RankSenders {
+        CliCommand::TopSenders {
             account,
             mailbox,
+            offset,
             limit,
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .group_by_sender(mailbox.as_deref(), &account, limit, None)
+                .top_senders(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        CliCommand::RankUnsubscribe {
+        CliCommand::TopSubscriptions {
             account,
             mailbox,
+            offset,
             limit,
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .group_by_list(mailbox.as_deref(), &account, limit, None)
+                .top_subscriptions(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -311,11 +334,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             account,
             mailbox,
             uids,
+            expected_uid_validity,
             include_content,
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .get_messages_by_uid(&mailbox, &account, &uids, include_content, false)
+                .get_messages_by_uid(
+                    &mailbox,
+                    &account,
+                    &uids,
+                    expected_uid_validity,
+                    include_content,
+                    false,
+                )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -324,12 +355,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             account,
             mailbox,
             uid,
+            expected_uid_validity,
             flags,
             color,
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .add_flags(&mailbox, &account, uid, &flags, color.as_deref())
+                .add_flags(
+                    &mailbox,
+                    &account,
+                    uid,
+                    expected_uid_validity,
+                    &flags,
+                    color.as_deref(),
+                )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())

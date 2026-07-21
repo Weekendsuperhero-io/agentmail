@@ -26,8 +26,36 @@ pub enum AgentmailError {
     #[error("Mailbox not found: {0}")]
     MailboxNotFound(String),
 
-    #[error("Message not found: UID {0}")]
+    #[error(
+        "Message not found: UID {0} (the message no longer exists on the server; if this UID came from a ranking sample, re-run the ranking for a fresh sample instead of retrying this one)"
+    )]
     MessageNotFound(u32),
+
+    #[error(
+        "mailbox '{mailbox}' did not provide UIDVALIDITY; refusing a stale-UID-sensitive action"
+    )]
+    UidValidityUnavailable { mailbox: String },
+
+    #[error(
+        "UIDVALIDITY changed for mailbox '{mailbox}': expected {expected}, observed {actual:?}; refresh discovery results before retrying"
+    )]
+    UidValidityChanged {
+        mailbox: String,
+        expected: u32,
+        actual: Option<u32>,
+    },
+
+    #[error("explicit one-click unsubscribe consent is required")]
+    UnsubscribeConsentRequired,
+
+    #[error("invalid unsubscribe policy: {0}")]
+    InvalidUnsubscribePolicy(String),
+
+    #[error("cancelled by client")]
+    Cancelled,
+
+    #[error("invalid search query: {0}")]
+    InvalidSearch(String),
 
     #[error("Not connected")]
     NotConnected,
@@ -39,4 +67,61 @@ pub enum AgentmailError {
     Other(String),
 }
 
+impl AgentmailError {
+    /// Whether this error indicates the IMAP **connection** dropped (broken
+    /// pipe / reset / EOF / lost), as opposed to a server-level command
+    /// rejection (`No`/`Bad`), a parse error, or a config/credential problem.
+    /// Used to decide whether retrying the operation once with a fresh
+    /// connection could help — see `ConnectionPool::with_session_retry`.
+    pub fn is_connection_error(&self) -> bool {
+        match self {
+            AgentmailError::Imap(e) => matches!(
+                e,
+                async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost
+            ),
+            AgentmailError::Io(_) | AgentmailError::Tls(_) | AgentmailError::NotConnected => true,
+            _ => false,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, AgentmailError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_connection_vs_other_errors() {
+        // Connection-level → retryable.
+        assert!(
+            AgentmailError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe"))
+                .is_connection_error()
+        );
+        assert!(
+            AgentmailError::Imap(async_imap::error::Error::ConnectionLost).is_connection_error()
+        );
+        assert!(
+            AgentmailError::Imap(async_imap::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset"
+            )))
+            .is_connection_error()
+        );
+        assert!(AgentmailError::NotConnected.is_connection_error());
+
+        // Server rejection / client errors → NOT retryable.
+        assert!(
+            !AgentmailError::Imap(async_imap::error::Error::No("denied".into()))
+                .is_connection_error()
+        );
+        assert!(
+            !AgentmailError::Imap(async_imap::error::Error::Bad("syntax".into()))
+                .is_connection_error()
+        );
+        assert!(!AgentmailError::Parse("bad".into()).is_connection_error());
+        assert!(!AgentmailError::AccountNotFound("a".into()).is_connection_error());
+        assert!(!AgentmailError::Credential("nope".into()).is_connection_error());
+        assert!(!AgentmailError::Cancelled.is_connection_error());
+    }
+}

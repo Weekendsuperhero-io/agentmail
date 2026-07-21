@@ -7,17 +7,18 @@ use serde::{Deserialize, Serialize};
 /// A configured IMAP account.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct AccountInfo {
     pub name: String,
     pub host: String,
     pub username: String,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_default: bool,
 }
 
 /// A mailbox on the server with message counts.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MailboxInfo {
     pub name: String,
     pub account: String,
@@ -30,20 +31,25 @@ pub struct MailboxInfo {
     /// Full IMAP path including hierarchy
     pub path: String,
     /// `true` when the mailbox cannot be SELECTed (virtual container only).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub no_select: bool,
     /// `true` when no child mailboxes exist or can be created.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub no_inferiors: bool,
-    /// RFC 6154 special-use role: "all", "archive", "drafts", "flagged",
-    /// "junk", "sent", or "trash". `None` for ordinary user mailboxes.
+    /// First recognized special-use role, retained for API compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// All recognized registered IMAP special-use roles. The current set is
+    /// "all", "archive", "drafts", "flagged", "important", "junk",
+    /// "memos", "scheduled", "sent", "snoozed", and "trash".
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 /// Metadata for a MIME attachment part (no binary content).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct AttachmentInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -53,9 +59,22 @@ pub struct AttachmentInfo {
     pub content_id: Option<String>,
 }
 
+/// Stable identity for an IMAP message within one mailbox UID epoch.
+///
+/// A numeric UID is never reusable without its mailbox and UIDVALIDITY.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct MailboxMessageIdentity {
+    pub mailbox: String,
+    pub uid_validity: u32,
+    pub uid: u32,
+}
+
 /// A parsed email message.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MessageInfo {
     /// IMAP UID (unique within mailbox + UIDVALIDITY epoch)
     pub uid: u32,
@@ -92,19 +111,19 @@ pub struct MessageInfo {
     pub message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(default)]
     pub references: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(default)]
     pub bcc: Vec<String>,
 
     // MIME structure
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(default)]
     pub attachments: Vec<AttachmentInfo>,
 
     // All headers (raw original values)
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    #[serde(default)]
     #[schemars(with = "std::collections::HashMap<String, Vec<String>>")]
     pub headers: HashMap<String, Vec<String>>,
 }
@@ -132,11 +151,20 @@ pub struct SearchCriteria {
     pub flagged: Option<bool>,
     pub deleted: Option<bool>,
     pub header: Option<(String, String)>,
+    /// Internal-date lower bound (inclusive) — IMAP `SINCE`.
+    pub since: Option<chrono::NaiveDate>,
+    /// Internal-date upper bound (exclusive) — IMAP `BEFORE`.
+    pub before: Option<chrono::NaiveDate>,
+    /// Minimum RFC822 size in octets — IMAP `LARGER`.
+    pub larger_than: Option<u32>,
+    /// Maximum RFC822 size in octets — IMAP `SMALLER`.
+    pub smaller_than: Option<u32>,
 }
 
 /// Summary of messages from a single sender address.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct SenderSummary {
     /// Combined `"Display Name <email>"` for direct use in search.
     pub sender: String,
@@ -144,6 +172,8 @@ pub struct SenderSummary {
     pub address: String,
     /// Display name from the most recent message.
     pub display_name: String,
+    /// Newest message that can be safely inspected or used by a later action.
+    pub sample: MailboxMessageIdentity,
     /// Number of messages from this sender.
     pub count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +185,7 @@ pub struct SenderSummary {
 /// Summary of mailing list messages grouped by sender.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct ListSummary {
     /// Sender display string (`"Display Name <email>"` or just `"email"`).
     pub sender: String,
@@ -163,22 +194,16 @@ pub struct ListSummary {
     /// Sender display name (used internally; not serialized — already in `sender`).
     #[serde(skip_serializing)]
     pub display_name: String,
-    /// Raw List-Unsubscribe header value (used internally; not serialized — `unsubscribe_url` has the extracted URL).
-    #[serde(skip_serializing)]
-    pub list_unsubscribe: Option<String>,
-    /// Extracted HTTPS unsubscribe URL, if present.
+    /// Whether the newest message advertises syntactically valid RFC 8058
+    /// one-click headers. Execution still re-fetches the message and requires
+    /// a passing DKIM signature over both headers.
+    pub advertised_one_click: bool,
+    /// Newest message that can be safely passed to unsubscribe_message.
+    pub sample: MailboxMessageIdentity,
+    /// Decoded Subject of the sample message, fetched live at page time so a
+    /// caller can see WHAT the subscription is before acting. Never persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub unsubscribe_url: Option<String>,
-    /// Raw List-Unsubscribe-Post header value from the newest message.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub list_unsubscribe_post: Option<String>,
-    /// Whether RFC 8058 one-click unsubscribe is supported.
-    pub one_click: bool,
-    /// UID of the newest message — can be passed to unsubscribe_message.
-    pub sample_uid: u32,
-    /// Mailbox containing sample_uid (relevant for account-wide scans).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_mailbox: Option<String>,
+    pub subject: Option<String>,
     /// Number of messages from this sender with List-Unsubscribe.
     pub count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -223,6 +248,8 @@ pub struct ListCapabilitiesResponse {
 pub struct GetMessagesResponse {
     pub mailbox: String,
     pub account: String,
+    /// UIDVALIDITY epoch shared by every message UID in this response.
+    pub uid_validity: u32,
     pub offset: usize,
     pub limit: usize,
     pub total: usize,
@@ -235,6 +262,8 @@ pub struct GetMessagesResponse {
 pub struct GetMessagesByUidResponse {
     pub mailbox: String,
     pub account: String,
+    /// UIDVALIDITY epoch checked before fetching the requested UIDs.
+    pub uid_validity: u32,
     pub messages: Vec<MessageInfo>,
 }
 
@@ -244,6 +273,8 @@ pub struct GetMessagesByUidResponse {
 pub struct SearchMessagesResponse {
     pub mailbox: String,
     pub account: String,
+    /// UIDVALIDITY epoch shared by every message UID in this response.
+    pub uid_validity: u32,
     pub offset: usize,
     pub limit: usize,
     pub total_matches: usize,
@@ -258,15 +289,14 @@ pub struct ListFlagsResponse {
     pub account: String,
     pub total_flags: usize,
     pub flags: Vec<FlagCount>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub colors: Vec<ColorCount>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub per_mailbox: Vec<MailboxFlagBreakdown>,
 }
 
 /// A flag name with its count.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct FlagCount {
     pub flag: String,
     pub count: u32,
@@ -275,6 +305,7 @@ pub struct FlagCount {
 /// A resolved Apple Mail color with its count.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct ColorCount {
     pub color: String,
     pub count: u32,
@@ -283,6 +314,7 @@ pub struct ColorCount {
 /// Per-mailbox flag breakdown.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MailboxFlagBreakdown {
     pub mailbox: String,
     pub total_flags: usize,
@@ -298,44 +330,65 @@ pub struct FindAttachmentsResponse {
     pub total: usize,
     pub offset: usize,
     pub limit: usize,
-    pub uids: Vec<u32>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<AttachmentMessage>,
     pub per_mailbox: Vec<MailboxAttachmentCount>,
+}
+
+/// A mailbox-safe attachment search hit.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct AttachmentMessage {
+    pub mailbox: String,
+    pub uid_validity: u32,
+    pub uid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<DateTime<Utc>>,
 }
 
 /// Per-mailbox attachment count.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MailboxAttachmentCount {
     pub mailbox: String,
     pub count: usize,
 }
 
-/// Response for rank_senders.
+/// Response for top_senders.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct RankSendersResponse {
+pub struct TopSendersResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,
     pub unique_senders: usize,
+    pub offset: usize,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
     pub senders: Vec<SenderSummary>,
 }
 
-/// Response for rank_unsubscribe.
+/// Response for top_subscriptions.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct RankUnsubscribeResponse {
+pub struct TopSubscriptionsResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,
     pub unique_lists: usize,
+    pub offset: usize,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
     pub lists: Vec<ListSummary>,
 }
 
 /// Summary of messages grouped by List-Id (RFC 2919).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct ListIdSummary {
     /// The List-Id header value (grouping key).
     pub list_id: String,
@@ -343,27 +396,34 @@ pub struct ListIdSummary {
     pub display_name: String,
     /// Unique sender addresses seen for this list (for context).
     pub senders: Vec<String>,
+    /// Total unique senders, including senders omitted from the preview.
+    pub sender_count: usize,
     /// Number of messages with this List-Id.
     pub count: u32,
-    /// UID of the newest message.
-    pub sample_uid: u32,
-    /// Mailbox containing sample_uid.
+    /// Newest message that can be safely inspected.
+    pub sample: MailboxMessageIdentity,
+    /// Decoded Subject of the sample message, fetched live at page time so a
+    /// caller can see WHAT the list is before acting on it. Never persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_mailbox: Option<String>,
+    pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_date: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub newest_date: Option<DateTime<Utc>>,
 }
 
-/// Response for rank_list_id.
+/// Response for top_mailing_lists.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct RankListIdResponse {
+pub struct TopMailingListsResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,
     pub unique_lists: usize,
+    pub offset: usize,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
     pub lists: Vec<ListIdSummary>,
 }
 
@@ -377,15 +437,106 @@ pub struct DeleteListIdResponse {
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mailboxes: Vec<PerMailboxDeleteResult>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// True when the caller requested a permanent delete (Trash bypassed on
+    /// standard IMAP; Gmail safely routes the request through Trash).
+    pub permanent: bool,
 }
 
 // ============================================================================
 // Write tool responses
 // ============================================================================
+
+/// How a delete should dispose of messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeleteMode {
+    /// Move to the account's Trash mailbox when one exists, else permanently
+    /// delete (flag `\Deleted` + UID EXPUNGE).
+    #[default]
+    TrashFirst,
+    /// Always permanently delete, bypassing Trash. Irreversible.
+    Permanent,
+}
+
+/// When matching-message cleanup may run relative to the unsubscribe attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupWhen {
+    /// Only after the one-click POST verifiably succeeded.
+    #[default]
+    AfterSuccess,
+    /// Even when DKIM, URL validation, DNS, or the HTTPS POST failed. Cleanup
+    /// identity requirements (authenticated List-Id or the sender fallback)
+    /// still apply unchanged.
+    Always,
+}
+
+/// Which identity cleanup may match messages by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupIdentityMode {
+    /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
+    ListIdOnly,
+    /// Prefer the authenticated List-Id; when there is none, fall back to the
+    /// exact sender's bulk mail — constrained to the target's own List-Id
+    /// whenever the message carries one, so other lists from the same sender
+    /// are untouched.
+    #[default]
+    ListIdOrSender,
+}
+
+/// How cleanup disposes of matched messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupDeletion {
+    /// Move to Trash; skip cleanup when no Trash mailbox is resolvable.
+    #[default]
+    Trash,
+    /// Move to Trash, but permit an irreversible UID EXPUNGE when Trash is
+    /// unavailable or the MOVE fails. Never used on Gmail, where in-place
+    /// EXPUNGE only removes the current label.
+    TrashThenPermanent,
+    /// Permanently delete (flag `\Deleted` + UID EXPUNGE), bypassing Trash.
+    /// On Gmail this safely routes through Trash instead.
+    Permanent,
+}
+
+/// Matching-message cleanup policy. The three axes are orthogonal; every
+/// combination is meaningful, so no cross-field validation exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CleanupPolicy {
+    pub when: CleanupWhen,
+    pub identity: CleanupIdentityMode,
+    pub deletion: CleanupDeletion,
+}
+
+impl CleanupPolicy {
+    /// The `DeleteMode` this deletion policy requests.
+    pub fn mode(self) -> DeleteMode {
+        match self.deletion {
+            CleanupDeletion::Permanent => DeleteMode::Permanent,
+            CleanupDeletion::Trash | CleanupDeletion::TrashThenPermanent => DeleteMode::TrashFirst,
+        }
+    }
+
+    /// Whether a failed Trash resolution or MOVE may escalate to EXPUNGE.
+    pub fn allow_permanent_fallback(self) -> bool {
+        self.deletion == CleanupDeletion::TrashThenPermanent
+    }
+}
+
+/// Safety policy for an authenticated one-click unsubscribe and optional
+/// matching-message cleanup. `cleanup: None` means unsubscribe only — the
+/// nested policy exists exactly when cleanup was requested, so contradictory
+/// flag combinations are unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsubscribeOptions {
+    /// UIDVALIDITY observed when the sample UID was discovered.
+    pub expected_uid_validity: u32,
+    /// Explicit RFC 8058 user consent. Execution refuses `false` rather than
+    /// treating a tool annotation as authorization.
+    pub confirm_one_click: bool,
+    /// Delete matching messages after the POST attempt, under this policy.
+    pub cleanup: Option<CleanupPolicy>,
+}
 
 /// Response for delete_messages.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -397,13 +548,16 @@ pub struct DeleteMessagesResponse {
     pub failed: usize,
     /// True when configured trash mailbox was unavailable and deletion
     /// fell back to flag+expunge (permanent delete).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub trash_fallback: bool,
+    /// True when the caller requested a permanent delete (Trash bypassed on
+    /// standard IMAP; Gmail safely routes the request through Trash).
+    pub permanent: bool,
 }
 
 /// Per-mailbox deletion result (shared by delete_by_sender and unsubscribe_message).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct PerMailboxDeleteResult {
     pub mailbox: String,
     pub found: usize,
@@ -421,11 +575,11 @@ pub struct DeleteBySenderResponse {
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     /// Mailboxes that could not be selected or searched (skipped during scan).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// True when the caller requested a permanent delete (Trash bypassed).
+    pub permanent: bool,
 }
 
 /// Response for move_message.
@@ -439,6 +593,51 @@ pub struct MoveMessageResponse {
     pub moved: bool,
 }
 
+/// Per-mailbox result of a bulk move (shared by move_list_id and
+/// move_by_sender).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct PerMailboxMoveResult {
+    pub mailbox: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+}
+
+/// Response for move_list_id.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveListIdResponse {
+    /// `*` when the account-wide mutation plan was swept.
+    pub mailbox: String,
+    pub account: String,
+    pub list_id: String,
+    pub destination: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+    pub mailboxes: Vec<PerMailboxMoveResult>,
+    /// Mailboxes that could not be selected or searched (skipped during scan).
+    pub skipped: Vec<String>,
+}
+
+/// Response for move_by_sender.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveBySenderResponse {
+    /// `*` when the account-wide mutation plan was swept.
+    pub mailbox: String,
+    pub account: String,
+    pub sender: String,
+    pub destination: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+    pub mailboxes: Vec<PerMailboxMoveResult>,
+    pub skipped: Vec<String>,
+}
+
 /// Response for create_mailbox.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -447,13 +646,13 @@ pub struct CreateMailboxResponse {
     pub mailbox: String,
     pub created: bool,
     /// True when mailbox already existed (CREATE was skipped).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub already_exists: bool,
 }
 
 /// Recipients for a draft email.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct DraftRecipients {
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -477,13 +676,21 @@ pub struct CreateDraftResponse {
     pub drafts_mailbox: String,
     pub subject: String,
     pub recipients: DraftRecipients,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub attachments: Vec<String>,
+    /// UIDVALIDITY of the drafts mailbox when the new draft's identity could
+    /// be recovered (best-effort — async-imap exposes no APPENDUID).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid_validity: Option<u32>,
+    /// UID of the created draft, when recoverable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
 }
 
 /// A downloaded attachment file.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct DownloadedFile {
     pub index: usize,
     pub filename: String,
@@ -515,6 +722,7 @@ pub struct GetMessageSourceResponse {
 /// Result of a one-click unsubscribe attempt.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct UnsubscribeResult {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -530,16 +738,27 @@ pub struct UnsubscribeResult {
 /// Bulk deletion results from unsubscribe_message.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
 pub struct MatchingMessagesResult {
     pub matched_by: String,
     pub sender: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_id: Option<String>,
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     /// Mailboxes that could not be selected or searched (skipped during scan).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// True when cleanup actually used UID EXPUNGE rather than Trash. Gmail's
+    /// safe provider-specific permanent request remains false here because it
+    /// moves to Trash.
+    pub permanent: bool,
+    /// True when a failed or unavailable Trash path used an explicitly
+    /// authorized permanent fallback.
+    pub trash_fallback: bool,
+    /// False when any mailbox was skipped or any matching UID failed.
+    pub complete: bool,
 }
 
 /// Response for unsubscribe_message.
@@ -549,6 +768,8 @@ pub struct UnsubscribeResponse {
     pub mailbox: String,
     pub account: String,
     pub uid: u32,
+    /// Live UIDVALIDITY that was checked before the action.
+    pub uid_validity: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub list_unsubscribe: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -557,9 +778,19 @@ pub struct UnsubscribeResponse {
     pub list_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pathway: Option<String>,
+    /// True only when a cryptographic DKIM verification passed and its h= tag
+    /// covered both RFC 8058 list headers.
+    pub dkim_verified: bool,
+    /// True only when the same passing DKIM signature also covered the single
+    /// List-Id used as an optional account-wide cleanup identity.
+    pub list_id_authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dkim_domain: Option<String>,
     pub unsubscribed: UnsubscribeResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matching_messages: Option<MatchingMessagesResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_skipped_reason: Option<String>,
 }
 
 // ============================================================================

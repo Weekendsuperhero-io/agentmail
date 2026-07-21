@@ -1,6 +1,15 @@
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart};
 
+/// Extract the generated Message-ID (without angle brackets) from a composed
+/// RFC822 message, for locating the stored copy on the server afterwards.
+pub fn extract_message_id(rfc822: &[u8]) -> Option<String> {
+    mail_parser::MessageParser::default()
+        .parse(rfc822)?
+        .message_id()
+        .map(str::to_string)
+}
+
 /// Parse a string into a lettre Mailbox.
 /// Accepts bare emails ("user@example.com") and full addresses ("Name <user@example.com>").
 fn parse_mailbox(addr: &str) -> crate::Result<Mailbox> {
@@ -26,7 +35,10 @@ pub fn compose_draft(
     from: Option<&str>,
     attachments: &[crate::types::DraftAttachment],
 ) -> crate::Result<Vec<u8>> {
-    let mut builder = Message::builder().subject(subject);
+    // `message_id(None)` makes lettre generate a unique `<uuid@host>` —
+    // without it drafts ship with no Message-ID (lettre auto-adds Date but
+    // not Message-ID), which breaks threading and trips some spam filters.
+    let mut builder = Message::builder().subject(subject).message_id(None);
 
     if let Some(from_addr) = from {
         builder = builder.from(parse_mailbox(from_addr)?);
@@ -101,6 +113,13 @@ mod tests {
         assert!(
             !msg.is_content_type("multipart", "mixed"),
             "expected non-multipart message when no attachments"
+        );
+
+        // RFC 5322 required headers must be present.
+        assert!(msg.date().is_some(), "draft must carry a Date header");
+        assert!(
+            msg.message_id().is_some(),
+            "draft must carry a Message-ID header"
         );
     }
 
@@ -235,5 +254,36 @@ mod tests {
             .filter_map(|p| p.attachment_name().map(|s| s.to_string()))
             .collect();
         assert_eq!(names, vec!["weird.xyz123"]);
+    }
+
+    #[test]
+    fn extract_message_id_reads_the_header_and_none_when_absent() {
+        // Present: the angle brackets are stripped (needed to locate the stored
+        // copy on the server after APPEND).
+        let with = b"Message-ID: <abc123@host.example>\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(
+            extract_message_id(with).as_deref(),
+            Some("abc123@host.example")
+        );
+
+        // Absent: no Message-ID header → None.
+        let without = b"Subject: no id here\r\n\r\nbody";
+        assert_eq!(extract_message_id(without), None);
+
+        // Round-trip: the id compose_draft generates is recoverable.
+        let raw = compose_draft(
+            "s",
+            "b",
+            &["a@b.c".to_string()],
+            &[],
+            &[],
+            Some("me@example.com"),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            extract_message_id(&raw).is_some(),
+            "a composed draft's generated Message-ID must be extractable"
+        );
     }
 }

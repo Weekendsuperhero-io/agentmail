@@ -5,6 +5,14 @@ use mail_parser::{MessageParser, MimeHeaders};
 use crate::content;
 use crate::types::{AttachmentInfo, MessageInfo};
 
+/// Decode the Subject from a raw header block (RFC 2047 encoded-words
+/// included). `None` when the block has no non-empty subject.
+pub(crate) fn parse_subject(header: &[u8]) -> Option<String> {
+    let parsed = MessageParser::default().parse(header)?;
+    let subject = parsed.subject()?.trim();
+    (!subject.is_empty()).then(|| subject.to_string())
+}
+
 /// Parse raw RFC822 bytes into a MessageInfo.
 pub fn parse_rfc822(
     raw: &[u8],
@@ -108,9 +116,15 @@ pub fn parse_rfc822(
 
 /// Lightweight parse of just FROM and DATE from partial header bytes.
 /// Returns (email_address, display_name, date).
-pub fn parse_sender_date(
-    raw: &[u8],
-) -> crate::Result<(String, String, Option<chrono::DateTime<chrono::Utc>>)> {
+/// Parsed partial-header fields: `(email, display_name, date, message_id)`.
+pub type SenderHeaders = (
+    String,
+    String,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+);
+
+pub fn parse_sender_date(raw: &[u8]) -> crate::Result<SenderHeaders> {
     let parsed = MessageParser::default().parse(raw).ok_or_else(|| {
         crate::AgentmailError::Parse("Failed to parse partial headers".to_string())
     })?;
@@ -121,7 +135,12 @@ pub fn parse_sender_date(
         .date()
         .and_then(|d| chrono::DateTime::from_timestamp(d.to_timestamp(), 0));
 
-    Ok((email, name, date))
+    // Message-ID identifies the logical message across folders — used to
+    // deduplicate account-wide scans (the same message appears under each
+    // Gmail label / in All Mail with a different per-mailbox UID).
+    let message_id = parsed.message_id().map(|s| s.to_string());
+
+    Ok((email, name, date, message_id))
 }
 
 /// Extract (email, display_name) from a From address. Email is lowercased for grouping.
@@ -187,7 +206,9 @@ fn build_headers_map(parsed: &mail_parser::Message<'_>) -> HashMap<String, Vec<S
     for (name, value) in parsed.headers_raw() {
         let trimmed = value.trim().to_string();
         if !trimmed.is_empty() {
-            map.entry(name.to_string()).or_default().push(trimmed);
+            // entry_ref: `name` is a borrowed `&str` — allocate the owned key
+            // only when a header first appears. See PERF-entry-ref.md.
+            map.entry_ref(name).or_default().push(trimmed);
         }
     }
     map
@@ -343,5 +364,60 @@ fn format_single_addr(a: &mail_parser::Addr<'_>) -> String {
         email.to_string()
     } else {
         format!("{} <{}>", name, email)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `build_headers_map` accumulates REPEATED headers (same name appearing
+    /// multiple times — e.g. the `Received:` trace) into one key's `Vec`. This
+    /// is exactly the get-or-insert path the `entry_ref` conversion changed: the
+    /// owned `String` key is created once (first occurrence), and every later
+    /// occurrence is a borrowed-key hit that just pushes onto the existing `Vec`.
+    /// See PERF-entry-ref.md.
+    #[test]
+    fn build_headers_map_accumulates_repeated_headers() {
+        let raw = b"Received: from a.example\r\n\
+                    Received: from b.example\r\n\
+                    Subject: Hi there\r\n\
+                    \r\n\
+                    body";
+        let parsed = MessageParser::default()
+            .parse(raw.as_slice())
+            .expect("parse");
+        let map = build_headers_map(&parsed);
+
+        let received = map.get("Received").expect("Received header present");
+        assert_eq!(
+            received.len(),
+            2,
+            "both Received values accumulate under one key"
+        );
+        assert!(received.iter().any(|v| v.contains("a.example")));
+        assert!(received.iter().any(|v| v.contains("b.example")));
+
+        // A single-occurrence header is a one-element Vec, trimmed.
+        assert_eq!(
+            map.get("Subject").map(Vec::as_slice),
+            Some(["Hi there".to_string()].as_slice())
+        );
+    }
+
+    /// Empty (whitespace-only) header values are skipped — no key is created,
+    /// so no owned key is allocated for them.
+    #[test]
+    fn build_headers_map_skips_empty_values() {
+        let raw = b"X-Empty:   \r\nSubject: Hi\r\n\r\nbody";
+        let parsed = MessageParser::default()
+            .parse(raw.as_slice())
+            .expect("parse");
+        let map = build_headers_map(&parsed);
+        assert!(
+            !map.contains_key("X-Empty"),
+            "empty header value is skipped"
+        );
+        assert!(map.contains_key("Subject"));
     }
 }

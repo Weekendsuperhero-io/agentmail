@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "rust-rmcp-server-development": {
+      "source": "weekendsuperhero-io/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-rmcp-server-development/SKILL.md",
+      "computedHash": "6581207057588b6738e6d3f18f29cdc2f64d2e33f0d2b2c1b444a712b22675fb"
+    }
+  }
+}
