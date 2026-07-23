@@ -4,7 +4,7 @@ use super::AgentMailServer;
 use super::args::*;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{PromptMessage, PromptMessageRole},
+    model::{PromptMessage, Role},
     prompt, prompt_router,
 };
 
@@ -19,7 +19,7 @@ impl AgentMailServer {
         params: Parameters<InboxSummaryArgs>,
     ) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Give me a comprehensive overview of my email for account \"{}\". \
                  First, call list_mailboxes with this account to see selectable folders, message totals, and unread counts. \
@@ -40,7 +40,7 @@ impl AgentMailServer {
         params: Parameters<CleanupSenderArgs>,
     ) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Help me clean up all emails from \"{}\" in account \"{}\". \
                  First, use search_messages with mailbox=\"INBOX\", senderContains, and limit=5. Results are metadata-only; \
@@ -63,7 +63,7 @@ impl AgentMailServer {
     ) -> Vec<PromptMessage> {
         let mailbox = params.0.mailbox.as_deref().unwrap_or("INBOX");
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Find all messages with attachments in mailbox \"{}\" for account \"{}\". \
                  Use find_attachments with limit=10. Each hit has mailbox, uidValidity, uid, date, and resourceUri. \
@@ -98,10 +98,7 @@ impl AgentMailServer {
              (with optional attachments) to save it. Show me a preview before saving; create_draft resolves \
              the proper Drafts mailbox and applies the Draft flag itself.",
         );
-        vec![PromptMessage::new_text(
-            PromptMessageRole::User,
-            instructions,
-        )]
+        vec![PromptMessage::new_text(Role::User, instructions)]
     }
 
     #[prompt(
@@ -113,7 +110,7 @@ impl AgentMailServer {
         params: Parameters<UnsubscribeCleanupArgs>,
     ) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Help me clean up mailing list clutter in account \"{}\". \
                  Step 1: Use top_subscriptions with mailbox and limit omitted to get the default account-wide page of 10 \
@@ -142,7 +139,7 @@ impl AgentMailServer {
         params: Parameters<ListIdCleanupArgs>,
     ) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Help me clean up mailing lists in account \"{}\". \
                  Step 1: Use top_mailing_lists with mailbox and limit omitted to get the default account-wide page of 10 \

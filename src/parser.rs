@@ -148,13 +148,13 @@ fn extract_from_parts(addr: Option<&mail_parser::Address<'_>>) -> (String, Strin
     match addr {
         Some(mail_parser::Address::List(list)) if !list.is_empty() => {
             let a = &list[0];
-            let email = a.address.as_deref().unwrap_or("").to_lowercase();
+            let email = canonical_sender_address(a.address.as_deref().unwrap_or(""));
             let name = a.name.as_deref().unwrap_or("").to_string();
             (email, name)
         }
         Some(mail_parser::Address::Group(groups)) if !groups.is_empty() => {
             if let Some(a) = groups[0].addresses.first() {
-                let email = a.address.as_deref().unwrap_or("").to_lowercase();
+                let email = canonical_sender_address(a.address.as_deref().unwrap_or(""));
                 let name = a.name.as_deref().unwrap_or("").to_string();
                 (email, name)
             } else {
@@ -163,6 +163,11 @@ fn extract_from_parts(addr: Option<&mail_parser::Address<'_>>) -> (String, Strin
         }
         _ => (String::new(), String::new()),
     }
+}
+
+pub(crate) fn canonical_sender_address(address: &str) -> String {
+    let lower = address.to_lowercase();
+    crate::config::canonicalize_email(&lower).unwrap_or(lower)
 }
 
 // ---------------------------------------------------------------------------

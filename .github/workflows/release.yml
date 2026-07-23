@@ -7,7 +7,7 @@ on:
 
 jobs:
   release:
-    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-rust-release.yml@main
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-rust-release.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
     with:
       validate-runs-on: ubuntu-latest
       rust-cache-provider: github
@@ -28,5 +28,5 @@ jobs:
       # macos-universal-arm64-artifact: macos-aarch64
       # macos-universal-x86_64-artifact: macos-x86_64
       publish-crates-io: true
-      cargo-publish-command: cargo publish
+      cargo-publish-command: cargo publish --locked
     secrets: inherit

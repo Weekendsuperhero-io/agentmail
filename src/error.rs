@@ -11,6 +11,9 @@ pub enum AgentmailError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("mutation journal database error: {0}")]
+    JournalSqlite(#[from] rusqlite::Error),
+
     #[error("Configuration error: {0}")]
     Config(String),
 

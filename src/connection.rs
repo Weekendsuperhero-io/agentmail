@@ -527,12 +527,16 @@ impl ConnectionPool {
     /// default to a single held connection and all concurrent work queues on it
     /// rather than opening a second, rate-limited LOGIN).
     fn account_max_connections(&self, account_name: &str) -> usize {
-        match self.config.accounts.get(account_name) {
+        let configured = match self.config.accounts.get(account_name) {
             Some(c) => c
                 .max_connections
                 .unwrap_or_else(|| recommended_max_connections(&c.host)),
             None => MAX_CONCURRENT_PER_ACCOUNT,
-        }
+        };
+        // `Config::validate` rejects this range, while the clamp protects
+        // legacy callers that still use the unchecked constructor. In
+        // particular, Semaphore(0) must never deadlock an account forever.
+        configured.clamp(1, 32)
     }
 
     /// Pop one reusable idle session for the account, PREFERRING the UID-Mode
@@ -1255,6 +1259,8 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 1, // closed port — a real connect attempt would error differently
                 username: "user@example.com".to_string(),
+                email: None,
+                aliases: Vec::new(),
                 password: Some(crate::secret::Secret::new_raw("unused")),
                 tls: true,
                 max_connections: None,

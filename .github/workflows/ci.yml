@@ -8,7 +8,7 @@ on:
 
 jobs:
   ci:
-    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-rust-ci.yml@main
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-rust-ci.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
     with:
       check-os-json: '["ubuntu-latest","macos-latest","windows-latest"]'
       rust-cache-provider: github
@@ -18,4 +18,4 @@ jobs:
       # Run nextest when available (preferred runner + .config/nextest.toml).
       # Falls back to `cargo test` if nextest is unavailable or on Windows.
       # This still runs all tests including tests/proptest_draft.rs.
-      test-command: cargo nextest run --all-features --profile ci || cargo test --all-features
+      test-command: cargo nextest run --locked --all-features --profile ci || cargo test --locked --all-features

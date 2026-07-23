@@ -12,7 +12,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-description.yml@main
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-description.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
     with:
       trigger-phrase: "@AgentMuse pr-title"
       # Send full commit message bodies (not just `--oneline` subjects) so

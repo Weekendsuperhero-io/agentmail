@@ -5,14 +5,19 @@ use std::sync::Arc;
 use chrono::{DateTime, SecondsFormat, Utc};
 use hashbrown::HashMap;
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolResult, ListTasksResult, Task, TaskStatus};
+use rmcp::model::{CallToolResult, ContentBlock, ListTasksResult, Task, TaskStatus};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Task results are retained for 24 hours from task creation.
 pub(super) const TASK_TTL_MS: u64 = 86_400_000;
-/// Maximum number of unexpired tasks and enqueue reservations per process.
-pub(super) const MAX_LIVE_TASKS: usize = 128;
+/// Maximum number of concurrently active tasks and enqueue reservations.
+pub(super) const MAX_ACTIVE_TASKS: usize = 128;
+/// Maximum accepted tasks retained at once, active and terminal combined.
+/// Admission stops at this ceiling so no accepted result is evicted before
+/// its advertised TTL expires.
+pub(super) const MAX_TRACKED_TASKS: usize = 1_024;
 /// Protocol page size for `tasks/list`.
 pub(super) const TASK_PAGE_SIZE: usize = 25;
 
@@ -27,8 +32,10 @@ type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 pub(super) const DESTRUCTIVE_TOOLS: &[&str] = &[
     "delete_messages",
     "delete_by_sender",
+    "delete_by_domain",
     "delete_list_id",
     "unsubscribe_message",
+    "reconcile_moves",
 ];
 
 /// Try to extract the `account` field from a tool call's JSON arguments.
@@ -38,9 +45,70 @@ pub(super) fn extract_account(
     args.as_ref()?.get("account")?.as_str().map(String::from)
 }
 
+#[derive(Default)]
+pub(super) struct TaskCompletion {
+    result: parking_lot::Mutex<Option<Result<CallToolResult, McpError>>>,
+    changed: Notify,
+}
+
+impl TaskCompletion {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish the worker result once. A cancellation result wins races with
+    /// a worker that finishes after cancellation.
+    pub(super) fn complete(&self, result: Result<CallToolResult, McpError>) {
+        let mut slot = self.result.lock();
+        if slot.is_none() {
+            *slot = Some(result);
+            drop(slot);
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn cancel(&self, task_id: &str) {
+        let mut slot = self.result.lock();
+        *slot = Some(Ok(CallToolResult::error(vec![ContentBlock::text(
+            format!("Task {task_id} was cancelled before completion."),
+        )])));
+        drop(slot);
+        self.changed.notify_waiters();
+    }
+
+    fn snapshot(&self) -> Option<Result<CallToolResult, McpError>> {
+        self.result.lock().clone()
+    }
+
+    /// Wait until the task reaches a result-bearing terminal state. Cancelling
+    /// this particular `tasks/result` request does not cancel the task itself.
+    pub(super) async fn wait(
+        &self,
+        request_cancel: &CancellationToken,
+    ) -> Result<CallToolResult, McpError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(result) = self.snapshot() {
+                return result;
+            }
+            tokio::select! {
+                () = &mut changed => {}
+                () = request_cancel.cancelled() => {
+                    return Err(McpError::internal_error(
+                        "tasks/result request was cancelled",
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct ManagedTask {
     pub(super) meta: Task,
-    pub(super) result: Arc<parking_lot::Mutex<Option<Result<CallToolResult, McpError>>>>,
+    pub(super) completion: Arc<TaskCompletion>,
     pub(super) cancel: CancellationToken,
     pub(super) handle: JoinHandle<()>,
 }
@@ -105,11 +173,22 @@ impl TaskManager {
     /// The returned metadata already contains the creation-based TTL. Call
     /// [`Self::commit_task`] immediately after spawning the worker.
     pub(super) fn reserve_task(&mut self, task_id: String) -> Result<Task, McpError> {
-        self.prune_expired();
+        self.refresh_all();
 
-        if self.tasks.len() + self.reservations.len() >= MAX_LIVE_TASKS {
-            return Err(McpError::invalid_request(
-                format!("task capacity reached ({MAX_LIVE_TASKS} live tasks)"),
+        if self.tasks.len() + self.reservations.len() >= MAX_TRACKED_TASKS {
+            return Err(McpError::internal_error(
+                format!("task retention capacity reached ({MAX_TRACKED_TASKS} tasks)"),
+                None,
+            ));
+        }
+        let active = self
+            .tasks
+            .values()
+            .filter(|managed| !is_terminal(&managed.meta.status))
+            .count();
+        if active + self.reservations.len() >= MAX_ACTIVE_TASKS {
+            return Err(McpError::internal_error(
+                format!("task capacity reached ({MAX_ACTIVE_TASKS} active tasks)"),
                 None,
             ));
         }
@@ -146,7 +225,7 @@ impl TaskManager {
     pub(super) fn commit_task(
         &mut self,
         task_id: &str,
-        result: Arc<parking_lot::Mutex<Option<Result<CallToolResult, McpError>>>>,
+        completion: Arc<TaskCompletion>,
         cancel: CancellationToken,
         handle: JoinHandle<()>,
     ) -> Result<Task, McpError> {
@@ -167,7 +246,7 @@ impl TaskManager {
             task_id.to_string(),
             ManagedTask {
                 meta: reservation.meta,
-                result,
+                completion,
                 cancel,
                 handle,
             },
@@ -202,7 +281,7 @@ impl TaskManager {
 
         for task_id in expired_tasks {
             if let Some(managed) = self.tasks.remove(&task_id)
-                && is_active(&managed.meta.status)
+                && !is_terminal(&managed.meta.status)
             {
                 managed.cancel.cancel();
                 managed.handle.abort();
@@ -244,56 +323,52 @@ impl TaskManager {
             .ok_or_else(|| unknown_task(task_id))
     }
 
-    /// Clone a terminal task result, retaining it for repeat retrieval until expiry.
-    pub(super) fn task_result(&mut self, task_id: &str) -> Result<CallToolResult, McpError> {
+    /// Return the completion signal used by blocking `tasks/result` calls.
+    pub(super) fn task_completion(
+        &mut self,
+        task_id: &str,
+    ) -> Result<Arc<TaskCompletion>, McpError> {
         self.refresh_status(task_id);
-        let managed = self
-            .tasks
+        self.tasks
             .get(task_id)
-            .ok_or_else(|| unknown_task(task_id))?;
-        match managed.meta.status {
-            TaskStatus::Working => {
-                return Err(McpError::invalid_params("task is still running", None));
-            }
-            TaskStatus::InputRequired => {
-                return Err(McpError::invalid_params("task requires input", None));
-            }
-            TaskStatus::Cancelled => {
-                return Err(McpError::invalid_params("task was cancelled", None));
-            }
-            TaskStatus::Completed | TaskStatus::Failed => {}
-        }
-
-        managed
-            .result
-            .try_lock()
-            .and_then(|guard| guard.as_ref().cloned())
-            .ok_or_else(|| McpError::internal_error("task result is unavailable", None))?
+            .map(|managed| Arc::clone(&managed.completion))
+            .ok_or_else(|| unknown_task(task_id))
     }
 
     /// Cancel a non-terminal task and return its retained metadata.
     pub(super) fn cancel_task(&mut self, task_id: &str) -> Result<Task, McpError> {
-        self.prune_expired();
+        self.refresh_status(task_id);
         let updated_at = format_timestamp(&self.now());
         let managed = self
             .tasks
             .get_mut(task_id)
             .ok_or_else(|| unknown_task(task_id))?;
-        if is_active(&managed.meta.status) {
-            managed.cancel.cancel();
-            managed.handle.abort();
-            managed.meta.status = TaskStatus::Cancelled;
-            managed.meta.last_updated_at = updated_at;
+        if is_terminal(&managed.meta.status) {
+            return Err(McpError::invalid_params(
+                format!("task is already terminal: {task_id}"),
+                None,
+            ));
         }
+        managed.cancel.cancel();
+        managed.completion.cancel(task_id);
+        managed.handle.abort();
+        managed.meta.status = TaskStatus::Cancelled;
+        managed.meta.status_message = Some("The task was cancelled by request.".to_string());
+        managed.meta.last_updated_at = updated_at;
         Ok(managed.meta.clone())
     }
 
     /// List retained tasks newest-first with a process-local opaque cursor.
     pub(super) fn list_page(&mut self, cursor: Option<&str>) -> Result<ListTasksResult, McpError> {
         self.refresh_all();
-        let offset = cursor.map_or(Ok(0), |value| self.decode_cursor(value))?;
+        let before_sequence = cursor.map(|value| self.decode_cursor(value)).transpose()?;
 
         let mut entries: Vec<(&String, &ManagedTask)> = self.tasks.iter().collect();
+        if let Some(before_sequence) = before_sequence {
+            entries.retain(|(task_id, managed)| {
+                self.record_for(task_id, managed).sequence < before_sequence
+            });
+        }
         entries.sort_by(|(left_id, left), (right_id, right)| {
             let left_record = self.record_for(left_id, left);
             let right_record = self.record_for(right_id, right);
@@ -308,19 +383,25 @@ impl TaskManager {
                 .then_with(|| right_id.cmp(left_id))
         });
 
-        let total = entries.len();
-        let tasks = entries
+        let has_more = entries.len() > TASK_PAGE_SIZE;
+        let page = entries
             .iter()
-            .skip(offset)
             .take(TASK_PAGE_SIZE)
+            .copied()
+            .collect::<Vec<_>>();
+        let next_cursor = has_more.then(|| {
+            let (task_id, managed) = page
+                .last()
+                .expect("a page with more rows always has a final row");
+            self.encode_cursor(self.record_for(task_id, managed).sequence)
+        });
+        let tasks = page
+            .into_iter()
             .map(|(_, managed)| managed.meta.clone())
             .collect();
-        let page_end = offset.saturating_add(TASK_PAGE_SIZE).min(total);
-        let next_cursor = (page_end < total).then(|| self.encode_cursor(page_end));
 
         let mut result = ListTasksResult::new(tasks);
         result.next_cursor = next_cursor;
-        result.total = Some(total as u64);
         Ok(result)
     }
 
@@ -338,13 +419,13 @@ impl TaskManager {
             })
     }
 
-    fn encode_cursor(&self, offset: usize) -> String {
-        let masked = (offset as u64) ^ self.cursor_secret.mask;
+    fn encode_cursor(&self, before_sequence: u64) -> String {
+        let masked = before_sequence ^ self.cursor_secret.mask;
         let tag = mix64(masked ^ self.cursor_secret.tag);
         format!("{TASK_CURSOR_PREFIX}.{masked:016x}.{tag:016x}")
     }
 
-    fn decode_cursor(&self, cursor: &str) -> Result<usize, McpError> {
+    fn decode_cursor(&self, cursor: &str) -> Result<u64, McpError> {
         let mut parts = cursor.split('.');
         let Some(prefix) = parts.next() else {
             return Err(invalid_cursor());
@@ -364,33 +445,48 @@ impl TaskManager {
         if tag != mix64(masked ^ self.cursor_secret.tag) {
             return Err(invalid_cursor());
         }
-        let offset = masked ^ self.cursor_secret.mask;
-        let offset = usize::try_from(offset).map_err(|_| invalid_cursor())?;
-        if offset > MAX_LIVE_TASKS {
-            return Err(invalid_cursor());
-        }
-        Ok(offset)
+        Ok(masked ^ self.cursor_secret.mask)
     }
 }
 
 fn refresh_managed_task(managed: &mut ManagedTask, updated_at: &str) {
-    if !is_active(&managed.meta.status) || !managed.handle.is_finished() {
+    if is_terminal(&managed.meta.status) {
         return;
     }
 
-    let Some(result) = managed.result.try_lock() else {
+    let result = managed.completion.snapshot();
+    if result.is_none() && !managed.handle.is_finished() {
         return;
-    };
+    }
+    if result.is_none() {
+        managed.completion.complete(Err(McpError::internal_error(
+            "task worker ended without publishing a result",
+            None,
+        )));
+    }
+    let result = managed.completion.snapshot();
     managed.meta.status = match result.as_ref() {
         Some(Ok(call_result)) if call_result.is_error == Some(true) => TaskStatus::Failed,
         Some(Ok(_)) => TaskStatus::Completed,
         Some(Err(_)) | None => TaskStatus::Failed,
     };
+    managed.meta.status_message = match result {
+        Some(Err(error)) => Some(error.message.to_string()),
+        Some(Ok(ref call_result)) if call_result.is_error == Some(true) => call_result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone()),
+        _ => None,
+    };
     managed.meta.last_updated_at = updated_at.to_string();
 }
 
-fn is_active(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::Working | TaskStatus::InputRequired)
+fn is_terminal(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+    )
 }
 
 fn is_expired(created_at_millis: i64, now_millis: i64) -> bool {
@@ -427,7 +523,7 @@ fn mix64(mut value: u64) -> u64 {
 mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
-    use rmcp::model::Content;
+    use rmcp::model::ContentBlock;
     use tokio::sync::oneshot;
 
     use super::*;
@@ -469,12 +565,13 @@ mod tests {
         manager
             .reserve_task(task_id.to_string())
             .expect("task reservation should succeed");
-        let result = CallToolResult::success(vec![Content::text(task_id.to_string())]);
-        let result = Arc::new(parking_lot::Mutex::new(Some(Ok(result))));
+        let result = CallToolResult::success(vec![ContentBlock::text(task_id.to_string())]);
+        let completion = Arc::new(TaskCompletion::new());
+        completion.complete(Ok(result));
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(async {});
         let task = manager
-            .commit_task(task_id, result, cancel, handle)
+            .commit_task(task_id, completion, cancel, handle)
             .expect("task commit should succeed");
         manager
             .tasks
@@ -489,14 +586,14 @@ mod tests {
         manager
             .reserve_task(task_id.to_string())
             .expect("task reservation should succeed");
-        let result = Arc::new(parking_lot::Mutex::new(None));
+        let completion = Arc::new(TaskCompletion::new());
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
             worker_cancel.cancelled().await;
         });
         manager
-            .commit_task(task_id, result, cancel.clone(), handle)
+            .commit_task(task_id, completion, cancel.clone(), handle)
             .expect("task commit should succeed");
         cancel
     }
@@ -549,23 +646,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserve_task_should_reject_capacity_until_entries_expire() {
+    async fn task_completion_should_block_until_worker_publishes() {
+        let completion = Arc::new(TaskCompletion::new());
+        let waiting_completion = Arc::clone(&completion);
+        let waiter =
+            tokio::spawn(async move { waiting_completion.wait(&CancellationToken::new()).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "tasks/result must block while work is active"
+        );
+
+        completion.complete(Ok(CallToolResult::success(vec![ContentBlock::text(
+            "done",
+        )])));
+        let result = waiter
+            .await
+            .expect("waiter should not panic")
+            .expect("published result should be returned");
+
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_should_retain_a_final_error_result() {
         let clock = TestClock::new();
         let mut manager = manager(&clock);
-        for index in 0..MAX_LIVE_TASKS {
+        commit_running(&mut manager, "cancelled-result");
+        let completion = manager
+            .task_completion("cancelled-result")
+            .expect("task should be present");
+
+        let task = manager
+            .cancel_task("cancelled-result")
+            .expect("active task should be cancellable");
+        let result = completion
+            .wait(&CancellationToken::new())
+            .await
+            .expect("cancelled task should have a final result");
+
+        assert!(
+            task.status == TaskStatus::Cancelled && result.is_error == Some(true),
+            "cancelled status and final isError result must agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_terminal_task_should_return_invalid_params() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+        commit_completed(&mut manager, "completed");
+
+        let error = manager
+            .cancel_task("completed")
+            .expect_err("terminal tasks cannot be cancelled");
+
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn completed_tasks_should_not_consume_active_capacity() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+        for index in 0..MAX_ACTIVE_TASKS {
             commit_completed(&mut manager, &format!("task-{index:03}"));
+        }
+
+        let reservation = manager.reserve_task("new-active".to_string());
+
+        assert!(
+            reservation.is_ok(),
+            "terminal retention must not block new work"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_capacity_should_reject_admission_without_evicting_promised_results() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+        for index in 0..MAX_TRACKED_TASKS {
+            commit_completed(&mut manager, &format!("retained-{index:04}"));
         }
 
         let error = manager
             .reserve_task("overflow".to_string())
-            .expect_err("live capacity should be enforced");
-        clock.advance(TASK_TTL_MS);
-        let after_expiry = manager.reserve_task("after-expiry".to_string());
+            .expect_err("retention capacity should reject new tasks");
 
+        assert!(error.message.contains("retention capacity"));
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
         assert!(
-            error.message.contains("capacity") && after_expiry.is_ok(),
-            "capacity should reject live entries and recover after pruning"
+            manager.task_info("retained-0000").is_ok(),
+            "accepted task results must remain available until their TTL"
         );
+    }
+
+    #[tokio::test]
+    async fn active_tasks_should_enforce_capacity() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+        for index in 0..MAX_ACTIVE_TASKS {
+            commit_running(&mut manager, &format!("task-{index:03}"));
+        }
+
+        let error = manager
+            .reserve_task("overflow".to_string())
+            .expect_err("active capacity should be enforced");
+
+        assert!(error.message.contains("active tasks"));
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
     }
 
     #[tokio::test]
@@ -574,11 +762,16 @@ mod tests {
         let mut manager = manager(&clock);
         commit_completed(&mut manager, "repeatable");
 
-        let first = manager
-            .task_result("repeatable")
+        let completion = manager
+            .task_completion("repeatable")
+            .expect("task completion should be available");
+        let first = completion
+            .wait(&CancellationToken::new())
+            .await
             .expect("first result retrieval should succeed");
-        let second = manager
-            .task_result("repeatable")
+        let second = completion
+            .wait(&CancellationToken::new())
+            .await
             .expect("second result retrieval should succeed");
 
         assert_eq!(first, second);
@@ -603,11 +796,36 @@ mod tests {
         assert!(
             first.tasks.len() == TASK_PAGE_SIZE
                 && first.tasks[0].task_id == "task-26"
-                && first.total == Some(27)
                 && second.tasks.len() == 2
                 && second.tasks[0].task_id == "task-01"
                 && second.next_cursor.is_none(),
             "task pages should be bounded, newest-first, and complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_cursor_should_not_shift_when_new_tasks_arrive_between_pages() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+        for index in 0..27 {
+            commit_completed(&mut manager, &format!("task-{index:02}"));
+            clock.advance(1);
+        }
+
+        let first = manager.list_page(None).expect("first page");
+        commit_completed(&mut manager, "newer-task");
+        let second = manager
+            .list_page(first.next_cursor.as_deref())
+            .expect("second page");
+
+        assert_eq!(
+            second
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-01", "task-00"],
+            "the opaque cursor must continue after the prior page boundary"
         );
     }
 
@@ -656,8 +874,8 @@ mod tests {
         manager
             .reserve_task("first".to_string())
             .expect("task reservation should succeed");
-        let first_slot = Arc::new(parking_lot::Mutex::new(None));
-        let slot = Arc::clone(&first_slot);
+        let first_completion = Arc::new(TaskCompletion::new());
+        let worker_completion = Arc::clone(&first_completion);
         let worker_lock = Arc::clone(&lock);
         let worker_events = Arc::clone(&events);
         let first_handle = tokio::spawn(async move {
@@ -668,10 +886,17 @@ mod tests {
                 .expect("test should await the start signal");
             finish_rx.await.expect("test should signal completion");
             worker_events.lock().push("first:releasing");
-            *slot.lock() = Some(Ok(CallToolResult::success(vec![Content::text("first")])));
+            worker_completion.complete(Ok(CallToolResult::success(vec![ContentBlock::text(
+                "first",
+            )])));
         });
         manager
-            .commit_task("first", first_slot, CancellationToken::new(), first_handle)
+            .commit_task(
+                "first",
+                first_completion,
+                CancellationToken::new(),
+                first_handle,
+            )
             .expect("task commit should succeed");
 
         started_rx
@@ -682,20 +907,22 @@ mod tests {
         manager
             .reserve_task("second".to_string())
             .expect("task reservation should succeed");
-        let second_slot = Arc::new(parking_lot::Mutex::new(None));
-        let slot = Arc::clone(&second_slot);
+        let second_completion = Arc::new(TaskCompletion::new());
+        let worker_completion = Arc::clone(&second_completion);
         let worker_lock = Arc::clone(&lock);
         let worker_events = Arc::clone(&events);
         let second_handle = tokio::spawn(async move {
             let _guard = worker_lock.lock().await;
             worker_events.lock().push("second:acquired");
-            *slot.lock() = Some(Ok(CallToolResult::success(vec![Content::text("second")])));
+            worker_completion.complete(Ok(CallToolResult::success(vec![ContentBlock::text(
+                "second",
+            )])));
             done_tx.send(()).expect("test should await the done signal");
         });
         manager
             .commit_task(
                 "second",
-                second_slot,
+                second_completion,
                 CancellationToken::new(),
                 second_handle,
             )

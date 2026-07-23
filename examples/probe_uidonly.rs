@@ -156,6 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host,
         port,
         username: user,
+        email: None,
+        aliases: Vec::new(),
         password: Some(Secret::new_raw(&pass)),
         tls: true,
         max_connections: None,

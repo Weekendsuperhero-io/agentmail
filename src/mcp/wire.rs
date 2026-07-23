@@ -8,7 +8,7 @@
 
 use rmcp::{
     ErrorData as McpError,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     schemars::JsonSchema,
 };
 use serde::Serialize;
@@ -16,29 +16,33 @@ use serde::Serialize;
 use super::resources::format_email_uri;
 use crate::next_offset;
 
-const MAX_FALLBACK_CHARS: usize = 8_000;
 const MAX_BREAKDOWN_ROWS: usize = 50;
 const MAX_LIST_SENDER_PREVIEW: usize = 5;
 
-/// An MCP output that can provide a short fallback for clients that do not
-/// consume `structuredContent`.
-pub(super) trait WireOutput: Serialize {
-    fn text_summary(&self) -> String;
-}
+/// Marker for schema-stable MCP outputs that can be serialized on both result
+/// channels.
+pub(super) trait WireOutput: Serialize {}
 
-/// Construct one compact text block plus one structured value.
+/// Construct a structured value plus the same complete JSON in a text block.
 ///
-/// This deliberately does not call `CallToolResult::structured`, because that
-/// constructor also serializes the complete value into a JSON text block.
+/// Some MCP hosts still render only `content`, so truncating or summarizing
+/// this fallback silently changes a requested page (historically every ranked
+/// result looked like a five-row page). Keeping both representations equal
+/// makes `limit` mean the same thing in every host.
 pub(super) fn compact_result<T>(output: T) -> Result<CallToolResult, McpError>
 where
     T: WireOutput,
 {
-    let summary = truncate_fallback(output.text_summary());
     let structured = serde_json::to_value(output).map_err(|error| {
         McpError::internal_error(format!("failed to serialize tool result: {error}"), None)
     })?;
-    let mut result = CallToolResult::success(vec![Content::text(summary)]);
+    let fallback = serde_json::to_string(&structured).map_err(|error| {
+        McpError::internal_error(
+            format!("failed to serialize tool result text: {error}"),
+            None,
+        )
+    })?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(fallback)]);
     result.structured_content = Some(structured);
     Ok(result)
 }
@@ -55,7 +59,7 @@ where
 /// backend as down. Protocol errors stay reserved for malformed requests, which
 /// the tool handlers validate up front before the operation runs.
 pub(super) fn tool_error_result(e: &crate::AgentmailError) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(e.to_string())])
+    CallToolResult::error(vec![ContentBlock::text(e.to_string())])
 }
 
 /// Build the canonical body-resource URI for a UID-valid message identity.
@@ -66,33 +70,6 @@ pub(super) fn message_resource_uri(
     uid: u32,
 ) -> String {
     format_email_uri(account, mailbox, uid_validity, uid)
-}
-
-fn truncate_fallback(value: String) -> String {
-    if value.chars().count() <= MAX_FALLBACK_CHARS {
-        return value;
-    }
-
-    let mut truncated: String = value.chars().take(MAX_FALLBACK_CHARS - 1).collect();
-    truncated.push('…');
-    truncated
-}
-
-/// Short quoted subject fragment for ranking text summaries, empty when the
-/// sample had no subject. Keeps the 5-row summary line bounded.
-fn subject_snippet(subject: Option<&str>) -> String {
-    match subject {
-        Some(subject) => {
-            let snippet: String = subject.chars().take(40).collect();
-            let ellipsis = if subject.chars().count() > 40 {
-                "…"
-            } else {
-                ""
-            };
-            format!(" \"{snippet}{ellipsis}\"")
-        }
-        None => String::new(),
-    }
 }
 
 fn truncate_rows<T>(mut rows: Vec<T>) -> (Vec<T>, usize, bool) {
@@ -156,17 +133,7 @@ impl From<crate::ListAccountsResponse> for ListAccountsOutput {
     }
 }
 
-impl WireOutput for ListAccountsOutput {
-    fn text_summary(&self) -> String {
-        let names = self
-            .accounts
-            .iter()
-            .map(|account| account.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{} configured account(s): {names}", self.accounts.len())
-    }
-}
+impl WireOutput for ListAccountsOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -202,7 +169,6 @@ impl ListMailboxesOutput {
         limit: usize,
         total: usize,
     ) -> Self {
-        let limit = limit.clamp(1, 500);
         let mailboxes = value
             .mailboxes
             .into_iter()
@@ -229,23 +195,7 @@ impl ListMailboxesOutput {
     }
 }
 
-impl WireOutput for ListMailboxesOutput {
-    fn text_summary(&self) -> String {
-        let names = self
-            .mailboxes
-            .iter()
-            .map(|mailbox| mailbox.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} selectable mailbox(es) for {} ({} returned at offset {}): {names}",
-            self.total,
-            self.account,
-            self.mailboxes.len(),
-            self.offset
-        )
-    }
-}
+impl WireOutput for ListMailboxesOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -266,19 +216,7 @@ impl From<crate::ConnectionStatus> for CheckConnectionOutput {
     }
 }
 
-impl WireOutput for CheckConnectionOutput {
-    fn text_summary(&self) -> String {
-        if self.connected {
-            format!("{} connected successfully", self.account)
-        } else {
-            format!(
-                "{} connection failed: {}",
-                self.account,
-                self.error.as_deref().unwrap_or("unknown error")
-            )
-        }
-    }
-}
+impl WireOutput for CheckConnectionOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -296,16 +234,7 @@ impl From<crate::ListCapabilitiesResponse> for ListCapabilitiesOutput {
     }
 }
 
-impl WireOutput for ListCapabilitiesOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "{} advertises {} IMAP capability value(s): {}",
-            self.account,
-            self.capabilities.len(),
-            self.capabilities.join(", ")
-        )
-    }
-}
+impl WireOutput for ListCapabilitiesOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -381,49 +310,7 @@ impl From<crate::GetMessagesResponse> for GetMessagesOutput {
     }
 }
 
-impl WireOutput for GetMessagesOutput {
-    fn text_summary(&self) -> String {
-        message_rows_summary(
-            &format!(
-                "{} of {} message(s) from {} at offset {}; UIDVALIDITY {}.",
-                self.messages.len(),
-                self.total,
-                self.mailbox,
-                self.offset,
-                self.uid_validity
-            ),
-            &self.messages,
-        )
-    }
-}
-
-/// Per-row text lines for message listings. Hosts that surface only the text
-/// content block (not `structuredContent`) still need subjects and senders to
-/// be usable — bodies stay behind the resource URIs by policy.
-fn message_rows_summary(header: &str, messages: &[MessageMetadataOutput]) -> String {
-    let mut out = String::from(header);
-    for message in messages {
-        out.push_str(&format!(
-            "\n[{}] {} — {} ({}) {}",
-            message.uid,
-            clip(&message.subject, 70),
-            clip(&message.sender, 40),
-            message.date.as_deref().unwrap_or("no date"),
-            message.resource_uri,
-        ));
-    }
-    out
-}
-
-/// Truncate on a character boundary with an ellipsis marker.
-fn clip(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let mut clipped: String = value.chars().take(max_chars.saturating_sub(1)).collect();
-    clipped.push('…');
-    clipped
-}
+impl WireOutput for GetMessagesOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -468,21 +355,7 @@ impl From<crate::SearchMessagesResponse> for SearchMessagesOutput {
     }
 }
 
-impl WireOutput for SearchMessagesOutput {
-    fn text_summary(&self) -> String {
-        message_rows_summary(
-            &format!(
-                "{} of {} matching message(s) from {} at offset {}; UIDVALIDITY {}.",
-                self.messages.len(),
-                self.total,
-                self.mailbox,
-                self.offset,
-                self.uid_validity
-            ),
-            &self.messages,
-        )
-    }
-}
+impl WireOutput for SearchMessagesOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -575,22 +448,7 @@ impl From<crate::ListFlagsResponse> for ListFlagsOutput {
     }
 }
 
-impl WireOutput for ListFlagsOutput {
-    fn text_summary(&self) -> String {
-        let flags = self
-            .flags
-            .iter()
-            .map(|flag| format!("{}={}", flag.flag, flag.count))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} flag occurrence(s) in {} across {} flag value(s): {flags}",
-            self.total_flags,
-            self.mailbox,
-            self.flags.len()
-        )
-    }
-}
+impl WireOutput for ListFlagsOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -675,23 +533,7 @@ impl From<crate::FindAttachmentsResponse> for FindAttachmentsOutput {
     }
 }
 
-impl WireOutput for FindAttachmentsOutput {
-    fn text_summary(&self) -> String {
-        let resources = self
-            .messages
-            .iter()
-            .take(5)
-            .map(|message| message.resource_uri.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} of {} attachment-bearing message(s) at offset {}. Resources: {resources}",
-            self.messages.len(),
-            self.total,
-            self.offset
-        )
-    }
-}
+impl WireOutput for FindAttachmentsOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -777,28 +619,74 @@ impl From<crate::TopSendersResponse> for TopSendersOutput {
     }
 }
 
-impl WireOutput for TopSendersOutput {
-    fn text_summary(&self) -> String {
-        let rows = self
-            .senders
-            .iter()
-            .take(5)
-            .map(|sender| {
-                format!(
-                    "{}={} ({})",
-                    sender.address, sender.count, sender.sample.resource_uri
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} of {} ranked sender(s) at offset {}: {rows}",
-            self.senders.len(),
-            self.total,
-            self.offset
-        )
+impl WireOutput for TopSendersOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct DomainRankOutput {
+    /// Exact canonical Header From domain. Parent domains and subdomains are
+    /// intentionally distinct rows.
+    pub(super) domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) registrable_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subdomain: Option<String>,
+    pub(super) count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) oldest_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) newest_date: Option<String>,
+    pub(super) sample: MessageSampleOutput,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TopDomainsOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    pub(super) total_messages: u32,
+    /// Total exact-domain rows in the pagination universe.
+    pub(super) total: usize,
+    pub(super) offset: usize,
+    pub(super) limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) next_offset: Option<usize>,
+    pub(super) domains: Vec<DomainRankOutput>,
+}
+
+impl From<crate::TopDomainsResponse> for TopDomainsOutput {
+    fn from(value: crate::TopDomainsResponse) -> Self {
+        let account = value.account;
+        Self {
+            domains: value
+                .domains
+                .into_iter()
+                .map(|domain| DomainRankOutput {
+                    domain: domain.domain,
+                    registrable_domain: domain.registrable_domain,
+                    subdomain: domain.subdomain,
+                    count: domain.count,
+                    subject: domain.subject,
+                    oldest_date: domain.oldest_date.map(|date| date.to_rfc3339()),
+                    newest_date: domain.newest_date.map(|date| date.to_rfc3339()),
+                    sample: MessageSampleOutput::new(&account, domain.sample),
+                })
+                .collect(),
+            account,
+            mailbox: value.mailbox,
+            total_messages: value.total_messages,
+            total: value.unique_domains,
+            offset: value.offset,
+            limit: value.limit,
+            next_offset: value.next_offset,
+        }
     }
 }
+
+impl WireOutput for TopDomainsOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -864,32 +752,7 @@ impl From<crate::TopSubscriptionsResponse> for TopSubscriptionsOutput {
     }
 }
 
-impl WireOutput for TopSubscriptionsOutput {
-    fn text_summary(&self) -> String {
-        let rows = self
-            .lists
-            .iter()
-            .take(5)
-            .map(|list| {
-                format!(
-                    "{}={} oneClick={}{} ({})",
-                    list.address,
-                    list.count,
-                    list.advertised_one_click,
-                    subject_snippet(list.subject.as_deref()),
-                    list.sample.resource_uri
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} of {} ranked subscription(s) at offset {}: {rows}",
-            self.lists.len(),
-            self.total,
-            self.offset
-        )
-    }
-}
+impl WireOutput for TopSubscriptionsOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -960,31 +823,7 @@ impl From<crate::TopMailingListsResponse> for TopMailingListsOutput {
     }
 }
 
-impl WireOutput for TopMailingListsOutput {
-    fn text_summary(&self) -> String {
-        let rows = self
-            .lists
-            .iter()
-            .take(5)
-            .map(|list| {
-                format!(
-                    "{}={}{} ({})",
-                    list.list_id,
-                    list.count,
-                    subject_snippet(list.subject.as_deref()),
-                    list.sample.resource_uri
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} of {} ranked mailing list(s) at offset {}: {rows}",
-            self.lists.len(),
-            self.total,
-            self.offset
-        )
-    }
-}
+impl WireOutput for TopMailingListsOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -994,6 +833,9 @@ pub(super) struct PerMailboxDeleteOutput {
     pub(super) found: usize,
     pub(super) deleted: usize,
     pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
 }
 
 impl From<crate::PerMailboxDeleteResult> for PerMailboxDeleteOutput {
@@ -1003,6 +845,9 @@ impl From<crate::PerMailboxDeleteResult> for PerMailboxDeleteOutput {
             found: value.found,
             deleted: value.deleted,
             failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
         }
     }
 }
@@ -1014,6 +859,9 @@ pub(super) struct DeleteMessagesOutput {
     pub(super) mailbox: String,
     pub(super) deleted: usize,
     pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
     pub(super) trash_fallback: bool,
     pub(super) permanent: bool,
 }
@@ -1025,20 +873,16 @@ impl From<crate::DeleteMessagesResponse> for DeleteMessagesOutput {
             mailbox: value.mailbox,
             deleted: value.deleted,
             failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
             trash_fallback: value.trash_fallback,
             permanent: value.permanent,
         }
     }
 }
 
-impl WireOutput for DeleteMessagesOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "Deleted {} message(s) from {}; {} failed; permanent={}, trashFallback={}",
-            self.deleted, self.mailbox, self.failed, self.permanent, self.trash_fallback
-        )
-    }
-}
+impl WireOutput for DeleteMessagesOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1049,6 +893,9 @@ pub(super) struct DeleteBySenderOutput {
     pub(super) found: usize,
     pub(super) deleted: usize,
     pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
     pub(super) mailboxes: Vec<PerMailboxDeleteOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
@@ -1074,6 +921,9 @@ impl From<crate::DeleteBySenderResponse> for DeleteBySenderOutput {
             found: value.found,
             deleted: value.deleted,
             failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
             mailboxes,
             mailboxes_total,
             mailboxes_truncated,
@@ -1085,14 +935,61 @@ impl From<crate::DeleteBySenderResponse> for DeleteBySenderOutput {
     }
 }
 
-impl WireOutput for DeleteBySenderOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "Found {} message(s) from {}; deleted {}, failed {}, skipped {} mailbox(es); permanent={}",
-            self.found, self.sender, self.deleted, self.failed, self.skipped_total, self.permanent
-        )
+impl WireOutput for DeleteBySenderOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DeleteByDomainOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    /// One exact canonical domain; no subdomains are included implicitly.
+    pub(super) domain: String,
+    pub(super) found: usize,
+    pub(super) deleted: usize,
+    pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
+    pub(super) mailboxes: Vec<PerMailboxDeleteOutput>,
+    pub(super) mailboxes_total: usize,
+    pub(super) mailboxes_truncated: bool,
+    pub(super) skipped: Vec<String>,
+    pub(super) skipped_total: usize,
+    pub(super) skipped_truncated: bool,
+    pub(super) permanent: bool,
+}
+
+impl From<crate::DeleteByDomainResponse> for DeleteByDomainOutput {
+    fn from(value: crate::DeleteByDomainResponse) -> Self {
+        let mailboxes = value
+            .mailboxes
+            .into_iter()
+            .map(PerMailboxDeleteOutput::from)
+            .collect();
+        let (mailboxes, mailboxes_total, mailboxes_truncated) = truncate_rows(mailboxes);
+        let (skipped, skipped_total, skipped_truncated) = truncate_rows(value.skipped);
+        Self {
+            account: value.account,
+            mailbox: value.mailbox,
+            domain: value.domain,
+            found: value.found,
+            deleted: value.deleted,
+            failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
+            mailboxes,
+            mailboxes_total,
+            mailboxes_truncated,
+            skipped,
+            skipped_total,
+            skipped_truncated,
+            permanent: value.permanent,
+        }
     }
 }
+
+impl WireOutput for DeleteByDomainOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1103,6 +1000,9 @@ pub(super) struct DeleteListIdOutput {
     pub(super) found: usize,
     pub(super) deleted: usize,
     pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
     pub(super) mailboxes: Vec<PerMailboxDeleteOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
@@ -1128,6 +1028,9 @@ impl From<crate::DeleteListIdResponse> for DeleteListIdOutput {
             found: value.found,
             deleted: value.deleted,
             failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
             mailboxes,
             mailboxes_total,
             mailboxes_truncated,
@@ -1139,14 +1042,7 @@ impl From<crate::DeleteListIdResponse> for DeleteListIdOutput {
     }
 }
 
-impl WireOutput for DeleteListIdOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "Found {} message(s) for List-Id {}; deleted {}, failed {}, skipped {} mailbox(es); permanent={}",
-            self.found, self.list_id, self.deleted, self.failed, self.skipped_total, self.permanent
-        )
-    }
-}
+impl WireOutput for DeleteListIdOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1156,6 +1052,9 @@ pub(super) struct PerMailboxMoveOutput {
     pub(super) found: usize,
     pub(super) moved: usize,
     pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
 }
 
 impl From<crate::PerMailboxMoveResult> for PerMailboxMoveOutput {
@@ -1165,6 +1064,9 @@ impl From<crate::PerMailboxMoveResult> for PerMailboxMoveOutput {
             found: value.found,
             moved: value.moved,
             failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
         }
     }
 }
@@ -1179,6 +1081,9 @@ pub(super) struct MoveListIdOutput {
     pub(super) found: usize,
     pub(super) moved: usize,
     pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
     pub(super) mailboxes: Vec<PerMailboxMoveOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
@@ -1204,6 +1109,9 @@ impl From<crate::MoveListIdResponse> for MoveListIdOutput {
             found: value.found,
             moved: value.moved,
             failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
             mailboxes,
             mailboxes_total,
             mailboxes_truncated,
@@ -1214,14 +1122,7 @@ impl From<crate::MoveListIdResponse> for MoveListIdOutput {
     }
 }
 
-impl WireOutput for MoveListIdOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "Found {} message(s) for List-Id {}; moved {} to \"{}\", failed {}, skipped {} mailbox(es)",
-            self.found, self.list_id, self.moved, self.destination, self.failed, self.skipped_total
-        )
-    }
-}
+impl WireOutput for MoveListIdOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1233,6 +1134,9 @@ pub(super) struct MoveBySenderOutput {
     pub(super) found: usize,
     pub(super) moved: usize,
     pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
     pub(super) mailboxes: Vec<PerMailboxMoveOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
@@ -1258,6 +1162,9 @@ impl From<crate::MoveBySenderResponse> for MoveBySenderOutput {
             found: value.found,
             moved: value.moved,
             failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
             mailboxes,
             mailboxes_total,
             mailboxes_truncated,
@@ -1268,14 +1175,170 @@ impl From<crate::MoveBySenderResponse> for MoveBySenderOutput {
     }
 }
 
-impl WireOutput for MoveBySenderOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "Found {} message(s) from {}; moved {} to \"{}\", failed {}, skipped {} mailbox(es)",
-            self.found, self.sender, self.moved, self.destination, self.failed, self.skipped_total
-        )
+impl WireOutput for MoveBySenderOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MoveByDomainOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    /// One exact canonical domain; no subdomains are included implicitly.
+    pub(super) domain: String,
+    pub(super) destination: String,
+    pub(super) found: usize,
+    pub(super) moved: usize,
+    pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
+    pub(super) mailboxes: Vec<PerMailboxMoveOutput>,
+    pub(super) mailboxes_total: usize,
+    pub(super) mailboxes_truncated: bool,
+    pub(super) skipped: Vec<String>,
+    pub(super) skipped_total: usize,
+    pub(super) skipped_truncated: bool,
+}
+
+impl From<crate::MoveByDomainResponse> for MoveByDomainOutput {
+    fn from(value: crate::MoveByDomainResponse) -> Self {
+        let mailboxes = value
+            .mailboxes
+            .into_iter()
+            .map(PerMailboxMoveOutput::from)
+            .collect();
+        let (mailboxes, mailboxes_total, mailboxes_truncated) = truncate_rows(mailboxes);
+        let (skipped, skipped_total, skipped_truncated) = truncate_rows(value.skipped);
+        Self {
+            account: value.account,
+            mailbox: value.mailbox,
+            domain: value.domain,
+            destination: value.destination,
+            found: value.found,
+            moved: value.moved,
+            failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
+            mailboxes,
+            mailboxes_total,
+            mailboxes_truncated,
+            skipped,
+            skipped_total,
+            skipped_truncated,
+        }
     }
 }
+
+impl WireOutput for MoveByDomainOutput {}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) enum MoveStatusOutput {
+    Moved,
+    Failed,
+    ReconciliationPending,
+    NeedsAttention,
+}
+
+impl From<crate::MoveStatus> for MoveStatusOutput {
+    fn from(value: crate::MoveStatus) -> Self {
+        match value {
+            crate::MoveStatus::Moved => Self::Moved,
+            crate::MoveStatus::Failed => Self::Failed,
+            crate::MoveStatus::ReconciliationPending => Self::ReconciliationPending,
+            crate::MoveStatus::NeedsAttention => Self::NeedsAttention,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct PendingMoveOutput {
+    pub(super) operation_id: String,
+    pub(super) source_mailbox: String,
+    #[schemars(range(min = 1))]
+    pub(super) source_uid_validity: u32,
+    #[schemars(range(min = 1))]
+    pub(super) source_uid: u32,
+    pub(super) destination: String,
+    pub(super) status: MoveStatusOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) detail: Option<String>,
+    pub(super) created_at: String,
+    pub(super) updated_at: String,
+}
+
+impl From<crate::PendingMove> for PendingMoveOutput {
+    fn from(value: crate::PendingMove) -> Self {
+        Self {
+            operation_id: value.operation_id,
+            source_mailbox: value.source_mailbox,
+            source_uid_validity: value.source_uid_validity,
+            source_uid: value.source_uid,
+            destination: value.destination,
+            status: value.status.into(),
+            detail: value.detail,
+            created_at: value.created_at.to_rfc3339(),
+            updated_at: value.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ListPendingMovesOutput {
+    pub(super) account: String,
+    pub(super) operations: Vec<PendingMoveOutput>,
+}
+
+impl From<crate::ListPendingMovesResponse> for ListPendingMovesOutput {
+    fn from(value: crate::ListPendingMovesResponse) -> Self {
+        Self {
+            account: value.account,
+            operations: value
+                .operations
+                .into_iter()
+                .map(PendingMoveOutput::from)
+                .collect(),
+        }
+    }
+}
+
+impl WireOutput for ListPendingMovesOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ReconcileMovesOutput {
+    pub(super) account: String,
+    pub(super) examined: usize,
+    pub(super) completed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) failed: usize,
+    pub(super) operations: Vec<PendingMoveOutput>,
+}
+
+impl From<crate::ReconcileMovesResponse> for ReconcileMovesOutput {
+    fn from(value: crate::ReconcileMovesResponse) -> Self {
+        Self {
+            account: value.account,
+            examined: value.examined,
+            completed: value.completed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            failed: value.failed,
+            operations: value
+                .operations
+                .into_iter()
+                .map(PendingMoveOutput::from)
+                .collect(),
+        }
+    }
+}
+
+impl WireOutput for ReconcileMovesOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1287,6 +1350,10 @@ pub(super) struct MoveMessageOutput {
     #[schemars(range(min = 1))]
     pub(super) uid: u32,
     pub(super) destination: String,
+    pub(super) moved: bool,
+    pub(super) status: MoveStatusOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) operation_id: Option<String>,
 }
 
 impl MoveMessageOutput {
@@ -1297,18 +1364,14 @@ impl MoveMessageOutput {
             uid_validity,
             uid: value.uid,
             destination: value.destination,
+            moved: value.moved,
+            status: value.status.into(),
+            operation_id: value.operation_id,
         }
     }
 }
 
-impl WireOutput for MoveMessageOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "Moved UID {} (UIDVALIDITY {}) from {} to {}",
-            self.uid, self.uid_validity, self.mailbox, self.destination
-        )
-    }
-}
+impl WireOutput for MoveMessageOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1330,23 +1393,7 @@ impl From<crate::CreateMailboxResponse> for CreateMailboxOutput {
     }
 }
 
-impl WireOutput for CreateMailboxOutput {
-    fn text_summary(&self) -> String {
-        if self.created {
-            format!("Created mailbox {} in {}", self.mailbox, self.account)
-        } else if self.already_exists {
-            format!(
-                "Mailbox {} already exists in {}",
-                self.mailbox, self.account
-            )
-        } else {
-            format!(
-                "Mailbox {} was not created in {}",
-                self.mailbox, self.account
-            )
-        }
-    }
-}
+impl WireOutput for CreateMailboxOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1392,20 +1439,7 @@ impl From<crate::CreateDraftResponse> for CreateDraftOutput {
     }
 }
 
-impl WireOutput for CreateDraftOutput {
-    fn text_summary(&self) -> String {
-        match &self.resource_uri {
-            Some(resource_uri) => format!(
-                "Created draft in {} for {} with {} attachment(s): {resource_uri}",
-                self.drafts_mailbox, self.account, self.attachment_count
-            ),
-            None => format!(
-                "Created draft in {} for {} with {} attachment(s)",
-                self.drafts_mailbox, self.account, self.attachment_count
-            ),
-        }
-    }
-}
+impl WireOutput for CreateDraftOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1458,23 +1492,7 @@ impl DownloadAttachmentsOutput {
     }
 }
 
-impl WireOutput for DownloadAttachmentsOutput {
-    fn text_summary(&self) -> String {
-        let paths = self
-            .downloaded
-            .iter()
-            .take(10)
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "Downloaded {} attachment(s) from UID {} (UIDVALIDITY {}) to: {paths}",
-            self.downloaded.len(),
-            self.uid,
-            self.uid_validity
-        )
-    }
-}
+impl WireOutput for DownloadAttachmentsOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1498,6 +1516,9 @@ pub(super) struct MatchingMessagesOutput {
     pub(super) found: usize,
     pub(super) deleted: usize,
     pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
     pub(super) mailboxes: Vec<PerMailboxDeleteOutput>,
     pub(super) mailboxes_total: usize,
     pub(super) mailboxes_truncated: bool,
@@ -1525,6 +1546,9 @@ impl From<crate::MatchingMessagesResult> for MatchingMessagesOutput {
             found: value.found,
             deleted: value.deleted,
             failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
             mailboxes,
             mailboxes_total,
             mailboxes_truncated,
@@ -1582,26 +1606,7 @@ impl From<crate::UnsubscribeResponse> for UnsubscribeMessageOutput {
     }
 }
 
-impl WireOutput for UnsubscribeMessageOutput {
-    fn text_summary(&self) -> String {
-        let cleanup = self.matching_messages.as_ref().map_or_else(
-            || "no matching-message cleanup".to_string(),
-            |matching| {
-                format!(
-                    "cleanup found {}, deleted {}, failed {}, complete={}",
-                    matching.found, matching.deleted, matching.failed, matching.complete
-                )
-            },
-        );
-        format!(
-            "Unsubscribe success={}, HTTP status={:?}, DKIM verified={}, List-Id authenticated={}; {cleanup}",
-            self.unsubscribed.success,
-            self.unsubscribed.http_status,
-            self.dkim_verified,
-            self.list_id_authenticated
-        )
-    }
-}
+impl WireOutput for UnsubscribeMessageOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1630,18 +1635,7 @@ impl AddFlagsOutput {
     }
 }
 
-impl WireOutput for AddFlagsOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "Updated UID {} (UIDVALIDITY {}) in {}; flags: {}; color: {}",
-            self.uid,
-            self.uid_validity,
-            self.mailbox,
-            self.flags.join(", "),
-            self.color.as_deref().unwrap_or("none")
-        )
-    }
-}
+impl WireOutput for AddFlagsOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1670,18 +1664,7 @@ impl RemoveFlagsOutput {
     }
 }
 
-impl WireOutput for RemoveFlagsOutput {
-    fn text_summary(&self) -> String {
-        format!(
-            "Updated UID {} (UIDVALIDITY {}) in {}; flags: {}; color: {}",
-            self.uid,
-            self.uid_validity,
-            self.mailbox,
-            self.flags.join(", "),
-            self.color.as_deref().unwrap_or("none")
-        )
-    }
-}
+impl WireOutput for RemoveFlagsOutput {}
 
 #[cfg(test)]
 mod tests {
@@ -1726,11 +1709,31 @@ mod tests {
     }
 
     #[test]
-    fn fallback_is_limited_by_characters_without_splitting_unicode() {
-        let value = truncate_fallback("📨".repeat(MAX_FALLBACK_CHARS + 10));
+    fn fallback_contains_the_complete_structured_result() {
+        let result = compact_result(ListAccountsOutput {
+            accounts: (0..8)
+                .map(|index| AccountOutput {
+                    name: format!("account-{index}"),
+                    is_default: index == 0,
+                })
+                .collect(),
+        })
+        .expect("result should serialize");
+        let text = result.content[0]
+            .as_text()
+            .expect("fallback should be text");
+        let fallback: serde_json::Value =
+            serde_json::from_str(&text.text).expect("fallback should be JSON");
 
-        assert_eq!(value.chars().count(), MAX_FALLBACK_CHARS);
-        assert!(value.ends_with('…'));
+        assert_eq!(Some(fallback), result.structured_content);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["accounts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8,
+            "the text fallback must not silently truncate results to five rows"
+        );
     }
 
     #[test]
@@ -1754,14 +1757,21 @@ mod tests {
         assert_ref_free::<ListFlagsOutput>();
         assert_ref_free::<FindAttachmentsOutput>();
         assert_ref_free::<TopSendersOutput>();
+        assert_ref_free::<TopDomainsOutput>();
         assert_ref_free::<TopSubscriptionsOutput>();
         assert_ref_free::<TopMailingListsOutput>();
         assert_ref_free::<CreateMailboxOutput>();
         assert_ref_free::<DeleteMessagesOutput>();
         assert_ref_free::<DeleteBySenderOutput>();
+        assert_ref_free::<DeleteByDomainOutput>();
         assert_ref_free::<DownloadAttachmentsOutput>();
         assert_ref_free::<CreateDraftOutput>();
         assert_ref_free::<MoveMessageOutput>();
+        assert_ref_free::<MoveListIdOutput>();
+        assert_ref_free::<MoveBySenderOutput>();
+        assert_ref_free::<MoveByDomainOutput>();
+        assert_ref_free::<ListPendingMovesOutput>();
+        assert_ref_free::<ReconcileMovesOutput>();
         assert_ref_free::<UnsubscribeMessageOutput>();
         assert_ref_free::<DeleteListIdOutput>();
         assert_ref_free::<AddFlagsOutput>();

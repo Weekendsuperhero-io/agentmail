@@ -9,7 +9,7 @@ imap-proto = { path = "vendor/imap-proto" }
 
 [package]
 name = "agentmail"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.94"
 description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
@@ -30,9 +30,9 @@ name = "agentmail"
 path = "src/main.rs"
 
 [dependencies]
-# IMAP protocol (tokio runtime). `compress` enables RFC 4978 COMPRESS=DEFLATE,
-# negotiated on every connection — a large win on Yahoo/AOL 100k full-header
-# scans. All supported providers advertise COMPRESS=DEFLATE.
+# IMAP protocol (tokio runtime). `compress` enables optional RFC 4978
+# COMPRESS=DEFLATE, negotiated after login only when the server advertises it.
+# It materially reduces transfer size for large full-header scans.
 async-imap = { version = "0.11", default-features = false, features = [
   "runtime-tokio",
   "compress",
@@ -44,15 +44,16 @@ dirs = "6"
 fast_html2md = "0.0"
 futures = "0.3"
 hashbrown = { version = "0.17", features = ["rayon", "serde"] }
+idna = "1"
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 mail-parser = "0.11"
 mail-auth = { version = "0.11.2", default-features = false, features = ["ring"] }
 native-tls = "0.2"
 parking_lot = "0.12"
 percent-encoding = "2"
+psl = "2"
 reqwest = { version = "0.13", features = ["json"] }
-rmcp = { version = "=1.7.0", features = ["server", "macros", "transport-io"] }
-rmcp-macros = "=1.7.0"
+rmcp = { version = "=2.2.0", features = ["server", "macros", "transport-io"] }
 # Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native
 # sqlite — libsqlite3-sys has `links = "sqlite3"`, so exactly one version may

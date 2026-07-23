@@ -72,6 +72,8 @@ impl MailProvider {
             host: self.host().to_string(),
             port: self.port(),
             username: username.to_string(),
+            email: None,
+            aliases: Vec::new(),
             password,
             tls: true,
             max_connections: None,

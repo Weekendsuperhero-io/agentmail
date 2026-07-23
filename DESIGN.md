@@ -2,9 +2,9 @@
 
 ## Overview
 
-Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 21 tools and 6 prompts for reading, searching, composing, organizing, and managing email across multiple accounts.
+Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 28 tools and 6 prompts for reading, searching, composing, organizing, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
 
-MCP protocol: [2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) (also negotiates 2025-03-26 and 2024-11-05) | rmcp 1.4
+MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | rmcp 2.2
 
 No Mail.app dependency. Pure IMAP over TLS. Works on macOS, Linux, and Windows.
 
@@ -20,9 +20,9 @@ graph TB
     end
 
     subgraph "agentmail-mcp (in-process)"
-        MCP[AgentMailServer<br/>21 tools, 6 prompts, tasks]
+        MCP[AgentMailServer<br/>28 tools, 6 prompts, tasks]
         MK[Agentmail Facade]
-        POOL[ConnectionPool<br/>3 sessions/account]
+        POOL[ConnectionPool<br/>provider-aware cap/account]
         CRED[Credential Resolver]
     end
 
@@ -79,12 +79,17 @@ agentmail/
   src/
     lib.rs          # Agentmail facade (25+ async methods)
     main.rs         # CLI dispatch (clap), account configuration
-    mcp.rs          # AgentMailServer, 21 tools, 6 prompts, task manager, serve_on()/serve_stdio()
+    mcp/            # AgentMailServer, tools, prompts, tasks, resources, transports
     imap_client.rs  # Raw IMAP operations (SELECT, FETCH, SEARCH, STORE)
     connection.rs   # Per-account session pool + semaphore concurrency
     config.rs       # AccountConfig, Config (file + programmatic)
     credentials.rs  # Password resolution: env → config secret → default keyring
     secret.rs       # Secret resolution (raw / cmd / keyring)
+    header_cache.rs # Live-validated UID/header ranking projection
+    domain.rs       # Canonical sender-domain and public-suffix handling
+    mutation_journal.rs # Retry-safe mutation reconciliation state
+    mailbox_catalog.rs # Bounded mailbox-layout cache
+    scan_plan.rs    # Discovery and mutation mailbox-selection policy
     provider.rs     # MailProvider enum (Gmail, iCloud, Yahoo, Fastmail)
     parser.rs       # RFC822 parsing via mail-parser
     content.rs      # HTML → Markdown, truncation, cleanup
@@ -99,7 +104,7 @@ agentmail/
 sequenceDiagram
     participant Tool as MCP Tool
     participant Pool as ConnectionPool
-    participant Sem as Semaphore (3)
+    participant Sem as Per-account semaphore
     participant Sessions as Idle Sessions
     participant IMAP as IMAP Server
 
@@ -128,7 +133,7 @@ sequenceDiagram
     Pool->>Sem: release permit
 ```
 
-- Default 3 concurrent IMAP operations per account (configurable via `max_connections`), well within provider limits
+- Default 1 concurrent IMAP operation for Yahoo/AOL and 3 otherwise; configurable from 1 through 32
 - Sessions validated with NOOP before reuse
 - Stale sessions dropped, fresh ones created on demand
 - `PooledSession` auto-releases semaphore permit on drop
@@ -148,7 +153,12 @@ flowchart TD
 
 When running in-process, the agent app calls `init_keyring_with_service("agent")` so passwords are stored under the agent's keyring service, not "agentmail". The signed agent app avoids macOS Keychain popups.
 
-## MCP Tools (21)
+Credential commands run with stdin closed, a 15-second deadline, and 64 KiB
+bounds on each output stream. Non-zero exit, invalid UTF-8, empty output,
+timeout, and overflow are distinct failures. Child processes are killed on
+timeout/drop, and every `Secret` debug representation is redacted.
+
+## MCP Tools
 
 ### Read Operations (read_only_hint = true)
 
@@ -162,9 +172,11 @@ When running in-process, the agent app calls `init_keyring_with_service("agent")
 | `search_messages`     | IMAP SEARCH with text/header/flag filters                        |
 | `list_flags`          | List all flags in use with counts; resolves Apple Mail colors    |
 | `find_attachments`    | Scan for messages with attachments                               |
-| `rank_senders`        | Rank senders by message count                                    |
-| `rank_unsubscribe`    | Rank bulk-mail senders by List-Unsubscribe, sorted by one-click  |
-| `rank_list_id`        | Rank mailing lists by List-Id (RFC 2919), groups across senders  |
+| `top_senders`         | Rank senders by message count                                    |
+| `top_domains`         | Rank exact sender domains/subdomains with a live sample subject  |
+| `top_subscriptions`   | Rank bulk-mail senders by List-Unsubscribe, sorted by one-click  |
+| `top_mailing_lists`   | Rank mailing lists by List-Id (RFC 2919), groups across senders  |
+| `list_pending_moves`  | Inspect durable COPY-fallback operations needing recovery/review |
 
 ### Write Operations
 
@@ -172,8 +184,13 @@ When running in-process, the agent app calls `init_keyring_with_service("agent")
 | ---------------------- | ----------------------------------------------------------------- |
 | `delete_messages`      | Delete by UID (up to 500)                                         |
 | `delete_by_sender`     | Delete all from a sender, optionally across all mailboxes         |
+| `delete_by_domain`     | Delete all from one exact canonical sender domain                 |
 | `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes  |
+| `move_by_sender`       | Move messages from an exact sender identity                       |
+| `move_by_domain`       | Move messages from one exact canonical sender domain              |
+| `move_list_id`         | Move messages with an exact List-Id                               |
 | `move_message`         | IMAP MOVE between mailboxes                                       |
+| `reconcile_moves`      | Safely resume durable COPY-fallback operations                    |
 | `create_mailbox`       | Create new folder                                                 |
 | `create_draft`         | Compose RFC822 → Drafts folder                                    |
 | `add_flags`            | Add flags and/or Apple Mail color (union semantics)               |
@@ -194,7 +211,11 @@ When running in-process, the agent app calls `init_keyring_with_service("agent")
 
 ## Provider Defaults
 
-The `MailProvider` enum provides sensible IMAP defaults per provider. Users only need to enter their email and app password. Trash and drafts mailboxes are auto-detected at runtime via RFC 6154 special-use attributes (`\Trash`, `\Drafts`), with string-matching fallback for servers that don't support RFC 6154.
+The `MailProvider` enum provides sensible IMAP endpoint defaults per provider.
+Authentication can use an app password or an externally refreshed XOAUTH2
+access token. Trash and drafts mailboxes are auto-detected at runtime via RFC
+6154 special-use attributes (`\Trash`, `\Drafts`), with string-matching
+fallback for servers that don't support RFC 6154.
 
 | Provider | Host                    |
 | -------- | ----------------------- |
@@ -217,12 +238,32 @@ Email content flows through a pipeline:
 ## Key Design Decisions
 
 - **Pure IMAP, no Mail.app** — cross-platform, works with any IMAP provider
-- **Connection pooling** — 3 sessions/account avoids provider rate limits while enabling parallelism
+- **Connection pooling** — provider-aware per-account caps avoid login-rate-limit bursts while allowing parallelism where safe
 - **BODY.PEEK throughout** — reading never has side effects
-- **App passwords over OAuth** — simpler for users, no client ID registration needed
+- **Password and XOAUTH2 authentication** — app passwords remain simple for standalone use; OAuth refresh/consent stays in an external token helper
 - **Config file for standalone, runtime injection for in-process** — same library code, different config sources
 - **Passwords in OS keyring, never in DB** — proper security, no key management burden
 - **Mailbox attributes** — RFC 6154 special-use roles (trash, junk, drafts, sent, archive, all, flagged) and RFC 3501 flags (noSelect, noInferiors) surfaced from IMAP LIST. Scan-all operations use roles to skip Trash/Junk/Drafts with string-matching fallback for servers without RFC 6154 support
-- **Tool annotations** — `read_only_hint`, `destructive_hint`, `idempotent_hint` per MCP 2025-06-18 spec
-- **Progress notifications** — long operations (rank_senders, find_attachments) report progress to MCP client
-- **Task support (SEP-1686)** — 9 long-running tools support optional async task invocation (enqueue, poll, cancel). Destructive tasks targeting the same account are serialized to prevent IMAP state conflicts
+- **Tool annotations** — `read_only_hint`, `destructive_hint`, `idempotent_hint`, and optional task execution per MCP 2025-11-25
+- **Progress notifications** — long operations report progress to the MCP client
+- **Task support (SEP-1686)** — taskable operations support enqueue, poll, repeatable result retrieval, and cancellation. Destructive tasks targeting the same account are serialized to prevent IMAP state conflicts
+- **Forward recovery for MOVE** — servers without native UID MOVE use a separate `synchronous=FULL` journal. Ambiguous COPY/cleanup outcomes return durable operation IDs and explicit pending/attention states; reconciliation never repeats COPY without evidence that the earlier attempt created nothing
+
+## Configuration and Local Security
+
+File-loaded configuration is normalized and validated before use. Hosts and
+usernames must be non-empty, ports must be non-zero, `max_connections` must be
+within `1..=32`, an explicit default account must exist, and plaintext IMAP
+(`tls = false`) is refused. The interactive configurator validates the combined
+TOML before replacing it atomically, uses `0600` files on Unix, and disables
+terminal echo for password entry. A primary mailbox `email` is modelled
+separately from the login username, and `aliases` are canonicalized and
+deduplicated for own-address comparisons; opaque IMAP usernames remain valid.
+
+## Verification
+
+Pull requests exercise locked dependencies across Linux, macOS, and Windows.
+Reusable workflows and third-party actions are pinned to immutable commits. A
+weekly `cargo audit` job checks the lockfile, and a scheduled stress workflow
+runs the ignored 216K-message header-cache snapshot test that is too expensive
+for every pull request.

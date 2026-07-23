@@ -12,8 +12,10 @@ pub mod scan_cache;
 pub mod secret;
 pub mod types;
 
+mod domain;
 mod header_cache;
 mod mailbox_catalog;
+mod mutation_journal;
 mod scan_plan;
 mod unsubscribe;
 
@@ -27,7 +29,17 @@ pub use provider::MailProvider;
 pub use secret::init_service_name;
 pub use types::*;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+const MAX_DRAFT_RECIPIENTS: usize = 100;
+const MAX_DRAFT_BODY_BYTES: usize = 1024 * 1024;
+const MAX_DRAFT_ATTACHMENTS: usize = 20;
+const MAX_DRAFT_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_DRAFT_ATTACHMENTS_TOTAL_BYTES: usize = 40 * 1024 * 1024;
+const MAX_DRAFT_MIME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PAGE_OFFSET: usize = 1_000_000;
+const MAX_PAGE_LIMIT: usize = 100;
+const MAX_MAILBOX_PAGE_LIMIT: usize = 500;
 
 /// High-level facade for IMAP operations.
 /// Owns the connection pool and configuration.
@@ -37,6 +49,15 @@ pub struct Agentmail {
     mailbox_catalog: mailbox_catalog::MailboxCatalog,
     /// Persistent UID membership and immutable ranking-header projection.
     header_cache: header_cache::HeaderCache,
+    /// Durable state machine for COPY-based MOVE recovery. This is separate
+    /// from the disposable header cache by design.
+    mutation_journal: mutation_journal::MutationJournal,
+    /// Common per-account mutation boundary. Every public operation that can
+    /// change server state takes this lock, so direct Rust calls and MCP task
+    /// calls cannot race each other.
+    mutation_locks: parking_lot::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
 }
 
 /// Where the header cache lives — the builder's programmatic answer to the
@@ -159,7 +180,20 @@ impl AgentmailBuilder {
         self
     }
 
+    /// Validate and normalize programmatic configuration before construction.
+    /// New embedding code should prefer this over [`Self::build`].
+    pub fn try_build(mut self) -> Result<Agentmail> {
+        self.config.normalize_and_validate()?;
+        Ok(self.finish())
+    }
+
+    /// Build without revalidating configuration. Retained for source
+    /// compatibility; configs loaded from disk have already been validated.
     pub fn build(self) -> Agentmail {
+        self.finish()
+    }
+
+    fn finish(self) -> Agentmail {
         if let Some(timeout) = self.imap_timeout {
             imap_client::set_imap_timeout(timeout);
         }
@@ -176,12 +210,23 @@ impl AgentmailBuilder {
         if let Some(interval) = self.keepalive {
             pool.set_keepalive(interval);
         }
-        let header_cache = match self.cache {
-            CacheLocation::Auto => header_cache::HeaderCache::default(),
-            CacheLocation::Disabled => header_cache::HeaderCache::disabled(),
-            CacheLocation::Dir(dir) => {
-                header_cache::HeaderCache::at_path(dir.join(header_cache::HeaderCache::FILE_NAME))
-            }
+        let (header_cache, mutation_journal) = match self.cache {
+            CacheLocation::Auto => (
+                header_cache::HeaderCache::default(),
+                mutation_journal::MutationJournal::default_persistent(),
+            ),
+            // Disabling the ranking cache must not silently disable mutation
+            // durability. COPY-based MOVE still needs its independent journal.
+            CacheLocation::Disabled => (
+                header_cache::HeaderCache::disabled(),
+                mutation_journal::MutationJournal::default_persistent(),
+            ),
+            CacheLocation::Dir(dir) => (
+                header_cache::HeaderCache::at_path(dir.join(header_cache::HeaderCache::FILE_NAME)),
+                mutation_journal::MutationJournal::at_path(
+                    dir.join(mutation_journal::MutationJournal::FILE_NAME),
+                ),
+            ),
         };
         // Born-UID-Mode defaults to on exactly when the cache can amortize the
         // full-mailbox UID walk; disabling the cache keeps the windowed
@@ -191,6 +236,8 @@ impl AgentmailBuilder {
             pool,
             mailbox_catalog: mailbox_catalog::MailboxCatalog::default(),
             header_cache,
+            mutation_journal,
+            mutation_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -201,6 +248,11 @@ impl Agentmail {
     /// [`Agentmail::builder`] instead.
     pub fn new(config: Config) -> Self {
         Self::builder(config).build()
+    }
+
+    /// Validate and normalize a programmatically assembled configuration.
+    pub fn try_new(config: Config) -> Result<Self> {
+        Self::builder(config).try_build()
     }
 
     /// Start building an [`Agentmail`] with programmatic settings — cache
@@ -246,11 +298,27 @@ impl Agentmail {
     /// user's own sent mail from sender rankings ("skip myself as a sender")
     /// without hiding the Sent folder from other tools.
     fn own_addresses(&self, account: &str) -> hashbrown::HashSet<String> {
-        let mut set = hashbrown::HashSet::new();
-        if let Some(cfg) = self.pool.account_config(account) {
-            set.insert(cfg.username.to_lowercase());
-        }
-        set
+        self.pool
+            .account_config(account)
+            .map(config::AccountConfig::canonical_addresses)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    fn mutation_account_key(&self, account: &str) -> Result<String> {
+        let config = self
+            .pool
+            .account_config(account)
+            .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
+        Ok(format!(
+            "{}:{}|{}|{}:{}",
+            config.host.to_ascii_lowercase(),
+            config.port,
+            u8::from(config.tls),
+            config.username.len(),
+            config.username
+        ))
     }
 
     fn validate_uid_selector(
@@ -269,6 +337,27 @@ impl Agentmail {
             return Err(AgentmailError::MessageNotFound(0));
         }
         Ok(())
+    }
+
+    fn validate_page_with_max(offset: usize, limit: usize, max_limit: usize) -> Result<()> {
+        if offset > MAX_PAGE_OFFSET {
+            return Err(AgentmailError::Other(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}"
+            )));
+        }
+        if !(1..=max_limit).contains(&limit) {
+            return Err(AgentmailError::Other(format!(
+                "limit must be between 1 and {max_limit}"
+            )));
+        }
+        offset.checked_add(limit).ok_or_else(|| {
+            AgentmailError::Other("offset plus limit exceeds the supported range".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn validate_page(offset: usize, limit: usize) -> Result<()> {
+        Self::validate_page_with_max(offset, limit, MAX_PAGE_LIMIT)
     }
 
     async fn live_ranking_headers(
@@ -304,6 +393,26 @@ impl Agentmail {
                 .fence_account_mutation(account, config)
                 .await;
         }
+    }
+
+    /// Serialize every server-side mutation for one account at the library
+    /// boundary. Weak entries keep the map bounded after inactive accounts
+    /// have no queued or running mutation.
+    async fn lock_account_mutation(&self, account: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.mutation_locks.lock();
+            if let Some(lock) = locks.get(account).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                if locks.len() >= 64 {
+                    locks.retain(|_, lock| lock.strong_count() > 0);
+                }
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(account.to_string(), std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 
     /// Resolve server capabilities for an account, using the pool's cache and
@@ -429,6 +538,7 @@ impl Agentmail {
         offset: usize,
         limit: usize,
     ) -> Result<(ListMailboxesResponse, usize)> {
+        Self::validate_page_with_max(offset, limit, MAX_MAILBOX_PAGE_LIMIT)?;
         if !self.pool.config().accounts.contains_key(account) {
             return Err(AgentmailError::AccountNotFound(account.to_string()));
         }
@@ -476,6 +586,7 @@ impl Agentmail {
         account: &str,
         mailbox_name: &str,
     ) -> Result<CreateMailboxResponse> {
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let mut session = self.pool.acquire(account).await?;
 
         // Check if mailbox already exists (make CREATE idempotent)
@@ -523,6 +634,7 @@ impl Agentmail {
         include_content: bool,
         include_headers: bool,
     ) -> Result<GetMessagesResponse> {
+        Self::validate_page(offset, limit)?;
         let (mailbox_s, account_s) = (mailbox.to_string(), account.to_string());
         let (messages, total, uid_validity) = self
             .pool
@@ -604,6 +716,7 @@ impl Agentmail {
         include_content: bool,
         include_headers: bool,
     ) -> Result<SearchMessagesResponse> {
+        Self::validate_page(offset, limit)?;
         let (mailbox_s, account_s, criteria_c) =
             (mailbox.to_string(), account.to_string(), criteria.clone());
         let (messages, total, uid_validity) = self
@@ -735,7 +848,7 @@ impl Agentmail {
         account: &str,
         samples: &[MailboxMessageIdentity],
         cancel: Option<&CancelFn>,
-    ) -> hashbrown::HashMap<(String, u32), String> {
+    ) -> hashbrown::HashMap<(String, u32, u32), String> {
         let SampleSubjects { subjects, missing } = sample_subjects(session, samples, cancel).await;
         if !missing.is_empty() {
             tracing::debug!(
@@ -744,9 +857,9 @@ impl Agentmail {
                 "pruning ranking samples the server no longer has"
             );
             if let Some(config) = self.pool.account_config(account) {
-                for (mailbox, uid) in &missing {
+                for (mailbox, uid_validity, uid) in &missing {
                     self.header_cache
-                        .prune_uid(account, config, mailbox, *uid)
+                        .prune_uid(account, config, mailbox, *uid_validity, *uid)
                         .await;
                 }
             }
@@ -787,6 +900,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopSendersResponse> {
+        Self::validate_page(offset, limit)?;
         for attempt in 1..=Self::SCAN_RESUME_ATTEMPTS {
             match self
                 .top_senders_once(mailbox, account, offset, limit, on_progress, cancel)
@@ -896,11 +1010,11 @@ impl Agentmail {
             .live_ranking_headers(session.session(), &mailboxes, on_progress, cancel)
             .await?;
         for (mbox, row) in live_rows {
-            if row.sender_email.is_empty() || own.contains(&row.sender_email) {
-                continue;
-            }
             if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
                 continue; // already counted this message from another folder
+            }
+            if row.sender_email.is_empty() || own.contains(&row.sender_email) {
+                continue;
             }
             let key = (row.sender_email.clone(), row.sender_name.clone());
             let uid_validity =
@@ -971,7 +1085,9 @@ impl Agentmail {
         });
 
         let unique_senders = senders.len();
-        let total_messages = senders.iter().map(|s| s.count).sum::<u32>();
+        let total_messages = senders
+            .iter()
+            .fold(0_u32, |total, sender| total.saturating_add(sender.count));
         let senders: Vec<_> = senders.into_iter().skip(offset).take(limit).collect();
         let item_count = senders.len();
 
@@ -984,6 +1100,251 @@ impl Agentmail {
             limit,
             next_offset: next_offset(offset, item_count, unique_senders),
             senders,
+        })
+    }
+
+    /// Group messages by the exact canonical domain of the first parsed
+    /// Header From address. Parent domains and subdomains are separate rows;
+    /// the Header From value is organizational metadata, not proof of DKIM
+    /// ownership.
+    pub async fn top_domains(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        offset: usize,
+        limit: usize,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<TopDomainsResponse> {
+        Self::validate_page(offset, limit)?;
+        for attempt in 1..=Self::SCAN_RESUME_ATTEMPTS {
+            match self
+                .top_domains_once(mailbox, account, offset, limit, on_progress, cancel)
+                .await
+            {
+                Err(error)
+                    if error.is_connection_error() && attempt < Self::SCAN_RESUME_ATTEMPTS =>
+                {
+                    Self::scan_resume_backoff(attempt, "top_domains", cancel).await?;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the final attempt always returns")
+    }
+
+    async fn top_domains_once(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        offset: usize,
+        limit: usize,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<TopDomainsResponse> {
+        let (mut session, uid_mode) = self.acquire_uid_scan(account).await?;
+        let mailboxes = match mailbox {
+            Some(mailbox) => vec![mailbox.to_string()],
+            None => {
+                self.account_scan_mailboxes(
+                    account,
+                    session.session(),
+                    scan_plan::ScanPurpose::Discovery,
+                )
+                .await?
+            }
+        };
+        let config = self
+            .pool
+            .account_config(account)
+            .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
+        let own = self.own_addresses(account);
+        let own_vec = own.iter().cloned().collect::<Vec<_>>();
+
+        if let Some(page) = self
+            .header_cache
+            .top_domains_page(
+                session.session(),
+                account,
+                config,
+                &mailboxes,
+                uid_mode,
+                &own_vec,
+                offset,
+                limit,
+                on_progress,
+                cancel,
+            )
+            .await?
+        {
+            let unique_domains = usize::try_from(page.total_groups).unwrap_or(usize::MAX);
+            let total_messages = u32::try_from(page.total_messages).unwrap_or(u32::MAX);
+            let cached_row_count = page.items.len();
+            let cached_domains = page
+                .items
+                .into_iter()
+                .map(|row| {
+                    let identity = domain::domain_identity(&row.domain)?;
+                    Some(DomainSummary {
+                        domain: identity.domain,
+                        registrable_domain: identity.registrable_domain,
+                        subdomain: identity.subdomain,
+                        count: u32::try_from(row.count).unwrap_or(u32::MAX),
+                        sample: MailboxMessageIdentity {
+                            mailbox: row.sample.mailbox,
+                            uid_validity: row.sample.uid_validity,
+                            uid: row.sample.uid,
+                        },
+                        subject: None,
+                        oldest_date: row.oldest_date,
+                        newest_date: row.newest_date,
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(mut domains) = cached_domains {
+                let samples = domains
+                    .iter()
+                    .map(|row| row.sample.clone())
+                    .collect::<Vec<_>>();
+                let subjects = self
+                    .page_sample_subjects(session.session(), account, &samples, cancel)
+                    .await;
+                for row in &mut domains {
+                    row.subject = subjects
+                        .get(&(
+                            row.sample.mailbox.clone(),
+                            row.sample.uid_validity,
+                            row.sample.uid,
+                        ))
+                        .cloned();
+                }
+                Self::uid_mode_release(session, uid_mode).await;
+                return Ok(TopDomainsResponse {
+                    mailbox: mailbox.unwrap_or("*").to_string(),
+                    account: account.to_string(),
+                    total_messages,
+                    unique_domains,
+                    offset,
+                    limit,
+                    next_offset: next_offset(offset, domains.len(), unique_domains),
+                    domains,
+                });
+            } else {
+                tracing::warn!(
+                    target: "agentmail",
+                    cached_rows = cached_row_count,
+                    "domain cache contained an invalid canonical domain; using live ranking"
+                );
+                // Keep the acquired session and continue through the live
+                // path. Silently filtering a corrupt SQL row would make
+                // OFFSET pagination repeat or skip otherwise valid groups.
+            }
+        }
+
+        use hashbrown::{HashMap, HashSet};
+        let mut grouped: HashMap<String, DomainSummary> = HashMap::new();
+        let mut seen = HashSet::new();
+        let rows = self
+            .live_ranking_headers(session.session(), &mailboxes, on_progress, cancel)
+            .await?;
+        for (source_mailbox, row) in rows {
+            if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
+                continue;
+            }
+            if row.sender_email.is_empty() || own.contains(&row.sender_email) {
+                continue;
+            }
+            let Some(identity) = domain::domain_from_address(&row.sender_email)
+                .and_then(|domain| domain::domain_identity(&domain))
+            else {
+                continue;
+            };
+            let uid_validity =
+                row.uid_validity
+                    .ok_or_else(|| AgentmailError::UidValidityUnavailable {
+                        mailbox: source_mailbox.clone(),
+                    })?;
+            let entry = grouped
+                .entry(identity.domain.clone())
+                .or_insert_with(|| DomainSummary {
+                    domain: identity.domain,
+                    registrable_domain: identity.registrable_domain,
+                    subdomain: identity.subdomain,
+                    count: 0,
+                    sample: MailboxMessageIdentity {
+                        mailbox: source_mailbox.clone(),
+                        uid_validity,
+                        uid: row.uid,
+                    },
+                    subject: None,
+                    oldest_date: None,
+                    newest_date: None,
+                });
+            entry.count = entry.count.saturating_add(1);
+            if ranking_sample_is_newer(
+                (row.date, &source_mailbox, row.uid),
+                (
+                    entry.newest_date,
+                    Some(entry.sample.mailbox.as_str()),
+                    entry.sample.uid,
+                ),
+                entry.count == 1,
+            ) {
+                entry.sample = MailboxMessageIdentity {
+                    mailbox: source_mailbox,
+                    uid_validity,
+                    uid: row.uid,
+                };
+            }
+            if let Some(date) = row.date {
+                entry.oldest_date = Some(entry.oldest_date.map_or(date, |oldest| oldest.min(date)));
+                entry.newest_date = Some(entry.newest_date.map_or(date, |newest| newest.max(date)));
+            }
+        }
+
+        let mut domains = grouped.into_values().collect::<Vec<_>>();
+        domains.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.domain.cmp(&right.domain))
+        });
+        let unique_domains = domains.len();
+        let total_messages = domains
+            .iter()
+            .fold(0_u32, |total, row| total.saturating_add(row.count));
+        let mut domains = domains
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        let samples = domains
+            .iter()
+            .map(|row| row.sample.clone())
+            .collect::<Vec<_>>();
+        let subjects = self
+            .page_sample_subjects(session.session(), account, &samples, cancel)
+            .await;
+        for row in &mut domains {
+            row.subject = subjects
+                .get(&(
+                    row.sample.mailbox.clone(),
+                    row.sample.uid_validity,
+                    row.sample.uid,
+                ))
+                .cloned();
+        }
+        imap_client::check_cancel(cancel)?;
+        Self::uid_mode_release(session, uid_mode).await;
+        Ok(TopDomainsResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            total_messages,
+            unique_domains,
+            offset,
+            limit,
+            next_offset: next_offset(offset, domains.len(), unique_domains),
+            domains,
         })
     }
 
@@ -1003,6 +1364,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopSubscriptionsResponse> {
+        Self::validate_page(offset, limit)?;
         for attempt in 1..=Self::SCAN_RESUME_ATTEMPTS {
             match self
                 .top_subscriptions_once(mailbox, account, offset, limit, on_progress, cancel)
@@ -1095,7 +1457,11 @@ impl Agentmail {
                 .await;
             for row in &mut lists {
                 row.subject = subjects
-                    .get(&(row.sample.mailbox.clone(), row.sample.uid))
+                    .get(&(
+                        row.sample.mailbox.clone(),
+                        row.sample.uid_validity,
+                        row.sample.uid,
+                    ))
                     .cloned();
             }
             Self::uid_mode_release(session, uid_mode).await;
@@ -1125,14 +1491,14 @@ impl Agentmail {
             .live_ranking_headers(session.session(), &mailboxes, on_progress, cancel)
             .await?;
         for (mbox, row) in live_rows {
+            if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
+                continue; // already counted this message from another folder
+            }
             if (row.list_unsubscribe.is_none() && row.list_unsubscribe_post.is_none())
                 || row.sender_email.is_empty()
                 || own.contains(&row.sender_email)
             {
                 continue;
-            }
-            if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
-                continue; // already counted this message from another folder
             }
             let key = (row.sender_email.clone(), row.sender_name.clone());
             let uid_validity =
@@ -1217,7 +1583,9 @@ impl Agentmail {
         });
 
         let unique_lists = lists.len();
-        let total_messages = lists.iter().map(|l| l.count).sum::<u32>();
+        let total_messages = lists
+            .iter()
+            .fold(0_u32, |total, list| total.saturating_add(list.count));
         let mut lists: Vec<_> = lists.into_iter().skip(offset).take(limit).collect();
         let item_count = lists.len();
 
@@ -1230,7 +1598,11 @@ impl Agentmail {
             .await;
         for row in &mut lists {
             row.subject = subjects
-                .get(&(row.sample.mailbox.clone(), row.sample.uid))
+                .get(&(
+                    row.sample.mailbox.clone(),
+                    row.sample.uid_validity,
+                    row.sample.uid,
+                ))
                 .cloned();
         }
         session.release().await;
@@ -1260,6 +1632,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<TopMailingListsResponse> {
+        Self::validate_page(offset, limit)?;
         for attempt in 1..=Self::SCAN_RESUME_ATTEMPTS {
             match self
                 .top_mailing_lists_once(mailbox, account, offset, limit, on_progress, cancel)
@@ -1345,7 +1718,11 @@ impl Agentmail {
                 .await;
             for row in &mut lists {
                 row.subject = subjects
-                    .get(&(row.sample.mailbox.clone(), row.sample.uid))
+                    .get(&(
+                        row.sample.mailbox.clone(),
+                        row.sample.uid_validity,
+                        row.sample.uid,
+                    ))
                     .cloned();
             }
             Self::uid_mode_release(session, uid_mode).await;
@@ -1383,6 +1760,9 @@ impl Agentmail {
             .live_ranking_headers(session.session(), &mailboxes, on_progress, cancel)
             .await?;
         for (mbox, row) in live_rows {
+            if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
+                continue; // already counted this message from another folder
+            }
             let raw_list_id = match row.list_id {
                 Some(ref id) if !id.is_empty() => id.clone(),
                 _ => continue, // Skip messages without List-Id
@@ -1390,10 +1770,6 @@ impl Agentmail {
             let Some(list_id) = normalize_list_id(&raw_list_id) else {
                 continue;
             };
-            if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
-                continue; // already counted this message from another folder
-            }
-
             let uid_validity =
                 row.uid_validity
                     .ok_or_else(|| AgentmailError::UidValidityUnavailable {
@@ -1480,7 +1856,9 @@ impl Agentmail {
         });
 
         let unique_lists = lists.len();
-        let total_messages = lists.iter().map(|l| l.count).sum::<u32>();
+        let total_messages = lists
+            .iter()
+            .fold(0_u32, |total, list| total.saturating_add(list.count));
         let mut lists: Vec<_> = lists.into_iter().skip(offset).take(limit).collect();
         let item_count = lists.len();
 
@@ -1493,7 +1871,11 @@ impl Agentmail {
             .await;
         for row in &mut lists {
             row.subject = subjects
-                .get(&(row.sample.mailbox.clone(), row.sample.uid))
+                .get(&(
+                    row.sample.mailbox.clone(),
+                    row.sample.uid_validity,
+                    row.sample.uid,
+                ))
                 .cloned();
         }
         session.release().await;
@@ -1643,10 +2025,23 @@ impl Agentmail {
                 bulk_only,
                 list_id,
             } => {
-                let criteria = SearchCriteria {
-                    from: Some(email.clone()),
-                    deleted: Some(false),
-                    ..Default::default()
+                let sender_has_idn = domain::domain_from_address(email)
+                    .is_some_and(|domain| domain.split('.').any(|label| label.starts_with("xn--")));
+                let criteria = if sender_has_idn {
+                    // The public sender identity uses an IDNA A-label, while
+                    // the header may contain the equivalent EAI U-label.
+                    // Search every non-deleted visible row, then confirm the
+                    // exact canonical sender below.
+                    SearchCriteria {
+                        deleted: Some(false),
+                        ..Default::default()
+                    }
+                } else {
+                    SearchCriteria {
+                        from: Some(email.clone()),
+                        deleted: Some(false),
+                        ..Default::default()
+                    }
                 };
                 let query = imap_client::build_search_query_pub(&criteria)?;
                 let candidates = imap_client::search_uids(session, &query).await?;
@@ -1675,6 +2070,71 @@ impl Agentmail {
                         .map(|(uid, _, _)| uid)
                         .collect())
                 }
+            }
+            DeleteSelector::Domain(expected_domain) => {
+                let expected_domain =
+                    domain::canonicalize_domain(expected_domain).ok_or_else(|| {
+                        AgentmailError::Other("domain must be a valid DNS domain name".to_string())
+                    })?;
+                let mut candidates = if expected_domain
+                    .split('.')
+                    .any(|label| label.starts_with("xn--"))
+                {
+                    // IMAP servers are not required to normalize an EAI
+                    // U-label in From to the equivalent IDNA A-label used by
+                    // the public domain identity. Enumerate the visible set
+                    // for IDNs, then let the live parser below canonicalize
+                    // exact matches. The outer drain/UID-Mode logic preserves
+                    // whole-mailbox coverage on windowed providers.
+                    let criteria = SearchCriteria {
+                        deleted: Some(false),
+                        ..Default::default()
+                    };
+                    let query = imap_client::build_search_query_pub(&criteria)?;
+                    imap_client::search_uids(session, &query).await?
+                } else {
+                    let criteria = SearchCriteria {
+                        // Candidate search only. The live From parse below is
+                        // the mutation authority and enforces exact equality.
+                        from: Some(format!("@{expected_domain}")),
+                        deleted: Some(false),
+                        ..Default::default()
+                    };
+                    let query = imap_client::build_search_query_pub(&criteria)?;
+                    imap_client::search_uids(session, &query).await?
+                };
+                if let (Some(config), Some(uid_validity)) =
+                    (self.pool.account_config(account), mb.uid_validity)
+                {
+                    candidates.extend(
+                        self.header_cache
+                            .cached_domain_uids(
+                                account,
+                                config,
+                                mbox,
+                                &expected_domain,
+                                uid_validity,
+                            )
+                            .await,
+                    );
+                }
+                candidates.sort_unstable();
+                candidates.dedup();
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let own = self.own_addresses(account);
+                let fetched =
+                    imap_client::fetch_senders_batch(session, &candidates, cancel).await?;
+                Ok(fetched
+                    .into_iter()
+                    .filter(|(_uid, email, _name)| {
+                        !own.contains(email)
+                            && domain::domain_from_address(email).as_deref()
+                                == Some(expected_domain.as_str())
+                    })
+                    .map(|(uid, _, _)| uid)
+                    .collect())
             }
         }
     }
@@ -1720,9 +2180,25 @@ impl Agentmail {
                 cancel,
             )
             .await;
-        // Release routes by the UID-Mode mark: UID store or the Limited pool.
-        Self::uid_mode_release(session, uid_mode).await;
-        outcome
+        match outcome {
+            Ok(totals) if totals.session_usable => {
+                // Release routes by the UID-Mode mark: UID store or Limited.
+                Self::uid_mode_release(session, uid_mode).await;
+                Ok(totals)
+            }
+            Ok(totals) => {
+                // A timeout/EOF after mutation bytes makes the connection
+                // unsafe to reuse even though the durable result is useful.
+                drop(session);
+                Ok(totals)
+            }
+            Err(error) => {
+                // Conservative for every failed mutation path: a healthy
+                // subsequent call can reconnect, a desynchronized one cannot.
+                drop(session);
+                Err(error)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1743,10 +2219,13 @@ impl Agentmail {
         let mut totals = SweepTotals::default();
         let mut cache_dirtied = false;
 
-        for mbox in mailboxes {
+        for (mailbox_index, mbox) in mailboxes.iter().enumerate() {
             let mut mailbox_found = 0usize;
             let mut mailbox_affected = 0usize;
             let mut mailbox_failed = 0usize;
+            let mut mailbox_pending = 0usize;
+            let mut mailbox_needs_attention = 0usize;
+            let mut mailbox_operation_ids = Vec::new();
             let mut drained = false;
             for _pass in 0..Self::MAX_WINDOW_DRAIN_PASSES {
                 imap_client::check_cancel(cancel)?;
@@ -1786,42 +2265,95 @@ impl Agentmail {
                     self.fence_header_cache_mutation(account).await;
                     cache_dirtied = true;
                 }
-                let (affected, failed) = match action {
-                    SweepAction::Delete {
-                        trash,
-                        allow_permanent_fallback,
-                    } => {
-                        let result = imap_client::bulk_delete_messages_with_policy(
-                            session,
-                            &uids,
+                let (affected, failed, pending, needs_attention, operation_ids, session_usable) =
+                    match action {
+                        SweepAction::Delete {
                             trash,
-                            caps,
                             allow_permanent_fallback,
-                            on_progress,
-                            cancel,
-                        )
-                        .await?;
-                        totals.trash_fallback |= result.trash_fallback;
-                        (result.deleted.len(), result.failed.len())
-                    }
-                    SweepAction::Move { destination } => {
-                        let result = imap_client::bulk_move_messages(
-                            session,
-                            &uids,
-                            destination,
-                            caps,
-                            on_progress,
-                            cancel,
-                        )
-                        .await?;
-                        (result.moved.len(), result.failed.len())
-                    }
-                };
-                imap_client::sync(session).await?;
+                        } => {
+                            let account_key = if trash.is_some() && !caps.has_move() {
+                                self.mutation_account_key(account)?
+                            } else {
+                                String::new()
+                            };
+                            let source_uid_validity = mb.uid_validity.ok_or_else(|| {
+                                AgentmailError::UidValidityUnavailable {
+                                    mailbox: mbox.clone(),
+                                }
+                            })?;
+                            let result = imap_client::bulk_delete_messages_with_policy(
+                                session,
+                                &uids,
+                                trash,
+                                caps,
+                                allow_permanent_fallback,
+                                imap_client::JournalMoveContext {
+                                    journal: &self.mutation_journal,
+                                    account_key: &account_key,
+                                    source_mailbox: mbox,
+                                    source_uid_validity,
+                                },
+                                on_progress,
+                                cancel,
+                            )
+                            .await?;
+                            totals.trash_fallback |= result.trash_fallback;
+                            (
+                                result.deleted.len(),
+                                result.failed.len(),
+                                result.pending.len(),
+                                result.needs_attention.len(),
+                                result.operation_ids,
+                                result.session_usable,
+                            )
+                        }
+                        SweepAction::Move { destination } => {
+                            let account_key = if caps.has_move() {
+                                String::new()
+                            } else {
+                                self.mutation_account_key(account)?
+                            };
+                            let source_uid_validity = mb.uid_validity.ok_or_else(|| {
+                                AgentmailError::UidValidityUnavailable {
+                                    mailbox: mbox.clone(),
+                                }
+                            })?;
+                            let result = imap_client::bulk_move_messages(
+                                session,
+                                &uids,
+                                destination,
+                                caps,
+                                imap_client::JournalMoveContext {
+                                    journal: &self.mutation_journal,
+                                    account_key: &account_key,
+                                    source_mailbox: mbox,
+                                    source_uid_validity,
+                                },
+                                on_progress,
+                                cancel,
+                            )
+                            .await?;
+                            (
+                                result.moved.len(),
+                                result.failed.len(),
+                                result.pending.len(),
+                                result.needs_attention.len(),
+                                result.operation_ids,
+                                result.session_usable,
+                            )
+                        }
+                    };
+                totals.session_usable &= session_usable;
+                if session_usable {
+                    imap_client::sync(session).await?;
+                }
                 mailbox_found += uids.len();
                 mailbox_affected += affected;
                 mailbox_failed += failed;
-                if affected == 0 {
+                mailbox_pending += pending;
+                mailbox_needs_attention += needs_attention;
+                mailbox_operation_ids.extend(operation_ids);
+                if affected == 0 || !session_usable {
                     drained = true;
                     break;
                 }
@@ -1832,13 +2364,31 @@ impl Agentmail {
             totals.found += mailbox_found;
             totals.affected += mailbox_affected;
             totals.failed += mailbox_failed;
+            totals.pending += mailbox_pending;
+            totals.needs_attention += mailbox_needs_attention;
+            totals
+                .operation_ids
+                .extend(mailbox_operation_ids.iter().cloned());
             if mailbox_found > 0 {
                 totals.mailboxes.push(SweepMailboxTally {
                     mailbox: mbox.clone(),
                     found: mailbox_found,
                     affected: mailbox_affected,
                     failed: mailbox_failed,
+                    pending: mailbox_pending,
+                    needs_attention: mailbox_needs_attention,
+                    operation_ids: mailbox_operation_ids,
                 });
+            }
+            if !totals.session_usable {
+                // No later mailbox was attempted after an ambiguous mutation
+                // invalidated this connection. Report that coverage gap
+                // explicitly instead of returning an apparently complete
+                // account-wide result.
+                totals
+                    .skipped
+                    .extend(mailboxes.iter().skip(mailbox_index + 1).cloned());
+                break;
             }
         }
         Ok(totals)
@@ -1853,11 +2403,12 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteListIdResponse> {
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self
             .trash_for_mode(mode, account, session.session(), &caps)
-            .await;
+            .await?;
         if let Err(error) = Self::require_disposal_path(mode, trash.as_deref(), &caps) {
             session.release().await;
             return Err(error);
@@ -1898,6 +2449,9 @@ impl Agentmail {
             found: totals.found,
             deleted: totals.affected,
             failed: totals.failed,
+            pending: totals.pending,
+            needs_attention: totals.needs_attention,
+            operation_ids: totals.operation_ids,
             mailboxes: delete_tallies(totals.mailboxes),
             skipped: totals.skipped,
             permanent: mode == DeleteMode::Permanent,
@@ -2022,6 +2576,7 @@ impl Agentmail {
         color: Option<&str>,
     ) -> Result<UpdateFlagsResponse> {
         Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let mut session = self.pool.acquire(account).await?;
         imap_client::select_with_expected_uid_validity(
             session.session(),
@@ -2085,6 +2640,7 @@ impl Agentmail {
         remove_color: bool,
     ) -> Result<UpdateFlagsResponse> {
         Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let mut session = self.pool.acquire(account).await?;
         imap_client::select_with_expected_uid_validity(
             session.session(),
@@ -2141,6 +2697,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<FindAttachmentsResponse> {
+        Self::validate_page(offset, limit)?;
         let mut session = self.pool.acquire(account).await?;
 
         let mailboxes = match mailbox {
@@ -2235,6 +2792,7 @@ impl Agentmail {
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteMessagesResponse> {
         Self::validate_uid_selector(mailbox, expected_uid_validity, uids)?;
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         imap_client::select_with_expected_uid_validity(
@@ -2245,7 +2803,7 @@ impl Agentmail {
         .await?;
         let trash = self
             .trash_for_mode(mode, account, session.session(), &caps)
-            .await;
+            .await?;
         if let Err(error) = Self::require_disposal_path(mode, trash.as_deref(), &caps) {
             session.release().await;
             return Err(error);
@@ -2261,24 +2819,42 @@ impl Agentmail {
         }
         // No silent permanent escalation: a failed Trash MOVE is reported as
         // failed UIDs, never upgraded to EXPUNGE the caller did not request.
+        let account_key = if trash.is_some() && !caps.has_move() {
+            self.mutation_account_key(account)?
+        } else {
+            String::new()
+        };
         let result = imap_client::bulk_delete_messages_with_policy(
             session.session(),
             uids,
             trash.as_deref(),
             &caps,
             false,
+            imap_client::JournalMoveContext {
+                journal: &self.mutation_journal,
+                account_key: &account_key,
+                source_mailbox: mailbox,
+                source_uid_validity: expected_uid_validity,
+            },
             on_progress,
             cancel,
         )
         .await?;
-        imap_client::sync(session.session()).await?;
-        session.release().await;
+        if result.session_usable {
+            imap_client::sync(session.session()).await?;
+            session.release().await;
+        } else {
+            drop(session);
+        }
 
         Ok(DeleteMessagesResponse {
             mailbox: mailbox.to_string(),
             account: account.to_string(),
             deleted: result.deleted.len(),
             failed: result.failed.len(),
+            pending: result.pending.len(),
+            needs_attention: result.needs_attention.len(),
+            operation_ids: result.operation_ids,
             trash_fallback: result.trash_fallback,
             permanent: mode == DeleteMode::Permanent,
         })
@@ -2301,24 +2877,26 @@ impl Agentmail {
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteBySenderResponse> {
         let email = email.trim();
-        if email.is_empty() {
+        if email.is_empty() || email.contains(['<', '>', '\r', '\n', '\0']) {
             return Err(AgentmailError::Other(
-                "sender email is required (use address from a top_senders/top_subscriptions row)"
+                "sender email must be a bare address (use address from a top_senders/top_subscriptions row)"
                     .to_string(),
             ));
         }
+        let email = parser::canonical_sender_address(email);
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self
             .trash_for_mode(mode, account, session.session(), &caps)
-            .await;
+            .await?;
         if let Err(error) = Self::require_disposal_path(mode, trash.as_deref(), &caps) {
             session.release().await;
             return Err(error);
         }
 
         let sender_display = if name.is_empty() {
-            email.to_string()
+            email.clone()
         } else {
             format!("{name} <{email}>")
         };
@@ -2340,7 +2918,7 @@ impl Agentmail {
                 session,
                 account,
                 DeleteSelector::Sender {
-                    email: email.to_string(),
+                    email,
                     name: name.to_string(),
                     bulk_only: false,
                     list_id: None,
@@ -2363,6 +2941,75 @@ impl Agentmail {
             found: totals.found,
             deleted: totals.affected,
             failed: totals.failed,
+            pending: totals.pending,
+            needs_attention: totals.needs_attention,
+            operation_ids: totals.operation_ids,
+            mailboxes: delete_tallies(totals.mailboxes),
+            skipped: totals.skipped,
+            permanent: mode == DeleteMode::Permanent,
+        })
+    }
+
+    /// Delete messages whose first parsed Header From address has one exact
+    /// canonical domain. `example.com` never includes `mail.example.com`.
+    pub async fn delete_by_domain(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        domain: &str,
+        mode: DeleteMode,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<DeleteByDomainResponse> {
+        let domain = domain::canonicalize_domain(domain).ok_or_else(|| {
+            AgentmailError::Other("domain must be a valid DNS domain name".to_string())
+        })?;
+        let _mutation_guard = self.lock_account_mutation(account).await;
+        let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
+        let trash = self
+            .trash_for_mode(mode, account, session.session(), &caps)
+            .await?;
+        if let Err(error) = Self::require_disposal_path(mode, trash.as_deref(), &caps) {
+            session.release().await;
+            return Err(error);
+        }
+        let mailboxes = match mailbox {
+            Some(mailbox) => vec![mailbox.to_string()],
+            None => {
+                self.account_scan_mailboxes(
+                    account,
+                    session.session(),
+                    scan_plan::ScanPurpose::Mutation,
+                )
+                .await?
+            }
+        };
+        let totals = self
+            .matching_sweep(
+                session,
+                account,
+                DeleteSelector::Domain(domain.clone()),
+                &mailboxes,
+                SweepAction::Delete {
+                    trash: trash.as_deref(),
+                    allow_permanent_fallback: false,
+                },
+                &caps,
+                on_progress,
+                cancel,
+            )
+            .await?;
+        Ok(DeleteByDomainResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            domain,
+            found: totals.found,
+            deleted: totals.affected,
+            failed: totals.failed,
+            pending: totals.pending,
+            needs_attention: totals.needs_attention,
+            operation_ids: totals.operation_ids,
             mailboxes: delete_tallies(totals.mailboxes),
             skipped: totals.skipped,
             permanent: mode == DeleteMode::Permanent,
@@ -2459,6 +3106,7 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<MoveListIdResponse> {
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let totals = self
             .move_sweep(
                 mailbox,
@@ -2477,6 +3125,9 @@ impl Agentmail {
             found: totals.found,
             moved: totals.affected,
             failed: totals.failed,
+            pending: totals.pending,
+            needs_attention: totals.needs_attention,
+            operation_ids: totals.operation_ids,
             mailboxes: move_tallies(totals.mailboxes),
             skipped: totals.skipped,
         })
@@ -2499,14 +3150,16 @@ impl Agentmail {
         cancel: Option<&CancelFn>,
     ) -> Result<MoveBySenderResponse> {
         let email = email.trim();
-        if email.is_empty() {
+        if email.is_empty() || email.contains(['<', '>', '\r', '\n', '\0']) {
             return Err(AgentmailError::Other(
-                "sender email is required (use address from a top_senders/top_subscriptions row)"
+                "sender email must be a bare address (use address from a top_senders/top_subscriptions row)"
                     .to_string(),
             ));
         }
+        let email = parser::canonical_sender_address(email);
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let sender_display = if name.is_empty() {
-            email.to_string()
+            email.clone()
         } else {
             format!("{name} <{email}>")
         };
@@ -2515,7 +3168,7 @@ impl Agentmail {
                 mailbox,
                 account,
                 DeleteSelector::Sender {
-                    email: email.to_string(),
+                    email,
                     name: name.to_string(),
                     bulk_only: false,
                     list_id: None,
@@ -2533,8 +3186,171 @@ impl Agentmail {
             found: totals.found,
             moved: totals.affected,
             failed: totals.failed,
+            pending: totals.pending,
+            needs_attention: totals.needs_attention,
+            operation_ids: totals.operation_ids,
             mailboxes: move_tallies(totals.mailboxes),
             skipped: totals.skipped,
+        })
+    }
+
+    /// Move messages from one exact canonical Header From domain. Subdomains
+    /// remain independent rows/actions.
+    pub async fn move_by_domain(
+        &self,
+        mailbox: Option<&str>,
+        account: &str,
+        domain: &str,
+        destination: &str,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<MoveByDomainResponse> {
+        let domain = domain::canonicalize_domain(domain).ok_or_else(|| {
+            AgentmailError::Other("domain must be a valid DNS domain name".to_string())
+        })?;
+        let _mutation_guard = self.lock_account_mutation(account).await;
+        let totals = self
+            .move_sweep(
+                mailbox,
+                account,
+                DeleteSelector::Domain(domain.clone()),
+                destination,
+                on_progress,
+                cancel,
+            )
+            .await?;
+        Ok(MoveByDomainResponse {
+            mailbox: mailbox.unwrap_or("*").to_string(),
+            account: account.to_string(),
+            domain,
+            destination: destination.trim().to_string(),
+            found: totals.found,
+            moved: totals.affected,
+            failed: totals.failed,
+            pending: totals.pending,
+            needs_attention: totals.needs_attention,
+            operation_ids: totals.operation_ids,
+            mailboxes: move_tallies(totals.mailboxes),
+            skipped: totals.skipped,
+        })
+    }
+
+    /// List durable COPY-based MOVE operations that are awaiting cleanup or
+    /// explicit review. Native UID MOVE never needs journal entries.
+    pub async fn list_pending_moves(&self, account: &str) -> Result<ListPendingMovesResponse> {
+        let account_key = self.mutation_account_key(account)?;
+        let operations = self
+            .mutation_journal
+            .list_pending(&account_key)
+            .await?
+            .into_iter()
+            .map(pending_move_from_operation)
+            .collect();
+        Ok(ListPendingMovesResponse {
+            account: account.to_string(),
+            operations,
+        })
+    }
+
+    /// Reconcile all pending COPY-based moves for an account, or one durable
+    /// operation ID. COPY is retried only when unchanged destination UIDNEXT
+    /// proves the ambiguous command did not create a message.
+    pub async fn reconcile_moves(
+        &self,
+        account: &str,
+        operation_id: Option<&str>,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<ReconcileMovesResponse> {
+        let _mutation_guard = self.lock_account_mutation(account).await;
+        let account_key = self.mutation_account_key(account)?;
+        let operations = if let Some(operation_id) = operation_id {
+            let operation = self
+                .mutation_journal
+                .get(operation_id)
+                .await?
+                .ok_or_else(|| {
+                    AgentmailError::Other(format!("unknown move operation '{operation_id}'"))
+                })?;
+            if operation.account_key != account_key {
+                return Err(AgentmailError::Other(format!(
+                    "move operation '{operation_id}' does not belong to account '{account}'"
+                )));
+            }
+            vec![operation]
+        } else {
+            self.mutation_journal.list_pending(&account_key).await?
+        };
+
+        let total = operations.len() as u64;
+        let mut completed = 0usize;
+        let mut pending = 0usize;
+        let mut needs_attention = 0usize;
+        let mut failed = 0usize;
+        for (index, operation) in operations.iter().cloned().enumerate() {
+            imap_client::check_cancel(cancel)?;
+            let mut session = self.pool.acquire(account).await?;
+            let source_mailbox = operation.source_mailbox.clone();
+            let outcome = imap_client::reconcile_journaled_move(
+                session.session(),
+                imap_client::JournalMoveContext {
+                    journal: &self.mutation_journal,
+                    account_key: &account_key,
+                    source_mailbox: &source_mailbox,
+                    source_uid_validity: operation.source_uid_validity,
+                },
+                operation,
+            )
+            .await;
+            match outcome {
+                Ok(outcome) => {
+                    match outcome.status {
+                        MoveStatus::Moved => completed += 1,
+                        MoveStatus::Failed => failed += 1,
+                        MoveStatus::ReconciliationPending => pending += 1,
+                        MoveStatus::NeedsAttention => needs_attention += 1,
+                    }
+                    if outcome.session_usable {
+                        let sync = imap_client::sync(session.session()).await;
+                        if sync.is_ok() {
+                            session.release().await;
+                        } else {
+                            drop(session);
+                        }
+                    } else {
+                        drop(session);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "agentmail",
+                        operation_id = operations[index].operation_id,
+                        error = %error,
+                        "move reconciliation attempt failed"
+                    );
+                    drop(session);
+                    failed += 1;
+                }
+            }
+            if let Some(progress) = on_progress {
+                progress((index + 1) as u64, total);
+            }
+        }
+        let operations = self
+            .mutation_journal
+            .list_pending(&account_key)
+            .await?
+            .into_iter()
+            .map(pending_move_from_operation)
+            .collect();
+        Ok(ReconcileMovesResponse {
+            account: account.to_string(),
+            examined: usize::try_from(total).unwrap_or(usize::MAX),
+            completed,
+            pending,
+            needs_attention,
+            failed,
+            operations,
         })
     }
 
@@ -2548,6 +3364,7 @@ impl Agentmail {
         destination: &str,
     ) -> Result<MoveMessageResponse> {
         Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
+        let _mutation_guard = self.lock_account_mutation(account).await;
         let mut session = self.pool.acquire(account).await?;
 
         // Validate destination mailbox exists
@@ -2568,16 +3385,35 @@ impl Agentmail {
         )
         .await?;
         self.fence_header_cache_mutation(account).await;
-        imap_client::move_message(session.session(), uid, destination, &caps).await?;
-        imap_client::sync(session.session()).await?;
-        session.release().await;
+        let account_key = self.mutation_account_key(account)?;
+        let outcome = imap_client::move_message(
+            session.session(),
+            uid,
+            destination,
+            &caps,
+            imap_client::JournalMoveContext {
+                journal: &self.mutation_journal,
+                account_key: &account_key,
+                source_mailbox: mailbox,
+                source_uid_validity: expected_uid_validity,
+            },
+        )
+        .await?;
+        if outcome.session_usable {
+            imap_client::sync(session.session()).await?;
+            session.release().await;
+        } else {
+            drop(session);
+        }
 
         Ok(MoveMessageResponse {
             mailbox: mailbox.to_string(),
             account: account.to_string(),
             uid,
             destination: destination.to_string(),
-            moved: true,
+            moved: outcome.status == MoveStatus::Moved,
+            status: outcome.status,
+            operation_id: outcome.operation_id,
         })
     }
 
@@ -2603,6 +3439,50 @@ impl Agentmail {
                 "At least one recipient (to, cc, or bcc) is required".to_string(),
             ));
         }
+        let recipient_count = to
+            .len()
+            .checked_add(cc.len())
+            .and_then(|count| count.checked_add(bcc.len()))
+            .ok_or_else(|| AgentmailError::Other("draft recipient count overflow".to_string()))?;
+        if recipient_count > MAX_DRAFT_RECIPIENTS {
+            return Err(AgentmailError::Other(format!(
+                "draft has {recipient_count} recipients; maximum is {MAX_DRAFT_RECIPIENTS}"
+            )));
+        }
+        if body.len() > MAX_DRAFT_BODY_BYTES {
+            return Err(AgentmailError::Other(format!(
+                "draft body is {} bytes; maximum is {MAX_DRAFT_BODY_BYTES}",
+                body.len()
+            )));
+        }
+        if attachments.len() > MAX_DRAFT_ATTACHMENTS {
+            return Err(AgentmailError::Other(format!(
+                "draft has {} attachments; maximum is {MAX_DRAFT_ATTACHMENTS}",
+                attachments.len()
+            )));
+        }
+        let mut attachment_bytes = 0usize;
+        for attachment in attachments {
+            if attachment.data.len() > MAX_DRAFT_ATTACHMENT_BYTES {
+                return Err(AgentmailError::Other(format!(
+                    "draft attachment '{}' is {} bytes; per-file maximum is {MAX_DRAFT_ATTACHMENT_BYTES}",
+                    attachment.filename,
+                    attachment.data.len()
+                )));
+            }
+            attachment_bytes = attachment_bytes
+                .checked_add(attachment.data.len())
+                .ok_or_else(|| {
+                    AgentmailError::Other("draft attachment size overflow".to_string())
+                })?;
+        }
+        if attachment_bytes > MAX_DRAFT_ATTACHMENTS_TOTAL_BYTES {
+            return Err(AgentmailError::Other(format!(
+                "draft attachments total {attachment_bytes} bytes; maximum is {MAX_DRAFT_ATTACHMENTS_TOTAL_BYTES}"
+            )));
+        }
+
+        let _mutation_guard = self.lock_account_mutation(account).await;
 
         let acct_config = self
             .pool
@@ -2611,6 +3491,12 @@ impl Agentmail {
         let from = &acct_config.username;
 
         let rfc822 = draft::compose_draft(subject, body, to, cc, bcc, Some(from), attachments)?;
+        if rfc822.len() > MAX_DRAFT_MIME_BYTES {
+            return Err(AgentmailError::Other(format!(
+                "composed draft is {} bytes; maximum is {MAX_DRAFT_MIME_BYTES}",
+                rfc822.len()
+            )));
+        }
 
         let mut session = self.pool.acquire(account).await?;
 
@@ -2818,6 +3704,7 @@ impl Agentmail {
 
         // Write files using async I/O
         let output_dir = output_dir.to_path_buf();
+        let output_dir_existed = output_dir.exists();
         tokio::fs::create_dir_all(&output_dir).await.map_err(|e| {
             AgentmailError::Other(format!(
                 "Failed to create directory '{}': {}",
@@ -2825,19 +3712,52 @@ impl Agentmail {
                 e
             ))
         })?;
+        #[cfg(unix)]
+        if !output_dir_existed {
+            tokio::fs::set_permissions(
+                &output_dir,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .await
+            .map_err(|error| {
+                AgentmailError::Other(format!(
+                    "Failed to make download directory '{}' private: {error}",
+                    output_dir.display()
+                ))
+            })?;
+        }
 
         let mut downloaded = Vec::new();
         for (index, (name, content_type, bytes)) in attachments.iter().enumerate() {
             let filename = format!("{}_{}_{}", uid, index, sanitize_filename(name));
             let path = output_dir.join(&filename);
-            tokio::fs::write(&path, bytes).await.map_err(|e| {
-                AgentmailError::Other(format!("Failed to write '{}': {}", path.display(), e))
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path).await.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AgentmailError::Other(format!(
+                        "refusing to overwrite existing attachment '{}'",
+                        path.display()
+                    ))
+                } else {
+                    AgentmailError::Other(format!("Failed to create '{}': {error}", path.display()))
+                }
+            })?;
+            file.write_all(bytes).await.map_err(|error| {
+                AgentmailError::Other(format!("Failed to write '{}': {error}", path.display()))
+            })?;
+            file.flush().await.map_err(|error| {
+                AgentmailError::Other(format!("Failed to flush '{}': {error}", path.display()))
             })?;
 
             downloaded.push(DownloadedFile {
                 index,
+                path: filename.clone(),
                 filename,
-                path: path.display().to_string(),
                 content_type: content_type.clone(),
                 size: bytes.len(),
             });
@@ -2876,6 +3796,7 @@ impl Agentmail {
             return Err(AgentmailError::MessageNotFound(0));
         }
         imap_client::check_cancel(cancel)?;
+        let _mutation_guard = self.lock_account_mutation(account).await;
 
         // Bind the numeric UID to the exact epoch returned by discovery, then
         // fetch the complete message transiently for local DKIM verification.
@@ -2899,7 +3820,7 @@ impl Agentmail {
                     // the healthy session (the server answered cleanly).
                     if let Some(config) = self.pool.account_config(account) {
                         self.header_cache
-                            .prune_uid(account, config, mailbox, uid)
+                            .prune_uid(account, config, mailbox, options.expected_uid_validity, uid)
                             .await;
                     }
                     session.release().await;
@@ -2993,7 +3914,7 @@ impl Agentmail {
         let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self
             .trash_for_mode(mode, account, session.session(), &caps)
-            .await;
+            .await?;
         if caps.is_gmail() && trash.is_none() {
             session.release().await;
             response.cleanup_skipped_reason = Some(
@@ -3056,7 +3977,10 @@ impl Agentmail {
             } => ("exact-sender-list-id-fallback", Some(normalized)),
             CleanupIdentity::Sender { list_id: None } => ("exact-sender-fallback", None),
         };
-        let complete = totals.skipped.is_empty() && totals.failed == 0;
+        let complete = totals.skipped.is_empty()
+            && totals.failed == 0
+            && totals.pending == 0
+            && totals.needs_attention == 0;
         response.matching_messages = Some(MatchingMessagesResult {
             matched_by: matched_by.to_string(),
             sender: sender_display,
@@ -3064,6 +3988,9 @@ impl Agentmail {
             found: totals.found,
             deleted: totals.affected,
             failed: totals.failed,
+            pending: totals.pending,
+            needs_attention: totals.needs_attention,
+            operation_ids: totals.operation_ids,
             mailboxes: delete_tallies(totals.mailboxes),
             skipped: totals.skipped,
             // Gmail's safe provider-specific interpretation of Permanent is
@@ -3130,14 +4057,13 @@ impl Agentmail {
         account: &str,
         session: &mut imap_client::ImapSession,
         caps: &imap_client::ServerCaps,
-    ) -> Option<String> {
+    ) -> Result<Option<String>> {
         if matches!(mode, DeleteMode::Permanent) && !caps.is_gmail() {
-            return None;
+            return Ok(None);
         }
         self.special_mailboxes(account, session)
             .await
-            .ok()
-            .and_then(|(trash, _)| trash)
+            .map(|(trash, _)| trash)
     }
 
     /// Refuse a trash-first delete when no Trash mailbox is resolvable.
@@ -3195,6 +4121,9 @@ enum DeleteSelector {
         bulk_only: bool,
         list_id: Option<String>,
     },
+    /// Messages whose first parsed Header From address has this exact
+    /// canonical domain. Parent/child domains never match implicitly.
+    Domain(String),
 }
 
 /// What a matching sweep does with each discovered batch. Discovery, the
@@ -3219,17 +4148,42 @@ struct SweepMailboxTally {
     found: usize,
     affected: usize,
     failed: usize,
+    pending: usize,
+    needs_attention: usize,
+    operation_ids: Vec<String>,
 }
 
 /// Aggregated outcome of a matching sweep across one or more mailboxes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SweepTotals {
     found: usize,
     affected: usize,
     failed: usize,
+    pending: usize,
+    needs_attention: usize,
+    operation_ids: Vec<String>,
     mailboxes: Vec<SweepMailboxTally>,
     skipped: Vec<String>,
     trash_fallback: bool,
+    /// False when a mutation response ended in timeout/EOF ambiguity.
+    session_usable: bool,
+}
+
+impl Default for SweepTotals {
+    fn default() -> Self {
+        Self {
+            found: 0,
+            affected: 0,
+            failed: 0,
+            pending: 0,
+            needs_attention: 0,
+            operation_ids: Vec::new(),
+            mailboxes: Vec::new(),
+            skipped: Vec::new(),
+            trash_fallback: false,
+            session_usable: true,
+        }
+    }
 }
 
 fn delete_tallies(tallies: Vec<SweepMailboxTally>) -> Vec<PerMailboxDeleteResult> {
@@ -3240,6 +4194,9 @@ fn delete_tallies(tallies: Vec<SweepMailboxTally>) -> Vec<PerMailboxDeleteResult
             found: tally.found,
             deleted: tally.affected,
             failed: tally.failed,
+            pending: tally.pending,
+            needs_attention: tally.needs_attention,
+            operation_ids: tally.operation_ids,
         })
         .collect()
 }
@@ -3252,8 +4209,35 @@ fn move_tallies(tallies: Vec<SweepMailboxTally>) -> Vec<PerMailboxMoveResult> {
             found: tally.found,
             moved: tally.affected,
             failed: tally.failed,
+            pending: tally.pending,
+            needs_attention: tally.needs_attention,
+            operation_ids: tally.operation_ids,
         })
         .collect()
+}
+
+fn pending_move_from_operation(operation: mutation_journal::MoveOperation) -> PendingMove {
+    use mutation_journal::MoveJournalState;
+    let status = match operation.state {
+        MoveJournalState::Complete => MoveStatus::Moved,
+        MoveJournalState::CopyFailed => MoveStatus::Failed,
+        MoveJournalState::NeedsAttention => MoveStatus::NeedsAttention,
+        MoveJournalState::Prepared
+        | MoveJournalState::CopyInFlight
+        | MoveJournalState::Copied
+        | MoveJournalState::DeleteInFlight => MoveStatus::ReconciliationPending,
+    };
+    PendingMove {
+        operation_id: operation.operation_id,
+        source_mailbox: operation.source_mailbox,
+        source_uid_validity: operation.source_uid_validity,
+        source_uid: operation.source_uid,
+        destination: operation.destination,
+        status,
+        detail: operation.detail,
+        created_at: operation.created_at,
+        updated_at: operation.updated_at,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3425,14 +4409,15 @@ where
 
 /// Outcome of a page-sample Subject fetch.
 struct SampleSubjects {
-    /// Decoded Subject per (mailbox, uid) that the server returned a row for.
-    subjects: hashbrown::HashMap<(String, u32), String>,
+    /// Decoded Subject per (mailbox, UIDVALIDITY, uid) that the server
+    /// returned a row for.
+    subjects: hashbrown::HashMap<(String, u32, u32), String>,
     /// Samples whose mailbox FETCH **succeeded** yet returned no row for the
     /// UID — the strongest available deleted-message signal on providers
     /// where external deletions are otherwise invisible (Yahoo/AOL advance
     /// neither UIDNEXT nor a trustworthy EXISTS). Never populated from a
     /// failed EXAMINE or FETCH: an outage must not masquerade as deletion.
-    missing: Vec<(String, u32)>,
+    missing: Vec<(String, u32, u32)>,
 }
 
 /// Fetch the decoded Subject of each ranking sample so a page can say WHAT a
@@ -3451,21 +4436,28 @@ async fn sample_subjects<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
-    let mut by_mailbox: hashbrown::HashMap<&str, Vec<u32>> = hashbrown::HashMap::new();
+    let mut by_mailbox_epoch: hashbrown::HashMap<(&str, u32), Vec<u32>> = hashbrown::HashMap::new();
     for sample in samples {
-        by_mailbox
-            .entry(sample.mailbox.as_str())
+        by_mailbox_epoch
+            .entry((sample.mailbox.as_str(), sample.uid_validity))
             .or_default()
             .push(sample.uid);
     }
 
     let mut subjects = hashbrown::HashMap::new();
     let mut missing = Vec::new();
-    for (mailbox, uids) in by_mailbox {
+    for ((mailbox, expected_uid_validity), uids) in by_mailbox_epoch {
         if imap_client::check_cancel(cancel).is_err() {
             break;
         }
-        if imap_client::examine(session, mailbox).await.is_err() {
+        let Ok(selected) = imap_client::examine(session, mailbox).await else {
+            continue;
+        };
+        // A UID is meaningful only inside its mailbox epoch. If the mailbox
+        // rolled over, neither enrich nor prune this stale sample: UID reuse
+        // could otherwise attach an unrelated subject or delete the new
+        // epoch's cache membership.
+        if selected.uid_validity != Some(expected_uid_validity) {
             continue;
         }
         let uid_set: String = uids
@@ -3490,13 +4482,13 @@ where
             let Some(uid) = fetch.uid else { continue };
             returned.insert(uid);
             if let Some(subject) = fetch.header().and_then(parser::parse_subject) {
-                subjects.insert((mailbox.to_string(), uid), subject);
+                subjects.insert((mailbox.to_string(), expected_uid_validity, uid), subject);
             }
         }
         missing.extend(
             uids.iter()
                 .filter(|uid| !returned.contains(*uid))
-                .map(|uid| (mailbox.to_string(), *uid)),
+                .map(|uid| (mailbox.to_string(), expected_uid_validity, *uid)),
         );
     }
     SampleSubjects { subjects, missing }
@@ -3652,6 +4644,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn next_offset_handles_full_final_partial_and_past_end_pages() {
+        assert_eq!(next_offset(0, 7, 20), Some(7));
+        assert_eq!(next_offset(7, 7, 14), None);
+        assert_eq!(next_offset(14, 6, 20), None);
+        assert_eq!(next_offset(25, 0, 20), None);
+    }
+
+    #[test]
     fn own_addresses_returns_lowercased_username() {
         let cfg = Config::from_accounts(vec![(
             "work".to_string(),
@@ -3659,6 +4659,8 @@ mod tests {
                 host: "imap.example.com".to_string(),
                 port: 993,
                 username: "Me@Example.COM".to_string(),
+                email: None,
+                aliases: Vec::new(),
                 password: None,
                 tls: true,
                 max_connections: None,
@@ -4130,7 +5132,7 @@ mod tests {
         let commands = server.await.expect("scripted server finishes");
         let joined = commands.concat();
         assert!(
-            joined.contains("UID STORE 5 +FLAGS (\\Deleted)"),
+            joined.contains("UID STORE 5 +FLAGS.SILENT (\\Deleted)"),
             "deletes exactly the confirmed UID: {commands:?}"
         );
         assert!(
@@ -4146,6 +5148,104 @@ mod tests {
             2,
             "drain loop re-selects once and stops on the empty pass: {commands:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn domain_sweep_confirms_exact_domain_and_excludes_child_and_own_sender() {
+        let (mut session, server) = scripted_sweep_session(" 5 7 9", |tag| {
+            let target = "From: Sender <sender@example.com>\r\n\r\n";
+            let child = "From: Child <sender@mail.example.com>\r\n\r\n";
+            let own = "From: Me <me@example.com>\r\n\r\n";
+            format!(
+                "* 1 FETCH (UID 5 BODY[HEADER.FIELDS (FROM)] {{{}}}\r\n{target})\r\n* 2 FETCH (UID 7 BODY[HEADER.FIELDS (FROM)] {{{}}}\r\n{child})\r\n* 3 FETCH (UID 9 BODY[HEADER.FIELDS (FROM)] {{{}}}\r\n{own})\r\n{tag} OK FETCH completed\r\n",
+                target.len(),
+                child.len(),
+                own.len()
+            )
+        })
+        .await;
+        let config = Config::from_accounts(vec![(
+            "test-account".to_string(),
+            AccountConfig {
+                host: "imap.example.com".to_string(),
+                port: 993,
+                username: "login".to_string(),
+                email: Some("me@example.com".to_string()),
+                aliases: Vec::new(),
+                password: None,
+                tls: true,
+                max_connections: None,
+                auth: AuthMethod::Password,
+            },
+        )]);
+        let mk = Agentmail::builder(config).disable_cache().build();
+        let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
+        let totals = mk
+            .matching_sweep_loop(
+                &mut session,
+                "test-account",
+                &DeleteSelector::Domain("example.com".to_string()),
+                &["INBOX".to_string()],
+                SweepAction::Delete {
+                    trash: None,
+                    allow_permanent_fallback: false,
+                },
+                &caps,
+                None,
+                None,
+            )
+            .await
+            .expect("scripted domain sweep succeeds");
+        assert_eq!(totals.found, 1);
+        assert_eq!(totals.affected, 1);
+
+        drop(session);
+        let commands = server.await.expect("scripted server finishes");
+        let joined = commands.concat();
+        assert!(joined.contains("UID STORE 5 +FLAGS.SILENT (\\Deleted)"));
+        assert!(!joined.contains("UID STORE 5,7"));
+        assert!(!joined.contains("UID STORE 5,7,9"));
+    }
+
+    #[tokio::test]
+    async fn idn_domain_sweep_enumerates_undeleted_then_confirms_u_label() {
+        let (mut session, server) = scripted_sweep_session(" 11 12", |tag| {
+            let target = "From: Reader <reader@bücher.de>\r\n\r\n";
+            let child = "From: Child <reader@mail.bücher.de>\r\n\r\n";
+            format!(
+                "* 1 FETCH (UID 11 BODY[HEADER.FIELDS (FROM)] {{{}}}\r\n{target})\r\n* 2 FETCH (UID 12 BODY[HEADER.FIELDS (FROM)] {{{}}}\r\n{child})\r\n{tag} OK FETCH completed\r\n",
+                target.len(),
+                child.len()
+            )
+        })
+        .await;
+        let mk = Agentmail::builder(Config::empty()).disable_cache().build();
+        let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
+        let totals = mk
+            .matching_sweep_loop(
+                &mut session,
+                "test-account",
+                &DeleteSelector::Domain("xn--bcher-kva.de".to_string()),
+                &["INBOX".to_string()],
+                SweepAction::Delete {
+                    trash: None,
+                    allow_permanent_fallback: false,
+                },
+                &caps,
+                None,
+                None,
+            )
+            .await
+            .expect("scripted IDN domain sweep succeeds");
+        assert_eq!(totals.found, 1);
+        assert_eq!(totals.affected, 1);
+
+        drop(session);
+        let commands = server.await.expect("scripted server finishes");
+        let joined = commands.concat();
+        assert!(joined.contains("UID SEARCH UNDELETED"));
+        assert!(!joined.contains("FROM \"@xn--bcher-kva.de\""));
+        assert!(joined.contains("UID STORE 11 +FLAGS.SILENT (\\Deleted)"));
     }
 
     /// The windowed-drain loop's reason to exist: on a server whose visible
@@ -4328,21 +5428,25 @@ mod tests {
             sample_subjects(&mut session, &samples, None).await;
 
         assert_eq!(
-            subjects.get(&("INBOX".to_string(), 5)).map(String::as_str),
+            subjects
+                .get(&("INBOX".to_string(), 9, 5))
+                .map(String::as_str),
             Some("Your July statement is ready")
         );
         assert_eq!(
-            subjects.get(&("INBOX".to_string(), 7)).map(String::as_str),
+            subjects
+                .get(&("INBOX".to_string(), 9, 7))
+                .map(String::as_str),
             Some("Résumé"),
             "RFC 2047 encoded-words are decoded"
         );
         assert!(
-            !subjects.contains_key(&("INBOX".to_string(), 9)),
+            !subjects.contains_key(&("INBOX".to_string(), 9, 9)),
             "a stale sample yields no subject instead of an error"
         );
         assert_eq!(
             missing,
-            vec![("INBOX".to_string(), 9)],
+            vec![("INBOX".to_string(), 9, 9)],
             "a UID absent from a SUCCESSFUL fetch is reported as deleted so \
              the caller can prune it; live UIDs are not"
         );
@@ -4356,6 +5460,65 @@ mod tests {
                 .count(),
             1,
             "one bounded fetch per mailbox covers the whole page: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sample_subjects_never_fetches_or_prunes_across_uidvalidity_rollover() {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = line.split_whitespace().next().unwrap().to_string();
+                commands.push(line.clone());
+                let reply = if line.contains(" LOGIN ") {
+                    format!("{tag} OK LOGIN completed\r\n")
+                } else if line.contains("EXAMINE") {
+                    format!(
+                        "* 1 EXISTS\r\n* OK [UIDVALIDITY 10] new epoch\r\n* OK [UIDNEXT 6] next\r\n{tag} OK [READ-ONLY] EXAMINE completed\r\n"
+                    )
+                } else {
+                    panic!("UID FETCH must not run across a UIDVALIDITY mismatch: {line:?}");
+                };
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let mut session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+
+        let sample = MailboxMessageIdentity {
+            mailbox: "INBOX".to_string(),
+            uid_validity: 9,
+            uid: 5,
+        };
+        let SampleSubjects { subjects, missing } =
+            sample_subjects(&mut session, &[sample], None).await;
+        assert!(subjects.is_empty());
+        assert!(
+            missing.is_empty(),
+            "an epoch mismatch is not proof that a UID is missing"
+        );
+
+        drop(session);
+        let commands = server.await.expect("scripted server finishes");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.contains("UID FETCH"))
+                .count(),
+            0
         );
     }
 
@@ -4469,7 +5632,7 @@ mod tests {
         let commands = server.await.expect("scripted server finishes");
         let joined = commands.concat();
         assert!(
-            joined.contains("UID STORE 11 +FLAGS (\\Deleted)"),
+            joined.contains("UID STORE 11 +FLAGS.SILENT (\\Deleted)"),
             "deletes only the constrained match: {commands:?}"
         );
         assert!(

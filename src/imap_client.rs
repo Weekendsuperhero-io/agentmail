@@ -1,6 +1,7 @@
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_imap::Session;
@@ -17,15 +18,56 @@ use crate::error::Result;
 use crate::parser;
 use crate::types::*;
 
-/// The concrete IMAP session type used throughout: a TLS stream with RFC 4978
-/// DEFLATE compression negotiated on every connection. `DeflateStream` is
-/// `!Unpin`, so it is wrapped in `Pin<Box<_>>` (which is `Unpin`) to satisfy
-/// async-imap's `Session<T>` bounds. A concrete type — not `dyn` — so it does
-/// not reintroduce the higher-ranked-lifetime conflict with
-/// `with_session_retry`'s op closures. Every supported provider advertises
-/// COMPRESS=DEFLATE; a server lacking it fails the compression handshake at
-/// connect.
-pub type ImapSession = Session<Pin<Box<DeflateStream<TlsStream<TcpStream>>>>>;
+/// Concrete transport shared by compressed and ordinary TLS sessions.
+/// Keeping this an enum (instead of a trait object) preserves the higher-rank
+/// async closure behavior required by the connection pool.
+#[derive(Debug)]
+pub enum ImapTransport {
+    Tls(TlsStream<TcpStream>),
+    Deflate(Pin<Box<DeflateStream<ImapTransport>>>),
+}
+
+impl AsyncRead for ImapTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Deflate(stream) => stream.as_mut().poll_read(context, buffer),
+        }
+    }
+}
+
+impl AsyncWrite for ImapTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::Deflate(stream) => stream.as_mut().poll_write(context, buffer),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_flush(context),
+            Self::Deflate(stream) => stream.as_mut().poll_flush(context),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Deflate(stream) => stream.as_mut().poll_shutdown(context),
+        }
+    }
+}
+
+pub type ImapSession = Session<ImapTransport>;
 
 /// Callback for reporting progress: `(completed, total)`.
 pub type ProgressFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
@@ -478,6 +520,11 @@ pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSessi
 
 /// A single TLS connect + login, no retry.
 async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSession> {
+    if !config.tls {
+        return Err(AgentmailError::Config(
+            "tls=false is unsupported; refusing to send IMAP credentials without TLS".to_string(),
+        ));
+    }
     let addr = format!("{}:{}", config.host, config.port);
     let tcp = imap_timeout(TcpStream::connect(&addr)).await?;
 
@@ -486,9 +533,10 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
     let connector = tokio_native_tls::TlsConnector::from(connector);
     let tls = imap_timeout(connector.connect(&config.host, tcp)).await?;
 
-    let mut client = async_imap::Client::new(tls);
+    let transport = ImapTransport::Tls(tls);
+    let mut client = async_imap::Client::new(transport);
     let auth_limit = imap_timeout_duration();
-    let plain = match config.auth {
+    let mut plain = match config.auth {
         crate::config::AuthMethod::Password => {
             match tokio::time::timeout(auth_limit, client.login(&config.username, password)).await {
                 Ok(Ok(session)) => session,
@@ -530,9 +578,32 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
         }
     };
 
-    // Negotiate DEFLATE compression. `compress` runs `COMPRESS DEFLATE` and
-    // wraps the stream; `Box::pin` gives the `Unpin` type the alias requires.
-    let mut session = imap_timeout(plain.compress(Box::pin)).await?;
+    // RFC 4978 is optional. Negotiate only when advertised; otherwise retain
+    // the authenticated TLS stream instead of making a compatible server fail
+    // during connection setup.
+    let supports_compress = match capability_strings(&mut plain).await {
+        Ok(capabilities) => capabilities
+            .iter()
+            .any(|capability| capability.eq_ignore_ascii_case("COMPRESS=DEFLATE")),
+        Err(error) if definitive_command_rejection(&error) => {
+            warn!(
+                target: "agentmail",
+                error = %error,
+                "post-login CAPABILITY was rejected; continuing without compression"
+            );
+            false
+        }
+        // A timeout, EOF, or parse/I/O error may have left unread response
+        // bytes on the stream. Never return that session to the pool as if it
+        // were synchronized merely because compression itself is optional.
+        Err(error) => return Err(error),
+    };
+    let mut session = if supports_compress {
+        imap_timeout(plain.compress(|compressed| ImapTransport::Deflate(Box::pin(compressed))))
+            .await?
+    } else {
+        plain
+    };
     send_client_id(&mut session).await;
     Ok(session)
 }
@@ -1942,22 +2013,27 @@ pub async fn fetch_attachment_uids(
 
 /// Result of bulk deletion: (deleted UIDs, failed UIDs, trash_fallback).
 /// `trash_fallback` is true when trash MOVE failed and we fell back to flag+expunge.
-pub struct BulkDeleteResult {
+pub(crate) struct BulkDeleteResult {
     pub deleted: Vec<u32>,
     pub failed: Vec<u32>,
+    pub pending: Vec<u32>,
+    pub needs_attention: Vec<u32>,
+    pub operation_ids: Vec<String>,
     pub trash_fallback: bool,
+    pub session_usable: bool,
 }
 
 /// Policy-aware bulk deletion. When `allow_permanent_fallback` is false, a
 /// failed MOVE/COPY-to-Trash remains a failed chunk and can never escalate to
 /// an irreversible UID EXPUNGE. Gmail never permits this fallback regardless
 /// of caller authorization because in-place EXPUNGE has label semantics there.
-pub async fn bulk_delete_messages_with_policy<T>(
+pub(crate) async fn bulk_delete_messages_with_policy<T>(
     session: &mut Session<T>,
     uids: &[u32],
     trash_mailbox: Option<&str>,
     caps: &ServerCaps,
     allow_permanent_fallback: bool,
+    journal: JournalMoveContext<'_>,
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
 ) -> Result<BulkDeleteResult>
@@ -1994,9 +2070,68 @@ where
 
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
+    let mut pending = Vec::new();
+    let mut needs_attention = Vec::new();
+    let mut operation_ids = Vec::new();
     let mut trash_fallback = false;
     let mut use_trash = trash_mailbox;
     let total = uids.len() as u64;
+
+    // COPY emulation is deliberately one UID per durable operation. A crash
+    // or lost tagged completion can therefore never cause a sweep retry to
+    // copy the same source UID again.
+    if let Some(trash) = trash_mailbox
+        && !caps.has_move()
+    {
+        let mut session_usable = true;
+        for (index, uid) in uids.iter().copied().enumerate() {
+            check_cancel(cancel)?;
+            let outcome = journaled_move_uid(session, uid, trash, journal).await?;
+            match outcome.status {
+                crate::types::MoveStatus::Moved => deleted.push(uid),
+                crate::types::MoveStatus::Failed
+                    if can_fallback_from_trash_to_permanent(caps, allow_permanent_fallback) =>
+                {
+                    trash_fallback = true;
+                    match flag_and_expunge(session, &uid.to_string()).await {
+                        Ok(()) => deleted.push(uid),
+                        Err(error) if definitive_command_rejection(&error) => failed.push(uid),
+                        Err(error) => return Err(error),
+                    }
+                }
+                crate::types::MoveStatus::Failed => failed.push(uid),
+                crate::types::MoveStatus::ReconciliationPending => {
+                    pending.push(uid);
+                    if let Some(operation_id) = outcome.operation_id {
+                        operation_ids.push(operation_id);
+                    }
+                }
+                crate::types::MoveStatus::NeedsAttention => {
+                    needs_attention.push(uid);
+                    if let Some(operation_id) = outcome.operation_id {
+                        operation_ids.push(operation_id);
+                    }
+                }
+            }
+            session_usable &= outcome.session_usable;
+            if let Some(progress) = on_progress {
+                progress((index + 1) as u64, total);
+            }
+            if !session_usable {
+                failed.extend(uids.iter().copied().skip(index + 1));
+                break;
+            }
+        }
+        return Ok(BulkDeleteResult {
+            deleted,
+            failed,
+            pending,
+            needs_attention,
+            operation_ids,
+            trash_fallback,
+            session_usable,
+        });
+    }
 
     for chunk in uids.chunks(500) {
         check_cancel(cancel)?;
@@ -2007,16 +2142,19 @@ where
             .join(",");
 
         let result: std::result::Result<(), AgentmailError> = if let Some(trash) = use_trash {
-            match move_uids(session, &uid_set, trash, caps).await {
+            match imap_timeout(session.uid_mv(&uid_set, trash)).await {
                 Ok(()) => Ok(()),
-                Err(_) if can_fallback_from_trash_to_permanent(caps, allow_permanent_fallback) => {
+                Err(error)
+                    if definitive_command_rejection(&error)
+                        && can_fallback_from_trash_to_permanent(caps, allow_permanent_fallback) =>
+                {
                     // Trash move failed — fall back to permanent delete for all
                     // remaining chunks (safe: non-Gmail + UIDPLUS confirmed).
                     trash_fallback = true;
                     use_trash = None;
                     flag_and_expunge(session, &uid_set).await
                 }
-                Err(e) => Err(e),
+                Err(error) => Err(error),
             }
         } else {
             flag_and_expunge(session, &uid_set).await
@@ -2027,7 +2165,8 @@ where
                 deleted.extend_from_slice(chunk);
                 let _ = imap_timeout(session.noop()).await;
             }
-            Err(_) => failed.extend_from_slice(chunk),
+            Err(error) if definitive_command_rejection(&error) => failed.extend_from_slice(chunk),
+            Err(error) => return Err(error),
         }
 
         if let Some(progress) = on_progress {
@@ -2038,7 +2177,11 @@ where
     Ok(BulkDeleteResult {
         deleted,
         failed,
+        pending,
+        needs_attention,
+        operation_ids,
         trash_fallback,
+        session_usable: true,
     })
 }
 
@@ -2046,25 +2189,147 @@ fn can_fallback_from_trash_to_permanent(caps: &ServerCaps, allow_permanent_fallb
     allow_permanent_fallback && caps.has_uidplus() && !caps.is_gmail()
 }
 
-/// Move a UID set to `destination`, using MOVE when the server advertises it
-/// (RFC 6851) or emulating with COPY + `\Deleted` + UID EXPUNGE otherwise.
-/// The emulation path requires UIDPLUS (callers gate on it).
-async fn move_uids<T>(
+/// Run `UID COPY` through the raw command surface so the tagged completion is
+/// always observed.  The high-level COPY helper currently checks the tagged
+/// status too, but keeping all fallback-MOVE commands on this path makes the
+/// mutation boundary explicit and lets reconciliation consume COPYUID without
+/// changing the wire operation later.
+async fn checked_uid_copy<T>(
     session: &mut Session<T>,
     uid_set: &str,
     destination: &str,
-    caps: &ServerCaps,
-) -> Result<()>
+) -> Result<Option<CopyUidMapping>>
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
-    if caps.has_move() {
-        imap_timeout(session.uid_mv(uid_set, destination)).await?;
-        Ok(())
-    } else {
-        imap_timeout(session.uid_copy(uid_set, destination)).await?;
-        flag_and_expunge(session, uid_set).await
+    let command = format!("UID COPY {uid_set} {}", quoted(destination)?);
+    checked_mutation_command(session, &command).await
+}
+
+/// UID mapping returned by RFC 4315 COPYUID. Source and destination UIDs are
+/// expanded and paired in protocol order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyUidMapping {
+    pub(crate) uid_validity: u32,
+    pub(crate) pairs: Vec<(u32, u32)>,
+}
+
+fn expand_uid_members(members: &[async_imap::imap_proto::UidSetMember]) -> Result<Vec<u32>> {
+    use async_imap::imap_proto::UidSetMember;
+
+    let mut expanded = Vec::new();
+    for member in members {
+        match member {
+            UidSetMember::Uid(uid) => expanded.push(*uid),
+            UidSetMember::UidRange(range) => {
+                let start = *range.start();
+                let end = *range.end();
+                if start == 0 || end == 0 || start > end {
+                    return Err(AgentmailError::Parse(
+                        "server returned an invalid COPYUID range".to_string(),
+                    ));
+                }
+                let additional = u64::from(end) - u64::from(start) + 1;
+                if additional > 100_000 {
+                    return Err(AgentmailError::Parse(
+                        "server returned an unreasonably large COPYUID range".to_string(),
+                    ));
+                }
+                expanded.extend(start..=end);
+            }
+        }
     }
+    if expanded.contains(&0) {
+        return Err(AgentmailError::Parse(
+            "server returned UID zero in COPYUID".to_string(),
+        ));
+    }
+    Ok(expanded)
+}
+
+fn copy_uid_mapping(
+    uid_validity: u32,
+    source: &[async_imap::imap_proto::UidSetMember],
+    destination: &[async_imap::imap_proto::UidSetMember],
+) -> Result<CopyUidMapping> {
+    let source = expand_uid_members(source)?;
+    let destination = expand_uid_members(destination)?;
+    if source.len() != destination.len() {
+        return Err(AgentmailError::Parse(
+            "server returned unequal COPYUID source and destination sets".to_string(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(source.len());
+    if source.iter().any(|uid| !seen.insert(*uid)) {
+        return Err(AgentmailError::Parse(
+            "server returned duplicate source UIDs in COPYUID".to_string(),
+        ));
+    }
+    Ok(CopyUidMapping {
+        uid_validity,
+        pairs: source.into_iter().zip(destination).collect(),
+    })
+}
+
+/// Execute one state-changing command and consume responses through its exact
+/// matching tag. Unlike async-imap's STORE/EXPUNGE streams, this cannot mistake
+/// a tagged NO/BAD for success. An EOF or timeout is returned as an error and
+/// callers must discard the session because command outcome may be ambiguous.
+async fn checked_mutation_command<T>(
+    session: &mut Session<T>,
+    command: &str,
+) -> Result<Option<CopyUidMapping>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    use async_imap::imap_proto::{Response, ResponseCode, Status};
+
+    imap_timeout(async {
+        let request_id = session.run_command(command).await?;
+        let mut copy_uid = None;
+        loop {
+            let response = session
+                .read_response()
+                .await?
+                .ok_or(async_imap::error::Error::ConnectionLost)?;
+            match response.parsed() {
+                Response::Data {
+                    status: Status::Ok,
+                    code: Some(ResponseCode::CopyUid(validity, source, destination)),
+                    ..
+                } => {
+                    copy_uid = Some(copy_uid_mapping(*validity, source, destination)?);
+                }
+                Response::Done {
+                    tag,
+                    status,
+                    code,
+                    information,
+                } if tag == &request_id => {
+                    if let Some(ResponseCode::CopyUid(validity, source, destination)) = code {
+                        copy_uid = Some(copy_uid_mapping(*validity, source, destination)?);
+                    }
+                    let detail = format!("code: {code:?}, info: {information:?}");
+                    return match status {
+                        Status::Ok => Ok(copy_uid),
+                        Status::No => {
+                            Err(AgentmailError::Imap(async_imap::error::Error::No(detail)))
+                        }
+                        Status::Bad => {
+                            Err(AgentmailError::Imap(async_imap::error::Error::Bad(detail)))
+                        }
+                        other => Err(AgentmailError::Imap(async_imap::error::Error::Io(
+                            std::io::Error::other(format!(
+                                "unexpected mutation completion status: {other:?}; {detail}"
+                            )),
+                        ))),
+                    };
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
 }
 
 /// Flag messages as deleted and expunge them (permanent delete). Uses UID
@@ -2076,20 +2341,14 @@ async fn flag_and_expunge<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
-    imap_timeout(async {
-        let _: Vec<_> = session
-            .uid_store(uid_set, "+FLAGS (\\Deleted)")
-            .await?
-            .collect::<Vec<_>>()
-            .await;
-        let _: Vec<_> = session
-            .uid_expunge(uid_set)
-            .await?
-            .collect::<Vec<_>>()
-            .await;
-        Ok::<_, async_imap::error::Error>(())
-    })
-    .await
+    checked_mutation_command(
+        session,
+        &format!("UID STORE {uid_set} +FLAGS.SILENT (\\Deleted)"),
+    )
+    .await?;
+    checked_mutation_command(session, &format!("UID EXPUNGE {uid_set}"))
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -2100,17 +2359,469 @@ where
 pub struct BulkMoveResult {
     pub moved: Vec<u32>,
     pub failed: Vec<u32>,
+    pub pending: Vec<u32>,
+    pub needs_attention: Vec<u32>,
+    pub operation_ids: Vec<String>,
+    /// False after EOF/timeout during a mutation; the owning pooled session
+    /// must be dropped rather than released for reuse.
+    pub session_usable: bool,
+}
+
+/// Durable identity required to emulate MOVE with COPY + source cleanup.
+#[derive(Clone, Copy)]
+pub(crate) struct JournalMoveContext<'a> {
+    pub(crate) journal: &'a crate::mutation_journal::MutationJournal,
+    pub(crate) account_key: &'a str,
+    pub(crate) source_mailbox: &'a str,
+    pub(crate) source_uid_validity: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MoveItemOutcome {
+    pub(crate) status: crate::types::MoveStatus,
+    pub(crate) operation_id: Option<String>,
+    pub(crate) session_usable: bool,
+}
+
+fn definitive_command_rejection(error: &AgentmailError) -> bool {
+    matches!(
+        error,
+        AgentmailError::Imap(async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_))
+    )
+}
+
+async fn finish_journaled_cleanup<T>(
+    session: &mut Session<T>,
+    context: JournalMoveContext<'_>,
+    operation: crate::mutation_journal::MoveOperation,
+) -> Result<MoveItemOutcome>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    use crate::mutation_journal::MoveJournalState;
+    use crate::types::MoveStatus;
+
+    let operation = if operation.state == MoveJournalState::Copied {
+        context
+            .journal
+            .transition(
+                &operation.operation_id,
+                &[MoveJournalState::Copied],
+                MoveJournalState::DeleteInFlight,
+                None,
+            )
+            .await?
+    } else {
+        operation
+    };
+    match flag_and_expunge(session, &operation.source_uid.to_string()).await {
+        Ok(()) => {
+            context
+                .journal
+                .transition(
+                    &operation.operation_id,
+                    &[MoveJournalState::DeleteInFlight],
+                    MoveJournalState::Complete,
+                    None,
+                )
+                .await?;
+            Ok(MoveItemOutcome {
+                status: MoveStatus::Moved,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            })
+        }
+        Err(error) if definitive_command_rejection(&error) => {
+            context
+                .journal
+                .transition(
+                    &operation.operation_id,
+                    &[MoveJournalState::DeleteInFlight],
+                    MoveJournalState::NeedsAttention,
+                    Some(&format!("source cleanup was rejected: {error}")),
+                )
+                .await?;
+            Ok(MoveItemOutcome {
+                status: MoveStatus::NeedsAttention,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "agentmail",
+                operation_id = operation.operation_id,
+                error = %error,
+                "COPY succeeded but source cleanup is pending reconciliation"
+            );
+            Ok(MoveItemOutcome {
+                status: MoveStatus::ReconciliationPending,
+                operation_id: Some(operation.operation_id),
+                session_usable: false,
+            })
+        }
+    }
+}
+
+async fn journaled_move_uid<T>(
+    session: &mut Session<T>,
+    uid: u32,
+    destination: &str,
+    context: JournalMoveContext<'_>,
+) -> Result<MoveItemOutcome>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    use crate::mutation_journal::{MoveJournalState, PrepareMove};
+    use crate::types::MoveStatus;
+
+    if !context.journal.is_persistent() {
+        return Err(AgentmailError::Other(
+            "durable mutation journal is unavailable; refusing COPY-based MOVE".to_string(),
+        ));
+    }
+    let destination_status =
+        imap_timeout(session.status(destination, "(UIDVALIDITY UIDNEXT MESSAGES)")).await?;
+    let destination_uid_validity =
+        destination_status
+            .uid_validity
+            .ok_or_else(|| AgentmailError::UidValidityUnavailable {
+                mailbox: destination.to_string(),
+            })?;
+    let destination_uid_next = destination_status.uid_next.ok_or_else(|| {
+        AgentmailError::Other(format!(
+            "destination mailbox '{destination}' did not provide UIDNEXT"
+        ))
+    })?;
+    let operation = context
+        .journal
+        .prepare(PrepareMove {
+            account_key: context.account_key,
+            source_mailbox: context.source_mailbox,
+            source_uid_validity: context.source_uid_validity,
+            source_uid: uid,
+            destination,
+            destination_uid_validity,
+            destination_uid_next,
+        })
+        .await?;
+
+    match operation.state {
+        MoveJournalState::Copied | MoveJournalState::DeleteInFlight => {
+            return finish_journaled_cleanup(session, context, operation).await;
+        }
+        MoveJournalState::CopyInFlight => {
+            return Ok(MoveItemOutcome {
+                status: MoveStatus::ReconciliationPending,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            });
+        }
+        MoveJournalState::NeedsAttention => {
+            return Ok(MoveItemOutcome {
+                status: MoveStatus::NeedsAttention,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            });
+        }
+        MoveJournalState::Prepared => {}
+        MoveJournalState::Complete => {
+            return Ok(MoveItemOutcome {
+                status: MoveStatus::Moved,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            });
+        }
+        MoveJournalState::CopyFailed => {
+            return Ok(MoveItemOutcome {
+                status: MoveStatus::Failed,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            });
+        }
+    }
+
+    let operation = context
+        .journal
+        .transition(
+            &operation.operation_id,
+            &[MoveJournalState::Prepared],
+            MoveJournalState::CopyInFlight,
+            None,
+        )
+        .await?;
+    match checked_uid_copy(session, &uid.to_string(), destination).await {
+        Ok(mapping) => {
+            let (copied_uid_validity, copied_uid) = match mapping {
+                Some(mapping) => {
+                    if mapping.pairs.len() != 1 || mapping.pairs[0].0 != uid {
+                        context
+                            .journal
+                            .transition(
+                                &operation.operation_id,
+                                &[MoveJournalState::CopyInFlight],
+                                MoveJournalState::NeedsAttention,
+                                Some("server returned COPYUID for unexpected source UIDs"),
+                            )
+                            .await?;
+                        return Ok(MoveItemOutcome {
+                            status: MoveStatus::NeedsAttention,
+                            operation_id: Some(operation.operation_id),
+                            session_usable: true,
+                        });
+                    }
+                    (Some(mapping.uid_validity), Some(mapping.pairs[0].1))
+                }
+                None => (None, None),
+            };
+            let copied = context
+                .journal
+                .record_copied(&operation.operation_id, copied_uid_validity, copied_uid)
+                .await?;
+            finish_journaled_cleanup(session, context, copied).await
+        }
+        Err(error) if definitive_command_rejection(&error) => {
+            context
+                .journal
+                .transition(
+                    &operation.operation_id,
+                    &[MoveJournalState::CopyInFlight],
+                    MoveJournalState::CopyFailed,
+                    Some(&format!("COPY was rejected: {error}")),
+                )
+                .await?;
+            Ok(MoveItemOutcome {
+                status: MoveStatus::Failed,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "agentmail",
+                operation_id = operation.operation_id,
+                error = %error,
+                "COPY completion is ambiguous; operation left for reconciliation"
+            );
+            Ok(MoveItemOutcome {
+                status: MoveStatus::ReconciliationPending,
+                operation_id: Some(operation.operation_id),
+                session_usable: false,
+            })
+        }
+    }
+}
+
+/// Resume one durable COPY-based MOVE without ever issuing a second COPY
+/// unless destination UIDNEXT proves that the first command changed nothing.
+pub(crate) async fn reconcile_journaled_move<T>(
+    session: &mut Session<T>,
+    context: JournalMoveContext<'_>,
+    operation: crate::mutation_journal::MoveOperation,
+) -> Result<MoveItemOutcome>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    use crate::mutation_journal::MoveJournalState;
+    use crate::types::MoveStatus;
+
+    match operation.state {
+        MoveJournalState::Complete => {
+            return Ok(MoveItemOutcome {
+                status: MoveStatus::Moved,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            });
+        }
+        MoveJournalState::CopyFailed => {
+            return Ok(MoveItemOutcome {
+                status: MoveStatus::Failed,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            });
+        }
+        MoveJournalState::NeedsAttention => {
+            return Ok(MoveItemOutcome {
+                status: MoveStatus::NeedsAttention,
+                operation_id: Some(operation.operation_id),
+                session_usable: true,
+            });
+        }
+        _ => {}
+    }
+
+    if let Err(error) = select_with_expected_uid_validity(
+        session,
+        &operation.source_mailbox,
+        operation.source_uid_validity,
+    )
+    .await
+    {
+        context
+            .journal
+            .transition(
+                &operation.operation_id,
+                &[
+                    MoveJournalState::Prepared,
+                    MoveJournalState::CopyInFlight,
+                    MoveJournalState::Copied,
+                    MoveJournalState::DeleteInFlight,
+                ],
+                MoveJournalState::NeedsAttention,
+                Some(&format!("source mailbox epoch changed: {error}")),
+            )
+            .await?;
+        return Ok(MoveItemOutcome {
+            status: MoveStatus::NeedsAttention,
+            operation_id: Some(operation.operation_id),
+            session_usable: true,
+        });
+    }
+    let source_exists = search_uids(session, &format!("UID {}", operation.source_uid))
+        .await?
+        .contains(&operation.source_uid);
+
+    match operation.state {
+        MoveJournalState::Copied | MoveJournalState::DeleteInFlight => {
+            if !source_exists {
+                context
+                    .journal
+                    .transition(
+                        &operation.operation_id,
+                        &[MoveJournalState::Copied, MoveJournalState::DeleteInFlight],
+                        MoveJournalState::Complete,
+                        None,
+                    )
+                    .await?;
+                return Ok(MoveItemOutcome {
+                    status: MoveStatus::Moved,
+                    operation_id: Some(operation.operation_id),
+                    session_usable: true,
+                });
+            }
+            finish_journaled_cleanup(session, context, operation).await
+        }
+        MoveJournalState::Prepared => {
+            if !source_exists {
+                context
+                    .journal
+                    .transition(
+                        &operation.operation_id,
+                        &[MoveJournalState::Prepared],
+                        MoveJournalState::NeedsAttention,
+                        Some("source disappeared before COPY"),
+                    )
+                    .await?;
+                return Ok(MoveItemOutcome {
+                    status: MoveStatus::NeedsAttention,
+                    operation_id: Some(operation.operation_id),
+                    session_usable: true,
+                });
+            }
+            journaled_move_uid(
+                session,
+                operation.source_uid,
+                &operation.destination,
+                context,
+            )
+            .await
+        }
+        MoveJournalState::CopyInFlight => {
+            if !source_exists {
+                context
+                    .journal
+                    .transition(
+                        &operation.operation_id,
+                        &[MoveJournalState::CopyInFlight],
+                        MoveJournalState::NeedsAttention,
+                        Some("source disappeared while COPY completion was ambiguous"),
+                    )
+                    .await?;
+                return Ok(MoveItemOutcome {
+                    status: MoveStatus::NeedsAttention,
+                    operation_id: Some(operation.operation_id),
+                    session_usable: true,
+                });
+            }
+            let destination = imap_timeout(
+                session.status(&operation.destination, "(UIDVALIDITY UIDNEXT MESSAGES)"),
+            )
+            .await?;
+            if destination.uid_validity != Some(operation.destination_uid_validity) {
+                context
+                    .journal
+                    .transition(
+                        &operation.operation_id,
+                        &[MoveJournalState::CopyInFlight],
+                        MoveJournalState::NeedsAttention,
+                        Some("destination UIDVALIDITY changed during reconciliation"),
+                    )
+                    .await?;
+                return Ok(MoveItemOutcome {
+                    status: MoveStatus::NeedsAttention,
+                    operation_id: Some(operation.operation_id),
+                    session_usable: true,
+                });
+            }
+            match destination.uid_next {
+                Some(uid_next) if uid_next == operation.destination_uid_next => {
+                    context
+                        .journal
+                        .transition(
+                            &operation.operation_id,
+                            &[MoveJournalState::CopyInFlight],
+                            MoveJournalState::Prepared,
+                            Some("destination UIDNEXT unchanged; safe to retry COPY"),
+                        )
+                        .await?;
+                    journaled_move_uid(
+                        session,
+                        operation.source_uid,
+                        &operation.destination,
+                        context,
+                    )
+                    .await
+                }
+                Some(_) => {
+                    context
+                        .journal
+                        .transition(
+                            &operation.operation_id,
+                            &[MoveJournalState::CopyInFlight],
+                            MoveJournalState::NeedsAttention,
+                            Some(
+                                "destination UIDNEXT advanced after ambiguous COPY; automatic matching was not unique",
+                            ),
+                        )
+                        .await?;
+                    Ok(MoveItemOutcome {
+                        status: MoveStatus::NeedsAttention,
+                        operation_id: Some(operation.operation_id),
+                        session_usable: true,
+                    })
+                }
+                None => Err(AgentmailError::Other(format!(
+                    "destination mailbox '{}' did not provide UIDNEXT",
+                    operation.destination
+                ))),
+            }
+        }
+        MoveJournalState::Complete
+        | MoveJournalState::CopyFailed
+        | MoveJournalState::NeedsAttention => unreachable!("terminal states returned above"),
+    }
 }
 
 /// Move messages by UID to `destination`, processing in 500-UID chunks.
 /// Uses MOVE when the server advertises it, else COPY + `\Deleted` +
 /// UID EXPUNGE (which needs UIDPLUS). A failed chunk is reported in `failed`
 /// and never retried here — the caller's drain loop re-discovers survivors.
-pub async fn bulk_move_messages<T>(
+pub(crate) async fn bulk_move_messages<T>(
     session: &mut Session<T>,
     uids: &[u32],
     destination: &str,
     caps: &ServerCaps,
+    journal: JournalMoveContext<'_>,
     on_progress: Option<&ProgressFn>,
     cancel: Option<&CancelFn>,
 ) -> Result<BulkMoveResult>
@@ -2124,42 +2835,95 @@ where
     }
     let mut moved = Vec::new();
     let mut failed = Vec::new();
+    let mut pending = Vec::new();
+    let mut needs_attention = Vec::new();
+    let mut operation_ids = Vec::new();
+    let mut session_usable = true;
     let total = uids.len() as u64;
-    for chunk in uids.chunks(500) {
-        check_cancel(cancel)?;
-        let uid_set: String = chunk
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        match move_uids(session, &uid_set, destination, caps).await {
-            Ok(()) => {
-                moved.extend_from_slice(chunk);
-                let _ = imap_timeout(session.noop()).await;
+    if caps.has_move() {
+        for chunk in uids.chunks(500) {
+            check_cancel(cancel)?;
+            let uid_set = chunk
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            match imap_timeout(session.uid_mv(&uid_set, destination)).await {
+                Ok(()) => moved.extend_from_slice(chunk),
+                Err(error) if definitive_command_rejection(&error) => {
+                    failed.extend_from_slice(chunk);
+                }
+                Err(error) => return Err(error),
             }
-            Err(_) => failed.extend_from_slice(chunk),
+            if let Some(progress) = on_progress {
+                progress((moved.len() + failed.len()) as u64, total);
+            }
         }
-        if let Some(progress) = on_progress {
-            progress((moved.len() + failed.len()) as u64, total);
+    } else {
+        for uid in uids {
+            check_cancel(cancel)?;
+            let outcome = journaled_move_uid(session, *uid, destination, journal).await?;
+            if let Some(operation_id) = outcome.operation_id {
+                operation_ids.push(operation_id);
+            }
+            match outcome.status {
+                crate::types::MoveStatus::Moved => moved.push(*uid),
+                crate::types::MoveStatus::Failed => failed.push(*uid),
+                crate::types::MoveStatus::ReconciliationPending => pending.push(*uid),
+                crate::types::MoveStatus::NeedsAttention => needs_attention.push(*uid),
+            }
+            session_usable &= outcome.session_usable;
+            if let Some(progress) = on_progress {
+                progress(
+                    (moved.len() + failed.len() + pending.len() + needs_attention.len()) as u64,
+                    total,
+                );
+            }
+            if !session_usable {
+                failed.extend(
+                    uids.iter()
+                        .copied()
+                        .skip_while(|candidate| *candidate != *uid)
+                        .skip(1),
+                );
+                break;
+            }
         }
     }
-    Ok(BulkMoveResult { moved, failed })
+    Ok(BulkMoveResult {
+        moved,
+        failed,
+        pending,
+        needs_attention,
+        operation_ids,
+        session_usable,
+    })
 }
 
 /// Move a message to another mailbox by UID. Uses MOVE when available, else
 /// COPY + `\Deleted` + UID EXPUNGE (which needs UIDPLUS).
-pub async fn move_message(
+pub(crate) async fn move_message(
     session: &mut ImapSession,
     uid: u32,
     destination: &str,
     caps: &ServerCaps,
-) -> Result<()> {
+    journal: JournalMoveContext<'_>,
+) -> Result<MoveItemOutcome> {
     if !caps.has_move() && !caps.has_uidplus() {
         return Err(AgentmailError::Other(
             "server supports neither MOVE nor UIDPLUS; cannot move messages safely".to_string(),
         ));
     }
-    move_uids(session, &uid.to_string(), destination, caps).await
+    if caps.has_move() {
+        imap_timeout(session.uid_mv(uid.to_string(), destination)).await?;
+        Ok(MoveItemOutcome {
+            status: crate::types::MoveStatus::Moved,
+            operation_id: None,
+            session_usable: true,
+        })
+    } else {
+        journaled_move_uid(session, uid, destination, journal).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3981,5 +4745,117 @@ mod tests {
         assert!(enabled.is_empty());
         drop(session);
         server.await.expect("scripted server should finish");
+    }
+
+    async fn scripted_cleanup_session(
+        reject_store: bool,
+        reject_expunge: bool,
+    ) -> (Session<DuplexStream>, tokio::task::JoinHandle<Vec<String>>) {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = command.split_whitespace().next().unwrap().to_string();
+                commands.push(command.clone());
+                let reply = if command.contains(" LOGIN ") {
+                    format!("{tag} OK LOGIN completed\r\n")
+                } else if command.contains("UID STORE") && reject_store {
+                    format!("{tag} NO STORE rejected\r\n")
+                } else if command.contains("UID STORE") {
+                    format!("{tag} OK STORE completed\r\n")
+                } else if command.contains("UID EXPUNGE") && reject_expunge {
+                    format!("{tag} BAD EXPUNGE rejected\r\n")
+                } else if command.contains("UID EXPUNGE") {
+                    format!("* 1 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n")
+                } else {
+                    panic!("unexpected cleanup command: {command:?}");
+                };
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+        (session, server)
+    }
+
+    #[tokio::test]
+    async fn checked_cleanup_never_treats_tagged_store_no_as_success() {
+        let (mut session, server) = scripted_cleanup_session(true, false).await;
+        let error = flag_and_expunge(&mut session, "42")
+            .await
+            .expect_err("tagged STORE NO must fail");
+        assert!(matches!(
+            error,
+            AgentmailError::Imap(async_imap::error::Error::No(_))
+        ));
+        drop(session);
+        let commands = server.await.unwrap();
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("UID STORE 42"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("UID EXPUNGE")),
+            "EXPUNGE must not follow a rejected STORE"
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_cleanup_never_treats_tagged_expunge_bad_as_success() {
+        let (mut session, server) = scripted_cleanup_session(false, true).await;
+        let error = flag_and_expunge(&mut session, "42")
+            .await
+            .expect_err("tagged EXPUNGE BAD must fail");
+        assert!(matches!(
+            error,
+            AgentmailError::Imap(async_imap::error::Error::Bad(_))
+        ));
+        drop(session);
+        let commands = server.await.unwrap();
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("UID STORE 42"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("UID EXPUNGE 42"))
+        );
+    }
+
+    #[test]
+    fn copyuid_ranges_expand_in_protocol_order_and_reject_mismatch() {
+        use async_imap::imap_proto::UidSetMember;
+
+        let mapping = copy_uid_mapping(
+            9,
+            &[UidSetMember::UidRange(1..=3), UidSetMember::Uid(8)],
+            &[UidSetMember::UidRange(101..=103), UidSetMember::Uid(108)],
+        )
+        .unwrap();
+        assert_eq!(mapping.pairs, [(1, 101), (2, 102), (3, 103), (8, 108)]);
+        assert!(
+            copy_uid_mapping(
+                9,
+                &[UidSetMember::UidRange(1..=2)],
+                &[UidSetMember::Uid(101)]
+            )
+            .is_err()
+        );
     }
 }
