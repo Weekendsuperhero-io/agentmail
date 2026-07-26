@@ -23,7 +23,7 @@ use crate::types::*;
 /// async closure behavior required by the connection pool.
 #[derive(Debug)]
 pub enum ImapTransport {
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
     Deflate(Pin<Box<DeflateStream<ImapTransport>>>),
 }
 
@@ -533,7 +533,7 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
     let connector = tokio_native_tls::TlsConnector::from(connector);
     let tls = imap_timeout(connector.connect(&config.host, tcp)).await?;
 
-    let transport = ImapTransport::Tls(tls);
+    let transport = ImapTransport::Tls(Box::new(tls));
     let mut client = async_imap::Client::new(transport);
     let auth_limit = imap_timeout_duration();
     let mut plain = match config.auth {

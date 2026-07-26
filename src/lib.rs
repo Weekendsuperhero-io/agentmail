@@ -3704,6 +3704,7 @@ impl Agentmail {
 
         // Write files using async I/O
         let output_dir = output_dir.to_path_buf();
+        #[cfg(unix)]
         let output_dir_existed = output_dir.exists();
         tokio::fs::create_dir_all(&output_dir).await.map_err(|e| {
             AgentmailError::Other(format!(
