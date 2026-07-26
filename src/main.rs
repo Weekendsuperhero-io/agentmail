@@ -665,6 +665,7 @@ impl Drop for TemporaryConfigFile {
 
 fn write_private_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    #[cfg(unix)]
     let parent_existed = parent.exists();
     std::fs::create_dir_all(parent)?;
     #[cfg(unix)]
