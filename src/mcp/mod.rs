@@ -388,6 +388,10 @@ impl ServerHandler for AgentMailServer {
         let task_cancel = context.ct.child_token();
         context.ct = task_cancel.clone();
         insert_related_task(&mut context.meta, &task_id);
+        // Captured BEFORE `context` moves into the worker: the push target.
+        let peer = context.peer.clone();
+        let notify_id = task_id.clone();
+        let notify_manager = Arc::clone(&self.task_manager);
         let handle = tokio::spawn(async move {
             // If destructive, acquire the per-account lock first.
             // This serializes destructive tasks — the task waits here until
@@ -409,9 +413,50 @@ impl ServerHandler for AgentMailServer {
             worker_completion.complete(result);
         });
 
-        self.task_manager
-            .lock()
-            .commit_task(&task_id, completion, task_cancel, handle)?;
+        self.task_manager.lock().commit_task(
+            &task_id,
+            Arc::clone(&completion),
+            task_cancel,
+            handle,
+        )?;
+
+        // Status watcher — the single producer of `notifications/tasks/status`.
+        //
+        // Spawned AFTER `commit_task` on purpose. The worker above can finish
+        // before the task is committed (a fast failure beats the commit to the
+        // lock), and `task_info` cannot resolve a task that is still only
+        // RESERVED — pushing from the worker therefore dropped the
+        // notification exactly when the task failed fastest.
+        //
+        // Waiting on the completion also unifies the two ways a task ends:
+        // `cancel_task` publishes a cancelled result, so cancellation wakes
+        // this same watcher rather than needing its own push (which would
+        // double-notify).
+        tokio::spawn(async move {
+            // A never-cancelled token: this watcher waits for the TASK, and
+            // must not be torn down by any one request's cancellation.
+            let _ = completion
+                .wait(&tokio_util::sync::CancellationToken::new())
+                .await;
+            // Read back through `task_info`, which runs the same lazy refresh
+            // a `tasks/get` would — so the pushed status can never contradict
+            // a subsequent poll.
+            let Ok(task) = notify_manager.lock().task_info(&notify_id) else {
+                return;
+            };
+            let notification = rmcp::model::ServerNotification::TaskStatusNotification(
+                rmcp::model::TaskStatusNotification::new(
+                    rmcp::model::TaskStatusNotificationParam::new(task),
+                ),
+            );
+            if let Err(error) = peer.send_notification(notification).await {
+                tracing::debug!(
+                    target: "agentmail",
+                    task = %notify_id,
+                    "tasks/status push failed — client gone: {error}"
+                );
+            }
+        });
 
         Ok(CreateTaskResult::new(task))
     }
@@ -453,6 +498,10 @@ impl ServerHandler for AgentMailServer {
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CancelTaskResult, McpError> {
+        // No push here: `cancel_task` publishes a cancelled result, which wakes
+        // the status watcher spawned in `enqueue_task`. That single watcher is
+        // the ONLY producer of `notifications/tasks/status`, so cancel and
+        // natural completion cannot double-notify.
         let task = self.task_manager.lock().cancel_task(&request.task_id)?;
         Ok(CancelTaskResult::new(task))
     }

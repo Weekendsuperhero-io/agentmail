@@ -143,7 +143,8 @@ impl AgentMailServer {
         name = "search_messages",
         output_schema = rmcp::handler::server::tool::schema_for_output::<SearchMessagesOutput>().expect("valid search_messages output schema"),
         description = "Search one required mailbox with filters: senderContains, subjectContains, toContains, query (IMAP full-text), read, flagged, headerKey/headerValueContains, since/before (YYYY-MM-DD), and largerThan/smallerThan (bytes). Filters are AND-combined. Returns metadata-only results newest-first with the mailbox UIDVALIDITY, pagination data (offset, limit, total, nextOffset), and one UIDVALIDITY-safe resourceUri per row; read that resource for content or append /headers or /source. Get mailbox names from list_mailboxes. Defaults: offset=0, limit=25 (max 50).",
-        annotations(title = "Search Messages", read_only_hint = true)
+        annotations(title = "Search Messages", read_only_hint = true),
+        execution(task_support = "optional")
     )]
     async fn search_messages_tool(
         &self,

@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 
 struct McpClient {
+    /// Notifications seen while awaiting responses (see `request`).
+    notifications: Vec<Value>,
     reader: BufReader<ReadHalf<tokio::io::DuplexStream>>,
     writer: WriteHalf<tokio::io::DuplexStream>,
     next_id: i64,
@@ -42,6 +44,7 @@ impl McpClient {
         });
         let (r, w) = tokio::io::split(client_io);
         let mut client = Self {
+            notifications: Vec::new(),
             reader: BufReader::new(r),
             writer: w,
             next_id: 0,
@@ -90,10 +93,57 @@ impl McpClient {
                 if value.get("id").and_then(Value::as_i64) == Some(id) {
                     return value;
                 }
+                // BUFFER, don't drop. A fast task can publish its terminal
+                // status before the enqueue response is even written, so a
+                // test that only reads AFTER the response would miss the
+                // notification entirely and wrongly conclude the server never
+                // pushes.
+                if value.get("id").is_none() {
+                    self.notifications.push(value);
+                }
             }
         })
         .await
         .unwrap_or_else(|_| panic!("timeout waiting for `{method}` response"))
+    }
+}
+
+impl McpClient {
+    /// Read frames until a NOTIFICATION with `method` arrives, discarding
+    /// responses along the way.
+    ///
+    /// `request` deliberately SKIPS notifications, so a test written only with
+    /// it cannot tell a server that pushes from one that never does.
+    async fn wait_for_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
+        // Already buffered by an earlier `request`? A fast task's push can beat
+        // the very response that started it.
+        if let Some(pos) = self
+            .notifications
+            .iter()
+            .position(|v| v.get("method").and_then(Value::as_str) == Some(method))
+        {
+            return Some(self.notifications.remove(pos));
+        }
+        tokio::time::timeout(timeout, async {
+            loop {
+                let mut buf = String::new();
+                let n = self.reader.read_line(&mut buf).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(&buf) else {
+                    continue;
+                };
+                if value.get("id").is_none()
+                    && value.get("method").and_then(Value::as_str) == Some(method)
+                {
+                    return Some(value);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 
@@ -1798,5 +1848,65 @@ async fn check_connection_unknown_account_is_an_iserror_result() {
     assert!(
         text.contains("Account not found"),
         "the error message reaches the caller: {result:#}"
+    );
+}
+
+/// A task-augmented call must PUSH `notifications/tasks/status` when it
+/// reaches a terminal state.
+///
+/// Task status is computed LAZILY here (`refresh_managed_task` runs on read),
+/// so before this the transition was observable only by polling `tasks/get` —
+/// a client that started a `delete_by_domain` over thousands of messages had
+/// no way to be told it finished.
+///
+/// Asserting on the notification specifically matters: every other task test
+/// in this file uses `request`, which skips notifications, so all of them
+/// passed against a server that never pushed at all.
+#[tokio::test]
+async fn task_terminal_transition_is_pushed_as_a_notification() {
+    let mut client = McpClient::start().await;
+    let queued = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "unsubscribe_message",
+                "arguments": {
+                    "account": "dummy",
+                    "mailbox": "INBOX",
+                    "uid": 1,
+                    "expectedUidValidity": 1,
+                    "confirmOneClick": false
+                },
+                "task": {"ttl": 60_000}
+            }),
+        )
+        .await;
+    assert!(queued.get("error").is_none(), "enqueue failed: {queued:#}");
+    let task_id = queued["result"]["task"]["taskId"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    let note = client
+        .wait_for_notification("notifications/tasks/status", Duration::from_secs(10))
+        .await
+        .expect("server must PUSH tasks/status on the terminal transition");
+
+    assert_eq!(note["params"]["taskId"], task_id.as_str());
+    let pushed = note["params"]["status"].as_str().unwrap_or("");
+    assert!(
+        matches!(pushed, "completed" | "failed"),
+        "pushed status must be terminal, got {pushed:?}"
+    );
+
+    // The PUSHED status must agree with the POLLED one — they are produced by
+    // the same lazy refresh, and a disagreement would be worse than no push.
+    let polled = client
+        .request("tasks/get", json!({"taskId": task_id}))
+        .await;
+    assert_eq!(
+        polled["result"]["status"].as_str(),
+        Some(pushed),
+        "pushed status must match a subsequent tasks/get: {polled:#}"
     );
 }
