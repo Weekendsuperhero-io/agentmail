@@ -6,8 +6,8 @@ use super::wire::{
     AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteByDomainOutput,
     DeleteBySenderOutput, DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput,
     MoveByDomainOutput, MoveBySenderOutput, MoveListIdOutput, MoveMessageOutput,
-    ReconcileMovesOutput, RemoveFlagsOutput, UnsubscribeMessageOutput, compact_result,
-    tool_error_result,
+    MoveSubscriptionOutput, ReconcileMovesOutput, RemoveFlagsOutput, UnsubscribeMessageOutput,
+    compact_result, tool_error_result,
 };
 use super::{make_cancel_fn, make_progress_fn};
 use crate::{
@@ -677,6 +677,51 @@ impl AgentMailServer {
         match result {
             Ok(data) => compact_result(MoveByDomainOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "move_subscription",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveSubscriptionOutput>().expect("valid move_subscription output schema"),
+        description = "Move the exact bulk-mail subscription represented by one top_subscriptions row to an existing destination mailbox. Map the row's nested sample to mailbox, expectedUidValidity, and uid; the action re-fetches that sample live, derives its canonical sender email and single List-Id when present, then sweeps the account-wide mutation plan. Every moved message must have the exact sender plus List-Unsubscribe or List-Unsubscribe-Post, and must also have the same List-Id when the sample has one. The destination is excluded. This files mail only; it does not send an unsubscribe request.",
+        annotations(
+            title = "Move Top Subscription",
+            read_only_hint = false,
+            destructive_hint = false
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn move_subscription_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<MoveSubscriptionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        if args.destination.trim().is_empty() {
+            return Err(McpError::invalid_params("destination is required", None));
+        }
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        let result = self
+            .agentmail
+            .move_subscription(
+                &args.mailbox,
+                &args.account,
+                args.uid,
+                args.expected_uid_validity,
+                &args.destination,
+                progress.callback(),
+                Some(&cancel),
+            )
+            .await;
+        progress.finish().await;
+        match result {
+            Ok(data) => compact_result(MoveSubscriptionOutput::from(data)),
+            Err(error) => Ok(tool_error_result(&error)),
         }
     }
 

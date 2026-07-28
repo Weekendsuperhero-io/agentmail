@@ -307,13 +307,13 @@ async fn initialize_reports_capabilities_and_identity() {
 }
 
 #[tokio::test]
-async fn tools_list_has_28_annotated_tools() {
+async fn tools_list_has_29_annotated_tools() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        28,
+        29,
         "tool count drifted — update docs and tests"
     );
 
@@ -1289,6 +1289,7 @@ async fn mutation_outputs_expose_ambiguous_move_recovery_state() {
         "move_list_id",
         "move_by_sender",
         "move_by_domain",
+        "move_subscription",
     ] {
         let properties = find_tool(tools, name)["outputSchema"]["properties"]
             .as_object()
@@ -1457,6 +1458,65 @@ async fn domain_tools_expose_exact_hierarchy_and_action_contracts() {
 }
 
 #[tokio::test]
+async fn top_subscription_move_maps_the_nested_sample_and_stays_non_destructive() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let tool = find_tool(tools, "move_subscription");
+    let input = &tool["inputSchema"];
+    let required: Vec<&str> = input["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for field in [
+        "account",
+        "mailbox",
+        "uid",
+        "expectedUidValidity",
+        "destination",
+    ] {
+        assert!(
+            required.contains(&field),
+            "move_subscription must require the ranking sample and destination: {required:?}"
+        );
+    }
+    assert_eq!(
+        schema_minimum(&input["properties"]["uid"]),
+        Some(1.0),
+        "sample UID must be non-zero"
+    );
+    assert_eq!(
+        schema_minimum(&input["properties"]["expectedUidValidity"]),
+        Some(1.0),
+        "sample UIDVALIDITY must be non-zero"
+    );
+    assert_eq!(tool["annotations"]["destructiveHint"], json!(false));
+    assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
+
+    let output = tool["outputSchema"]["properties"]
+        .as_object()
+        .expect("move_subscription output properties");
+    for field in [
+        "sampleMailbox",
+        "sampleUidValidity",
+        "sampleUid",
+        "sender",
+        "listId",
+        "matchedBy",
+        "found",
+        "moved",
+        "pending",
+        "needsAttention",
+        "operationIds",
+    ] {
+        assert!(
+            output.contains_key(field),
+            "move_subscription output must expose `{field}`"
+        );
+    }
+}
+
+#[tokio::test]
 async fn reconciliation_tools_expose_durable_operation_state() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
@@ -1596,9 +1656,11 @@ async fn unsubscribe_cleanup_prompt_uses_the_current_email_fallback_contract() {
     assert!(
         text.contains("exact sender email + List-Unsubscribe-Post")
             && text.contains("identity: \"listIdOrSender\"")
+            && text.contains("move_subscription")
+            && text.contains("Filing approval is not unsubscribe consent")
             && !text.contains("deleteMatching")
             && !text.contains("display name"),
-        "unsubscribe prompt must describe the current cleanup contract: {text}"
+        "unsubscribe prompt must separate filing consent and describe the current cleanup contract: {text}"
     );
 }
 
@@ -1672,6 +1734,7 @@ async fn mailbox_argument_follows_one_idiom() {
         "delete_messages",
         "download_attachments",
         "unsubscribe_message",
+        "move_subscription",
         "add_flags",
         "remove_flags",
         "move_message",

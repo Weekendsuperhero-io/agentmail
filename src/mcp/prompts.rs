@@ -103,7 +103,7 @@ impl AgentMailServer {
 
     #[prompt(
         name = "unsubscribe-cleanup",
-        description = "Identify high-volume mailing lists and perform consented, verified unsubscribe actions."
+        description = "Identify high-volume subscriptions and perform approved filing or consented, verified unsubscribe actions."
     )]
     async fn unsubscribe_cleanup_prompt(
         &self,
@@ -117,9 +117,15 @@ impl AgentMailServer {
                  of bulk-mail sender addresses. Results are grouped by normalized sender email and sorted by advertised one-click \
                  syntax first, then count; execution still requires live DKIM verification. \
                  Step 2: Present each row's address, count, advertisedOneClick, and nested \
-                 sample {{mailbox, uidValidity, uid, resourceUri}}. Ask me to approve each unsubscribe POST. \
-                 Step 3: For each one I explicitly approve, call unsubscribe_message with sample.uid as uid, \
-                 sample.uidValidity as expectedUidValidity, sample.mailbox as mailbox, and confirmOneClick=true. Omit cleanup \
+                 sample {{mailbox, uidValidity, uid, resourceUri}}. Offer either filing with move_subscription \
+                 or an unsubscribe POST; ask me to approve each action and destination. For filing, map the sample \
+                 to mailbox, expectedUidValidity, and uid; move_subscription derives the live exact sender and \
+                 optional List-Id scope and moves matching bulk mail account-wide. \
+                 Step 3: For each filing I approve, call move_subscription with sample.uid as uid, \
+                 sample.uidValidity as expectedUidValidity, sample.mailbox as mailbox, and my approved destination. \
+                 For each unsubscribe POST I approve, call unsubscribe_message with the same sample mapping and \
+                 confirmOneClick=true. Filing approval is not unsubscribe consent, and unsubscribe approval is not \
+                 filing approval. Omit cleanup \
                  unless I separately approve deleting matching mail. If I approve cleanup, use \
                  cleanup {{when: \"afterSuccess\", identity: \"listIdOrSender\", deletion: \"trash\"}}. This prefers a \
                  DKIM-authenticated List-Id; its sender fallback requires exact sender email + List-Unsubscribe-Post + \

@@ -1229,6 +1229,70 @@ impl From<crate::MoveByDomainResponse> for MoveByDomainOutput {
 
 impl WireOutput for MoveByDomainOutput {}
 
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MoveSubscriptionOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    pub(super) sample_mailbox: String,
+    pub(super) sample_uid_validity: u32,
+    pub(super) sample_uid: u32,
+    pub(super) sender: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) list_id: Option<String>,
+    pub(super) matched_by: String,
+    pub(super) destination: String,
+    pub(super) found: usize,
+    pub(super) moved: usize,
+    pub(super) failed: usize,
+    pub(super) pending: usize,
+    pub(super) needs_attention: usize,
+    pub(super) operation_ids: Vec<String>,
+    pub(super) mailboxes: Vec<PerMailboxMoveOutput>,
+    pub(super) mailboxes_total: usize,
+    pub(super) mailboxes_truncated: bool,
+    pub(super) skipped: Vec<String>,
+    pub(super) skipped_total: usize,
+    pub(super) skipped_truncated: bool,
+}
+
+impl From<crate::MoveSubscriptionResponse> for MoveSubscriptionOutput {
+    fn from(value: crate::MoveSubscriptionResponse) -> Self {
+        let mailboxes = value
+            .mailboxes
+            .into_iter()
+            .map(PerMailboxMoveOutput::from)
+            .collect();
+        let (mailboxes, mailboxes_total, mailboxes_truncated) = truncate_rows(mailboxes);
+        let (skipped, skipped_total, skipped_truncated) = truncate_rows(value.skipped);
+        Self {
+            account: value.account,
+            mailbox: value.mailbox,
+            sample_mailbox: value.sample_mailbox,
+            sample_uid_validity: value.sample_uid_validity,
+            sample_uid: value.sample_uid,
+            sender: value.sender,
+            list_id: value.list_id,
+            matched_by: value.matched_by,
+            destination: value.destination,
+            found: value.found,
+            moved: value.moved,
+            failed: value.failed,
+            pending: value.pending,
+            needs_attention: value.needs_attention,
+            operation_ids: value.operation_ids,
+            mailboxes,
+            mailboxes_total,
+            mailboxes_truncated,
+            skipped,
+            skipped_total,
+            skipped_truncated,
+        }
+    }
+}
+
+impl WireOutput for MoveSubscriptionOutput {}
+
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
@@ -1768,6 +1832,7 @@ mod tests {
         assert_ref_free::<MoveListIdOutput>();
         assert_ref_free::<MoveBySenderOutput>();
         assert_ref_free::<MoveByDomainOutput>();
+        assert_ref_free::<MoveSubscriptionOutput>();
         assert_ref_free::<ListPendingMovesOutput>();
         assert_ref_free::<ReconcileMovesOutput>();
         assert_ref_free::<UnsubscribeMessageOutput>();

@@ -305,21 +305,21 @@ impl ServerHandler for AgentMailServer {
              list_mailboxes requires one account and returns selectable mailboxes only, paginated with a default of 100. \
              get_messages and search_messages return metadata only, newest-first, with the mailbox UIDVALIDITY and a UIDVALIDITY-safe resourceUri for each row. \
              Read resourceUri for markdown content; append /headers for exact headers, /source for bounded raw RFC822, /info for JSON metadata with the attachment inventory, or /attachments/{index} for one attachment blob. \
-             Manage email: delete_messages, delete_by_sender, delete_by_domain, delete_list_id, move_message, move_list_id, move_by_sender, move_by_domain, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
-             Bulk filing: move_list_id and move_by_sender move every match to an existing destination mailbox in one call (e.g. statements into a folder) — never loop move_message per UID for that. \
+             Manage email: delete_messages, delete_by_sender, delete_by_domain, delete_list_id, move_message, move_list_id, move_by_sender, move_by_domain, move_subscription, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
+             Bulk filing: move_list_id, move_by_sender, move_by_domain, and move_subscription move every exact match to an existing destination mailbox in one call — never loop move_message per UID for that. \
              top_senders, top_domains, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
              Ranked tools use live offset pages with a maximum of 100; top_domains defaults to 20 rows and the other ranked tools default to 10. Pages may shift when mail changes. \
              On providers with a visible-window limit (Yahoo/AOL), rankings and account-wide delete/move sweeps cover the ENTIRE mailbox via RFC 9586 UID Mode when a persistent cache is available; without it, sweeps repeat passes as older mail backfills into view. \
              If an action reports Message not found for a ranking sample, the message was deleted since the scan — re-run the ranking for a fresh sample instead of retrying the same UID. \
              Account-wide discovery uses one selectable All mailbox when available; otherwise it skips Trash, Junk, Spam, Drafts, and virtual aggregate views. Destructive scans never write through aggregate views. \
              Every action that consumes a UID requires the same mailbox and non-zero expectedUidValidity returned during discovery, and fails closed if the mailbox UID epoch changed. \
-             Three cleanup workflows: (1) top_senders → delete_by_sender for unwanted personal senders, (2) top_domains → delete_by_domain or move_by_domain for one exact Header From domain, (3) top_subscriptions → unsubscribe_message for mailing lists. \
+             Ranking/action parity: top_senders → move_by_sender or delete_by_sender; top_domains → move_by_domain or delete_by_domain; top_mailing_lists → move_list_id or delete_list_id; top_subscriptions → move_subscription for filing or unsubscribe_message for a verified unsubscribe. \
              top_domains keeps parent domains and subdomains separate — actions on example.com never include mail.example.com implicitly; registrableDomain and subdomain are grouping context only. \
              Never use delete_by_sender for mailing list cleanup — it deletes ALL messages from a sender including non-bulk ones. \
              top_mailing_lists groups by List-Id header (RFC 2919) — all messages from the same mailing list regardless of sender. Use delete_list_id to remove an entire list. \
              top_senders groups by (email, display name) — same email with different display names are separate entries. \
              A non-native MOVE can return reconciliationPending or needsAttention with an operationId; use list_pending_moves to inspect durable operations and reconcile_moves to safely retry one operation or all pending operations. \
-             Ranking rows include a nested sample {mailbox, uidValidity, uid, resourceUri}; map those fields to mailbox, expectedUidValidity, and uid for a later action. \
+             Ranking rows include a nested sample {mailbox, uidValidity, uid, resourceUri}; map those fields to mailbox, expectedUidValidity, and uid for a later UID action. move_subscription live-validates that sample, then moves exact sender + list-action-header matches account-wide and also requires the sample's List-Id when present. \
              top_subscriptions advertisedOneClick is syntactic only; unsubscribe_message re-fetches exact headers and verifies DKIM. \
              unsubscribe_message requires explicit confirmOneClick=true. Optional matching-message cleanup is the nested cleanup {when, identity, deletion} object (omit it to only unsubscribe); it prefers the DKIM-authenticated List-Id, otherwise requires exact sender email + List-Unsubscribe-Post + the sample's List-Id when present, stops after a failed POST unless when=\"always\", and never silently escalates a Trash failure to permanent deletion unless deletion=\"trashThenPermanent\". \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
@@ -733,7 +733,7 @@ mod tests {
         let tools = AgentMailServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            28,
+            29,
             "tool count drifted — update docs and tests"
         );
         for tool in &tools {

@@ -670,8 +670,7 @@ pub struct MoveMessageResponse {
     pub operation_id: Option<String>,
 }
 
-/// Per-mailbox result of a bulk move (shared by move_list_id and
-/// move_by_sender).
+/// Per-mailbox result of a bulk move.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
@@ -731,6 +730,35 @@ pub struct MoveByDomainResponse {
     pub mailbox: String,
     pub account: String,
     pub domain: String,
+    pub destination: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
+    pub mailboxes: Vec<PerMailboxMoveResult>,
+    pub skipped: Vec<String>,
+}
+
+/// Response for move_subscription.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveSubscriptionResponse {
+    /// Always `*`: subscription rows are account-wide identities and the
+    /// destination mailbox is excluded from the sweep.
+    pub mailbox: String,
+    pub account: String,
+    /// Mailbox from the UIDVALIDITY-guarded ranking sample used to derive the
+    /// live sender and optional List-Id scope.
+    pub sample_mailbox: String,
+    pub sample_uid_validity: u32,
+    pub sample_uid: u32,
+    pub sender: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_id: Option<String>,
+    /// Human-readable statement of the exact live predicate used.
+    pub matched_by: String,
     pub destination: String,
     pub found: usize,
     pub moved: usize,

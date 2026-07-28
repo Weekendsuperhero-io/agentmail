@@ -392,8 +392,8 @@ Opens a web UI to exercise all advertised tools, 6 prompts, and task calls inter
 
 ## MCP Tools
 
-28 tools cover account discovery, mailbox management, message reading, search,
-bulk operations, recovery, flag management, and composition. 16 long-running tools support
+29 tools cover account discovery, mailbox management, message reading, search,
+bulk operations, recovery, flag management, and composition. 17 long-running tools support
 optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/tasks)
 (SEP-1686) for asynchronous execution.
 
@@ -421,6 +421,7 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 | `move_by_sender`       | Move all messages from an exact sender identity, optionally across all mailboxes      |
 | `move_by_domain`       | Move messages from one exact canonical sender domain                                 |
 | `move_list_id`         | Move all messages with an exact List-Id, optionally across all mailboxes               |
+| `move_subscription`    | Move the exact bulk-mail subscription represented by a `top_subscriptions` sample     |
 | `move_message`         | Move a message between mailboxes via IMAP MOVE                                        |
 | `reconcile_moves`      | Safely resume one or all pending COPY-fallback MOVE operations                        |
 | `create_draft`         | Compose RFC822 draft and append to Drafts folder                                      |
@@ -470,8 +471,9 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - Every discovery result that can lead to a UID action carries the complete
   `(mailbox, uidValidity, uid)` identity and a canonical `resourceUri`.
   `delete_messages`, `move_message`, `download_attachments`, `add_flags`,
-  `remove_flags`, and `unsubscribe_message` require `expectedUidValidity` and
-  refuse the action if a live `EXAMINE` observes another UID epoch.
+  `remove_flags`, `move_subscription`, and `unsubscribe_message` require
+  `expectedUidValidity` and refuse the action if a live `EXAMINE` observes
+  another UID epoch.
   `delete_by_sender` instead takes the exact sender identity (`email` +
   `name`, from a ranking row) and confirms it live in each mailbox, so it
   carries no sample UID or epoch guard.
@@ -482,6 +484,11 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   locally verifies a passing DKIM signature that covers both list headers.
   Subscription rows are grouped only by normalized sender email; display names
   and `List-Id` values do not create additional rows.
+- `move_subscription` maps that same nested sample to `mailbox`,
+  `expectedUidValidity`, and `uid`, re-fetches its exact headers live, and moves
+  account-wide matches having the exact sender plus either list-action header.
+  When the sample has one usable List-Id, matches must also have that exact
+  List-Id. The destination mailbox is excluded from the sweep.
 - The action-time DKIM source fetch is preceded by `RFC822.SIZE`, capped at 64 MiB, and fetched with a bounded IMAP partial. This per-source safety bound does not limit matching-message cleanup counts.
 - RFC 8058 requests accept exactly one parsed HTTPS URI, reject credentials, fragments, HTTP alternatives, private/link-local/loopback destinations, mixed public/private DNS answers, proxies, retries, and redirects, and require a direct 2xx response. The resolved public addresses are pinned for the request.
 - Matching-message cleanup is one optional `cleanup {when, identity, deletion}` object; omitting it means unsubscribe only. Defaults are fail-safe: `when: "afterSuccess"` (a failed unsubscribe never triggers cleanup unless `"always"` is explicit), `deletion: "trash"` (never permanent unless `"trashThenPermanent"` or `"permanent"` is explicit). Cleanup matches the normalized RFC 2919 List-Id only when the same passing DKIM signature covered that single List-Id; otherwise `identity: "listIdOrSender"` (default) requires exact normalized sender email plus `List-Unsubscribe-Post`, and also requires the target's normalized List-Id whenever the sampled message has one. Display names never affect this fallback.
@@ -626,7 +633,7 @@ Argument autocompletion (`completion/complete`) is supported for the prompts and
 ```
 agentmail (binary crate: agentmail-mcp)
   ├── serve                → MCP stdio server (tokio + rmcp)
-  │                          28 tools + 6 prompts, tasks, progress notifications
+  │                          29 tools + 6 prompts, tasks, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
   ├── create-mailbox       → CLI
@@ -650,7 +657,7 @@ agentmail (binary crate: agentmail-mcp)
 src/ (library + binary)
   ├── lib.rs          → Public API facade (25+ async methods)
   ├── main.rs         → CLI dispatch (clap), account configuration
-  ├── mcp/            → MCP server: 28 tools, 6 prompts, tasks, resources, completions
+  ├── mcp/            → MCP server: 29 tools, 6 prompts, tasks, resources, completions
   ├── config.rs       → TOML config loading, default account resolution
   ├── credentials.rs  → Password resolution (env → config secret → default keyring)
   ├── connection.rs   → IMAP connection pool (provider-aware per-account cap)

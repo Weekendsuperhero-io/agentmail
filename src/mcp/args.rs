@@ -587,6 +587,36 @@ pub(super) struct MoveByDomainArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    description = "Arguments for moving the exact bulk-mail subscription represented by a top_subscriptions sample."
+)]
+pub(super) struct MoveSubscriptionArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(
+        description = "Mailbox containing the ranking sample. Map top_subscriptions sample.mailbox here; matching messages are swept account-wide and the destination is excluded."
+    )]
+    pub(super) mailbox: String,
+    #[schemars(
+        range(min = 1),
+        description = "UID from top_subscriptions sample.uid. The live sample supplies the exact sender and optional List-Id scope."
+    )]
+    pub(super) uid: u32,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY from top_subscriptions sample.uidValidity. The action fails if the sample mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
+    #[schemars(
+        description = "Destination mailbox (required). Must already exist; use create_mailbox first if needed."
+    )]
+    pub(super) destination: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for listing durable MOVE operations awaiting reconciliation.")]
 pub(super) struct ListPendingMovesArgs {
     #[schemars(
