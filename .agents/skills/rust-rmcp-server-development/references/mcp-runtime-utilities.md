@@ -1,6 +1,6 @@
 # MCP Runtime Utilities
 
-Use this reference when designing runtime behavior around MCP primitives: capability negotiation, request control, notifications, HTTP security, authorization, and gateway forwarding.
+Use this reference when designing runtime behavior around MCP primitives: capability negotiation, request control, notifications, HTTP security, authorization, and bridge forwarding.
 
 Verified on 2026-06-09 against:
 
@@ -24,7 +24,7 @@ The runtime layer decides whether a primitive is available, how long it may run,
 
 The next MCP revision, versioned `2026-07-28` (release candidate locked May 2026), is a major shift: the core becomes stateless — the `initialize` handshake and `Mcp-Session-Id` header are removed — and MCP Apps and Tasks move into a formal extensions framework with a deprecation policy. `rmcp` 1.7.0 targets `2025-11-25`. Before designing behavior that depends on sessions or the initialize lifecycle for anything newer, check the spec changelog and current `rmcp` release notes.
 
-## Client, Server, Gateway
+## Client, Server, Bridge
 
 Client role:
 
@@ -42,15 +42,15 @@ Server role:
 - Emits progress, logs, list-changed notifications, and resource updates when appropriate.
 - Enforces auth, scope, input validation, root boundaries, and resource limits.
 
-Gateway role:
+Bridge role:
 
 - Acts as a server to the downstream host/client and as a client to one or more upstream MCP servers.
 - Negotiates capabilities independently on every connection; do not blindly mirror upstream capabilities.
-- Advertises only the features the gateway can faithfully proxy, aggregate, filter, secure, and test.
+- Advertises only the features the bridge can faithfully proxy, aggregate, filter, secure, and test.
 - Maps downstream cancellation, progress, tasks, pagination, and list-changed notifications to upstream operations when possible.
 - Keeps auth, roots, task IDs, cursors, resource URIs, and progress tokens scoped per downstream user/session.
 
-Implementation patterns: `rmcp-client-patterns.md` for the client role, `gateway-patterns.md` for the gateway role.
+Implementation patterns: `rmcp-client-patterns.md` for the client role, `bridge-patterns.md` for the bridge role.
 
 ## Capability Negotiation
 
@@ -119,7 +119,7 @@ Ping:
 
 - Either side can send `ping` to test liveness.
 - Use ping for connection health, not application-level readiness.
-- Make ping interval and timeout configurable for long-lived HTTP/SSE connections and gateways.
+- Make ping interval and timeout configurable for long-lived HTTP/SSE connections and bridges.
 
 Progress:
 
@@ -151,7 +151,7 @@ Tandem use:
 - A task may wrap `tools/call` and emit progress.
 - A task may pause with `input_required`, then use elicitation to collect missing input.
 - Client-side tasks may wrap `sampling/createMessage` or `elicitation/create`.
-- Gateways should map downstream task IDs to upstream task IDs and never expose upstream IDs directly unless that is part of the gateway contract.
+- Bridges should map downstream task IDs to upstream task IDs and never expose upstream IDs directly unless that is part of the bridge contract.
 
 RMCP mapping:
 
@@ -226,7 +226,7 @@ Client-side behavior:
 - Send `Authorization: Bearer <access-token>` on every authorized HTTP request.
 - Do not treat SSE disconnection as cancellation; send cancellation explicitly.
 
-Gateway behavior:
+Bridge behavior:
 
 - Validate downstream `Origin` and auth separately from upstream auth.
 - Do not forward downstream bearer tokens upstream unless that is explicitly the auth model.
@@ -240,7 +240,7 @@ Role responsibilities:
 
 - Server: act as an OAuth protected resource; publish discovery metadata; validate bearer tokens and audience binding on every request; `401` for missing/invalid/expired tokens, `403` for insufficient scope; never accept or transit tokens issued for another resource.
 - Client: discover metadata from `WWW-Authenticate` or well-known URIs; run the PKCE authorization-code flow with the `resource` parameter; send tokens only in the `Authorization` header.
-- Gateway: keep downstream identity separate from upstream credentials; apply the downstream user's permissions before upstream calls; token passthrough is forbidden.
+- Bridge: keep downstream identity separate from upstream credentials; apply the downstream user's permissions before upstream calls; token passthrough is forbidden.
 
 RFC specifics, the `rmcp` `auth` feature, and server middleware patterns: read `http-authorization.md`.
 
@@ -267,4 +267,4 @@ Use protocol errors for protocol failures and task status for task execution fai
 - Does progress stop after completion and remain monotonic?
 - Are ordinary cancellation and task cancellation handled separately?
 - Is HTTP protected against invalid Origin, missing auth, token audience mistakes, and session leakage?
-- Does gateway code isolate downstream users from upstream sessions, cursors, tasks, and tokens?
+- Does bridge code isolate downstream users from upstream sessions, cursors, tasks, and tokens?

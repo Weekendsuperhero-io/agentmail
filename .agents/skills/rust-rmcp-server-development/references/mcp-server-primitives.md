@@ -22,7 +22,7 @@ Prompt   = guide how to do something
 
 Many real servers use all three. Do not force everything into tools just because tools are the most visible primitive.
 
-Read `mcp-runtime-utilities.md` for the runtime layer around these primitives: capability negotiation, list change notifications, resource subscriptions, pagination, completion, logging, progress, cancellation, ping, tasks, authorization, timeouts, and gateway behavior.
+Read `mcp-runtime-utilities.md` for the runtime layer around these primitives: capability negotiation, list change notifications, resource subscriptions, pagination, completion, logging, progress, cancellation, ping, tasks, authorization, timeouts, and bridge behavior.
 
 ## Lifecycle And Capabilities
 

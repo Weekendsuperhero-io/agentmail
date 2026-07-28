@@ -54,7 +54,7 @@ where
 /// IMAP rejection, a consent-required stop — are outcomes the LLM should SEE
 /// and react to (e.g. re-run a ranking when a sampled UID went stale), so per
 /// the MCP spec they belong in the result with `isError: true`. Returning them
-/// as protocol errors (`McpError`) instead made the gateway classify a single
+/// as protocol errors (`McpError`) instead made the bridge classify a single
 /// bad call as `BackendConnectionFailed` — i.e. report the whole AgentMail
 /// backend as down. Protocol errors stay reserved for malformed requests, which
 /// the tool handlers validate up front before the operation runs.
@@ -1671,7 +1671,7 @@ mod tests {
     use super::*;
 
     /// A stale-UID (or any operational) failure is an `isError` tool RESULT, so
-    /// the gateway forwards it to the agent instead of classifying it as
+    /// the bridge forwards it to the agent instead of classifying it as
     /// `BackendConnectionFailed`, and the actionable message reaches the LLM.
     #[test]
     fn tool_error_result_is_an_iserror_result_carrying_the_message() {

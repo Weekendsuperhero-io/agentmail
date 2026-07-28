@@ -149,7 +149,7 @@ impl McpClient {
 
 /// Walk a schema JSON tree asserting no `$ref`/`$defs` keys — wire-level
 /// backstop for the unit test in `src/mcp.rs` (Gemini CLI, n8n, and some
-/// gateways reject or drop referenced schemas).
+/// bridges reject or drop referenced schemas).
 fn assert_no_refs(value: &Value, tool: &str, side: &str) {
     match value {
         Value::Object(map) => {
@@ -1075,7 +1075,7 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
         .await;
     // Consent-required is an operational STOP on a well-formed request, so it is
     // an isError RESULT the agent can act on (re-call with confirmOneClick:
-    // true) — not a protocol error, which the gateway would read as the whole
+    // true) — not a protocol error, which the bridge would read as the whole
     // backend failing.
     assert!(
         no_consent.get("error").is_none(),
@@ -1164,7 +1164,7 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             )
             .await;
         // The connect failure is an operational isError RESULT — not a -32602
-        // policy rejection, and not a protocol error the gateway would misread
+        // policy rejection, and not a protocol error the bridge would misread
         // as the whole backend being down.
         assert!(
             accepted.get("error").is_none(),
@@ -1830,7 +1830,7 @@ async fn check_connection_unknown_account_is_an_iserror_result() {
         .await;
 
     // An operational failure (the account doesn't exist) is a tool RESULT with
-    // isError: true — NOT a JSON-RPC protocol error. The gateway classifies a
+    // isError: true — NOT a JSON-RPC protocol error. The bridge classifies a
     // protocol error from a tool call as `BackendConnectionFailed` (the whole
     // backend "down"), so a bad account name must not present that way; the
     // agent should see the message and retry with a valid account.

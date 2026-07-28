@@ -36,7 +36,7 @@ For HTTP deployments:
 
 Core OAuth mechanics (RFC 9728 discovery, audience validation, server middleware) and the `rmcp` `auth` feature: read `http-authorization.md`.
 
-For gateways:
+For bridges:
 
 - Separate downstream user identity from upstream credentials.
 - Scope app state, UI resource URIs, task IDs, cursors, and auth tokens per downstream session.

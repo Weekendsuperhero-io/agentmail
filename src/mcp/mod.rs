@@ -683,7 +683,7 @@ mod tests {
         }
     }
 
-    /// The concrete case the gateway rejected: a mailbox with no special-use
+    /// The concrete case the bridge rejected: a mailbox with no special-use
     /// role must still serialize `roles: []` because the output schema
     /// requires the key.
     #[test]
@@ -705,7 +705,7 @@ mod tests {
     }
 
     /// Walk a schema JSON tree asserting no `$ref`/`$defs` keys — several MCP
-    /// hosts (Gemini CLI, n8n, some gateways) reject or drop referenced
+    /// hosts (Gemini CLI, n8n, some bridges) reject or drop referenced
     /// schemas, so every nested type must carry `#[schemars(inline)]`.
     fn assert_no_refs(value: &serde_json::Value, path: &str, tool: &str, side: &str) {
         match value {

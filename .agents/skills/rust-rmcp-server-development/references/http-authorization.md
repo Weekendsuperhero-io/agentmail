@@ -127,15 +127,15 @@ The gaps, and what to do about each:
 
 For integration-testing any of this without a real IdP, `oauth2-test-server` is an in-memory OAuth 2.0/OIDC authorization server with dynamic-registration support, built for exercising MCP auth flows. Several alternative Rust MCP frameworks also bundle server-side auth — they replace `rmcp` rather than extend it, so treat switching as an architecture decision, not a patch.
 
-## Gateways
+## Bridges
 
-A gateway terminates two independent auth legs and must never bridge them with the same token:
+A bridge terminates two independent auth legs and must never bridge them with the same token:
 
-- Downstream: the gateway is the protected resource; tokens are validated with the gateway as audience.
-- Upstream: the gateway is a client using its own credentials (or a real per-user token exchange).
+- Downstream: the bridge is the protected resource; tokens are validated with the bridge as audience.
+- Upstream: the bridge is a client using its own credentials (or a real per-user token exchange).
 - Forwarding a downstream bearer token upstream is the forbidden passthrough pattern; and proxying a shared third-party client ID requires per-client user consent to avoid the confused deputy problem.
 
-Mechanics live in `gateway-patterns.md`.
+Mechanics live in `bridge-patterns.md`.
 
 ## Checklist
 

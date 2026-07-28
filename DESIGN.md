@@ -16,7 +16,7 @@ graph TB
         UI[Settings UI]
         DB[(SQLite<br/>mail_accounts)]
         KR[OS Keyring<br/>passwords]
-        GW[MCP Gateway]
+        GW[MCP Bridge]
     end
 
     subgraph "agentmail-mcp (in-process)"
@@ -58,7 +58,7 @@ graph LR
     end
 
     subgraph "In-Process (Agent App)"
-        GW2[Gateway] <-->|DuplexStream| MCP2[AgentMailServer]
+        GW2[Bridge] <-->|DuplexStream| MCP2[AgentMailServer]
         MCP2 --> MK2[Agentmail]
         MK2 -->|Config::from_accounts| DB2[Agent DB]
     end

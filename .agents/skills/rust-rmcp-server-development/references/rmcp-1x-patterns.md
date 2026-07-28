@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
 
 Use this pattern instead of old `Server::builder()`, `StdioTransport::new()`, or separate `rmcp-macros` wiring unless current docs for the pinned version require otherwise.
 
-The service pattern above is the server role. For client and gateway processes, read `rmcp-client-patterns.md` and `gateway-patterns.md`.
+The service pattern above is the server role. For client and bridge processes, read `rmcp-client-patterns.md` and `bridge-patterns.md`.
 
 ## Cargo Dependencies
 
