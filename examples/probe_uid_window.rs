@@ -1,7 +1,7 @@
 //! Probe whether a windowed IMAP server (Yahoo/AOL pin the visible mailbox
 //! to its newest ~10,000 messages) honors direct UID addressing BELOW the
 //! visible window. Strict IMAP says no — `EXISTS` defines the session's
-//! mailbox — but gateway servers are often looser, and if this one answers,
+//! mailbox — but bridge servers are often looser, and if this one answers,
 //! whole-mailbox scans and deletes can UID-walk past the window instead of
 //! draining it via delete→backfill passes.
 //!
@@ -36,6 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host,
         port,
         username: user,
+        email: None,
+        aliases: Vec::new(),
         password: Some(Secret::new_raw(&pass)),
         tls: true,
         max_connections: None,
@@ -86,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Decisive test 2: direct UID FETCH below the window (some gateways
+    // Decisive test 2: direct UID FETCH below the window (some bridges
     // treat FETCH and SEARCH visibility differently).
     let fetch_lo = min_visible.saturating_sub(5_000).max(1);
     let fetch_hi = min_visible.saturating_sub(4_900).max(1);

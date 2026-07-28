@@ -9,7 +9,7 @@ jobs:
   changelog:
     permissions:
       contents: write
-    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-changelog.yml@main
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-changelog.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
     with:
       changelog-path: CHANGELOG.md
       # Split mode: CHANGELOG.md stays purely user-facing (it ships verbatim

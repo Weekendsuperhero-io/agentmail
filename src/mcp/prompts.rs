@@ -4,7 +4,7 @@ use super::AgentMailServer;
 use super::args::*;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{PromptMessage, PromptMessageRole},
+    model::{PromptMessage, Role},
     prompt, prompt_router,
 };
 
@@ -19,7 +19,7 @@ impl AgentMailServer {
         params: Parameters<InboxSummaryArgs>,
     ) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Give me a comprehensive overview of my email for account \"{}\". \
                  First, call list_mailboxes with this account to see selectable folders, message totals, and unread counts. \
@@ -40,7 +40,7 @@ impl AgentMailServer {
         params: Parameters<CleanupSenderArgs>,
     ) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Help me clean up all emails from \"{}\" in account \"{}\". \
                  First, use search_messages with mailbox=\"INBOX\", senderContains, and limit=5. Results are metadata-only; \
@@ -63,7 +63,7 @@ impl AgentMailServer {
     ) -> Vec<PromptMessage> {
         let mailbox = params.0.mailbox.as_deref().unwrap_or("INBOX");
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Find all messages with attachments in mailbox \"{}\" for account \"{}\". \
                  Use find_attachments with limit=10. Each hit has mailbox, uidValidity, uid, date, and resourceUri. \
@@ -98,36 +98,39 @@ impl AgentMailServer {
              (with optional attachments) to save it. Show me a preview before saving; create_draft resolves \
              the proper Drafts mailbox and applies the Draft flag itself.",
         );
-        vec![PromptMessage::new_text(
-            PromptMessageRole::User,
-            instructions,
-        )]
+        vec![PromptMessage::new_text(Role::User, instructions)]
     }
 
     #[prompt(
         name = "unsubscribe-cleanup",
-        description = "Identify high-volume mailing lists and perform consented, verified unsubscribe actions."
+        description = "Identify high-volume subscriptions and perform approved filing or consented, verified unsubscribe actions."
     )]
     async fn unsubscribe_cleanup_prompt(
         &self,
         params: Parameters<UnsubscribeCleanupArgs>,
     ) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Help me clean up mailing list clutter in account \"{}\". \
                  Step 1: Use top_subscriptions with mailbox and limit omitted to get the default account-wide page of 10 \
-                 of bulk-mail senders. Results are grouped by sender and sorted by advertised one-click \
+                 of bulk-mail sender addresses. Results are grouped by normalized sender email and sorted by advertised one-click \
                  syntax first, then count; execution still requires live DKIM verification. \
-                 Step 2: Present each row's address, display name, count, advertisedOneClick, and nested \
-                 sample {{mailbox, uidValidity, uid, resourceUri}}. Ask me to approve each unsubscribe POST. \
-                 Step 3: For each one I explicitly approve, call unsubscribe_message with sample.uid as uid, \
-                 sample.uidValidity as expectedUidValidity, sample.mailbox as mailbox, and confirmOneClick=true. Leave \
-                 deleteMatching=false unless I separately approve deleting matching mail. If I approve \
-                 cleanup, set deleteMatching=true; it matches an exact normalized List-Id only \
-                 when that header is covered by the same passing DKIM signature. Keep \
-                 deleteOnUnsubscribeFailure=false and allowPermanentFallback=false unless I separately \
-                 and explicitly authorize those higher-risk policies.",
+                 Step 2: Present each row's address, count, advertisedOneClick, and nested \
+                 sample {{mailbox, uidValidity, uid, resourceUri}}. Offer either filing with move_subscription \
+                 or an unsubscribe POST; ask me to approve each action and destination. For filing, map the sample \
+                 to mailbox, expectedUidValidity, and uid; move_subscription derives the live exact sender and \
+                 optional List-Id scope and moves matching bulk mail account-wide. \
+                 Step 3: For each filing I approve, call move_subscription with sample.uid as uid, \
+                 sample.uidValidity as expectedUidValidity, sample.mailbox as mailbox, and my approved destination. \
+                 For each unsubscribe POST I approve, call unsubscribe_message with the same sample mapping and \
+                 confirmOneClick=true. Filing approval is not unsubscribe consent, and unsubscribe approval is not \
+                 filing approval. Omit cleanup \
+                 unless I separately approve deleting matching mail. If I approve cleanup, use \
+                 cleanup {{when: \"afterSuccess\", identity: \"listIdOrSender\", deletion: \"trash\"}}. This prefers a \
+                 DKIM-authenticated List-Id; its sender fallback requires exact sender email + List-Unsubscribe-Post + \
+                 the sample's List-Id when it has one. Never use when=\"always\", deletion=\"trashThenPermanent\", or \
+                 deletion=\"permanent\" unless I separately and explicitly authorize that higher-risk policy.",
                 params.0.account
             ),
         )]
@@ -142,7 +145,7 @@ impl AgentMailServer {
         params: Parameters<ListIdCleanupArgs>,
     ) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Help me clean up mailing lists in account \"{}\". \
                  Step 1: Use top_mailing_lists with mailbox and limit omitted to get the default account-wide page of 10 \

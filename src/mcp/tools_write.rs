@@ -3,9 +3,10 @@
 use super::AgentMailServer;
 use super::args::*;
 use super::wire::{
-    AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteBySenderOutput,
-    DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput, MoveBySenderOutput,
-    MoveListIdOutput, MoveMessageOutput, RemoveFlagsOutput, UnsubscribeMessageOutput,
+    AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteByDomainOutput,
+    DeleteBySenderOutput, DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput,
+    MoveByDomainOutput, MoveBySenderOutput, MoveListIdOutput, MoveMessageOutput,
+    MoveSubscriptionOutput, ReconcileMovesOutput, RemoveFlagsOutput, UnsubscribeMessageOutput,
     compact_result, tool_error_result,
 };
 use super::{make_cancel_fn, make_progress_fn};
@@ -19,7 +20,12 @@ use rmcp::{
     model::{CallToolResult, Meta},
     tool, tool_router,
 };
+use tokio::io::AsyncReadExt as _;
 use tokio_util::sync::CancellationToken;
+
+const MAX_DRAFT_ATTACHMENTS: usize = 20;
+const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_DRAFT_ATTACHMENT_TOTAL_BYTES: u64 = 40 * 1024 * 1024;
 
 /// Map the flat `permanent` tool argument to a `DeleteMode`.
 fn delete_mode(permanent: bool) -> DeleteMode {
@@ -115,7 +121,7 @@ impl AgentMailServer {
 
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
-        match self
+        let result = self
             .agentmail
             .delete_messages(
                 &args.mailbox,
@@ -123,11 +129,12 @@ impl AgentMailServer {
                 &args.uids,
                 args.expected_uid_validity,
                 delete_mode(args.permanent),
-                progress.as_ref(),
+                progress.callback(),
                 Some(&cancel),
             )
-            .await
-        {
+            .await;
+        progress.finish().await;
+        match result {
             Ok(data) => compact_result(DeleteMessagesOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
         }
@@ -136,7 +143,7 @@ impl AgentMailServer {
     #[tool(
         name = "delete_by_sender",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteBySenderOutput>().expect("valid delete_by_sender output schema"),
-        description = "Delete all messages from an exact sender identity. Pass the address and displayName exactly as returned by a top_senders or top_subscriptions row; matching is exact on both fields, confirmed live before any deletion. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views. Do not use this for mailing-list cleanup (use delete_list_id or unsubscribe_message cleanup).",
+        description = "Delete all messages from an exact sender identity. Pass the address and displayName exactly as returned by a top_senders row; matching is exact on both fields, confirmed live before any deletion. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views. Do not use this for mailing-list cleanup (use delete_list_id or unsubscribe_message cleanup).",
         annotations(title = "Delete by Sender", destructive_hint = true),
         execution(task_support = "optional")
     )]
@@ -153,7 +160,7 @@ impl AgentMailServer {
 
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
-        match self
+        let result = self
             .agentmail
             .delete_by_sender(
                 args.mailbox.as_deref(),
@@ -161,12 +168,55 @@ impl AgentMailServer {
                 &args.email,
                 args.name.as_deref().unwrap_or_default(),
                 delete_mode(args.permanent),
-                progress.as_ref(),
+                progress.callback(),
                 Some(&cancel),
             )
-            .await
-        {
+            .await;
+        progress.finish().await;
+        match result {
             Ok(data) => compact_result(DeleteBySenderOutput::from(data)),
+            Err(e) => Ok(tool_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "delete_by_domain",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteByDomainOutput>().expect("valid delete_by_domain output schema"),
+        description = "Delete every message whose first parsed Header From address has one exact canonical domain. Pass domain exactly as returned by top_domains: example.com never includes mail.example.com or any other subdomain. Omit mailbox to sweep the account-wide mutation plan, which excludes Trash/Junk/Drafts and aggregate views. With permanent=false, Trash is preferred but permanent fallback may be used when Trash is unavailable; permanent=true bypasses Trash. Header From matching is organizational cleanup, not DKIM authentication.",
+        annotations(
+            title = "Delete by Exact Domain",
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn delete_by_domain_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<DeleteByDomainArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.domain.trim().is_empty() {
+            return Err(McpError::invalid_params("domain is required", None));
+        }
+
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        let result = self
+            .agentmail
+            .delete_by_domain(
+                args.mailbox.as_deref(),
+                &args.account,
+                &args.domain,
+                delete_mode(args.permanent),
+                progress.callback(),
+                Some(&cancel),
+            )
+            .await;
+        progress.finish().await;
+        match result {
+            Ok(data) => compact_result(DeleteByDomainOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
         }
     }
@@ -238,37 +288,111 @@ impl AgentMailServer {
                 None,
             ));
         }
+        if args.attachments.len() > MAX_DRAFT_ATTACHMENTS {
+            return Err(McpError::invalid_params(
+                format!("attachments supports at most {MAX_DRAFT_ATTACHMENTS} files"),
+                None,
+            ));
+        }
 
-        // Load attachments (best-effort per file; surface first error clearly)
+        // Resolve and stat every attachment before reading the first byte, so
+        // an oversized aggregate cannot leave a large partially loaded draft.
+        let mut preflight = Vec::with_capacity(args.attachments.len());
+        let mut preflight_total = 0_u64;
+        for (index, attachment) in args.attachments.iter().enumerate() {
+            let safe_path = self
+                .file_access
+                .confine_read(&attachment.path)
+                .map_err(|reason| {
+                    McpError::invalid_params(format!("attachment #{}: {reason}", index + 1), None)
+                })?;
+            let file = tokio::fs::File::open(&safe_path).await.map_err(|error| {
+                McpError::invalid_params(
+                    format!(
+                        "Failed to open attachment #{} at '{}': {error}",
+                        index + 1,
+                        attachment.path
+                    ),
+                    None,
+                )
+            })?;
+            let metadata = file.metadata().await.map_err(|error| {
+                McpError::invalid_params(
+                    format!(
+                        "Failed to inspect attachment #{} at '{}': {error}",
+                        index + 1,
+                        attachment.path
+                    ),
+                    None,
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(McpError::invalid_params(
+                    format!("attachment #{} is not a regular file", index + 1),
+                    None,
+                ));
+            }
+            let size = metadata.len();
+            if size > MAX_DRAFT_ATTACHMENT_BYTES {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "attachment #{} is {size} bytes; maximum per file is {MAX_DRAFT_ATTACHMENT_BYTES} bytes",
+                        index + 1
+                    ),
+                    None,
+                ));
+            }
+            preflight_total = preflight_total.checked_add(size).ok_or_else(|| {
+                McpError::invalid_params("attachment aggregate size overflow", None)
+            })?;
+            if preflight_total > MAX_DRAFT_ATTACHMENT_TOTAL_BYTES {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "attachments total {preflight_total} bytes; aggregate maximum is {MAX_DRAFT_ATTACHMENT_TOTAL_BYTES} bytes"
+                    ),
+                    None,
+                ));
+            }
+            preflight.push((size, file));
+        }
+
         let mut loaded: Vec<DraftAttachment> = Vec::with_capacity(args.attachments.len());
-        for (i, a) in args.attachments.iter().enumerate() {
-            // Confine the LLM-supplied attachment path to the file sandbox: an
-            // untrusted model (prompt-injected via email) must not be able to
-            // attach — and thereby exfiltrate through the saved draft — a
-            // sensitive local file such as ~/.ssh/id_rsa or /etc/passwd.
-            let safe_path = match self.file_access.confine_read(&a.path) {
-                Ok(path) => path,
-                Err(reason) => {
-                    return Err(McpError::invalid_params(
-                        format!("attachment #{}: {reason}", i + 1),
-                        None,
-                    ));
-                }
-            };
-            let data = match tokio::fs::read(&safe_path).await {
-                Ok(d) => d,
-                Err(e) => {
-                    return Err(McpError::invalid_params(
+        let mut loaded_total = 0_u64;
+        for (i, (a, (preflight_size, file))) in args.attachments.iter().zip(preflight).enumerate() {
+            let mut data = Vec::with_capacity(preflight_size as usize);
+            file.take(MAX_DRAFT_ATTACHMENT_BYTES + 1)
+                .read_to_end(&mut data)
+                .await
+                .map_err(|error| {
+                    McpError::invalid_params(
                         format!(
-                            "Failed to read attachment #{} at '{}': {}",
+                            "Failed to read attachment #{} at '{}': {error}",
                             i + 1,
-                            a.path,
-                            e
+                            a.path
                         ),
                         None,
-                    ));
-                }
-            };
+                    )
+                })?;
+            if data.len() as u64 > MAX_DRAFT_ATTACHMENT_BYTES {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "attachment #{} grew beyond the {MAX_DRAFT_ATTACHMENT_BYTES}-byte limit while being read",
+                        i + 1
+                    ),
+                    None,
+                ));
+            }
+            loaded_total = loaded_total.checked_add(data.len() as u64).ok_or_else(|| {
+                McpError::invalid_params("attachment aggregate size overflow", None)
+            })?;
+            if loaded_total > MAX_DRAFT_ATTACHMENT_TOTAL_BYTES {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "attachments grew beyond the {MAX_DRAFT_ATTACHMENT_TOTAL_BYTES}-byte aggregate limit while being read"
+                    ),
+                    None,
+                ));
+            }
             let filename = a
                 .filename
                 .clone()
@@ -348,7 +472,7 @@ impl AgentMailServer {
     #[tool(
         name = "unsubscribe_message",
         output_schema = rmcp::handler::server::tool::schema_for_output::<UnsubscribeMessageOutput>().expect("valid unsubscribe_message output schema"),
-        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally delete matching messages account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. Omit cleanup to only unsubscribe. When cleanup is present it deletes by the DKIM-authenticated List-Id, or (identity \"listIdOrSender\", the default) falls back to the exact sender's bulk mail scoped to the target's own List-Id when it carries one; cleanup.when gates running after a failed attempt and cleanup.deletion controls Trash versus permanent disposal.",
+        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally delete matching messages account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. Omit cleanup to only unsubscribe. When cleanup is present it deletes by the DKIM-authenticated List-Id, or (identity \"listIdOrSender\", the default) falls back to exact sender email + List-Unsubscribe-Post + the target's List-Id when it has one; cleanup.when gates running after a failed attempt and cleanup.deletion controls Trash versus permanent disposal.",
         annotations(
             title = "Unsubscribe from Mailing List",
             destructive_hint = true,
@@ -369,7 +493,7 @@ impl AgentMailServer {
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
 
-        match self
+        let result = self
             .agentmail
             .unsubscribe_message(
                 &args.mailbox,
@@ -380,11 +504,12 @@ impl AgentMailServer {
                     confirm_one_click: args.confirm_one_click,
                     cleanup: args.cleanup.map(cleanup_policy),
                 },
-                progress.as_ref(),
+                progress.callback(),
                 Some(&cancel),
             )
-            .await
-        {
+            .await;
+        progress.finish().await;
+        match result {
             Ok(data) => compact_result(UnsubscribeMessageOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
         }
@@ -406,18 +531,19 @@ impl AgentMailServer {
     ) -> Result<CallToolResult, McpError> {
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
-        match self
+        let result = self
             .agentmail
             .delete_list_id(
                 args.mailbox.as_deref(),
                 &args.account,
                 &args.list_id,
                 delete_mode(args.permanent),
-                progress.as_ref(),
+                progress.callback(),
                 Some(&cancel),
             )
-            .await
-        {
+            .await;
+        progress.finish().await;
+        match result {
             Ok(data) => compact_result(DeleteListIdOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
         }
@@ -446,18 +572,19 @@ impl AgentMailServer {
         }
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
-        match self
+        let result = self
             .agentmail
             .move_list_id(
                 args.mailbox.as_deref(),
                 &args.account,
                 &args.list_id,
                 &args.destination,
-                progress.as_ref(),
+                progress.callback(),
                 Some(&cancel),
             )
-            .await
-        {
+            .await;
+        progress.finish().await;
+        match result {
             Ok(data) => compact_result(MoveListIdOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
         }
@@ -466,7 +593,7 @@ impl AgentMailServer {
     #[tool(
         name = "move_by_sender",
         output_schema = rmcp::handler::server::tool::schema_for_output::<MoveBySenderOutput>().expect("valid move_by_sender output schema"),
-        description = "Move all messages from an exact sender identity to a destination mailbox in one operation — e.g. file monthly statements from a bank into a folder. Pass the address and displayName exactly as returned by a top_senders or top_subscriptions row; matching is exact on both fields, confirmed live before any move. The destination must already exist. Omit mailbox to sweep selectable storage mailboxes account-wide; the destination itself is always excluded.",
+        description = "Move all messages from an exact sender identity to a destination mailbox in one operation — e.g. file monthly statements from a bank into a folder. Pass the address and displayName exactly as returned by a top_senders row; matching is exact on both fields, confirmed live before any move. The destination must already exist. Omit mailbox to sweep selectable storage mailboxes account-wide; the destination itself is always excluded.",
         annotations(
             title = "Move by Sender",
             read_only_hint = false,
@@ -489,7 +616,7 @@ impl AgentMailServer {
         }
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
-        match self
+        let result = self
             .agentmail
             .move_by_sender(
                 args.mailbox.as_deref(),
@@ -497,12 +624,149 @@ impl AgentMailServer {
                 &args.email,
                 args.name.as_deref().unwrap_or_default(),
                 &args.destination,
-                progress.as_ref(),
+                progress.callback(),
                 Some(&cancel),
             )
-            .await
-        {
+            .await;
+        progress.finish().await;
+        match result {
             Ok(data) => compact_result(MoveBySenderOutput::from(data)),
+            Err(e) => Ok(tool_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "move_by_domain",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveByDomainOutput>().expect("valid move_by_domain output schema"),
+        description = "Move every message whose first parsed Header From address has one exact canonical domain to an existing destination mailbox. Pass domain exactly as returned by top_domains: example.com never includes mail.example.com or any other subdomain. Omit mailbox to sweep selectable storage mailboxes account-wide; the destination itself is excluded. Header From matching is organizational cleanup, not DKIM authentication.",
+        annotations(
+            title = "Move by Exact Domain",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn move_by_domain_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<MoveByDomainArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.domain.trim().is_empty() {
+            return Err(McpError::invalid_params("domain is required", None));
+        }
+        if args.destination.trim().is_empty() {
+            return Err(McpError::invalid_params("destination is required", None));
+        }
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        let result = self
+            .agentmail
+            .move_by_domain(
+                args.mailbox.as_deref(),
+                &args.account,
+                &args.domain,
+                &args.destination,
+                progress.callback(),
+                Some(&cancel),
+            )
+            .await;
+        progress.finish().await;
+        match result {
+            Ok(data) => compact_result(MoveByDomainOutput::from(data)),
+            Err(e) => Ok(tool_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "move_subscription",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveSubscriptionOutput>().expect("valid move_subscription output schema"),
+        description = "Move the exact bulk-mail subscription represented by one top_subscriptions row to an existing destination mailbox. Map the row's nested sample to mailbox, expectedUidValidity, and uid; the action re-fetches that sample live, derives its canonical sender email and single List-Id when present, then sweeps the account-wide mutation plan. Every moved message must have the exact sender plus List-Unsubscribe or List-Unsubscribe-Post, and must also have the same List-Id when the sample has one. The destination is excluded. This files mail only; it does not send an unsubscribe request.",
+        annotations(
+            title = "Move Top Subscription",
+            read_only_hint = false,
+            destructive_hint = false
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn move_subscription_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<MoveSubscriptionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        if args.destination.trim().is_empty() {
+            return Err(McpError::invalid_params("destination is required", None));
+        }
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        let result = self
+            .agentmail
+            .move_subscription(
+                &args.mailbox,
+                &args.account,
+                args.uid,
+                args.expected_uid_validity,
+                &args.destination,
+                progress.callback(),
+                Some(&cancel),
+            )
+            .await;
+        progress.finish().await;
+        match result {
+            Ok(data) => compact_result(MoveSubscriptionOutput::from(data)),
+            Err(error) => Ok(tool_error_result(&error)),
+        }
+    }
+
+    #[tool(
+        name = "reconcile_moves",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ReconcileMovesOutput>().expect("valid reconcile_moves output schema"),
+        description = "Safely reconcile durable non-native IMAP MOVE operations after a connection loss or ambiguous COPY/delete boundary. Pass one operationId from list_pending_moves, or omit it to process all pending operations for the account. The reconciler only removes a source message after it can prove the destination copy; ambiguous cases remain needsAttention instead of risking loss or duplicate deletion.",
+        annotations(
+            title = "Reconcile Pending Moves",
+            destructive_hint = true,
+            idempotent_hint = true
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn reconcile_moves_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<ReconcileMovesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args
+            .operation_id
+            .as_deref()
+            .is_some_and(|operation_id| operation_id.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                "operationId cannot be empty",
+                None,
+            ));
+        }
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        let result = self
+            .agentmail
+            .reconcile_moves(
+                &args.account,
+                args.operation_id.as_deref(),
+                progress.callback(),
+                Some(&cancel),
+            )
+            .await;
+        progress.finish().await;
+        match result {
+            Ok(data) => compact_result(ReconcileMovesOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
         }
     }

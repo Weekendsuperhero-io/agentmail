@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 
 struct McpClient {
+    /// Notifications seen while awaiting responses (see `request`).
+    notifications: Vec<Value>,
     reader: BufReader<ReadHalf<tokio::io::DuplexStream>>,
     writer: WriteHalf<tokio::io::DuplexStream>,
     next_id: i64,
@@ -29,6 +31,8 @@ impl McpClient {
                 host: "imap.invalid".to_string(),
                 port: 993,
                 username: "dummy@example.invalid".to_string(),
+                email: None,
+                aliases: Vec::new(),
                 password: Some(Secret::new_raw("unused")),
                 tls: true,
                 max_connections: None,
@@ -40,6 +44,7 @@ impl McpClient {
         });
         let (r, w) = tokio::io::split(client_io);
         let mut client = Self {
+            notifications: Vec::new(),
             reader: BufReader::new(r),
             writer: w,
             next_id: 0,
@@ -88,6 +93,14 @@ impl McpClient {
                 if value.get("id").and_then(Value::as_i64) == Some(id) {
                     return value;
                 }
+                // BUFFER, don't drop. A fast task can publish its terminal
+                // status before the enqueue response is even written, so a
+                // test that only reads AFTER the response would miss the
+                // notification entirely and wrongly conclude the server never
+                // pushes.
+                if value.get("id").is_none() {
+                    self.notifications.push(value);
+                }
             }
         })
         .await
@@ -95,9 +108,48 @@ impl McpClient {
     }
 }
 
+impl McpClient {
+    /// Read frames until a NOTIFICATION with `method` arrives, discarding
+    /// responses along the way.
+    ///
+    /// `request` deliberately SKIPS notifications, so a test written only with
+    /// it cannot tell a server that pushes from one that never does.
+    async fn wait_for_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
+        // Already buffered by an earlier `request`? A fast task's push can beat
+        // the very response that started it.
+        if let Some(pos) = self
+            .notifications
+            .iter()
+            .position(|v| v.get("method").and_then(Value::as_str) == Some(method))
+        {
+            return Some(self.notifications.remove(pos));
+        }
+        tokio::time::timeout(timeout, async {
+            loop {
+                let mut buf = String::new();
+                let n = self.reader.read_line(&mut buf).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(&buf) else {
+                    continue;
+                };
+                if value.get("id").is_none()
+                    && value.get("method").and_then(Value::as_str) == Some(method)
+                {
+                    return Some(value);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
 /// Walk a schema JSON tree asserting no `$ref`/`$defs` keys — wire-level
 /// backstop for the unit test in `src/mcp.rs` (Gemini CLI, n8n, and some
-/// gateways reject or drop referenced schemas).
+/// bridges reject or drop referenced schemas).
 fn assert_no_refs(value: &Value, tool: &str, side: &str) {
     match value {
         Value::Object(map) => {
@@ -211,6 +263,21 @@ async fn initialize_reports_capabilities_and_identity() {
             "missing `{cap}` capability: {caps:?}"
         );
     }
+    for path in [
+        &["tasks", "list"][..],
+        &["tasks", "cancel"][..],
+        &["tasks", "requests", "tools", "call"][..],
+    ] {
+        let mut value = &init["capabilities"];
+        for segment in path {
+            value = &value[*segment];
+        }
+        assert!(
+            value.is_object(),
+            "task capability `{}` must be advertised: {caps:?}",
+            path.join(".")
+        );
+    }
 
     assert_eq!(
         init["serverInfo"]["name"].as_str(),
@@ -240,13 +307,13 @@ async fn initialize_reports_capabilities_and_identity() {
 }
 
 #[tokio::test]
-async fn tools_list_has_23_annotated_tools() {
+async fn tools_list_has_29_annotated_tools() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        23,
+        29,
         "tool count drifted — update docs and tests"
     );
 
@@ -329,16 +396,11 @@ async fn list_accounts_works_without_network() {
     let content = result["content"].as_array().expect("compact content array");
     assert_eq!(content.len(), 1, "one compact fallback block: {result:#}");
     let fallback = content[0]["text"].as_str().expect("fallback text");
-    let structured_json = serde_json::to_string(&result["structuredContent"]).unwrap();
-    assert_ne!(
-        fallback, structured_json,
-        "text fallback must not duplicate structuredContent JSON"
+    let fallback_json: Value = serde_json::from_str(fallback).expect("fallback is complete JSON");
+    assert_eq!(
+        fallback_json, result["structuredContent"],
+        "text-only hosts must receive the same complete result as structuredContent"
     );
-    assert!(
-        !fallback.trim_start().starts_with('{'),
-        "fallback should be a concise summary, not serialized JSON: {fallback}"
-    );
-    assert!(fallback.contains("dummy"));
 }
 
 #[tokio::test]
@@ -361,6 +423,126 @@ async fn list_accounts_schema_omits_connection_credentials() {
             "list_accounts schema must omit `{credential}`: {output:#}"
         );
     }
+}
+
+#[tokio::test]
+async fn task_result_is_repeatable_related_and_terminal_cancel_is_rejected() {
+    let mut client = McpClient::start().await;
+    let queued = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "unsubscribe_message",
+                "arguments": {
+                    "account": "dummy",
+                    "mailbox": "INBOX",
+                    "uid": 1,
+                    "expectedUidValidity": 1,
+                    "confirmOneClick": false
+                },
+                "task": {"ttl": 60_000}
+            }),
+        )
+        .await;
+    assert!(
+        queued.get("error").is_none(),
+        "task enqueue failed: {queued:#}"
+    );
+    let task_id = queued["result"]["task"]["taskId"]
+        .as_str()
+        .expect("queued task id")
+        .to_string();
+
+    // tasks/result is the blocking result endpoint: the call must return the
+    // original tool result, never a transient "still running" error.
+    let first = client
+        .request("tasks/result", json!({"taskId": task_id}))
+        .await;
+    assert!(
+        first.get("error").is_none(),
+        "task result failed: {first:#}"
+    );
+    assert_eq!(first["result"]["isError"], json!(true));
+    assert_eq!(
+        first["result"]["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
+        json!(task_id)
+    );
+
+    let second = client
+        .request("tasks/result", json!({"taskId": task_id}))
+        .await;
+    assert_eq!(
+        second["result"], first["result"],
+        "retained task results must be repeatable"
+    );
+
+    let info = client
+        .request("tasks/get", json!({"taskId": task_id}))
+        .await;
+    assert_eq!(info["result"]["taskId"], json!(task_id));
+    assert_eq!(
+        info["result"]["status"],
+        json!("failed"),
+        "an isError tool result is a failed task: {info:#}"
+    );
+
+    let cancellation = client
+        .request("tasks/cancel", json!({"taskId": task_id}))
+        .await;
+    assert_eq!(
+        cancellation["error"]["code"],
+        json!(-32602),
+        "terminal task cancellation must be invalid params: {cancellation:#}"
+    );
+
+    let listed = client.request("tasks/list", json!({})).await;
+    let tasks = listed["result"]["tasks"]
+        .as_array()
+        .expect("task list array");
+    assert!(
+        tasks.iter().any(|task| task["taskId"] == task_id),
+        "retained task should be listed: {listed:#}"
+    );
+    assert!(
+        listed["result"].get("total").is_none(),
+        "tasks/list must not add a non-spec total field: {listed:#}"
+    );
+}
+
+#[tokio::test]
+async fn draft_attachment_limits_are_in_schema_and_enforced_before_io() {
+    let mut client = McpClient::start().await;
+    let listed = client.request("tools/list", json!({})).await;
+    let tools = listed["result"]["tools"].as_array().expect("tools array");
+    let attachments = &find_tool(tools, "create_draft")["inputSchema"]["properties"]["attachments"];
+    assert_eq!(attachments["maxItems"], json!(20));
+    let description = attachments["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("25 MiB") && description.contains("40 MiB"),
+        "attachment byte limits must be discoverable: {description}"
+    );
+
+    let too_many = (0..21)
+        .map(|index| json!({"path": format!("missing-{index}.txt")}))
+        .collect::<Vec<_>>();
+    let rejected = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "create_draft",
+                "arguments": {
+                    "account": "dummy",
+                    "to": ["recipient@example.invalid"],
+                    "attachments": too_many
+                }
+            }),
+        )
+        .await;
+    assert_eq!(
+        rejected["error"]["code"],
+        json!(-32602),
+        "attachment count must fail before filesystem access: {rejected:#}"
+    );
 }
 
 #[tokio::test]
@@ -394,7 +576,7 @@ async fn uid_actions_require_a_nonzero_expected_uidvalidity() {
     let tools = resp["result"]["tools"].as_array().expect("tools array");
 
     // delete_by_sender is absent by design: it deletes by a direct sender
-    // identity (email + displayName from a ranking row), not a sample UID, so
+    // identity (email + displayName from a top_senders row), not a sample UID, so
     // it carries no UIDVALIDITY guard — discovery confirms the identity live.
     for name in [
         "delete_messages",
@@ -446,8 +628,21 @@ async fn list_mailboxes_requires_account_and_enforces_page_bounds() {
     assert_eq!(schema_minimum(&input["properties"]["limit"]), Some(1.0));
     assert_eq!(schema_maximum(&input["properties"]["limit"]), Some(500.0));
 
+    let missing = client
+        .request(
+            "tools/call",
+            json!({"name": "list_mailboxes", "arguments": {}}),
+        )
+        .await;
+    assert_eq!(missing["result"]["isError"], json!(true));
+    assert!(
+        missing["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|message| message.contains("missing field `account`")),
+        "deserialization error should identify the missing field: {missing:#}"
+    );
+
     for arguments in [
-        json!({}),
         json!({"account": "dummy", "limit": 0}),
         json!({"account": "dummy", "limit": 501}),
     ] {
@@ -855,7 +1050,13 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             }),
         )
         .await;
-    assert_eq!(missing["error"]["code"], json!(-32602));
+    assert_eq!(missing["result"]["isError"], json!(true));
+    assert!(
+        missing["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|message| message.contains("missing field")),
+        "missing arguments must remain visible to the model: {missing:#}"
+    );
 
     let no_consent = client
         .request(
@@ -874,7 +1075,7 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
         .await;
     // Consent-required is an operational STOP on a well-formed request, so it is
     // an isError RESULT the agent can act on (re-call with confirmOneClick:
-    // true) — not a protocol error, which the gateway would read as the whole
+    // true) — not a protocol error, which the bridge would read as the whole
     // backend failing.
     assert!(
         no_consent.get("error").is_none(),
@@ -886,8 +1087,9 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
         "consent-required must be an isError result: {no_consent:#}"
     );
 
-    // An unknown field or a value outside the policy enums inside cleanup is
-    // a schema violation (-32602), not a silently ignored knob.
+    // rmcp surfaces argument-deserialization failures as isError tool results
+    // so the model sees the offending field/value rather than losing the
+    // detail in a transport-level failure.
     let unknown_cleanup_field = client
         .request(
             "tools/call",
@@ -904,10 +1106,12 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             }),
         )
         .await;
-    assert_eq!(
-        unknown_cleanup_field["error"]["code"],
-        json!(-32602),
-        "unknown cleanup fields must be rejected: {unknown_cleanup_field:#}"
+    assert_eq!(unknown_cleanup_field["result"]["isError"], json!(true));
+    assert!(
+        unknown_cleanup_field["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|message| message.contains("deleteMatching")),
+        "unknown cleanup fields must be named: {unknown_cleanup_field:#}"
     );
     let bad_cleanup_value = client
         .request(
@@ -925,10 +1129,12 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             }),
         )
         .await;
-    assert_eq!(
-        bad_cleanup_value["error"]["code"],
-        json!(-32602),
-        "out-of-enum cleanup values must be rejected: {bad_cleanup_value:#}"
+    assert_eq!(bad_cleanup_value["result"]["isError"], json!(true));
+    assert!(
+        bad_cleanup_value["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|message| message.contains("shred")),
+        "out-of-enum cleanup value must be named: {bad_cleanup_value:#}"
     );
 
     // Omitted cleanup and an empty cleanup object (all axes defaulted) both
@@ -958,7 +1164,7 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             )
             .await;
         // The connect failure is an operational isError RESULT — not a -32602
-        // policy rejection, and not a protocol error the gateway would misread
+        // policy rejection, and not a protocol error the bridge would misread
         // as the whole backend being down.
         assert!(
             accepted.get("error").is_none(),
@@ -970,6 +1176,25 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             "valid policies proceed to the network and fail there as an isError result: {accepted:#}"
         );
     }
+}
+
+#[tokio::test]
+async fn unsubscribe_identity_schema_documents_the_email_post_fallback() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let tool = find_tool(tools, "unsubscribe_message");
+    let description =
+        tool["inputSchema"]["properties"]["cleanup"]["properties"]["identity"]["description"]
+            .as_str()
+            .expect("cleanup identity description");
+
+    assert!(
+        description.contains("exact sender email")
+            && description.contains("List-Unsubscribe-Post")
+            && description.contains("target's List-Id"),
+        "cleanup identity must document every fallback constraint: {description}"
+    );
 }
 
 #[tokio::test]
@@ -1037,12 +1262,51 @@ async fn unsubscribe_output_schema_exposes_verification_and_cleanup_state() {
         "found",
         "deleted",
         "failed",
+        "pending",
+        "needsAttention",
+        "operationIds",
         "trashFallback",
         "complete",
     ] {
         assert!(
             cleanup_properties.contains_key(field),
             "matchingMessages should expose {field}: {cleanup:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mutation_outputs_expose_ambiguous_move_recovery_state() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    for name in [
+        "delete_messages",
+        "delete_by_sender",
+        "delete_by_domain",
+        "delete_list_id",
+        "move_list_id",
+        "move_by_sender",
+        "move_by_domain",
+        "move_subscription",
+    ] {
+        let properties = find_tool(tools, name)["outputSchema"]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("`{name}` output properties"));
+        for field in ["pending", "needsAttention", "operationIds"] {
+            assert!(
+                properties.contains_key(field),
+                "`{name}` must expose durable recovery field `{field}`"
+            );
+        }
+    }
+
+    let move_message = &find_tool(tools, "move_message")["outputSchema"]["properties"];
+    for field in ["moved", "status", "operationId"] {
+        assert!(
+            move_message.get(field).is_some(),
+            "move_message must expose `{field}`: {move_message:#}"
         );
     }
 }
@@ -1063,6 +1327,7 @@ async fn ranking_and_unsubscribe_outputs_do_not_expose_recipient_tokens() {
 
     for name in [
         "top_senders",
+        "top_domains",
         "top_subscriptions",
         "top_mailing_lists",
         "unsubscribe_message",
@@ -1080,6 +1345,7 @@ async fn rank_outputs_expose_nested_action_identities() {
 
     for (name, rows_field) in [
         ("top_senders", "senders"),
+        ("top_domains", "domains"),
         ("top_subscriptions", "lists"),
         ("top_mailing_lists", "lists"),
     ] {
@@ -1119,6 +1385,187 @@ async fn rank_outputs_expose_nested_action_identities() {
 }
 
 #[tokio::test]
+async fn top_subscriptions_schema_omits_display_name() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let output = &find_tool(tools, "top_subscriptions")["outputSchema"];
+    let subscription =
+        object_schema(&output["properties"]["lists"]["items"]).expect("subscription row object");
+    let properties = subscription["properties"]
+        .as_object()
+        .expect("subscription row properties");
+
+    assert!(
+        !properties.contains_key("displayName"),
+        "top_subscriptions must group and identify rows by address only: {subscription:#}"
+    );
+}
+
+#[tokio::test]
+async fn domain_tools_expose_exact_hierarchy_and_action_contracts() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let top = find_tool(tools, "top_domains");
+    let row = object_schema(&top["outputSchema"]["properties"]["domains"]["items"])
+        .expect("domain rank row");
+    let properties = row["properties"].as_object().expect("domain properties");
+    for field in [
+        "domain",
+        "registrableDomain",
+        "subdomain",
+        "count",
+        "subject",
+        "oldestDate",
+        "newestDate",
+        "sample",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "top_domains row must expose `{field}`: {row:#}"
+        );
+    }
+    assert!(
+        top["description"].as_str().is_some_and(
+            |description| description.contains("example.com never includes mail.example.com")
+        ),
+        "top_domains must state exact-domain semantics: {top:#}"
+    );
+
+    for name in ["delete_by_domain", "move_by_domain"] {
+        let tool = find_tool(tools, name);
+        let input = &tool["inputSchema"];
+        let required = input["required"].as_array().expect("required fields");
+        assert!(required.iter().any(|field| field == "domain"));
+        assert!(
+            input["properties"]["domain"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("never includes")),
+            "`{name}` must document exact-domain scope: {input:#}"
+        );
+        assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
+    }
+    assert_eq!(
+        find_tool(tools, "delete_by_domain")["annotations"]["destructiveHint"],
+        json!(true)
+    );
+    assert_eq!(
+        find_tool(tools, "move_by_domain")["annotations"]["destructiveHint"],
+        json!(false)
+    );
+}
+
+#[tokio::test]
+async fn top_subscription_move_maps_the_nested_sample_and_stays_non_destructive() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let tool = find_tool(tools, "move_subscription");
+    let input = &tool["inputSchema"];
+    let required: Vec<&str> = input["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for field in [
+        "account",
+        "mailbox",
+        "uid",
+        "expectedUidValidity",
+        "destination",
+    ] {
+        assert!(
+            required.contains(&field),
+            "move_subscription must require the ranking sample and destination: {required:?}"
+        );
+    }
+    assert_eq!(
+        schema_minimum(&input["properties"]["uid"]),
+        Some(1.0),
+        "sample UID must be non-zero"
+    );
+    assert_eq!(
+        schema_minimum(&input["properties"]["expectedUidValidity"]),
+        Some(1.0),
+        "sample UIDVALIDITY must be non-zero"
+    );
+    assert_eq!(tool["annotations"]["destructiveHint"], json!(false));
+    assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
+
+    let output = tool["outputSchema"]["properties"]
+        .as_object()
+        .expect("move_subscription output properties");
+    for field in [
+        "sampleMailbox",
+        "sampleUidValidity",
+        "sampleUid",
+        "sender",
+        "listId",
+        "matchedBy",
+        "found",
+        "moved",
+        "pending",
+        "needsAttention",
+        "operationIds",
+    ] {
+        assert!(
+            output.contains_key(field),
+            "move_subscription output must expose `{field}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_tools_expose_durable_operation_state() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let list = find_tool(tools, "list_pending_moves");
+    assert_eq!(list["annotations"]["readOnlyHint"], json!(true));
+    let operation = object_schema(&list["outputSchema"]["properties"]["operations"]["items"])
+        .expect("pending move row");
+    let properties = operation["properties"]
+        .as_object()
+        .expect("pending move properties");
+    for field in [
+        "operationId",
+        "sourceMailbox",
+        "sourceUidValidity",
+        "sourceUid",
+        "destination",
+        "status",
+        "detail",
+        "createdAt",
+        "updatedAt",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "pending move must expose `{field}`: {operation:#}"
+        );
+    }
+
+    let reconcile = find_tool(tools, "reconcile_moves");
+    assert_eq!(reconcile["annotations"]["destructiveHint"], json!(true));
+    assert_eq!(reconcile["annotations"]["idempotentHint"], json!(true));
+    assert_eq!(reconcile["execution"]["taskSupport"], json!("optional"));
+    for field in [
+        "examined",
+        "completed",
+        "pending",
+        "needsAttention",
+        "failed",
+        "operations",
+    ] {
+        assert!(
+            reconcile["outputSchema"]["properties"].get(field).is_some(),
+            "reconcile_moves must expose `{field}`: {reconcile:#}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn rank_limit_documents_default_of_10_and_maximum_of_100() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
@@ -1150,6 +1597,23 @@ async fn rank_limit_documents_default_of_10_and_maximum_of_100() {
             "`{name}` limit schema should expose the maximum"
         );
     }
+
+    let domains = find_tool(tools, "top_domains");
+    let description = domains["inputSchema"]["properties"]["limit"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        description.contains("Defaults to 20") && description.contains("maximum 100"),
+        "top_domains must document its 20-row default and 100-row maximum: {description}"
+    );
+    assert_eq!(
+        schema_minimum(&domains["inputSchema"]["properties"]["limit"]),
+        Some(1.0)
+    );
+    assert_eq!(
+        schema_maximum(&domains["inputSchema"]["properties"]["limit"]),
+        Some(100.0)
+    );
 }
 
 #[tokio::test]
@@ -1173,6 +1637,33 @@ async fn prompts_list_has_6_prompts() {
     }
 }
 
+#[tokio::test]
+async fn unsubscribe_cleanup_prompt_uses_the_current_email_fallback_contract() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "prompts/get",
+            json!({
+                "name": "unsubscribe-cleanup",
+                "arguments": {"account": "dummy"}
+            }),
+        )
+        .await;
+    let text = resp["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("unsubscribe cleanup prompt text");
+
+    assert!(
+        text.contains("exact sender email + List-Unsubscribe-Post")
+            && text.contains("identity: \"listIdOrSender\"")
+            && text.contains("move_subscription")
+            && text.contains("Filing approval is not unsubscribe consent")
+            && !text.contains("deleteMatching")
+            && !text.contains("display name"),
+        "unsubscribe prompt must separate filing consent and describe the current cleanup contract: {text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Contract-validation tests: the cleaned-up 0.3.0 tool contract.
 // ---------------------------------------------------------------------------
@@ -1191,6 +1682,7 @@ async fn paginated_outputs_share_one_envelope() {
         ("search_messages", "messages"),
         ("find_attachments", "messages"),
         ("top_senders", "senders"),
+        ("top_domains", "domains"),
         ("top_subscriptions", "lists"),
         ("top_mailing_lists", "lists"),
     ] {
@@ -1242,6 +1734,7 @@ async fn mailbox_argument_follows_one_idiom() {
         "delete_messages",
         "download_attachments",
         "unsubscribe_message",
+        "move_subscription",
         "add_flags",
         "remove_flags",
         "move_message",
@@ -1262,12 +1755,15 @@ async fn mailbox_argument_follows_one_idiom() {
         "list_flags",
         "find_attachments",
         "top_senders",
+        "top_domains",
         "top_subscriptions",
         "top_mailing_lists",
         "delete_list_id",
         "delete_by_sender",
+        "delete_by_domain",
         "move_list_id",
         "move_by_sender",
+        "move_by_domain",
     ] {
         let input = &find_tool(tools, name)["inputSchema"];
         assert!(
@@ -1385,7 +1881,8 @@ async fn create_draft_output_exposes_optional_draft_identity() {
     }
 }
 
-/// Unknown parameters are rejected with the offending field named, not
+/// Unknown parameters are rejected in an isError tool result with the
+/// offending field named, not
 /// silently ignored — an agent passing a removed parameter (e.g. the old
 /// `includeContent`) learns the current contract from the error instead of
 /// wondering why the flag "did nothing".
@@ -1406,13 +1903,9 @@ async fn unknown_parameters_are_rejected_not_ignored() {
         )
         .await;
 
-    assert_eq!(
-        resp["error"]["code"].as_i64(),
-        Some(-32602),
-        "unknown parameter should be invalid params: {resp:#}"
-    );
+    assert_eq!(resp["result"]["isError"], json!(true));
     assert!(
-        resp["error"]["message"]
+        resp["result"]["content"][0]["text"]
             .as_str()
             .is_some_and(|message| message.contains("includeContent")),
         "the error should name the unknown field: {resp:#}"
@@ -1462,7 +1955,7 @@ async fn check_connection_unknown_account_is_an_iserror_result() {
         .await;
 
     // An operational failure (the account doesn't exist) is a tool RESULT with
-    // isError: true — NOT a JSON-RPC protocol error. The gateway classifies a
+    // isError: true — NOT a JSON-RPC protocol error. The bridge classifies a
     // protocol error from a tool call as `BackendConnectionFailed` (the whole
     // backend "down"), so a bad account name must not present that way; the
     // agent should see the message and retry with a valid account.
@@ -1480,5 +1973,65 @@ async fn check_connection_unknown_account_is_an_iserror_result() {
     assert!(
         text.contains("Account not found"),
         "the error message reaches the caller: {result:#}"
+    );
+}
+
+/// A task-augmented call must PUSH `notifications/tasks/status` when it
+/// reaches a terminal state.
+///
+/// Task status is computed LAZILY here (`refresh_managed_task` runs on read),
+/// so before this the transition was observable only by polling `tasks/get` —
+/// a client that started a `delete_by_domain` over thousands of messages had
+/// no way to be told it finished.
+///
+/// Asserting on the notification specifically matters: every other task test
+/// in this file uses `request`, which skips notifications, so all of them
+/// passed against a server that never pushed at all.
+#[tokio::test]
+async fn task_terminal_transition_is_pushed_as_a_notification() {
+    let mut client = McpClient::start().await;
+    let queued = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "unsubscribe_message",
+                "arguments": {
+                    "account": "dummy",
+                    "mailbox": "INBOX",
+                    "uid": 1,
+                    "expectedUidValidity": 1,
+                    "confirmOneClick": false
+                },
+                "task": {"ttl": 60_000}
+            }),
+        )
+        .await;
+    assert!(queued.get("error").is_none(), "enqueue failed: {queued:#}");
+    let task_id = queued["result"]["task"]["taskId"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    let note = client
+        .wait_for_notification("notifications/tasks/status", Duration::from_secs(10))
+        .await
+        .expect("server must PUSH tasks/status on the terminal transition");
+
+    assert_eq!(note["params"]["taskId"], task_id.as_str());
+    let pushed = note["params"]["status"].as_str().unwrap_or("");
+    assert!(
+        matches!(pushed, "completed" | "failed"),
+        "pushed status must be terminal, got {pushed:?}"
+    );
+
+    // The PUSHED status must agree with the POLLED one — they are produced by
+    // the same lazy refresh, and a disagreement would be worse than no push.
+    let polled = client
+        .request("tasks/get", json!({"taskId": task_id}))
+        .await;
+    assert_eq!(
+        polled["result"]["status"].as_str(),
+        Some(pushed),
+        "pushed status must match a subsequent tasks/get: {polled:#}"
     );
 }

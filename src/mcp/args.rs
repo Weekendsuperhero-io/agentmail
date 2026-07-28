@@ -176,7 +176,7 @@ pub(super) struct DeleteBySenderArgs {
     )]
     pub(super) account: String,
     #[schemars(
-        description = "The sender's exact email address to match (from a top_senders or top_subscriptions row's address)."
+        description = "The sender's exact email address to match (from a top_senders row's address)."
     )]
     pub(super) email: String,
     #[serde(default)]
@@ -240,7 +240,8 @@ pub(super) struct CreateDraftArgs {
     pub(super) bcc: Vec<String>,
     #[serde(default)]
     #[schemars(
-        description = "Attachments to include. Each entry requires a local filesystem 'path'. 'filename' and 'contentType' are optional and will be inferred when omitted."
+        length(max = 20),
+        description = "Attachments to include (maximum 20 files, 25 MiB each, 40 MiB aggregate). Each entry requires a local filesystem 'path'. 'filename' and 'contentType' are optional and will be inferred when omitted."
     )]
     pub(super) attachments: Vec<DraftAttachmentArg>,
 }
@@ -335,8 +336,8 @@ pub(super) enum CleanupWhenArg {
 pub(super) enum CleanupIdentityArg {
     /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
     ListIdOnly,
-    /// Prefer the authenticated List-Id; otherwise fall back to the exact
-    /// sender's bulk mail, scoped to the target's own List-Id when it has one.
+    /// Prefer the authenticated List-Id; otherwise require the exact sender
+    /// email plus List-Unsubscribe-Post, and the target's List-Id when present.
     #[default]
     ListIdOrSender,
 }
@@ -371,7 +372,7 @@ pub(super) struct UnsubscribeCleanupSpec {
     pub(super) when: CleanupWhenArg,
     #[serde(default)]
     #[schemars(
-        description = "Cleanup identity: \"listIdOrSender\" (default) prefers the DKIM-authenticated List-Id and falls back to the exact sender's bulk mail scoped to the target's List-Id when one exists; \"listIdOnly\" requires the authenticated List-Id strictly."
+        description = "Cleanup identity: \"listIdOrSender\" (default) prefers the DKIM-authenticated List-Id and otherwise requires the exact sender email plus List-Unsubscribe-Post, also requiring the target's List-Id when one exists; \"listIdOnly\" requires the authenticated List-Id strictly."
     )]
     pub(super) identity: CleanupIdentityArg,
     #[serde(default)]
@@ -399,6 +400,28 @@ pub(super) struct TopSendersArgs {
     #[schemars(
         range(min = 1, max = 100),
         description = "Page size. Defaults to 10; maximum 100."
+    )]
+    pub(super) limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for listing exact Header From domains by message count.")]
+pub(super) struct TopDomainsArgs {
+    #[schemars(description = "Mailbox name. Omit to use the account-wide discovery plan.")]
+    pub(super) mailbox: Option<String>,
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(
+        range(max = 1_000_000),
+        description = "Zero-based ranked-row offset. Defaults to 0; maximum 1,000,000."
+    )]
+    pub(super) offset: Option<u64>,
+    #[schemars(
+        range(min = 1, max = 100),
+        description = "Page size. Defaults to 20; maximum 100."
     )]
     pub(super) limit: Option<u64>,
 }
@@ -470,6 +493,27 @@ pub(super) struct DeleteListIdArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for deleting mail from one exact sender domain.")]
+pub(super) struct DeleteByDomainArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(
+        description = "Exact canonical domain from a top_domains row. A parent such as example.com never includes mail.example.com."
+    )]
+    pub(super) domain: String,
+    #[schemars(description = "Mailbox to search. Omit to use the account-wide mutation plan.")]
+    pub(super) mailbox: Option<String>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "When true, permanently delete (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
+    )]
+    pub(super) permanent: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(
     description = "Arguments for moving all messages with a specific List-Id to another mailbox."
 )]
@@ -501,7 +545,7 @@ pub(super) struct MoveBySenderArgs {
     )]
     pub(super) account: String,
     #[schemars(
-        description = "The sender's exact email address to match (from a top_senders or top_subscriptions row's address)."
+        description = "The sender's exact email address to match (from a top_senders row's address)."
     )]
     pub(super) email: String,
     #[serde(default)]
@@ -517,6 +561,82 @@ pub(super) struct MoveBySenderArgs {
         description = "Mailbox to search. Omit to use the account-wide mutation plan (the destination itself is excluded)."
     )]
     pub(super) mailbox: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for moving mail from one exact sender domain.")]
+pub(super) struct MoveByDomainArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(
+        description = "Exact canonical domain from a top_domains row. A parent such as example.com never includes mail.example.com."
+    )]
+    pub(super) domain: String,
+    #[schemars(
+        description = "Destination mailbox (required). Must already exist; use create_mailbox first if needed."
+    )]
+    pub(super) destination: String,
+    #[schemars(
+        description = "Mailbox to search. Omit to use the account-wide mutation plan (the destination itself is excluded)."
+    )]
+    pub(super) mailbox: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    description = "Arguments for moving the exact bulk-mail subscription represented by a top_subscriptions sample."
+)]
+pub(super) struct MoveSubscriptionArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(
+        description = "Mailbox containing the ranking sample. Map top_subscriptions sample.mailbox here; matching messages are swept account-wide and the destination is excluded."
+    )]
+    pub(super) mailbox: String,
+    #[schemars(
+        range(min = 1),
+        description = "UID from top_subscriptions sample.uid. The live sample supplies the exact sender and optional List-Id scope."
+    )]
+    pub(super) uid: u32,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY from top_subscriptions sample.uidValidity. The action fails if the sample mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
+    #[schemars(
+        description = "Destination mailbox (required). Must already exist; use create_mailbox first if needed."
+    )]
+    pub(super) destination: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for listing durable MOVE operations awaiting reconciliation.")]
+pub(super) struct ListPendingMovesArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for safely reconciling durable non-native MOVE operations.")]
+pub(super) struct ReconcileMovesArgs {
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(
+        description = "Optional operationId from list_pending_moves. Omit to reconcile every pending operation for the account."
+    )]
+    pub(super) operation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

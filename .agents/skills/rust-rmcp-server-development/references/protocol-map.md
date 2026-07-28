@@ -90,7 +90,7 @@ flowchart TD
 
 ## What Is Deliberately Separate
 
-- Server features (2a) and client features (2b) are fully independent of each other; they meet only at capability negotiation. A tools-only server and a sampling-capable client are both complete MCP participants. A gateway is one process on both sides of that line.
+- Server features (2a) and client features (2b) are fully independent of each other; they meet only at capability negotiation. A tools-only server and a sampling-capable client are both complete MCP participants. A bridge is one process on both sides of that line.
 - Transports are interchangeable and feature-blind. Layers 2–4 never know which transport carries them. The one exception is authorization, which is defined only for HTTP transports.
 - Utilities (layer 3) belong to no feature: ping, progress, cancellation, and `_meta` ride on any request in either direction; pagination and `list_changed` attach to every listable primitive; tasks wrap requests from both sides.
 - Extensions are strictly additive. MCP Apps invents no primitives — it is conventions over resources (`ui://`), tools (`_meta.ui`), and JSON-RPC (re-spoken over postMessage). ext-auth extends the existing authorization layer. Core MCP works with no extensions at all.
@@ -99,7 +99,7 @@ flowchart TD
 
 - Layer 1 transports, sessions, HTTP security: `mcp-runtime-utilities.md`. Authorization: `http-authorization.md`.
 - Layer 2a primitives and when to use which: `mcp-server-primitives.md`. Schemas: `tool-schemas-and-output.md`.
-- Layer 2b from the client side: `rmcp-client-patterns.md`. Both sides at once: `gateway-patterns.md`.
+- Layer 2b from the client side: `rmcp-client-patterns.md`. Both sides at once: `bridge-patterns.md`.
 - Layer 3 utilities in tandem: `mcp-runtime-utilities.md`.
 - Layer 4: sibling skill `mcp-apps-auth-rmcp-development` (`apps-architecture.md`, `apps-host-bridge.md`, `auth-extensions.md`).
 

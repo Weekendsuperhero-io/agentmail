@@ -182,18 +182,13 @@ pub struct SenderSummary {
     pub newest_date: Option<DateTime<Utc>>,
 }
 
-/// Summary of mailing list messages grouped by sender.
+/// Summary of mailing-list messages grouped by normalized sender email.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
 pub struct ListSummary {
-    /// Sender display string (`"Display Name <email>"` or just `"email"`).
-    pub sender: String,
-    /// Normalized sender email address (lowercase).
+    /// Normalized sender email address and sole grouping key.
     pub address: String,
-    /// Sender display name (used internally; not serialized — already in `sender`).
-    #[serde(skip_serializing)]
-    pub display_name: String,
     /// Whether the newest message advertises syntactically valid RFC 8058
     /// one-click headers. Execution still re-fetches the message and requires
     /// a passing DKIM signature over both headers.
@@ -204,7 +199,7 @@ pub struct ListSummary {
     /// caller can see WHAT the subscription is before acting. Never persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
-    /// Number of messages from this sender with List-Unsubscribe.
+    /// Number of messages from this sender with list-action headers.
     pub count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_date: Option<DateTime<Utc>>,
@@ -370,6 +365,42 @@ pub struct TopSendersResponse {
     pub senders: Vec<SenderSummary>,
 }
 
+/// Summary of messages grouped by the exact normalized Header From domain.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct DomainSummary {
+    pub domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registrable_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subdomain: Option<String>,
+    pub count: u32,
+    pub sample: MailboxMessageIdentity,
+    /// Decoded subject of the live sample. Subjects are never persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_date: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_date: Option<DateTime<Utc>>,
+}
+
+/// Response for top_domains.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TopDomainsResponse {
+    pub mailbox: String,
+    pub account: String,
+    pub total_messages: u32,
+    pub unique_domains: usize,
+    pub offset: usize,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    pub domains: Vec<DomainSummary>,
+}
+
 /// Response for top_subscriptions.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -377,7 +408,7 @@ pub struct TopSubscriptionsResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,
-    pub unique_lists: usize,
+    pub unique_senders: usize,
     pub offset: usize,
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -437,6 +468,9 @@ pub struct DeleteListIdResponse {
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     pub skipped: Vec<String>,
     /// True when the caller requested a permanent delete (Trash bypassed on
@@ -476,10 +510,9 @@ pub enum CleanupWhen {
 pub enum CleanupIdentityMode {
     /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
     ListIdOnly,
-    /// Prefer the authenticated List-Id; when there is none, fall back to the
-    /// exact sender's bulk mail — constrained to the target's own List-Id
-    /// whenever the message carries one, so other lists from the same sender
-    /// are untouched.
+    /// Prefer the authenticated List-Id; when there is none, fall back to
+    /// messages from the exact sender email that carry List-Unsubscribe-Post.
+    /// When the target has one usable List-Id, require that same List-Id too.
     #[default]
     ListIdOrSender,
 }
@@ -546,6 +579,12 @@ pub struct DeleteMessagesResponse {
     pub account: String,
     pub deleted: usize,
     pub failed: usize,
+    /// COPY reached an ambiguity-safe journal state and needs reconciliation.
+    pub pending: usize,
+    /// Operations whose automatic recovery could not prove a unique safe path.
+    pub needs_attention: usize,
+    /// Durable operation identifiers for pending/attention items.
+    pub operation_ids: Vec<String>,
     /// True when configured trash mailbox was unavailable and deletion
     /// fell back to flag+expunge (permanent delete).
     pub trash_fallback: bool,
@@ -563,6 +602,9 @@ pub struct PerMailboxDeleteResult {
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
 }
 
 /// Response for delete_by_sender.
@@ -575,11 +617,43 @@ pub struct DeleteBySenderResponse {
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     /// Mailboxes that could not be selected or searched (skipped during scan).
     pub skipped: Vec<String>,
     /// True when the caller requested a permanent delete (Trash bypassed).
     pub permanent: bool,
+}
+
+/// Response for delete_by_domain. The selector is one exact canonical domain;
+/// subdomains are separate and are never included implicitly.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteByDomainResponse {
+    pub mailbox: String,
+    pub account: String,
+    pub domain: String,
+    pub found: usize,
+    pub deleted: usize,
+    pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
+    pub mailboxes: Vec<PerMailboxDeleteResult>,
+    pub skipped: Vec<String>,
+    pub permanent: bool,
+}
+
+/// Durable outcome of one move request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum MoveStatus {
+    Moved,
+    Failed,
+    ReconciliationPending,
+    NeedsAttention,
 }
 
 /// Response for move_message.
@@ -591,10 +665,12 @@ pub struct MoveMessageResponse {
     pub uid: u32,
     pub destination: String,
     pub moved: bool,
+    pub status: MoveStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
-/// Per-mailbox result of a bulk move (shared by move_list_id and
-/// move_by_sender).
+/// Per-mailbox result of a bulk move.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
@@ -603,6 +679,9 @@ pub struct PerMailboxMoveResult {
     pub found: usize,
     pub moved: usize,
     pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
 }
 
 /// Response for move_list_id.
@@ -617,6 +696,9 @@ pub struct MoveListIdResponse {
     pub found: usize,
     pub moved: usize,
     pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
     pub mailboxes: Vec<PerMailboxMoveResult>,
     /// Mailboxes that could not be selected or searched (skipped during scan).
     pub skipped: Vec<String>,
@@ -634,8 +716,96 @@ pub struct MoveBySenderResponse {
     pub found: usize,
     pub moved: usize,
     pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
     pub mailboxes: Vec<PerMailboxMoveResult>,
     pub skipped: Vec<String>,
+}
+
+/// Response for move_by_domain.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveByDomainResponse {
+    pub mailbox: String,
+    pub account: String,
+    pub domain: String,
+    pub destination: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
+    pub mailboxes: Vec<PerMailboxMoveResult>,
+    pub skipped: Vec<String>,
+}
+
+/// Response for move_subscription.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveSubscriptionResponse {
+    /// Always `*`: subscription rows are account-wide identities and the
+    /// destination mailbox is excluded from the sweep.
+    pub mailbox: String,
+    pub account: String,
+    /// Mailbox from the UIDVALIDITY-guarded ranking sample used to derive the
+    /// live sender and optional List-Id scope.
+    pub sample_mailbox: String,
+    pub sample_uid_validity: u32,
+    pub sample_uid: u32,
+    pub sender: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_id: Option<String>,
+    /// Human-readable statement of the exact live predicate used.
+    pub matched_by: String,
+    pub destination: String,
+    pub found: usize,
+    pub moved: usize,
+    pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
+    pub mailboxes: Vec<PerMailboxMoveResult>,
+    pub skipped: Vec<String>,
+}
+
+/// One durable non-native MOVE operation awaiting cleanup or review.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct PendingMove {
+    pub operation_id: String,
+    pub source_mailbox: String,
+    pub source_uid_validity: u32,
+    pub source_uid: u32,
+    pub destination: String,
+    pub status: MoveStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Response for list_pending_moves.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPendingMovesResponse {
+    pub account: String,
+    pub operations: Vec<PendingMove>,
+}
+
+/// Response for reconcile_moves.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileMovesResponse {
+    pub account: String,
+    pub examined: usize,
+    pub completed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub failed: usize,
+    pub operations: Vec<PendingMove>,
 }
 
 /// Response for create_mailbox.
@@ -747,6 +917,9 @@ pub struct MatchingMessagesResult {
     pub found: usize,
     pub deleted: usize,
     pub failed: usize,
+    pub pending: usize,
+    pub needs_attention: usize,
+    pub operation_ids: Vec<String>,
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     /// Mailboxes that could not be selected or searched (skipped during scan).
     pub skipped: Vec<String>,

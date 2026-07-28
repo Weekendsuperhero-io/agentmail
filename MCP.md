@@ -20,7 +20,7 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
   required; nothing defaults to INBOX, because a UID and
   `expectedUidValidity` are only meaningful with the mailbox they came from.
 
-## Tools (21)
+## Tools (29)
 
 ### Discovery & Connection
 
@@ -85,6 +85,8 @@ an unknown account raises `-32602`.
 | 9   | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only`, `taskable` |
 | 10  | `top_subscriptions` | Top bulk-mail senders with advertised one-click syntax and UIDVALIDITY-guarded samples.             | `read_only`, `taskable` |
 | 11  | `top_mailing_lists`     | Top mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.           | `read_only`, `taskable` |
+| 12  | `top_domains`     | Exact canonical Header From domains and subdomains with counts, dates, and a live sample subject.   | `read_only`, `taskable` |
+| 13  | `list_pending_moves` | List durable COPY-fallback MOVE operations awaiting reconciliation or review.                       | `read_only`             |
 
 #### Output Schemas
 
@@ -149,16 +151,17 @@ Mailbox breakdowns are capped at 50 rows and include total/truncation metadata.
 ```
 
 Grouped by `(email, display name)`; the same address with different display
-names is separate. On all three `top_*` tools, `total` counts the ranked rows
-(unique senders/lists — the pagination universe) while `totalMessages` counts
-messages scanned. All three use `offset`/`limit` pagination with
-a default of 10 and maximum of 100.
+names is separate. On the `top_*` tools, `total` counts the ranked rows
+(unique senders/lists/domains — the pagination universe) while `totalMessages`
+counts messages scanned. Sender, subscription, and mailing-list rankings
+default to 10 rows; domain rankings default to 20. All accept at most 100.
 
-**Windowed providers:** Yahoo/AOL expose only the newest ~10,000 messages of
-a mailbox to IMAP (`EXISTS`, `STATUS`, `UID SEARCH`, and direct `UID FETCH`
-are all capped — see `docs/standards/imap/yahoo-aol-quirks.md`). Rankings
-there cover the visible window; account-wide deletes are unaffected because
-they repeat passes as older mail backfills into view. Account-wide discovery uses one selectable
+**Windowed providers:** Yahoo/AOL Limited Mode exposes only a recent mailbox
+window (see `docs/standards/imap/yahoo-aol-quirks.md`). When the server
+advertises RFC 9586 UIDONLY and the persistent cache is enabled, Agentmail uses
+UID Mode and a resumable membership walk so rankings cover the full mailbox.
+Without UIDONLY, discovery is limited to what the server exposes; destructive
+sweeps repeat passes as older mail backfills into view. Account-wide discovery uses one selectable
 `\All` mailbox when available. Otherwise it enumerates storage mailboxes,
 excludes Trash/Junk/Drafts and virtual All/Flagged/Important views, and
 deduplicates by Message-ID across folders. Sender rankings exclude the
@@ -169,18 +172,20 @@ account's own address.
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "total",
   "offset", "limit", "nextOffset?",
   "lists": [{
-    "address", "displayName", "advertisedOneClick": bool,
+    "address", "advertisedOneClick": bool,
     "count", "subject?", "oldestDate?", "newestDate?",
     "sample": MessageIdentity
   }] }
 ```
-Sorted: advertised one-click senders first, then by count. `advertisedOneClick`
-checks exact local RFC 2369/8058 syntax; it does not claim DKIM success.
+Grouped only by normalized sender email; display names and `List-Id` values do
+not split a sender's row. Sorted: advertised one-click senders first, then by
+count. `advertisedOneClick` checks exact local RFC 2369/8058 syntax; it does not
+claim DKIM success.
 Opaque unsubscribe URLs and recipient tokens are not exposed. Use the nested
-`sample` identity for a later `unsubscribe_message` call. `subject` is the
-sample message's decoded Subject, fetched live for the returned page only and
-never persisted in the ranking cache; it is absent when the sample could not
-be fetched.
+`sample` identity for a later `move_subscription` or `unsubscribe_message`
+call. `subject` is the sample message's decoded Subject, fetched live for the
+returned page only and never persisted in the ranking cache; it is absent when
+the sample could not be fetched.
 
 **top_mailing_lists**
 ```json
@@ -202,21 +207,43 @@ before deleting or moving it. `top_senders` intentionally has no subject —
 one sender spans many lists and subject families, so a single sample would
 mislead.
 
+**top_domains**
+```json
+{ "mailbox": "INBOX" | "*", "account", "totalMessages", "total",
+  "offset", "limit", "nextOffset?",
+  "domains": [{
+    "domain": "mail.example.co.uk",
+    "registrableDomain?": "example.co.uk", "subdomain?": "mail",
+    "count", "subject?", "oldestDate?", "newestDate?",
+    "sample": MessageIdentity
+  }] }
+```
+
+The grouping key is the exact canonical domain from the parsed Header From
+address. Parent domains never include subdomains implicitly:
+`example.com` and `mail.example.com` are separate rows and separate mutation
+selectors. Public Suffix List fields describe the relationship without
+changing the grouping. The default page size is 20 and the maximum is 100.
+`subject` is decoded from the live sample for the returned page and is never
+persisted in the ranking cache. As with every ranking, `limit = N` returns up
+to N domain rows; it is not a fixed five-row preview.
+
 ```json
 MessageIdentity = { "mailbox", "uidValidity", "uid", "resourceUri" }
 ```
 
-The three `top_*` tools share a persistent ranking-header projection. Every reuse is validated with live `EXAMINE` metadata and the RFC identity tuple `(mailbox, UIDVALIDITY, UID)`. Cache hits avoid header fetches, proven appends fetch only new UIDs, and deletions reconcile UID membership without refetching unchanged headers. A busy-mailbox snapshot is returned but remains reconcile-required until a stable snapshot is observed.
+The `top_*` tools share a persistent ranking-header projection. Every reuse is validated with live `EXAMINE` metadata and the RFC identity tuple `(mailbox, UIDVALIDITY, UID)`. Cache hits avoid header fetches, proven appends fetch only new UIDs, and deletions reconcile UID membership without refetching unchanged headers. A busy-mailbox snapshot is returned but remains reconcile-required until a stable snapshot is observed.
 
-The schema-v3 cache contains account mutation state, mailbox snapshot state,
-UID membership, sender address/name, date, Message-ID, normalized List-Id and
-display name, plus booleans for list-header and advertised-one-click presence.
+The schema-v6 cache contains account mutation state, mailbox snapshot state,
+UID membership, sender address/name and canonical sender domain, date,
+Message-ID, normalized List-Id and display name, plus booleans for list-header
+and advertised-one-click presence.
 It does not store List-Unsubscribe URLs, recipient tokens, raw list-action
 headers, bodies, subjects, recipients, flags, attachments, passwords,
 authentication tokens, keychain secrets, or complete messages. The cache
-namespace necessarily includes the configured account name, IMAP
-host/port/TLS mode, and login username to prevent identities from different
-servers colliding. SQLite uses WAL mode with
+namespace includes the IMAP host/port/TLS mode and login username to prevent
+server identities from colliding, but deliberately excludes the local account
+display name so renaming an account reuses the same projection. SQLite uses WAL mode with
 `synchronous=NORMAL`. Set
 `AGENTMAIL_DISABLE_HEADER_CACHE=1` to disable it or `AGENTMAIL_CACHE_DIR` to
 override its root; cache errors fall back to live IMAP.
@@ -229,16 +256,20 @@ override its root; cache errors fall back to live IMAP.
 
 | #   | Tool                   | Description                                                                           | Annotations                              |
 | --- | ---------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------- |
-| 12  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`, `taskable`   |
-| 13  | `delete_by_sender`     | Delete all from an exact sender identity (`email` + `name` from a ranking row). Omit `mailbox` for account-wide. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
-| 14  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
-| 15  | `move_list_id`         | Move all messages with an **exact** List-Id to a destination mailbox in one operation (e.g. archive a statement list). Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
-| 16  | `move_by_sender`       | Move all messages from an exact sender identity (`email` + `name`) to a destination mailbox in one operation. Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
-| 17  | `move_message`         | IMAP MOVE between mailboxes (COPY+EXPUNGE fallback when MOVE unsupported)             |                                          |
-| 18  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
-| 19  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. Returns the draft identity when recoverable. |                                          |
-| 20  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
-| 21  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional matching-message cleanup via the nested `cleanup {when, identity, deletion}` object (omitted = unsubscribe only). | `destructive`, `open_world`, `taskable`  |
+| 14  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`, `taskable`   |
+| 15  | `delete_by_sender`     | Delete all from an exact sender identity (`email` + `name` from a ranking row). Omit `mailbox` for account-wide. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
+| 16  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
+| 17  | `delete_by_domain`     | Delete all messages from one exact canonical domain from `top_domains`; subdomains are never implicit. | `destructive`, `taskable`                 |
+| 18  | `move_list_id`         | Move all messages with an **exact** List-Id to a destination mailbox in one operation (e.g. archive a statement list). Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
+| 19  | `move_by_sender`       | Move all messages from an exact sender identity (`email` + `name`) to a destination mailbox in one operation. Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
+| 20  | `move_by_domain`       | Move all messages from one exact canonical domain to a destination; subdomains are never implicit. | `taskable`                               |
+| 21  | `move_subscription`    | Move the exact bulk-mail subscription represented by a UIDVALIDITY-safe `top_subscriptions` sample; destination excluded. | `taskable`                               |
+| 22  | `move_message`         | IMAP MOVE between mailboxes (durable COPY+EXPUNGE fallback when MOVE is unavailable). |                                          |
+| 23  | `reconcile_moves`      | Safely resume one or all pending COPY-fallback MOVE operations.                       | `destructive`, `taskable`                |
+| 24  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
+| 25  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. Returns the draft identity when recoverable. |                                          |
+| 26  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
+| 27  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional matching-message cleanup via the nested `cleanup {when, identity, deletion}` object (omitted = unsubscribe only). | `destructive`, `open_world`, `taskable`  |
 
 **`permanent` flag (delete tools):** default false moves to Trash when a Trash mailbox exists, else permanently deletes. When true, flags `\Deleted` + UID EXPUNGE directly, bypassing Trash — irreversible. Permanent delete requires the server to advertise UIDPLUS; on servers without it the call is refused (plain EXPUNGE would purge unrelated `\Deleted` messages).
 
@@ -247,15 +278,23 @@ No delete silently escalates: Trash unavailability is refused up front
 UIDs. `unsubscribe_message` cleanup permits escalation only via
 `cleanup.deletion = "trashThenPermanent"`.
 
-`move_list_id` and `move_by_sender` share the delete tools' discovery
-(server search, cached List-Id projection fast-path, live exact confirm,
-UID-Mode full-mailbox sweep on Yahoo/AOL) but MOVE matches to the required
-`destination` instead of deleting. The destination must already exist and is
-always excluded from account-wide sweeps.
+`move_list_id`, `move_by_sender`, `move_by_domain`, and `move_subscription`
+share the delete tools' mutation and durable recovery machinery. The first
+three take their ranking identity directly. `move_subscription` instead
+re-fetches the selected `top_subscriptions` sample under its UIDVALIDITY epoch,
+then requires the exact canonical sender plus either `List-Unsubscribe` or
+`List-Unsubscribe-Post`; when the sample has one usable List-Id, every match
+must also carry that exact normalized List-Id. This covers the same bulk-mail
+surface as the ranking without sweeping ordinary mail from that sender.
+
+All four bulk movers live-confirm candidates and feed matches into the same
+window-draining, UID-Mode-aware move engine and durable COPY-fallback recovery
+path. The destination must already exist and is always excluded from
+account-wide sweeps.
 
 **Gmail:** on Gmail (`X-GM-EXT-1`), in-place `\Deleted`+EXPUNGE only removes a *label* — the message survives in All Mail. agentmail therefore routes every delete, including `permanent`, through `[Gmail]/Trash` (which removes the message from all labels; Gmail purges Trash on its own schedule). Immediate hard-purge isn't available on Gmail.
 
-`delete_messages` accepts at most 500 explicitly supplied UIDs over MCP. `delete_by_sender`, `delete_list_id`, `move_by_sender`, `move_list_id`, and unsubscribe matching have no total match limit; they split server mutations into 500-UID wire batches. A `top_*` ranking `limit` never becomes a deletion limit.
+`delete_messages` accepts at most 500 explicitly supplied UIDs over MCP. `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `move_by_sender`, `move_by_domain`, `move_list_id`, `move_subscription`, and unsubscribe matching have no total match limit; they split server mutations into 500-UID wire batches. A `top_*` ranking `limit` never becomes a mutation limit.
 
 UID-based tools never accept a bare UID as durable identity, and every UID
 consumer requires the `mailbox` the identity came from (there is no INBOX
@@ -266,9 +305,11 @@ default). The following arguments are required together with
 - `move_message`, `download_attachments`, `add_flags`, and `remove_flags`:
   the UID from a current discovery result.
 - `unsubscribe_message`: the `sample` from `top_subscriptions`.
+- `move_subscription`: the same nested `sample`, plus the destination mailbox.
 
-`delete_by_sender`, `move_by_sender`, `delete_list_id`, and `move_list_id`
-instead take direct identity values (`email` + `name`, or `listId`) from
+`delete_by_sender`, `move_by_sender`, `delete_by_domain`, `move_by_domain`,
+`delete_list_id`, and `move_list_id` instead take direct identity values
+(`email` + `name`, exact `domain`, or `listId`) from
 ranking rows and confirm them live in each mailbox — no sample UID or epoch
 guard.
 
@@ -281,6 +322,7 @@ identity.
 **delete_messages**
 ```json
 { "mailbox", "account", "deleted": 5, "failed": 0,
+  "pending": 0, "needsAttention": 0, "operationIds": [],
   "trashFallback": bool, "permanent": bool }
 ```
 
@@ -288,8 +330,10 @@ identity.
 ```json
 { "mailbox": "INBOX" | "*", "account",
   "sender": "Display Name <email>",
-  "found", "deleted", "failed",
-  "mailboxes": [{ "mailbox", "found", "deleted", "failed" }],
+  "found", "deleted", "failed", "pending", "needsAttention",
+  "operationIds": [],
+  "mailboxes": [{ "mailbox", "found", "deleted", "failed",
+    "pending", "needsAttention", "operationIds": [] }],
   "mailboxesTotal", "mailboxesTruncated",
   "skipped": [], "skippedTotal", "skippedTruncated", "permanent": bool }
 ```
@@ -301,20 +345,35 @@ truncation fields preserve audit completeness.
 ```json
 { "mailbox": "INBOX" | "*", "account",
   "listId": "list-id.example.com",
-  "found", "deleted", "failed",
-  "mailboxes": [{ "mailbox", "found", "deleted", "failed" }],
+  "found", "deleted", "failed", "pending", "needsAttention",
+  "operationIds": [],
+  "mailboxes": [{ "mailbox", "found", "deleted", "failed",
+    "pending", "needsAttention", "operationIds": [] }],
   "mailboxesTotal", "mailboxesTruncated",
   "skipped": ["mailbox"], "skippedTotal", "skippedTruncated",
   "permanent": bool }
 ```
 `mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched; policy-excluded special-use views are not reported as errors.
 
+**delete_by_domain**
+```json
+{ "mailbox": "INBOX" | "*", "account", "domain": "mail.example.com",
+  "found", "deleted", "failed", "pending", "needsAttention",
+  "operationIds": [],
+  "mailboxes": [{ "mailbox", "found", "deleted", "failed",
+    "pending", "needsAttention", "operationIds": [] }],
+  "mailboxesTotal", "mailboxesTruncated",
+  "skipped": [], "skippedTotal", "skippedTruncated", "permanent": bool }
+```
+
 **move_list_id**
 ```json
 { "mailbox": "INBOX" | "*", "account",
   "listId": "list-id.example.com", "destination": "Statements",
-  "found", "moved", "failed",
-  "mailboxes": [{ "mailbox", "found", "moved", "failed" }],
+  "found", "moved", "failed", "pending", "needsAttention",
+  "operationIds": [],
+  "mailboxes": [{ "mailbox", "found", "moved", "failed",
+    "pending", "needsAttention", "operationIds": [] }],
   "mailboxesTotal", "mailboxesTruncated",
   "skipped": ["mailbox"], "skippedTotal", "skippedTruncated" }
 ```
@@ -323,16 +382,78 @@ truncation fields preserve audit completeness.
 ```json
 { "mailbox": "INBOX" | "*", "account",
   "sender": "Display Name <email>", "destination": "Statements",
-  "found", "moved", "failed",
-  "mailboxes": [{ "mailbox", "found", "moved", "failed" }],
+  "found", "moved", "failed", "pending", "needsAttention",
+  "operationIds": [],
+  "mailboxes": [{ "mailbox", "found", "moved", "failed",
+    "pending", "needsAttention", "operationIds": [] }],
+  "mailboxesTotal", "mailboxesTruncated",
+  "skipped": [], "skippedTotal", "skippedTruncated" }
+```
+
+**move_by_domain**
+```json
+{ "mailbox": "INBOX" | "*", "account",
+  "domain": "mail.example.com", "destination": "Statements",
+  "found", "moved", "failed", "pending", "needsAttention",
+  "operationIds": [],
+  "mailboxes": [{ "mailbox", "found", "moved", "failed",
+    "pending", "needsAttention", "operationIds": [] }],
   "mailboxesTotal", "mailboxesTruncated",
   "skipped": [], "skippedTotal", "skippedTruncated" }
 ```
 
 **move_message**
 ```json
-{ "mailbox", "account", "uidValidity", "uid", "destination" }
+{ "mailbox", "account", "uidValidity", "uid", "destination",
+  "moved": bool,
+  "status": "moved" | "failed" | "reconciliationPending" | "needsAttention",
+  "operationId?" }
 ```
+
+**list_pending_moves**
+```json
+{ "account", "operations": [PendingMove] }
+```
+
+**reconcile_moves**
+```json
+{ "account", "examined", "completed", "pending", "needsAttention",
+  "failed", "operations": [PendingMove] }
+```
+
+```json
+PendingMove = {
+  "operationId", "sourceMailbox", "sourceUidValidity", "sourceUid",
+  "destination",
+  "status": "reconciliationPending" | "needsAttention",
+  "detail?", "createdAt", "updatedAt"
+}
+```
+
+**move_subscription**
+```json
+{ "mailbox": "*", "account",
+  "sampleMailbox", "sampleUidValidity", "sampleUid",
+  "sender", "listId?", "matchedBy", "destination": "Subscriptions",
+  "found", "moved", "failed", "pending", "needsAttention",
+  "operationIds": [],
+  "mailboxes": [{ "mailbox", "found", "moved", "failed",
+    "pending", "needsAttention", "operationIds": [] }],
+  "mailboxesTotal", "mailboxesTruncated",
+  "skipped": [], "skippedTotal", "skippedTruncated" }
+```
+
+Native `UID MOVE` does not create a journal record. When the server lacks MOVE,
+Agentmail records intent in a separate durable SQLite journal before COPY,
+consumes the exact tagged command completion, records `COPYUID` when supplied,
+and only then removes the source. An EOF or timeout is ambiguous, so the pooled
+session is discarded and the response reports `reconciliationPending` with an
+`operationId` rather than claiming success or issuing an unsafe second COPY.
+`reconcile_moves` retries COPY only when unchanged destination `UIDNEXT` proves
+that the earlier attempt created nothing; otherwise it continues source cleanup
+or reports `needsAttention` for explicit review. The journal uses
+`synchronous=FULL` and remains enabled even when the disposable ranking cache
+is disabled.
 
 **create_mailbox**
 ```json
@@ -370,33 +491,35 @@ Required action identity and consent:
   "uid": 42,
   "expectedUidValidity": 3857529045,
   "confirmOneClick": true,
-  "deleteMatching": false,
-  "deleteOnUnsubscribeFailure": false,
-  "allowSenderFallback": true,
-  "allowPermanentFallback": false,
-  "permanent": false
+  "cleanup": {
+    "when": "afterSuccess",
+    "identity": "listIdOrSender",
+    "deletion": "trash"
+  }
 }
 ```
 
-The first four fields after `mailbox` identify a live-ranked message and record
-explicit RFC 8058 consent. The destructive switches (`deleteMatching`,
-`deleteOnUnsubscribeFailure`, `allowPermanentFallback`, `permanent`) default
-to `false`. `allowSenderFallback` defaults to `true`: it only activates when
-`deleteMatching` was already requested and no DKIM-authenticated List-Id
-exists, narrowing cleanup to the verified exact sender's bulk mail instead of
-refusing outright. List-Id cleanup requires the same passing DKIM signature
-to cover the single `List-Id` header. `permanent=true` is an explicit
-hard-delete request on standard IMAP; on Gmail it safely moves to Trash because
-in-place EXPUNGE only removes a label. `allowPermanentFallback=true` separately
-permits escalation only when a Trash-first cleanup cannot use Trash, and is
-never applied on Gmail.
+The fields through `confirmOneClick` identify a live-ranked message and record
+explicit RFC 8058 consent. Omit `cleanup` to perform only the unsubscribe POST.
+When cleanup is present, `identity: "listIdOrSender"` first prefers the single
+List-Id covered by the passing DKIM signature. Its fallback requires the exact
+normalized sender email plus `List-Unsubscribe-Post`; when the sampled message
+has one usable List-Id, matching messages must carry that same normalized
+List-Id too. Display names do not affect fallback matching.
+
+Cleanup defaults are `when: "afterSuccess"`, `identity: "listIdOrSender"`, and
+`deletion: "trash"`. `"always"` permits cleanup after a failed unsubscribe.
+`"trashThenPermanent"` permits an irreversible UID EXPUNGE fallback when Trash
+cannot be used, while `"permanent"` requests hard deletion directly. Gmail
+routes permanent disposal through Trash because in-place EXPUNGE only removes
+a label.
 
 ```json
 { "mailbox", "account", "uid", "uidValidity", "listId?",
   "dkimVerified": bool, "listIdAuthenticated": bool, "dkimDomain?",
   "unsubscribed": { "success": bool, "httpStatus?", "reason?" },
   "matchingMessages?": {
-    "matchedBy": "list-id" | "exact-sender-fallback",
+    "matchedBy": "list-id" | "sender-email-list-id-fallback" | "sender-email-fallback",
     "sender", "listId?", "found", "deleted", "failed",
     "mailboxes": [{ "mailbox", "found", "deleted", "failed" }],
     "mailboxesTotal", "mailboxesTruncated",
@@ -426,8 +549,8 @@ message ceiling and continues to mutate in 500-UID batches.
 
 | #   | Tool           | Description                                                                          | Annotations |
 | --- | -------------- | ------------------------------------------------------------------------------------ | ----------- |
-| 20  | `add_flags`    | Add flags and/or set Apple Mail `color` (a color-name string; union semantics). Colors: red, orange, yellow, green, blue, purple, gray. | `idempotent` |
-| 21  | `remove_flags` | Remove specific flags and/or clear the Apple Mail color with `clearColor: true`. Others preserved. | `idempotent` |
+| 28  | `add_flags`    | Add flags and/or set Apple Mail `color` (a color-name string; union semantics). Colors: red, orange, yellow, green, blue, purple, gray. | `idempotent` |
+| 29  | `remove_flags` | Remove specific flags and/or clear the Apple Mail color with `clearColor: true`. Others preserved. | `idempotent` |
 
 #### Output Schemas
 
@@ -448,25 +571,25 @@ Returns the full updated flag set after the operation.
 | 2   | `cleanup-sender`      | Find & bulk-delete from a specific sender         | `account`, `sender`          |
 | 3   | `find-attachments`    | Scan for downloadable attachments                 | `account`, `mailbox?`        |
 | 4   | `compose-email`       | Guided draft composition (supports attachments via create_draft) | `account`, `to?`, `subject?` |
-| 5   | `unsubscribe-cleanup` | Rank lists, obtain consent, verified unsubscribe  | `account`                    |
+| 5   | `unsubscribe-cleanup` | Rank subscriptions; offer filing or verified unsubscribe | `account`                    |
 | 6   | `list-id-cleanup`     | Identify mailing lists by List-Id, bulk-delete    | `account`                    |
 
 ## Task Support (SEP-1686)
 
-10 long-running tools support `execution.taskSupport = "optional"` — clients can invoke them normally (synchronous with progress notifications) or as background tasks (enqueue, poll, retrieve result).
+The tools listed below support `execution.taskSupport = "optional"` — clients can invoke them normally (synchronous with progress notifications) or as background tasks (enqueue, poll, retrieve result).
 
-**Taskable tools:** `list_flags`, `find_attachments`, `top_senders`, `top_subscriptions`, `top_mailing_lists`, `delete_messages`, `delete_by_sender`, `delete_list_id`, `move_list_id`, `move_by_sender`, `download_attachments`, `unsubscribe_message`
+**Taskable tools:** `list_flags`, `find_attachments`, `top_senders`, `top_domains`, `top_subscriptions`, `top_mailing_lists`, `delete_messages`, `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `move_list_id`, `move_by_sender`, `move_by_domain`, `move_subscription`, `reconcile_moves`, `download_attachments`, `unsubscribe_message`
 
-**Destructive task serialization:** Destructive tasks (`delete_messages`, `delete_by_sender`, `delete_list_id`, `unsubscribe_message`) targeting the same account are serialized — each waits for the previous destructive task to finish before starting. Non-destructive tasks run concurrently without restriction.
+**Destructive task serialization:** Destructive tasks (`delete_messages`, `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `reconcile_moves`, and `unsubscribe_message`) targeting the same account are serialized — each waits for the previous destructive task to finish before starting. Non-destructive tasks run concurrently without restriction.
 
-**Task lifecycle:** `tasks/list`, `tasks/get`, `tasks/getResult`, `tasks/cancel`
+**Task lifecycle:** `tasks/list`, `tasks/get`, `tasks/result`, `tasks/cancel`
 
 **Cancellation:** `tasks/cancel` first cancels the cooperative task token and then aborts the async future; active SQLite publication checks that token and rolls back. For direct calls, `notifications/cancelled` stops scans at mailbox/fetch-chunk boundaries and interrupts unsubscribe DNS, DKIM, and HTTP waits through a 25 ms cancellation poll. Cancellation during an HTTP send is inherently ambiguous because the endpoint may already have received the POST.
 
 Tasks are retained for 24 hours from creation, including completed, failed, and
 cancelled metadata. At most 128 live tasks/reservations are accepted per server
 process. `tasks/list` is newest-first in pages of 25 and uses an opaque,
-process-local cursor. `tasks/getResult` is repeatable until expiry; retrieving a
+process-local cursor. `tasks/result` is repeatable until expiry; retrieving a
 result does not evict it. Expired active tasks are cancelled and removed.
 
 ## Tool Result Encoding
@@ -474,7 +597,7 @@ result does not evict it. Expired active tasks are cancelled and removed.
 Every tool returns one short text block for clients that do not consume
 structured output and one authoritative `structuredContent` object. The text
 block is a summary capped at 8,000 characters, not a second escaped copy of the
-JSON payload. All 21 output schemas are root objects with nested definitions
+JSON payload. All tool output schemas are root objects with nested definitions
 inlined, so they contain no `$defs` or `$ref`.
 
 Potentially long mailbox/skipped breakdowns are capped at 50 rows and include

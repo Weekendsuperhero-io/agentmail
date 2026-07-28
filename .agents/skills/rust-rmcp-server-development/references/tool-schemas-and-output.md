@@ -55,11 +55,11 @@ Behavior to rely on:
 
 ## The Compatibility Caveat
 
-RMCP emits valid JSON Schema 2020-12, which is exactly what the MCP spec requires. The problem is downstream: when a parameter or output struct references other named types, schemars factors those types into `$defs` entries referenced by `$ref` — and several real hosts, clients, and gateways mishandle that:
+RMCP emits valid JSON Schema 2020-12, which is exactly what the MCP spec requires. The problem is downstream: when a parameter or output struct references other named types, schemars factors those types into `$defs` entries referenced by `$ref` — and several real hosts, clients, and bridges mishandle that:
 
 - Gemini CLI rejected tool schemas containing `$defs`/`$ref` (gemini-cli issue 13326).
 - n8n discarded `$defs` and `$ref` when importing MCP tool schemas, silently breaking validation (n8n issue 25964).
-- Assorted gateways and smaller hosts strip keywords they do not understand.
+- Assorted bridges and smaller hosts strip keywords they do not understand.
 
 This is a host-side validation gap, not an RMCP or schemars bug, but it becomes your bug at integration time. Symptoms:
 
@@ -104,7 +104,7 @@ In order of preference:
    }
    ```
 
-Decide per target host: if every host you support handles `$defs` (Claude and the official SDK-based hosts do), nested schemas are fine. If the host set is open-ended — especially behind a gateway — stay flat or inline.
+Decide per target host: if every host you support handles `$defs` (Claude and the official SDK-based hosts do), nested schemas are fine. If the host set is open-ended — especially behind a bridge — stay flat or inline.
 
 ## structuredContent Versus content
 

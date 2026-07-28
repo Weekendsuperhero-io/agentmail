@@ -1,6 +1,6 @@
 # RMCP Client Patterns
 
-Use this reference when building an MCP client, host, or test harness in Rust, when spawning MCP servers from Rust code, or when handling server-initiated sampling, elicitation, or roots requests. For the client half of a gateway, read this first, then `gateway-patterns.md`.
+Use this reference when building an MCP client, host, or test harness in Rust, when spawning MCP servers from Rust code, or when handling server-initiated sampling, elicitation, or roots requests. For the client half of a bridge, read this first, then `bridge-patterns.md`.
 
 Verified on 2026-06-09 against:
 

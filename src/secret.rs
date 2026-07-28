@@ -6,13 +6,20 @@
 //! - `Keyring` — OS keyring entry (macOS Keychain, etc.)
 //! - `Command` — shell command whose stdout is the password
 
+use std::fmt;
+use std::process::Stdio;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Keyring service name. Set at app startup. Falls back to `"agentmail"` for standalone use.
 static SERVICE_NAME: OnceLock<String> = OnceLock::new();
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Initialize the keyring service name.
 ///
@@ -69,8 +76,22 @@ pub enum SecretError {
     #[error("setting a command-based secret is not supported")]
     CommandNotWritable,
 
-    #[error("command failed ({status}): {stderr}")]
-    CommandFailed { status: String, stderr: String },
+    #[error(
+        "credential command failed ({status}); stderr was withheld because credential helpers may emit secret material"
+    )]
+    CommandFailed { status: String },
+
+    #[error("credential command timed out after {seconds}s")]
+    CommandTimedOut { seconds: u64 },
+
+    #[error("credential command output exceeded the {limit_bytes}-byte safety limit")]
+    CommandOutputTooLarge { limit_bytes: usize },
+
+    #[error("credential command output was not valid UTF-8")]
+    CommandOutputNotUtf8,
+
+    #[error("credential command returned an empty secret")]
+    CommandOutputEmpty,
 
     #[error("command I/O error: {0}")]
     CommandIo(String),
@@ -115,7 +136,7 @@ pub(crate) fn classify_platform_message(msg: &str) -> Option<SecretError> {
 }
 
 /// A secret value that can be stored in different backends.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Secret {
     /// Plaintext value.
@@ -125,6 +146,108 @@ pub enum Secret {
     /// Shell command whose stdout is the secret.
     #[serde(alias = "cmd")]
     Command(String),
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Raw(_) => formatter.write_str("Raw([REDACTED])"),
+            Self::Keyring(_) => formatter.write_str("Keyring([REDACTED])"),
+            Self::Command(_) => formatter.write_str("Command([REDACTED])"),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CommandRunError {
+    Io(std::io::Error),
+    OutputTooLarge,
+}
+
+impl From<std::io::Error> for CommandRunError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+async fn read_bounded<R>(reader: R, limit: usize) -> Result<Vec<u8>, CommandRunError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > limit {
+        return Err(CommandRunError::OutputTooLarge);
+    }
+    Ok(bytes)
+}
+
+async fn command_secret_with_limits(
+    command: &str,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<String, SecretError> {
+    let mut child = tokio::process::Command::new("sh")
+        .args(["-c", command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| SecretError::CommandIo(error.to_string()))?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        SecretError::Internal("credential command stdout pipe was unavailable".to_string())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        SecretError::Internal("credential command stderr pipe was unavailable".to_string())
+    })?;
+
+    let execution = async {
+        tokio::try_join!(
+            async { child.wait().await.map_err(CommandRunError::from) },
+            read_bounded(stdout, output_limit),
+            read_bounded(stderr, output_limit),
+        )
+    };
+
+    let outcome = tokio::time::timeout(timeout, execution).await;
+    let (status, stdout, _stderr) = match outcome {
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(SecretError::CommandTimedOut {
+                seconds: timeout.as_secs(),
+            });
+        }
+        Ok(Err(CommandRunError::OutputTooLarge)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(SecretError::CommandOutputTooLarge {
+                limit_bytes: output_limit,
+            });
+        }
+        Ok(Err(CommandRunError::Io(error))) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(SecretError::CommandIo(error.to_string()));
+        }
+        Ok(Ok(output)) => output,
+    };
+
+    if !status.success() {
+        return Err(SecretError::CommandFailed {
+            status: status.to_string(),
+        });
+    }
+    let secret = String::from_utf8(stdout).map_err(|_| SecretError::CommandOutputNotUtf8)?;
+    let secret = secret.trim().to_string();
+    if secret.is_empty() {
+        return Err(SecretError::CommandOutputEmpty);
+    }
+    Ok(secret)
 }
 
 impl Secret {
@@ -154,18 +277,7 @@ impl Secret {
                 .map_err(|e| SecretError::Internal(e.to_string()))?
             }
             Secret::Command(cmd) => {
-                let output = tokio::process::Command::new("sh")
-                    .args(["-c", cmd])
-                    .output()
-                    .await
-                    .map_err(|e| SecretError::CommandIo(e.to_string()))?;
-                if !output.status.success() {
-                    return Err(SecretError::CommandFailed {
-                        status: output.status.to_string(),
-                        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-                    });
-                }
-                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                command_secret_with_limits(cmd, COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT_BYTES).await
             }
         }
     }
@@ -259,13 +371,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_failure_surfaces_stderr() {
+    async fn command_failure_withholds_stderr() {
         let s = Secret::Command("echo boom 1>&2; exit 1".to_string());
         let err = s.get().await.unwrap_err();
-        match err {
-            SecretError::CommandFailed { stderr, .. } => assert!(stderr.contains("boom")),
-            other => panic!("expected CommandFailed, got {other:?}"),
-        }
+        assert!(matches!(err, SecretError::CommandFailed { .. }));
+        assert!(!err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn secret_debug_never_exposes_secret_material() {
+        let values = [
+            Secret::new_raw("hunter2"),
+            Secret::new_keyring("private@example.com"),
+            Secret::Command("printf super-secret-token".to_string()),
+        ];
+
+        let rendered = format!("{values:?}");
+
+        assert_eq!(rendered.matches("[REDACTED]").count(), 3);
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("private@example.com"));
+        assert!(!rendered.contains("super-secret-token"));
+    }
+
+    #[tokio::test]
+    async fn command_timeout_terminates_the_credential_process() {
+        let error = command_secret_with_limits(
+            "sleep 5",
+            Duration::from_millis(25),
+            MAX_COMMAND_OUTPUT_BYTES,
+        )
+        .await
+        .expect_err("slow command must time out");
+
+        assert!(matches!(error, SecretError::CommandTimedOut { .. }));
+    }
+
+    #[tokio::test]
+    async fn command_output_is_bounded() {
+        let error = command_secret_with_limits("printf 123456789", Duration::from_secs(1), 4)
+            .await
+            .expect_err("oversized output must fail");
+
+        assert!(matches!(
+            error,
+            SecretError::CommandOutputTooLarge { limit_bytes: 4 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_empty_output_is_rejected() {
+        let error = command_secret_with_limits("true", Duration::from_secs(1), 4)
+            .await
+            .expect_err("empty output must fail");
+
+        assert!(matches!(error, SecretError::CommandOutputEmpty));
     }
 
     // ----- Error mapping (pure function, no store needed) -----

@@ -28,7 +28,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-review.yml@main
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-review.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
     with:
       runs-on: ubuntu-latest
       max-commit-messages: 300

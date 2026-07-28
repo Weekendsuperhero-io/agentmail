@@ -23,8 +23,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    AnnotateAble, CompleteRequestParams, CompleteResult, CompletionContext, CompletionInfo,
-    RawResourceTemplate, ReadResourceResult, ResourceContents, ResourceTemplate,
+    CompleteRequestParams, CompleteResult, CompletionContext, CompletionInfo, ReadResourceResult,
+    ResourceContents, ResourceTemplate,
 };
 
 pub(super) const EMAIL_BODY_TEMPLATE: &str = "email://{account}/{mailbox}/{uidValidity}/{uid}";
@@ -184,7 +184,7 @@ pub(super) fn parse_email_uri(uri: &str) -> Result<EmailResourceUri, String> {
 
 pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
     vec![
-        RawResourceTemplate::new(EMAIL_BODY_TEMPLATE, "email-message")
+        ResourceTemplate::new(EMAIL_BODY_TEMPLATE, "email-message")
             .with_title("Email message (markdown)")
             .with_description(
                 "A single email rendered as markdown. Percent-encode the account and \
@@ -193,26 +193,23 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  and the UIDVALIDITY + UID identity from a current discovery result. \
                  Markdown output is limited to 100,000 characters.",
             )
-            .with_mime_type("text/markdown")
-            .no_annotation(),
-        RawResourceTemplate::new(EMAIL_HEADERS_TEMPLATE, "email-message-headers")
+            .with_mime_type("text/markdown"),
+        ResourceTemplate::new(EMAIL_HEADERS_TEMPLATE, "email-message-headers")
             .with_title("Email message headers (exact RFC822 syntax)")
             .with_description(
                 "The exact RFC822 header block for a live message identity, preserving \
                  field names, order, folding, and line endings. Output is limited to 64 KiB.",
             )
-            .with_mime_type("text/rfc822-headers")
-            .no_annotation(),
-        RawResourceTemplate::new(EMAIL_SOURCE_TEMPLATE, "email-message-source")
+            .with_mime_type("text/rfc822-headers"),
+        ResourceTemplate::new(EMAIL_SOURCE_TEMPLATE, "email-message-source")
             .with_title("Email message (raw RFC822 source)")
             .with_description(
                 "The raw RFC822 source of a single email, including all headers \
                  and MIME structure. Output is limited to 256 KiB; use the markdown, \
                  headers, or attachment APIs for larger messages.",
             )
-            .with_mime_type("message/rfc822")
-            .no_annotation(),
-        RawResourceTemplate::new(EMAIL_INFO_TEMPLATE, "email-message-info")
+            .with_mime_type("message/rfc822"),
+        ResourceTemplate::new(EMAIL_INFO_TEMPLATE, "email-message-info")
             .with_title("Email message info (JSON metadata)")
             .with_description(
                 "Compact JSON metadata for a live message: subject, sender, \
@@ -222,9 +219,8 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  /attachments/{index} resource URI — plus sibling body, headers, \
                  and source resource URIs. Read this before fetching attachments.",
             )
-            .with_mime_type("application/json")
-            .no_annotation(),
-        RawResourceTemplate::new(EMAIL_ATTACHMENT_TEMPLATE, "email-message-attachment")
+            .with_mime_type("application/json"),
+        ResourceTemplate::new(EMAIL_ATTACHMENT_TEMPLATE, "email-message-attachment")
             .with_title("Email attachment (binary)")
             .with_description(
                 "One MIME attachment of a live message, addressed by zero-based \
@@ -232,8 +228,7 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  content type. Discover indices, names, and sizes via the /info \
                  resource. Attachments above 4 MiB are refused — use the \
                  download_attachments tool to save large files to disk.",
-            )
-            .no_annotation(),
+            ),
     ]
 }
 
@@ -950,10 +945,7 @@ mod tests {
     fn templates_include_message_info_and_attachment_forms() {
         let templates = email_resource_templates();
 
-        let uris: Vec<&str> = templates
-            .iter()
-            .map(|t| t.raw.uri_template.as_str())
-            .collect();
+        let uris: Vec<&str> = templates.iter().map(|t| t.uri_template.as_str()).collect();
         assert_eq!(
             uris,
             [

@@ -1,4 +1,4 @@
-# Yahoo / AOL IMAP gateway quirks (empirically confirmed)
+# Yahoo / AOL IMAP bridge quirks (empirically confirmed)
 
 AOL mail runs on Yahoo IMAP infrastructure (`imap.aol.com` routes through
 `*.omega.yahoo.com` pods). Three server behaviors were confirmed against a

@@ -1,14 +1,14 @@
-# Gateway Patterns
+# Bridge Patterns
 
-Use this reference when one Rust process must act as an MCP server to downstream clients and as an MCP client to upstream servers: aggregators, proxies, filters, and gateways that add their own tools or data.
+Use this reference when one Rust process must act as an MCP server to downstream clients and as an MCP client to upstream servers: aggregators, proxies, filters, and bridges that add their own tools or data.
 
 Verified on 2026-06-09 against:
 
 - `rmcp` 1.7.0 source: `handler/server.rs` (ServerHandler signatures), `service/client.rs` and `service/server.rs` (peer methods), `service.rs` (`ServiceError`, `NotificationContext`).
 - MCP specification 2025-11-25 security best practices (token passthrough, confused deputy, session hijacking).
-- `modelcontextprotocol/rust-sdk` ships no official gateway example as of 1.7.0; these patterns compose its documented client and server APIs.
+- `modelcontextprotocol/rust-sdk` ships no official bridge example as of 1.7.0; these patterns compose its documented client and server APIs.
 
-The role rules (what a gateway may advertise, what must stay isolated) live in `mcp-runtime-utilities.md`. This file is the implementation shape. Read `rmcp-client-patterns.md` first; a gateway is that client embedded inside a `ServerHandler`.
+The role rules (what a bridge may advertise, what must stay isolated) live in `mcp-runtime-utilities.md`. This file is the implementation shape. Read `rmcp-client-patterns.md` first; a bridge is that client embedded inside a `ServerHandler`.
 
 ## Process Shape
 
@@ -19,7 +19,7 @@ use rmcp::{RoleClient, service::RunningService};
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
-pub struct Gateway {
+pub struct Bridge {
     /// Upstream connections keyed by a stable name ("github", "tickets").
     upstreams: Arc<RwLock<HashMap<String, RunningService<RoleClient, ()>>>>,
 }
@@ -32,7 +32,7 @@ Decisions to make explicitly:
 
 ## Forwarding Tools
 
-Namespace upstream tool names so they cannot collide with each other or with the gateway's own tools, and split the name again on the way in:
+Namespace upstream tool names so they cannot collide with each other or with the bridge's own tools, and split the name again on the way in:
 
 ```rust
 use rmcp::{
@@ -49,13 +49,13 @@ fn upstream_error(e: ServiceError) -> McpError {
     }
 }
 
-impl ServerHandler for Gateway {
+impl ServerHandler for Bridge {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut tools = Vec::new(); // start with the gateway's own tools
+        let mut tools = Vec::new(); // start with the bridge's own tools
         for (name, upstream) in self.upstreams.read().await.iter() {
             for mut tool in upstream.list_all_tools().await.map_err(upstream_error)? {
                 tool.name = format!("{name}__{}", tool.name).into();
@@ -98,13 +98,13 @@ Notes on this shape:
 Anything that identifies in-flight work upstream must be re-keyed before it reaches a downstream session, or one user can replay another user's handles:
 
 - **Pagination cursors**: simplest is to merge lists and return one page (`next_cursor: None`). If you paginate, mint your own opaque cursor that encodes `(upstream, upstream_cursor)` and reject cursors that do not belong to the requesting session with `-32602`.
-- **Progress tokens**: when the downstream request carries a `progressToken`, forward the call with a token you mint, keep a `upstream_token -> (downstream_session, downstream_token)` map, and translate each upstream `notify_progress` back through the gateway's server peer.
+- **Progress tokens**: when the downstream request carries a `progressToken`, forward the call with a token you mint, keep a `upstream_token -> (downstream_session, downstream_token)` map, and translate each upstream `notify_progress` back through the bridge's server peer.
 - **Task IDs**: same indirection. Upstream task IDs never appear downstream; expired or foreign task IDs get a protocol error, not a pass-through.
 - **Sessions**: downstream `Mcp-Session-Id` values are yours; generate them with a secure RNG and bind them to the authenticated user (the spec's security page recommends keying session state as `<user_id>:<session_id>`).
 
 ## Forwarding Notifications
 
-Upstream notifications arrive in the gateway's `ClientHandler`; re-emit them downstream through each affected session's `Peer<RoleServer>` (capture those peers from `RequestContext` or your connection-accept loop, and drop them when sessions close):
+Upstream notifications arrive in the bridge's `ClientHandler`; re-emit them downstream through each affected session's `Peer<RoleServer>` (capture those peers from `RequestContext` or your connection-accept loop, and drop them when sessions close):
 
 ```rust
 use rmcp::{ClientHandler, RoleClient, service::NotificationContext};
@@ -123,26 +123,26 @@ Fan out only to sessions entitled to that upstream, and map `resources/updated` 
 
 ## Capability Intersection
 
-Advertise only what the gateway implements end to end. Compute after upstream initialization:
+Advertise only what the bridge implements end to end. Compute after upstream initialization:
 
-- Tools/prompts/resources: advertise if the gateway serves its own or proxies at least one upstream that does.
+- Tools/prompts/resources: advertise if the bridge serves its own or proxies at least one upstream that does.
 - `listChanged`: advertise only if you actually re-emit the notification (code above).
-- `subscribe`, completions, tasks: advertise only if every routed upstream supports it, or the gateway shims it (for example, polling upstream and synthesizing `resources/updated`).
-- Client-direction features (sampling, elicitation, roots) do not pass through transparently: an upstream's `create_message` request terminates at the gateway's `ClientHandler`. Either answer it there or implement explicit relay logic to the downstream client — never advertise sampling/elicitation support to upstreams you cannot actually satisfy.
+- `subscribe`, completions, tasks: advertise only if every routed upstream supports it, or the bridge shims it (for example, polling upstream and synthesizing `resources/updated`).
+- Client-direction features (sampling, elicitation, roots) do not pass through transparently: an upstream's `create_message` request terminates at the bridge's `ClientHandler`. Either answer it there or implement explicit relay logic to the downstream client — never advertise sampling/elicitation support to upstreams you cannot actually satisfy.
 
 ## Auth Separation
 
-The spec's security best practices are blunt here, and they bind gateways directly:
+The spec's security best practices are blunt here, and they bind bridges directly:
 
-- Token passthrough is "explicitly forbidden": the gateway MUST NOT accept tokens that were not issued to the gateway, and MUST NOT forward downstream bearer tokens upstream. Downstream tokens authenticate the user *to the gateway* (audience = gateway, RFC 8707); upstream calls use the gateway's own credentials or a proper per-user token exchange.
+- Token passthrough is "explicitly forbidden": the bridge MUST NOT accept tokens that were not issued to the bridge, and MUST NOT forward downstream bearer tokens upstream. Downstream tokens authenticate the user *to the bridge* (audience = bridge, RFC 8707); upstream calls use the bridge's own credentials or a proper per-user token exchange.
 - Proxying a third-party authorization server invites the confused-deputy problem: keep a per-user registry of approved downstream `client_id`s and obtain consent before the first forwarding for each client.
 - Validate downstream auth on every request; never use the session ID as proof of identity.
 
 Implementation patterns for both sides are in `http-authorization.md`.
 
-## Gateway Checklist
+## Bridge Checklist
 
-- Tool names and resource URIs cannot collide across upstreams or with gateway-own primitives.
+- Tool names and resource URIs cannot collide across upstreams or with bridge-own primitives.
 - No downstream bearer token ever appears in an upstream request, log, or error message.
 - Upstream cursors, task IDs, and progress tokens never reach a downstream session unmapped; foreign handles are rejected per session.
 - Advertised capabilities match what is actually proxied or shimmed — nothing more.

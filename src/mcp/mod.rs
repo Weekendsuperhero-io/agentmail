@@ -9,23 +9,27 @@ mod tools_read;
 mod tools_write;
 mod wire;
 
-use self::tasks::{DESTRUCTIVE_TOOLS, TaskManager, extract_account};
+use self::tasks::{DESTRUCTIVE_TOOLS, TaskCompletion, TaskManager, extract_account};
+use futures::{FutureExt as _, StreamExt as _};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
     model::{
         CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
-        CompleteRequestParams, CompleteResult, CreateTaskResult, GetPromptRequestParams,
-        GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult,
-        GetTaskResultParams, Implementation, ListPromptsResult, ListResourceTemplatesResult,
-        ListTasksResult, Meta, PaginatedRequestParams, ProgressNotificationParam,
-        ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
+        CompleteRequestParams, CompleteResult, CreateTaskResult, GetTaskParams,
+        GetTaskPayloadParams, GetTaskPayloadResult, GetTaskResult, Implementation,
+        ListResourceTemplatesResult, ListTasksResult, Meta, PaginatedRequestParams,
+        ProgressNotificationParam, ReadResourceRequestParams, ReadResourceResult,
+        RelatedTaskMetadata, ServerCapabilities, ServerInfo, TasksCapability,
     },
     prompt_handler,
     service::RequestContext,
     tool_handler,
 };
-use std::sync::Arc;
+use std::{panic::AssertUnwindSafe, sync::Arc};
+
+const PREWARM_CONCURRENCY: usize = 3;
+const PREWARM_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -58,23 +62,108 @@ fn account_log_hint(account: &str) -> String {
     mask_prefix_for_log(account)
 }
 
-/// Build an optional progress callback from MCP meta + peer.
-/// Returns `None` if the client didn't provide a progress token.
-fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> Option<crate::ProgressFn> {
-    let token = meta.get_progress_token()?.clone();
+fn insert_related_task(meta: &mut Meta, task_id: &str) {
+    meta.0.insert(
+        RelatedTaskMetadata::META_KEY.to_string(),
+        serde_json::json!({ "taskId": task_id }),
+    );
+}
+
+fn attach_related_task(result: &mut CallToolResult, task_id: &str) {
+    let meta = result.meta.get_or_insert_with(Meta::new);
+    insert_related_task(meta, task_id);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProgressUpdate {
+    completed: u64,
+    total: u64,
+}
+
+struct ProgressReporter {
+    callback: Option<crate::ProgressFn>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ProgressReporter {
+    fn disabled() -> Self {
+        Self {
+            callback: None,
+            worker: None,
+        }
+    }
+
+    fn callback(&self) -> Option<&crate::ProgressFn> {
+        self.callback.as_ref()
+    }
+
+    /// Flush the latest coalesced update before the tool result is returned.
+    async fn finish(mut self) {
+        self.callback.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.await;
+        }
+    }
+}
+
+fn normalized_progress(
+    previous: Option<ProgressUpdate>,
+    completed: u64,
+    total: u64,
+) -> Option<ProgressUpdate> {
+    if previous.is_some_and(|previous| completed < previous.completed) {
+        return None;
+    }
+    let total = previous
+        .map_or(total, |previous| total.max(previous.total))
+        .max(completed);
+    let update = ProgressUpdate { completed, total };
+    (previous != Some(update)).then_some(update)
+}
+
+/// Build a bounded, coalescing progress stream. One worker serializes all
+/// notifications for the request, preserving monotonic progress and avoiding
+/// a detached Tokio task per callback.
+fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> ProgressReporter {
+    let Some(token) = meta.get_progress_token() else {
+        return ProgressReporter::disabled();
+    };
+    let related_task = meta.0.get(RelatedTaskMetadata::META_KEY).cloned();
     let peer = peer.clone();
-    Some(Arc::new(move |completed: u64, total: u64| {
-        let peer = peer.clone();
-        let token = token.clone();
-        tokio::spawn(async move {
-            let _ = peer
-                .notify_progress(
-                    ProgressNotificationParam::new(token, completed as f64)
-                        .with_total(total as f64),
-                )
-                .await;
-        });
-    }))
+    let (sender, mut receiver) = tokio::sync::watch::channel(None::<ProgressUpdate>);
+    let latest = Arc::new(parking_lot::Mutex::new(None::<ProgressUpdate>));
+    let callback_latest = Arc::clone(&latest);
+    let callback = Arc::new(move |completed: u64, total: u64| {
+        let mut previous = callback_latest.lock();
+        let Some(update) = normalized_progress(*previous, completed, total) else {
+            return;
+        };
+        *previous = Some(update);
+        sender.send_replace(Some(update));
+    });
+    let worker = tokio::spawn(async move {
+        while receiver.changed().await.is_ok() {
+            let Some(update) = *receiver.borrow_and_update() else {
+                continue;
+            };
+            let mut notification =
+                ProgressNotificationParam::new(token.clone(), update.completed as f64)
+                    .with_total(update.total as f64);
+            if let Some(related_task) = related_task.clone() {
+                let mut meta = Meta::new();
+                meta.0
+                    .insert(RelatedTaskMetadata::META_KEY.to_string(), related_task);
+                notification.meta = Some(meta);
+            }
+            if peer.notify_progress(notification).await.is_err() {
+                break;
+            }
+        }
+    });
+    ProgressReporter {
+        callback: Some(callback),
+        worker: Some(worker),
+    }
 }
 
 /// Build a `CancelFn` from the request's cancellation token. Fires when the
@@ -105,6 +194,7 @@ fn to_mcp_error(e: &crate::AgentmailError) -> McpError {
         E::Imap(_)
         | E::Tls(_)
         | E::Io(_)
+        | E::JournalSqlite(_)
         | E::Parse(_)
         | E::NotConnected
         | E::PoolExhausted
@@ -113,7 +203,7 @@ fn to_mcp_error(e: &crate::AgentmailError) -> McpError {
     }
 }
 
-pub(super) fn bounded_usize(
+fn bounded_usize(
     value: Option<u64>,
     default: usize,
     min: usize,
@@ -133,8 +223,25 @@ pub(super) fn bounded_usize(
     Ok(value)
 }
 
-pub(super) fn bounded_offset(value: Option<u64>) -> Result<usize, McpError> {
-    bounded_usize(value, 0, 0, 1_000_000, "offset")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Pagination {
+    pub(super) offset: usize,
+    pub(super) limit: usize,
+}
+
+impl Pagination {
+    /// Validate the common MCP offset/limit envelope in one place.
+    pub(super) fn new(
+        offset: Option<u64>,
+        limit: Option<u64>,
+        default_limit: usize,
+        max_limit: usize,
+    ) -> Result<Self, McpError> {
+        Ok(Self {
+            offset: bounded_usize(offset, 0, 0, 1_000_000, "offset")?,
+            limit: bounded_usize(limit, default_limit, 1, max_limit, "limit")?,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,15 +277,18 @@ impl AgentMailServer {
 #[prompt_handler]
 impl ServerHandler for AgentMailServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_prompts()
-                .enable_resources()
-                .enable_completions()
-                .enable_tasks()
-                .build(),
-        )
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .enable_resources()
+            .enable_completions()
+            .enable_tasks()
+            .build();
+        // `enable_tasks()` only switches the capability on. The protocol also
+        // requires the server to declare the supported lifecycle methods and
+        // which requests may be task-augmented.
+        capabilities.tasks = Some(TasksCapability::server_default());
+        ServerInfo::new(capabilities)
         // Without this the server announces itself as "rmcp" — rmcp's
         // Implementation::from_build_env() bakes in its own crate name.
         // Version carries the build SHA so `initialize` responses and logs
@@ -195,21 +305,23 @@ impl ServerHandler for AgentMailServer {
              list_mailboxes requires one account and returns selectable mailboxes only, paginated with a default of 100. \
              get_messages and search_messages return metadata only, newest-first, with the mailbox UIDVALIDITY and a UIDVALIDITY-safe resourceUri for each row. \
              Read resourceUri for markdown content; append /headers for exact headers, /source for bounded raw RFC822, /info for JSON metadata with the attachment inventory, or /attachments/{index} for one attachment blob. \
-             Manage email: delete_messages, delete_by_sender, delete_list_id, move_message, move_list_id, move_by_sender, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
-             Bulk filing: move_list_id and move_by_sender move every match to an existing destination mailbox in one call (e.g. statements into a folder) — never loop move_message per UID for that. \
-             top_senders, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
-             Ranked tools use live offset pages with a default of 10 and maximum of 100; pages may shift when mail changes. \
+             Manage email: delete_messages, delete_by_sender, delete_by_domain, delete_list_id, move_message, move_list_id, move_by_sender, move_by_domain, move_subscription, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
+             Bulk filing: move_list_id, move_by_sender, move_by_domain, and move_subscription move every exact match to an existing destination mailbox in one call — never loop move_message per UID for that. \
+             top_senders, top_domains, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
+             Ranked tools use live offset pages with a maximum of 100; top_domains defaults to 20 rows and the other ranked tools default to 10. Pages may shift when mail changes. \
              On providers with a visible-window limit (Yahoo/AOL), rankings and account-wide delete/move sweeps cover the ENTIRE mailbox via RFC 9586 UID Mode when a persistent cache is available; without it, sweeps repeat passes as older mail backfills into view. \
              If an action reports Message not found for a ranking sample, the message was deleted since the scan — re-run the ranking for a fresh sample instead of retrying the same UID. \
              Account-wide discovery uses one selectable All mailbox when available; otherwise it skips Trash, Junk, Spam, Drafts, and virtual aggregate views. Destructive scans never write through aggregate views. \
              Every action that consumes a UID requires the same mailbox and non-zero expectedUidValidity returned during discovery, and fails closed if the mailbox UID epoch changed. \
-             Two cleanup workflows: (1) top_senders → delete_by_sender for unwanted personal senders, (2) top_subscriptions → unsubscribe_message for mailing lists. \
+             Ranking/action parity: top_senders → move_by_sender or delete_by_sender; top_domains → move_by_domain or delete_by_domain; top_mailing_lists → move_list_id or delete_list_id; top_subscriptions → move_subscription for filing or unsubscribe_message for a verified unsubscribe. \
+             top_domains keeps parent domains and subdomains separate — actions on example.com never include mail.example.com implicitly; registrableDomain and subdomain are grouping context only. \
              Never use delete_by_sender for mailing list cleanup — it deletes ALL messages from a sender including non-bulk ones. \
              top_mailing_lists groups by List-Id header (RFC 2919) — all messages from the same mailing list regardless of sender. Use delete_list_id to remove an entire list. \
              top_senders groups by (email, display name) — same email with different display names are separate entries. \
-             Ranking rows include a nested sample {mailbox, uidValidity, uid, resourceUri}; map those fields to mailbox, expectedUidValidity, and uid for a later action. \
+             A non-native MOVE can return reconciliationPending or needsAttention with an operationId; use list_pending_moves to inspect durable operations and reconcile_moves to safely retry one operation or all pending operations. \
+             Ranking rows include a nested sample {mailbox, uidValidity, uid, resourceUri}; map those fields to mailbox, expectedUidValidity, and uid for a later UID action. move_subscription live-validates that sample, then moves exact sender + list-action-header matches account-wide and also requires the sample's List-Id when present. \
              top_subscriptions advertisedOneClick is syntactic only; unsubscribe_message re-fetches exact headers and verifies DKIM. \
-             unsubscribe_message requires explicit confirmOneClick=true. Optional matching-message cleanup is the nested cleanup {when, identity, deletion} object (omit it to only unsubscribe); it prefers the DKIM-authenticated List-Id, stops after a failed POST unless when=\"always\", and never silently escalates a Trash failure to permanent deletion unless deletion=\"trashThenPermanent\". \
+             unsubscribe_message requires explicit confirmOneClick=true. Optional matching-message cleanup is the nested cleanup {when, identity, deletion} object (omit it to only unsubscribe); it prefers the DKIM-authenticated List-Id, otherwise requires exact sender email + List-Unsubscribe-Post + the sample's List-Id when present, stops after a failed POST unless when=\"always\", and never silently escalates a Trash failure to permanent deletion unless deletion=\"trashThenPermanent\". \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
              find_attachments returns mailbox-safe {mailbox, uidValidity, uid, date, resourceUri} hits; pass that identity to download_attachments. \
              Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), plus /headers (exact headers), /source (bounded raw RFC822), /info (JSON metadata: subject, sender, date, flags, size, attachment inventory), and /attachments/{index} (one attachment as a blob with its own content type, 4 MiB limit). Percent-encode account and mailbox, including '/' in mailbox names as %2F. \
@@ -267,16 +379,19 @@ impl ServerHandler for AgentMailServer {
         // Reserve before spawning so capacity rejection cannot start work.
         let task = self.task_manager.lock().reserve_task(task_id.clone())?;
 
-        let result_slot: Arc<parking_lot::Mutex<Option<Result<CallToolResult, McpError>>>> =
-            Arc::new(parking_lot::Mutex::new(None));
-
         let server = self.clone();
-        let slot = Arc::clone(&result_slot);
+        let completion = Arc::new(TaskCompletion::new());
+        let worker_completion = Arc::clone(&completion);
         // Keep transport cancellation inherited from the request while also
         // giving tasks/cancel a token that reaches cooperative library work
         // and spawn_blocking SQLite publication.
         let task_cancel = context.ct.child_token();
         context.ct = task_cancel.clone();
+        insert_related_task(&mut context.meta, &task_id);
+        // Captured BEFORE `context` moves into the worker: the push target.
+        let peer = context.peer.clone();
+        let notify_id = task_id.clone();
+        let notify_manager = Arc::clone(&self.task_manager);
         let handle = tokio::spawn(async move {
             // If destructive, acquire the per-account lock first.
             // This serializes destructive tasks — the task waits here until
@@ -286,13 +401,62 @@ impl ServerHandler for AgentMailServer {
                 Some(ref lock) => Some(lock.lock().await),
                 None => None,
             };
-            let result = server.call_tool(request, context).await;
-            *slot.lock() = Some(result);
+            let result = AssertUnwindSafe(server.call_tool(request, context))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    Err(McpError::internal_error(
+                        "task worker panicked while executing the tool",
+                        None,
+                    ))
+                });
+            worker_completion.complete(result);
         });
 
-        self.task_manager
-            .lock()
-            .commit_task(&task_id, result_slot, task_cancel, handle)?;
+        self.task_manager.lock().commit_task(
+            &task_id,
+            Arc::clone(&completion),
+            task_cancel,
+            handle,
+        )?;
+
+        // Status watcher — the single producer of `notifications/tasks/status`.
+        //
+        // Spawned AFTER `commit_task` on purpose. The worker above can finish
+        // before the task is committed (a fast failure beats the commit to the
+        // lock), and `task_info` cannot resolve a task that is still only
+        // RESERVED — pushing from the worker therefore dropped the
+        // notification exactly when the task failed fastest.
+        //
+        // Waiting on the completion also unifies the two ways a task ends:
+        // `cancel_task` publishes a cancelled result, so cancellation wakes
+        // this same watcher rather than needing its own push (which would
+        // double-notify).
+        tokio::spawn(async move {
+            // A never-cancelled token: this watcher waits for the TASK, and
+            // must not be torn down by any one request's cancellation.
+            let _ = completion
+                .wait(&tokio_util::sync::CancellationToken::new())
+                .await;
+            // Read back through `task_info`, which runs the same lazy refresh
+            // a `tasks/get` would — so the pushed status can never contradict
+            // a subsequent poll.
+            let Ok(task) = notify_manager.lock().task_info(&notify_id) else {
+                return;
+            };
+            let notification = rmcp::model::ServerNotification::TaskStatusNotification(
+                rmcp::model::TaskStatusNotification::new(
+                    rmcp::model::TaskStatusNotificationParam::new(task),
+                ),
+            );
+            if let Err(error) = peer.send_notification(notification).await {
+                tracing::debug!(
+                    target: "agentmail",
+                    task = %notify_id,
+                    "tasks/status push failed — client gone: {error}"
+                );
+            }
+        });
 
         Ok(CreateTaskResult::new(task))
     }
@@ -309,19 +473,21 @@ impl ServerHandler for AgentMailServer {
 
     async fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let task = self.task_manager.lock().task_info(&request.task_id)?;
-        Ok(GetTaskResult { meta: None, task })
+        Ok(GetTaskResult::new(task))
     }
 
     async fn get_task_result(
         &self,
-        request: GetTaskResultParams,
-        _context: RequestContext<RoleServer>,
+        request: GetTaskPayloadParams,
+        context: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
-        let result = self.task_manager.lock().task_result(&request.task_id)?;
+        let completion = self.task_manager.lock().task_completion(&request.task_id)?;
+        let mut result = completion.wait(&context.ct).await?;
+        attach_related_task(&mut result, &request.task_id);
         let value = serde_json::to_value(result)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(GetTaskPayloadResult::new(value))
@@ -332,8 +498,12 @@ impl ServerHandler for AgentMailServer {
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CancelTaskResult, McpError> {
+        // No push here: `cancel_task` publishes a cancelled result, which wakes
+        // the status watcher spawned in `enqueue_task`. That single watcher is
+        // the ONLY producer of `notifications/tasks/status`, so cancel and
+        // natural completion cannot double-notify.
         let task = self.task_manager.lock().cancel_task(&request.task_id)?;
-        Ok(CancelTaskResult { meta: None, task })
+        Ok(CancelTaskResult::new(task))
     }
 }
 
@@ -373,34 +543,57 @@ where
 ///
 /// This is the entry point for the standalone `agentmail serve` binary.
 pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error::Error>> {
-    // Pre-warm: validate credentials and open one connection per account.
-    for account in mk.account_names() {
-        let account_hint = account_log_hint(&account);
-        match mk.check_connection(&account).await {
-            Ok(status) if status.connected => {
-                eprintln!("agentmail: {} connected", account_hint);
-            }
-            Ok(status) => {
-                eprintln!(
-                    "agentmail: {} connection failed: {}",
-                    account_hint,
-                    status.error.as_deref().unwrap_or("unknown")
-                );
-            }
-            Err(e) => {
-                eprintln!("agentmail: {} credential error: {}", account_hint, e);
-            }
-        }
-    }
-
     let server = AgentMailServer::new(mk);
+    let prewarm_agentmail = Arc::clone(&server.agentmail);
     let service = server
         .serve(rmcp::transport::io::stdio())
         .await
         .inspect_err(|e| {
             eprintln!("agentmail: server error: {}", e);
         })?;
-    service.waiting().await?;
+    // Initialization is already complete. Connection warming is bounded and
+    // never delays the MCP handshake or availability of config-backed tools.
+    let prewarm = tokio::spawn(async move {
+        futures::stream::iter(prewarm_agentmail.account_names())
+            .for_each_concurrent(PREWARM_CONCURRENCY, |account| {
+                let agentmail = Arc::clone(&prewarm_agentmail);
+                async move {
+                    let account_hint = account_log_hint(&account);
+                    match tokio::time::timeout(
+                        PREWARM_ACCOUNT_TIMEOUT,
+                        agentmail.check_connection(&account),
+                    )
+                    .await
+                    {
+                        Ok(Ok(status)) if status.connected => {
+                            eprintln!("agentmail: {} connected", account_hint);
+                        }
+                        Ok(Ok(status)) => {
+                            eprintln!(
+                                "agentmail: {} connection failed: {}",
+                                account_hint,
+                                status.error.as_deref().unwrap_or("unknown")
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!("agentmail: {} credential error: {}", account_hint, error);
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "agentmail: {} connection prewarm timed out after {}s",
+                                account_hint,
+                                PREWARM_ACCOUNT_TIMEOUT.as_secs()
+                            );
+                        }
+                    }
+                }
+            })
+            .await;
+    });
+    let result = service.waiting().await;
+    prewarm.abort();
+    let _ = prewarm.await;
+    result?;
     Ok(())
 }
 
@@ -411,6 +604,59 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pagination_applies_defaults_and_bounds_consistently() {
+        assert_eq!(
+            Pagination::new(None, None, 20, 100).expect("defaults should be valid"),
+            Pagination {
+                offset: 0,
+                limit: 20,
+            }
+        );
+        assert!(Pagination::new(Some(1_000_001), Some(1), 20, 100).is_err());
+        assert!(Pagination::new(None, Some(0), 20, 100).is_err());
+        assert!(Pagination::new(None, Some(101), 20, 100).is_err());
+        assert_eq!(
+            Pagination::new(Some(7), Some(7), 20, 100).expect("explicit page is preserved"),
+            Pagination {
+                offset: 7,
+                limit: 7,
+            }
+        );
+        assert_eq!(
+            Pagination::new(Some(1_000_000), Some(100), 20, 100)
+                .expect("documented inclusive maxima are accepted"),
+            Pagination {
+                offset: 1_000_000,
+                limit: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn progress_updates_are_monotonic_and_deduplicated() {
+        let previous = ProgressUpdate {
+            completed: 5,
+            total: 10,
+        };
+        assert_eq!(normalized_progress(Some(previous), 4, 10), None);
+        assert_eq!(normalized_progress(Some(previous), 5, 10), None);
+        assert_eq!(
+            normalized_progress(Some(previous), 7, 6),
+            Some(ProgressUpdate {
+                completed: 7,
+                total: 10,
+            })
+        );
+        assert_eq!(
+            normalized_progress(Some(previous), 12, 8),
+            Some(ProgressUpdate {
+                completed: 12,
+                total: 12,
+            })
+        );
+    }
 
     /// Output schemas mark every non-Option field `required`, and strict MCP
     /// hosts validate `structuredContent` against them — so a field that is
@@ -437,7 +683,7 @@ mod tests {
         }
     }
 
-    /// The concrete case the gateway rejected: a mailbox with no special-use
+    /// The concrete case the bridge rejected: a mailbox with no special-use
     /// role must still serialize `roles: []` because the output schema
     /// requires the key.
     #[test]
@@ -459,7 +705,7 @@ mod tests {
     }
 
     /// Walk a schema JSON tree asserting no `$ref`/`$defs` keys — several MCP
-    /// hosts (Gemini CLI, n8n, some gateways) reject or drop referenced
+    /// hosts (Gemini CLI, n8n, some bridges) reject or drop referenced
     /// schemas, so every nested type must carry `#[schemars(inline)]`.
     fn assert_no_refs(value: &serde_json::Value, path: &str, tool: &str, side: &str) {
         match value {
@@ -487,7 +733,7 @@ mod tests {
         let tools = AgentMailServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            23,
+            29,
             "tool count drifted — update docs and tests"
         );
         for tool in &tools {

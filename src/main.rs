@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::io::{IsTerminal, Write};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -65,6 +66,17 @@ enum CliCommand {
         #[arg(long, default_value = "0")]
         offset: usize,
         #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+    /// Top exact Header From domains and subdomains (omit --mailbox to scan all)
+    TopDomains {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        mailbox: Option<String>,
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        #[arg(long, default_value = "20")]
         limit: usize,
     },
     /// Top bulk-mail senders by List-Unsubscribe-Post presence, then count (omit --mailbox to scan all)
@@ -164,6 +176,19 @@ enum CliCommand {
         #[arg(long, num_args = 0..)]
         bcc: Vec<String>,
     },
+    /// List durable COPY-fallback MOVE operations awaiting recovery or review
+    ListPendingMoves {
+        #[arg(long)]
+        account: String,
+    },
+    /// Safely reconcile one or all pending COPY-fallback MOVE operations
+    ReconcileMoves {
+        #[arg(long)]
+        account: String,
+        /// Operation ID from list-pending-moves; omit to reconcile all
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -228,15 +253,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .get(&account)
                 .ok_or_else(|| format!("Account '{}' not found in config", account))?;
 
-            eprint!(
+            let password = prompt_secret(&format!(
                 "Enter password for {} ({}): ",
                 account, acct_config.username
-            );
-            let mut password = String::new();
-            std::io::stdin().read_line(&mut password)?;
-            let password = password.trim();
+            ))?;
 
-            agentmail::credentials::set_password(&account, acct_config, password).await?;
+            agentmail::credentials::set_password(&account, acct_config, &password).await?;
             eprintln!("Password stored successfully.");
             Ok(())
         }
@@ -291,6 +313,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
                 .top_senders(mailbox.as_deref(), &account, offset, limit, None, None)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        CliCommand::TopDomains {
+            account,
+            mailbox,
+            offset,
+            limit,
+        } => {
+            let mk = agentmail::Agentmail::from_default_config()?;
+            let value = mk
+                .top_domains(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -384,6 +419,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
                 .create_draft(&account, &subject, &body, &to, &cc, &bcc, &[])
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        CliCommand::ListPendingMoves { account } => {
+            let mk = agentmail::Agentmail::from_default_config()?;
+            let value = mk.list_pending_moves(&account).await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        CliCommand::ReconcileMoves {
+            account,
+            operation_id,
+        } => {
+            let mk = agentmail::Agentmail::from_default_config()?;
+            let value = mk
+                .reconcile_moves(&account, operation_id.as_deref(), None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -488,7 +540,8 @@ fn init_platform_keyring() {
 // ---------------------------------------------------------------------------
 
 fn prompt(label: &str) -> Result<String, Box<dyn std::error::Error>> {
-    eprint!("{}", label);
+    eprint!("{label}");
+    std::io::stderr().flush()?;
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf)?;
     Ok(buf.trim().to_string())
@@ -496,6 +549,7 @@ fn prompt(label: &str) -> Result<String, Box<dyn std::error::Error>> {
 
 fn prompt_default(label: &str, default: &str) -> Result<String, Box<dyn std::error::Error>> {
     eprint!("{} [{}]: ", label, default);
+    std::io::stderr().flush()?;
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf)?;
     let val = buf.trim();
@@ -504,6 +558,157 @@ fn prompt_default(label: &str, default: &str) -> Result<String, Box<dyn std::err
     } else {
         Ok(val.to_string())
     }
+}
+
+fn trim_line_ending(mut value: String) -> String {
+    while value.ends_with('\r') || value.ends_with('\n') {
+        value.pop();
+    }
+    value
+}
+
+#[cfg(unix)]
+struct TerminalEchoGuard;
+
+#[cfg(unix)]
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+fn prompt_secret(label: &str) -> Result<String, Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    if std::io::stdin().is_terminal() {
+        let script = r#"
+            $secret = Read-Host -Prompt $env:AGENTMAIL_SECRET_PROMPT -AsSecureString
+            $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
+            try {
+                [Console]::Out.WriteLine([Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer))
+            } finally {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+            }
+        "#;
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-Command", script])
+            .env("AGENTMAIL_SECRET_PROMPT", label.trim_end())
+            .stdin(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .output()?;
+        if !output.status.success() {
+            return Err(format!("hidden password prompt failed: {}", output.status).into());
+        }
+        return Ok(trim_line_ending(
+            String::from_utf8(output.stdout)
+                .map_err(|_| "hidden password prompt returned invalid UTF-8")?,
+        ));
+    }
+
+    eprint!("{label}");
+    std::io::stderr().flush()?;
+
+    #[cfg(unix)]
+    let echo_guard = if std::io::stdin().is_terminal() {
+        let status = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err("could not disable terminal echo for the password prompt".into());
+        }
+        Some(TerminalEchoGuard)
+    } else {
+        None
+    };
+
+    let mut value = String::new();
+    let read_result = std::io::stdin().read_line(&mut value);
+    #[cfg(unix)]
+    if echo_guard.is_some() {
+        drop(echo_guard);
+        eprintln!();
+    }
+    read_result?;
+    Ok(trim_line_ending(value))
+}
+
+fn valid_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+struct TemporaryConfigFile {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl Drop for TemporaryConfigFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn write_private_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    #[cfg(unix)]
+    let parent_existed = parent.exists();
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    if !parent_existed {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary_path = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+    let mut temporary = TemporaryConfigFile {
+        path: temporary_path.clone(),
+        armed: true,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary_path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+
+    std::fs::rename(&temporary_path, path)?;
+    temporary.armed = false;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 struct ProviderPreset {
@@ -570,25 +775,62 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
     if account_name.is_empty() {
         return Err("Account name cannot be empty".into());
     }
+    if !valid_account_name(&account_name) {
+        return Err("Account name may contain only ASCII letters, numbers, '-' and '_'".into());
+    }
 
     // 3. Host / port / username
     let (host, port, username) = if let Some(ref p) = preset {
         let host = prompt_default("IMAP host", p.host)?;
         let port_str = prompt_default("IMAP port", &p.port.to_string())?;
-        let port: u16 = port_str.parse().unwrap_or(p.port);
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| format!("Invalid IMAP port '{port_str}'"))?;
         eprintln!("  (hint: {})", p.username_hint);
         let username = prompt("Username: ")?;
         (host, port, username)
     } else {
         let host = prompt("IMAP host: ")?;
         let port_str = prompt_default("IMAP port", "993")?;
-        let port: u16 = port_str.parse().unwrap_or(993);
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| format!("Invalid IMAP port '{port_str}'"))?;
         let username = prompt("Username: ")?;
         (host, port, username)
     };
     if host.is_empty() || username.is_empty() {
         return Err("Host and username are required".into());
     }
+
+    let suggested_email = agentmail::config::canonicalize_email(&username).unwrap_or_default();
+    let email = if suggested_email.is_empty() {
+        prompt("Primary email (optional, used to recognize your own mail): ")?
+    } else {
+        prompt_default("Primary email", &suggested_email)?
+    };
+    let aliases = prompt("Aliases (comma-separated, optional): ")?
+        .split(',')
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    let mut account_config = agentmail::AccountConfig::new(&host, &username)
+        .with_port(port)
+        .with_aliases(aliases);
+    if !email.is_empty() {
+        account_config = account_config.with_email(email);
+    }
+    let validated =
+        agentmail::Config::try_from_accounts(vec![(account_name.clone(), account_config)])?;
+    let account_config = validated
+        .accounts
+        .get(&account_name)
+        .expect("validated account is present");
+    let host = account_config.host.clone();
+    let username = account_config.username.clone();
+    let email = account_config.email.clone();
+    let aliases = account_config.aliases.clone();
 
     // 4. Password method
     eprintln!("\nPassword storage:");
@@ -601,33 +843,32 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         "command" | "cmd" | "2" => {
             let default_cmd = format!(
                 "security find-internet-password -s {} -a {} -w",
-                host, username
+                shell_quote(&host),
+                shell_quote(&username)
             );
             eprintln!("  (hint: use the default to read Apple Mail's stored password)");
             let cmd = prompt_default("Command", &default_cmd)?;
             (format!("password.cmd = {:?}", cmd), false)
         }
         "raw" | "3" => {
-            let pw = prompt("Password: ")?;
+            let pw = prompt_secret("Password: ")?;
             (format!("password.raw = {:?}", pw), false)
         }
-        _ => {
+        "keyring" | "1" => {
             // keyring (default)
-            (format!("password.keyring = \"mail.{}\"", username), true)
+            (
+                format!("password.keyring = {:?}", format!("mail.{username}")),
+                true,
+            )
         }
+        _ => return Err("Password method must be keyring, command, or raw".into()),
     };
 
     // 5. Write config file
     let config_path = agentmail::Config::default_path();
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Check if account already exists
-    if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        let key = format!("[accounts.{}]", account_name);
-        if content.contains(&key) {
+    let existing = if config_path.exists() {
+        let config = agentmail::Config::load_from(&config_path)?;
+        if config.accounts.contains_key(&account_name) {
             return Err(format!(
                 "Account '{}' already exists in {}. Edit the file directly to modify it.",
                 account_name,
@@ -635,22 +876,35 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
             )
             .into());
         }
-    }
+        std::fs::read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
 
-    let mut section = format!("\n[accounts.{}]\n", account_name);
+    let mut section = format!("[accounts.{account_name:?}]\n");
     section.push_str(&format!("host = {:?}\n", host));
     if port != 993 {
         section.push_str(&format!("port = {}\n", port));
     }
     section.push_str(&format!("username = {:?}\n", username));
+    if let Some(email) = email {
+        section.push_str(&format!("email = {email:?}\n"));
+    }
+    if !aliases.is_empty() {
+        section.push_str(&format!("aliases = {aliases:?}\n"));
+    }
     section.push_str(&format!("{}\n", password_toml));
 
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config_path)?;
-    file.write_all(section.as_bytes())?;
+    let separator = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let combined = format!("{existing}{separator}\n{section}");
+    let mut parsed: agentmail::Config = toml::from_str(&combined)
+        .map_err(|error| format!("Generated config is invalid: {}", error.message()))?;
+    parsed.normalize_and_validate()?;
+    write_private_atomic(&config_path, combined.as_bytes())?;
     eprintln!(
         "\nWrote account '{}' to {}",
         account_name,
@@ -659,14 +913,14 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
 
     // 6. Store password in keyring if needed
     if need_store_password {
-        eprint!("Enter password for {} ({}): ", account_name, username);
-        let mut pw = String::new();
-        std::io::stdin().read_line(&mut pw)?;
-        let pw = pw.trim();
+        let pw = prompt_secret(&format!(
+            "Enter password for {} ({}): ",
+            account_name, username
+        ))?;
 
         let mut secret = agentmail::secret::Secret::new_keyring(format!("mail.{}", username));
         secret
-            .set(pw)
+            .set(&pw)
             .await
             .map_err(|e| format!("Failed to store password: {}", e))?;
         eprintln!("Password stored in system keychain.");
@@ -690,4 +944,116 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_names_reject_toml_structure_characters() {
+        assert!(valid_account_name("work_2026-07"));
+        assert!(!valid_account_name("work]\n[accounts.evil"));
+    }
+
+    #[test]
+    fn top_domains_cli_uses_the_documented_page_defaults() {
+        let cli = Cli::try_parse_from(["agentmail", "top-domains", "--account", "work"])
+            .expect("valid command");
+
+        match cli.command.expect("subcommand") {
+            CliCommand::TopDomains {
+                account,
+                mailbox,
+                offset,
+                limit,
+            } => {
+                assert_eq!(account, "work");
+                assert_eq!(mailbox, None);
+                assert_eq!(offset, 0);
+                assert_eq!(limit, 20);
+            }
+            _ => panic!("expected top-domains"),
+        }
+    }
+
+    #[test]
+    fn top_domains_cli_preserves_explicit_offset_and_limit() {
+        let cli = Cli::try_parse_from([
+            "agentmail",
+            "top-domains",
+            "--account",
+            "work",
+            "--offset",
+            "7",
+            "--limit",
+            "7",
+        ])
+        .expect("valid command");
+
+        match cli.command.expect("subcommand") {
+            CliCommand::TopDomains { offset, limit, .. } => {
+                assert_eq!(offset, 7);
+                assert_eq!(limit, 7);
+            }
+            _ => panic!("expected top-domains"),
+        }
+    }
+
+    #[test]
+    fn reconcile_moves_cli_accepts_one_operation_id() {
+        let cli = Cli::try_parse_from([
+            "agentmail",
+            "reconcile-moves",
+            "--account",
+            "work",
+            "--operation-id",
+            "operation-123",
+        ])
+        .expect("valid command");
+
+        match cli.command.expect("subcommand") {
+            CliCommand::ReconcileMoves {
+                account,
+                operation_id,
+            } => {
+                assert_eq!(account, "work");
+                assert_eq!(operation_id.as_deref(), Some("operation-123"));
+            }
+            _ => panic!("expected reconcile-moves"),
+        }
+    }
+
+    #[test]
+    fn private_atomic_write_replaces_complete_file() {
+        let directory =
+            std::env::temp_dir().join(format!("agentmail-config-write-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("config.toml");
+
+        write_private_atomic(&path, b"first").expect("first write");
+        write_private_atomic(&path, b"second").expect("replacement write");
+        let contents = std::fs::read(&path).expect("read replacement");
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert_eq!(contents, b"second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_atomic_write_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory =
+            std::env::temp_dir().join(format!("agentmail-config-mode-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("config.toml");
+        write_private_atomic(&path, b"secret").expect("private write");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert_eq!(mode, 0o600);
+    }
 }

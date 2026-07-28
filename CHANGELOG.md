@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-07-18T00:00
+updated: 2026-07-22T00:00
 ---
 # Changelog
 
@@ -10,6 +10,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-07-22
+
+### Highlights
+
+- **Domain organization** — added `top_domains`, `delete_by_domain`, and
+  `move_by_domain`, with registrable-domain and subdomain breakdowns plus a
+  representative subject for each exact domain.
+- **Exact requested limits** — ranking pages now return up to the requested
+  `limit`; the five-item cap applies only to the documented mailing-list sender
+  preview.
+- **Recoverable mutations** — MOVE fallbacks use a durable mutation journal,
+  operation IDs, pending-operation inspection, and explicit reconciliation
+  instead of silently repeating uncertain COPY/delete work.
+- **MCP tasks and SDK** — upgraded to `rmcp` 2.2 and the 2025-11-25 MCP task
+  model, including background execution, result retrieval, paging, and
+  cancellation for long-running tools.
+- **Configuration and credential security** — validates account and transport
+  settings, supports separate primary email addresses and aliases, requires
+  TLS, hides password prompts, writes configuration atomically with private
+  Unix permissions, and bounds/redacts credential-helper execution.
+- **Optional IMAP compression** — negotiates RFC 4978 `COMPRESS=DEFLATE` after
+  login when the server advertises it, while retaining ordinary TLS sessions
+  on servers without the capability.
+
+## [0.3.0] - 2026-07-18
 
 ### Added
 - **Authenticated one-click unsubscribe** — RFC 8058 execution now fetches the complete target transiently and verifies DKIM locally with `mail-auth`; at least one passing signature must include both `List-Unsubscribe` and `List-Unsubscribe-Post` in its `h=` tag. The full message is never cached.
