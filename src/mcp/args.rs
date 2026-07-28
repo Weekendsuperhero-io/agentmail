@@ -176,7 +176,7 @@ pub(super) struct DeleteBySenderArgs {
     )]
     pub(super) account: String,
     #[schemars(
-        description = "The sender's exact email address to match (from a top_senders or top_subscriptions row's address)."
+        description = "The sender's exact email address to match (from a top_senders row's address)."
     )]
     pub(super) email: String,
     #[serde(default)]
@@ -336,8 +336,8 @@ pub(super) enum CleanupWhenArg {
 pub(super) enum CleanupIdentityArg {
     /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
     ListIdOnly,
-    /// Prefer the authenticated List-Id; otherwise fall back to the exact
-    /// sender's bulk mail, scoped to the target's own List-Id when it has one.
+    /// Prefer the authenticated List-Id; otherwise require the exact sender
+    /// email plus List-Unsubscribe-Post, and the target's List-Id when present.
     #[default]
     ListIdOrSender,
 }
@@ -372,7 +372,7 @@ pub(super) struct UnsubscribeCleanupSpec {
     pub(super) when: CleanupWhenArg,
     #[serde(default)]
     #[schemars(
-        description = "Cleanup identity: \"listIdOrSender\" (default) prefers the DKIM-authenticated List-Id and falls back to the exact sender's bulk mail scoped to the target's List-Id when one exists; \"listIdOnly\" requires the authenticated List-Id strictly."
+        description = "Cleanup identity: \"listIdOrSender\" (default) prefers the DKIM-authenticated List-Id and otherwise requires the exact sender email plus List-Unsubscribe-Post, also requiring the target's List-Id when one exists; \"listIdOnly\" requires the authenticated List-Id strictly."
     )]
     pub(super) identity: CleanupIdentityArg,
     #[serde(default)]
@@ -545,7 +545,7 @@ pub(super) struct MoveBySenderArgs {
     )]
     pub(super) account: String,
     #[schemars(
-        description = "The sender's exact email address to match (from a top_senders or top_subscriptions row's address)."
+        description = "The sender's exact email address to match (from a top_senders row's address)."
     )]
     pub(super) email: String,
     #[serde(default)]

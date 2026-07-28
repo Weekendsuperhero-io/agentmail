@@ -182,18 +182,13 @@ pub struct SenderSummary {
     pub newest_date: Option<DateTime<Utc>>,
 }
 
-/// Summary of mailing list messages grouped by sender.
+/// Summary of mailing-list messages grouped by normalized sender email.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
 pub struct ListSummary {
-    /// Sender display string (`"Display Name <email>"` or just `"email"`).
-    pub sender: String,
-    /// Normalized sender email address (lowercase).
+    /// Normalized sender email address and sole grouping key.
     pub address: String,
-    /// Sender display name (used internally; not serialized — already in `sender`).
-    #[serde(skip_serializing)]
-    pub display_name: String,
     /// Whether the newest message advertises syntactically valid RFC 8058
     /// one-click headers. Execution still re-fetches the message and requires
     /// a passing DKIM signature over both headers.
@@ -204,7 +199,7 @@ pub struct ListSummary {
     /// caller can see WHAT the subscription is before acting. Never persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
-    /// Number of messages from this sender with List-Unsubscribe.
+    /// Number of messages from this sender with list-action headers.
     pub count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_date: Option<DateTime<Utc>>,
@@ -413,7 +408,7 @@ pub struct TopSubscriptionsResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,
-    pub unique_lists: usize,
+    pub unique_senders: usize,
     pub offset: usize,
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -515,10 +510,9 @@ pub enum CleanupWhen {
 pub enum CleanupIdentityMode {
     /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
     ListIdOnly,
-    /// Prefer the authenticated List-Id; when there is none, fall back to the
-    /// exact sender's bulk mail — constrained to the target's own List-Id
-    /// whenever the message carries one, so other lists from the same sender
-    /// are untouched.
+    /// Prefer the authenticated List-Id; when there is none, fall back to
+    /// messages from the exact sender email that carry List-Unsubscribe-Post.
+    /// When the target has one usable List-Id, require that same List-Id too.
     #[default]
     ListIdOrSender,
 }

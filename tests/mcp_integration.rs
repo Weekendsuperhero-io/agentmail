@@ -576,7 +576,7 @@ async fn uid_actions_require_a_nonzero_expected_uidvalidity() {
     let tools = resp["result"]["tools"].as_array().expect("tools array");
 
     // delete_by_sender is absent by design: it deletes by a direct sender
-    // identity (email + displayName from a ranking row), not a sample UID, so
+    // identity (email + displayName from a top_senders row), not a sample UID, so
     // it carries no UIDVALIDITY guard — discovery confirms the identity live.
     for name in [
         "delete_messages",
@@ -1179,6 +1179,25 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
 }
 
 #[tokio::test]
+async fn unsubscribe_identity_schema_documents_the_email_post_fallback() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let tool = find_tool(tools, "unsubscribe_message");
+    let description =
+        tool["inputSchema"]["properties"]["cleanup"]["properties"]["identity"]["description"]
+            .as_str()
+            .expect("cleanup identity description");
+
+    assert!(
+        description.contains("exact sender email")
+            && description.contains("List-Unsubscribe-Post")
+            && description.contains("target's List-Id"),
+        "cleanup identity must document every fallback constraint: {description}"
+    );
+}
+
+#[tokio::test]
 async fn unsubscribe_tool_declares_destructive_open_world_behavior() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
@@ -1365,6 +1384,24 @@ async fn rank_outputs_expose_nested_action_identities() {
 }
 
 #[tokio::test]
+async fn top_subscriptions_schema_omits_display_name() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let output = &find_tool(tools, "top_subscriptions")["outputSchema"];
+    let subscription =
+        object_schema(&output["properties"]["lists"]["items"]).expect("subscription row object");
+    let properties = subscription["properties"]
+        .as_object()
+        .expect("subscription row properties");
+
+    assert!(
+        !properties.contains_key("displayName"),
+        "top_subscriptions must group and identify rows by address only: {subscription:#}"
+    );
+}
+
+#[tokio::test]
 async fn domain_tools_expose_exact_hierarchy_and_action_contracts() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
@@ -1538,6 +1575,31 @@ async fn prompts_list_has_6_prompts() {
             "prompt `{name}` has no description"
         );
     }
+}
+
+#[tokio::test]
+async fn unsubscribe_cleanup_prompt_uses_the_current_email_fallback_contract() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "prompts/get",
+            json!({
+                "name": "unsubscribe-cleanup",
+                "arguments": {"account": "dummy"}
+            }),
+        )
+        .await;
+    let text = resp["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("unsubscribe cleanup prompt text");
+
+    assert!(
+        text.contains("exact sender email + List-Unsubscribe-Post")
+            && text.contains("identity: \"listIdOrSender\"")
+            && !text.contains("deleteMatching")
+            && !text.contains("display name"),
+        "unsubscribe prompt must describe the current cleanup contract: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------

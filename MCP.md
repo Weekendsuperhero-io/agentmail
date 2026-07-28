@@ -172,13 +172,15 @@ account's own address.
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "total",
   "offset", "limit", "nextOffset?",
   "lists": [{
-    "address", "displayName", "advertisedOneClick": bool,
+    "address", "advertisedOneClick": bool,
     "count", "subject?", "oldestDate?", "newestDate?",
     "sample": MessageIdentity
   }] }
 ```
-Sorted: advertised one-click senders first, then by count. `advertisedOneClick`
-checks exact local RFC 2369/8058 syntax; it does not claim DKIM success.
+Grouped only by normalized sender email; display names and `List-Id` values do
+not split a sender's row. Sorted: advertised one-click senders first, then by
+count. `advertisedOneClick` checks exact local RFC 2369/8058 syntax; it does not
+claim DKIM success.
 Opaque unsubscribe URLs and recipient tokens are not exposed. Use the nested
 `sample` identity for a later `unsubscribe_message` call. `subject` is the
 sample message's decoded Subject, fetched live for the returned page only and
@@ -466,33 +468,35 @@ Required action identity and consent:
   "uid": 42,
   "expectedUidValidity": 3857529045,
   "confirmOneClick": true,
-  "deleteMatching": false,
-  "deleteOnUnsubscribeFailure": false,
-  "allowSenderFallback": true,
-  "allowPermanentFallback": false,
-  "permanent": false
+  "cleanup": {
+    "when": "afterSuccess",
+    "identity": "listIdOrSender",
+    "deletion": "trash"
+  }
 }
 ```
 
-The first four fields after `mailbox` identify a live-ranked message and record
-explicit RFC 8058 consent. The destructive switches (`deleteMatching`,
-`deleteOnUnsubscribeFailure`, `allowPermanentFallback`, `permanent`) default
-to `false`. `allowSenderFallback` defaults to `true`: it only activates when
-`deleteMatching` was already requested and no DKIM-authenticated List-Id
-exists, narrowing cleanup to the verified exact sender's bulk mail instead of
-refusing outright. List-Id cleanup requires the same passing DKIM signature
-to cover the single `List-Id` header. `permanent=true` is an explicit
-hard-delete request on standard IMAP; on Gmail it safely moves to Trash because
-in-place EXPUNGE only removes a label. `allowPermanentFallback=true` separately
-permits escalation only when a Trash-first cleanup cannot use Trash, and is
-never applied on Gmail.
+The fields through `confirmOneClick` identify a live-ranked message and record
+explicit RFC 8058 consent. Omit `cleanup` to perform only the unsubscribe POST.
+When cleanup is present, `identity: "listIdOrSender"` first prefers the single
+List-Id covered by the passing DKIM signature. Its fallback requires the exact
+normalized sender email plus `List-Unsubscribe-Post`; when the sampled message
+has one usable List-Id, matching messages must carry that same normalized
+List-Id too. Display names do not affect fallback matching.
+
+Cleanup defaults are `when: "afterSuccess"`, `identity: "listIdOrSender"`, and
+`deletion: "trash"`. `"always"` permits cleanup after a failed unsubscribe.
+`"trashThenPermanent"` permits an irreversible UID EXPUNGE fallback when Trash
+cannot be used, while `"permanent"` requests hard deletion directly. Gmail
+routes permanent disposal through Trash because in-place EXPUNGE only removes
+a label.
 
 ```json
 { "mailbox", "account", "uid", "uidValidity", "listId?",
   "dkimVerified": bool, "listIdAuthenticated": bool, "dkimDomain?",
   "unsubscribed": { "success": bool, "httpStatus?", "reason?" },
   "matchingMessages?": {
-    "matchedBy": "list-id" | "exact-sender-fallback",
+    "matchedBy": "list-id" | "sender-email-list-id-fallback" | "sender-email-fallback",
     "sender", "listId?", "found", "deleted", "failed",
     "mailboxes": [{ "mailbox", "found", "deleted", "failed" }],
     "mailboxesTotal", "mailboxesTruncated",

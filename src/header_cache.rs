@@ -132,7 +132,6 @@ pub(crate) struct CachedDomainRank {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CachedSubscriptionRank {
     pub(crate) address: String,
-    pub(crate) display_name: String,
     pub(crate) count: u64,
     pub(crate) oldest_date: Option<DateTime<Utc>>,
     pub(crate) newest_date: Option<DateTime<Utc>>,
@@ -1847,58 +1846,56 @@ async fn query_subscription_page(
                     )
              ),
              grouped AS (
-                 SELECT sender_email, sender_name, COUNT(*) AS message_count,
+                 SELECT sender_email, COUNT(*) AS message_count,
                         MIN(date_unix_ms) AS oldest_date_unix_ms,
                         MAX(date_unix_ms) AS newest_date_unix_ms
                    FROM eligible
-                  GROUP BY sender_email, sender_name
+                  GROUP BY sender_email
              ),
              samples AS (
-                 SELECT sender_email, sender_name, mailbox, uid_validity, uid,
+                 SELECT sender_email, mailbox, uid_validity, uid,
                         date_unix_ms, advertised_one_click,
                         ROW_NUMBER() OVER (
-                            PARTITION BY sender_email, sender_name
+                            PARTITION BY sender_email
                             ORDER BY (date_unix_ms IS NOT NULL) DESC,
                                      date_unix_ms DESC, mailbox DESC, uid DESC
                         ) AS sample_rank
                    FROM eligible
              )
-             SELECT grouped.sender_email, grouped.sender_name,
-                    grouped.message_count, grouped.oldest_date_unix_ms,
+             SELECT grouped.sender_email, grouped.message_count,
+                    grouped.oldest_date_unix_ms,
                     grouped.newest_date_unix_ms, samples.mailbox,
                     samples.uid_validity, samples.uid, samples.date_unix_ms,
                     samples.advertised_one_click
                FROM grouped
                JOIN samples
                  ON samples.sender_email = grouped.sender_email
-                AND samples.sender_name = grouped.sender_name
                 AND samples.sample_rank = 1;",
         )?;
         let (total_groups, total_messages) = rank_totals(&connection, "subscription_rank_groups")?;
         let mut statement = connection.prepare(
-            "SELECT sender_email, sender_name, message_count,
+            "SELECT sender_email, message_count,
                     oldest_date_unix_ms, newest_date_unix_ms, mailbox,
                     uid_validity, uid, date_unix_ms, advertised_one_click
                FROM subscription_rank_groups
               ORDER BY advertised_one_click DESC, message_count DESC,
-                       sender_email, sender_name
+                       sender_email
               LIMIT ?1 OFFSET ?2",
         )?;
         let rows =
             statement.query_map(params![sql_rank_limit(limit)?, sql_offset(offset)], |row| {
                 Ok(CachedSubscriptionRank {
                     address: row.get(0)?,
-                    display_name: row.get(1)?,
-                    count: sql_u64(row.get::<_, i64>(2)?)?,
-                    oldest_date: sql_date(row.get(3)?),
-                    newest_date: sql_date(row.get(4)?),
+                    count: sql_u64(row.get::<_, i64>(1)?)?,
+                    oldest_date: sql_date(row.get(2)?),
+                    newest_date: sql_date(row.get(3)?),
                     sample: CachedRankSample {
-                        mailbox: row.get(5)?,
-                        uid_validity: sql_u32(row.get::<_, i64>(6)?)?,
-                        uid: sql_u32(row.get::<_, i64>(7)?)?,
-                        date: sql_date(row.get(8)?),
+                        mailbox: row.get(4)?,
+                        uid_validity: sql_u32(row.get::<_, i64>(5)?)?,
+                        uid: sql_u32(row.get::<_, i64>(6)?)?,
+                        date: sql_date(row.get(7)?),
                     },
-                    advertised_one_click: row.get::<_, i64>(9)? != 0,
+                    advertised_one_click: row.get::<_, i64>(8)? != 0,
                 })
             })?;
         let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3790,7 +3787,7 @@ mod tests {
                 rank_row(
                     2,
                     "news@example.com",
-                    "News",
+                    "Latest News",
                     Some(3_000),
                     Some("<news-new@example.com>"),
                     Some("Current Name <news.example.com>"),
@@ -3817,7 +3814,7 @@ mod tests {
                 rank_row(
                     20,
                     "news@example.com",
-                    "News",
+                    "Latest News",
                     Some(3_000),
                     Some("<news-new@example.com>"),
                     Some("Current Name <news.example.com>"),

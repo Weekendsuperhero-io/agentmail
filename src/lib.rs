@@ -1348,11 +1348,11 @@ impl Agentmail {
         })
     }
 
-    /// Group mailing-list messages by sender.
+    /// Group mailing-list messages by normalized sender email.
     ///
     /// Includes messages that have List-Unsubscribe or List-Unsubscribe-Post.
-    /// Groups by exact sender (email + display name). The sample_uid and
-    /// unsubscribe info come from the newest message in each group.
+    /// Display names and List-Id values do not split sender groups. The sample
+    /// identity and one-click flag come from the newest message in each group.
     ///
     /// When `mailbox` is `None`, scans all mailboxes in the account.
     pub async fn top_subscriptions(
@@ -1431,13 +1431,7 @@ impl Agentmail {
                 .items
                 .into_iter()
                 .map(|row| ListSummary {
-                    sender: if row.display_name.is_empty() {
-                        row.address.clone()
-                    } else {
-                        format!("{} <{}>", row.display_name, row.address)
-                    },
                     address: row.address,
-                    display_name: row.display_name,
                     advertised_one_click: row.advertised_one_click,
                     sample: MailboxMessageIdentity {
                         mailbox: row.sample.mailbox,
@@ -1465,15 +1459,15 @@ impl Agentmail {
                     .cloned();
             }
             Self::uid_mode_release(session, uid_mode).await;
-            let unique_lists = usize::try_from(page.total_groups).unwrap_or(usize::MAX);
+            let unique_senders = usize::try_from(page.total_groups).unwrap_or(usize::MAX);
             return Ok(TopSubscriptionsResponse {
                 mailbox: mailbox.unwrap_or("*").to_string(),
                 account: account.to_string(),
                 total_messages: u32::try_from(page.total_messages).unwrap_or(u32::MAX),
-                unique_lists,
+                unique_senders,
                 offset,
                 limit,
-                next_offset: next_offset(offset, item_count, unique_lists),
+                next_offset: next_offset(offset, item_count, unique_senders),
                 lists,
             });
         }
@@ -1481,8 +1475,7 @@ impl Agentmail {
         use hashbrown::{HashMap, HashSet};
         use types::ListSummary;
 
-        // Key by (email, display_name) for exact sender grouping
-        let mut map: HashMap<(String, String), ListSummary> = HashMap::new();
+        let mut map: HashMap<String, ListSummary> = HashMap::new();
         // Dedup the same logical message across folders (Gmail labels / All Mail).
         let mut seen: HashSet<String> = HashSet::new();
         // Don't rank the user themselves (their own sent mail).
@@ -1500,33 +1493,24 @@ impl Agentmail {
             {
                 continue;
             }
-            let key = (row.sender_email.clone(), row.sender_name.clone());
+            let key = row.sender_email.clone();
             let uid_validity =
                 row.uid_validity
                     .ok_or_else(|| AgentmailError::UidValidityUnavailable {
                         mailbox: mbox.clone(),
                     })?;
-            let entry = map.entry(key).or_insert_with(|| {
-                let sender_display = if row.sender_name.is_empty() {
-                    row.sender_email.clone()
-                } else {
-                    format!("{} <{}>", row.sender_name, row.sender_email)
-                };
-                ListSummary {
-                    sender: sender_display,
-                    address: row.sender_email.clone(),
-                    display_name: row.sender_name.clone(),
-                    advertised_one_click: false,
-                    sample: MailboxMessageIdentity {
-                        mailbox: mbox.clone(),
-                        uid_validity,
-                        uid: row.uid,
-                    },
-                    subject: None,
-                    count: 0,
-                    oldest_date: None,
-                    newest_date: None,
-                }
+            let entry = map.entry(key).or_insert_with(|| ListSummary {
+                address: row.sender_email.clone(),
+                advertised_one_click: false,
+                sample: MailboxMessageIdentity {
+                    mailbox: mbox.clone(),
+                    uid_validity,
+                    uid: row.uid,
+                },
+                subject: None,
+                count: 0,
+                oldest_date: None,
+                newest_date: None,
             });
 
             entry.count += 1;
@@ -1552,10 +1536,6 @@ impl Agentmail {
                     row.list_unsubscribe.as_deref(),
                     row.list_unsubscribe_post.as_deref(),
                 );
-                if !row.sender_name.is_empty() {
-                    entry.display_name = row.sender_name.clone();
-                    entry.sender = format!("{} <{}>", entry.display_name, row.sender_email);
-                }
             }
 
             if let Some(d) = row.date {
@@ -1579,10 +1559,9 @@ impl Agentmail {
                 .cmp(&a.advertised_one_click)
                 .then_with(|| b.count.cmp(&a.count))
                 .then_with(|| a.address.cmp(&b.address))
-                .then_with(|| a.display_name.cmp(&b.display_name))
         });
 
-        let unique_lists = lists.len();
+        let unique_senders = lists.len();
         let total_messages = lists
             .iter()
             .fold(0_u32, |total, list| total.saturating_add(list.count));
@@ -1611,10 +1590,10 @@ impl Agentmail {
             mailbox: mailbox.unwrap_or("*").to_string(),
             account: account.to_string(),
             total_messages,
-            unique_lists,
+            unique_senders,
             offset,
             limit,
-            next_offset: next_offset(offset, item_count, unique_lists),
+            next_offset: next_offset(offset, item_count, unique_senders),
             lists,
         })
     }
@@ -2019,57 +1998,32 @@ impl Agentmail {
                 )
                 .await
             }
-            DeleteSelector::Sender {
-                email,
-                name,
-                bulk_only,
-                list_id,
-            } => {
-                let sender_has_idn = domain::domain_from_address(email)
-                    .is_some_and(|domain| domain.split('.').any(|label| label.starts_with("xn--")));
-                let criteria = if sender_has_idn {
-                    // The public sender identity uses an IDNA A-label, while
-                    // the header may contain the equivalent EAI U-label.
-                    // Search every non-deleted visible row, then confirm the
-                    // exact canonical sender below.
-                    SearchCriteria {
-                        deleted: Some(false),
-                        ..Default::default()
-                    }
-                } else {
-                    SearchCriteria {
-                        from: Some(email.clone()),
-                        deleted: Some(false),
-                        ..Default::default()
-                    }
-                };
-                let query = imap_client::build_search_query_pub(&criteria)?;
-                let candidates = imap_client::search_uids(session, &query).await?;
+            DeleteSelector::Sender { email, name } => {
+                let candidates = candidate_sender_uids(session, email).await?;
                 if candidates.is_empty() {
                     return Ok(Vec::new());
                 }
-                if *bulk_only {
-                    // Unsubscribe cleanup: only the sender's bulk mail (must
-                    // carry a List-Unsubscribe header), never personal replies.
-                    filter_sender_bulk_mail(
-                        session,
-                        &candidates,
-                        email,
-                        name,
-                        list_id.as_deref(),
-                        cancel,
-                    )
-                    .await
-                } else {
-                    // delete_by_sender: every message from the exact identity.
-                    let fetched =
-                        imap_client::fetch_senders_batch(session, &candidates, cancel).await?;
-                    Ok(fetched
-                        .into_iter()
-                        .filter(|(_uid, e, n)| e == email && n == name)
-                        .map(|(uid, _, _)| uid)
-                        .collect())
+                let fetched =
+                    imap_client::fetch_senders_batch(session, &candidates, cancel).await?;
+                Ok(fetched
+                    .into_iter()
+                    .filter(|(_uid, e, n)| e == email && n == name)
+                    .map(|(uid, _, _)| uid)
+                    .collect())
+            }
+            DeleteSelector::SubscriptionSender { email, list_id } => {
+                let candidates = candidate_sender_uids(session, email).await?;
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
                 }
+                filter_subscription_sender_mail(
+                    session,
+                    &candidates,
+                    email,
+                    list_id.as_deref(),
+                    cancel,
+                )
+                .await
             }
             DeleteSelector::Domain(expected_domain) => {
                 let expected_domain =
@@ -2861,7 +2815,7 @@ impl Agentmail {
     }
 
     /// Delete all messages from an exact sender identity (email + display
-    /// name, as returned by `top_senders`/`top_subscriptions` rows).
+    /// name, as returned by a `top_senders` row).
     ///
     /// `mailbox: None` means the account-wide mutation plan, matching
     /// `delete_list_id`. Discovery re-finds and confirms the identity live in
@@ -2879,7 +2833,7 @@ impl Agentmail {
         let email = email.trim();
         if email.is_empty() || email.contains(['<', '>', '\r', '\n', '\0']) {
             return Err(AgentmailError::Other(
-                "sender email must be a bare address (use address from a top_senders/top_subscriptions row)"
+                "sender email must be a bare address (use address from a top_senders row)"
                     .to_string(),
             ));
         }
@@ -2920,8 +2874,6 @@ impl Agentmail {
                 DeleteSelector::Sender {
                     email,
                     name: name.to_string(),
-                    bulk_only: false,
-                    list_id: None,
                 },
                 &search_mailboxes,
                 SweepAction::Delete {
@@ -3152,7 +3104,7 @@ impl Agentmail {
         let email = email.trim();
         if email.is_empty() || email.contains(['<', '>', '\r', '\n', '\0']) {
             return Err(AgentmailError::Other(
-                "sender email must be a bare address (use address from a top_senders/top_subscriptions row)"
+                "sender email must be a bare address (use address from a top_senders row)"
                     .to_string(),
             ));
         }
@@ -3170,8 +3122,6 @@ impl Agentmail {
                 DeleteSelector::Sender {
                     email,
                     name: name.to_string(),
-                    bulk_only: false,
-                    list_id: None,
                 },
                 destination,
                 on_progress,
@@ -3830,7 +3780,7 @@ impl Agentmail {
             }
         };
         let headers = unsubscribe::parse_list_headers(&target.raw_message);
-        let (target_email, target_name, _, _) =
+        let (target_email, _, _, _) =
             parser::parse_sender_date(&target.raw_message).unwrap_or_default();
         session.release().await;
 
@@ -3890,24 +3840,18 @@ impl Agentmail {
             Ok(identity) => identity,
             Err(CleanupIdentityError::UnauthenticatedListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup was skipped: the sender's DKIM signature does not cover the List-Id header (List-Id is spoofable, so an unauthenticated value must not select an account-wide delete), and cleanup.identity was \"listIdOnly\". To clean up: use cleanup.identity \"listIdOrSender\" to delete this exact sender's bulk mail scoped to this List-Id, use delete_list_id with an explicitly chosen listId, or use delete_by_sender."
+                    "Matching-message cleanup was skipped: the sender's DKIM signature does not cover the List-Id header (List-Id is spoofable, so an unauthenticated value must not select an account-wide delete), and cleanup.identity was \"listIdOnly\". To clean up: use cleanup.identity \"listIdOrSender\" to match exact sender email + List-Unsubscribe-Post + this List-Id, use delete_list_id with an explicitly chosen listId, or use delete_by_sender."
                         .to_string(),
                 );
                 return Ok(response);
             }
             Err(CleanupIdentityError::NoUsableListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup was skipped: the message carries no single usable List-Id, and cleanup.identity was \"listIdOnly\". To clean up: use cleanup.identity \"listIdOrSender\" to delete this exact sender's bulk mail, or use delete_by_sender."
+                    "Matching-message cleanup was skipped: the message carries no single usable List-Id, and cleanup.identity was \"listIdOnly\". To clean up: use cleanup.identity \"listIdOrSender\" to match the exact sender email plus List-Unsubscribe-Post, or use delete_by_sender."
                         .to_string(),
                 );
                 return Ok(response);
             }
-        };
-
-        let sender_display = if target_name.is_empty() {
-            target_email.clone()
-        } else {
-            format!("{} <{}>", target_name, target_email)
         };
 
         let mode = cleanup.mode();
@@ -3941,10 +3885,8 @@ impl Agentmail {
             CleanupIdentity::ListId { normalized, .. } => {
                 DeleteSelector::ListId(normalized.clone())
             }
-            CleanupIdentity::Sender { list_id } => DeleteSelector::Sender {
+            CleanupIdentity::Sender { list_id } => DeleteSelector::SubscriptionSender {
                 email: target_email.clone(),
-                name: target_name.clone(),
-                bulk_only: true,
                 list_id: list_id.clone(),
             },
         };
@@ -3975,8 +3917,8 @@ impl Agentmail {
             // List-Id match.
             CleanupIdentity::Sender {
                 list_id: Some(normalized),
-            } => ("exact-sender-list-id-fallback", Some(normalized)),
-            CleanupIdentity::Sender { list_id: None } => ("exact-sender-fallback", None),
+            } => ("sender-email-list-id-fallback", Some(normalized)),
+            CleanupIdentity::Sender { list_id: None } => ("sender-email-fallback", None),
         };
         let complete = totals.skipped.is_empty()
             && totals.failed == 0
@@ -3984,7 +3926,7 @@ impl Agentmail {
             && totals.needs_attention == 0;
         response.matching_messages = Some(MatchingMessagesResult {
             matched_by: matched_by.to_string(),
-            sender: sender_display,
+            sender: target_email,
             list_id,
             found: totals.found,
             deleted: totals.affected,
@@ -4110,16 +4052,14 @@ enum DeleteSelector {
     /// Messages whose List-Id matches (exact). `exact_list_id_uids` normalizes
     /// internally, so the raw header value is accepted here.
     ListId(String),
-    /// Messages from an exact sender identity. `bulk_only` restricts to mail
-    /// that also carries a List-Unsubscribe header (unsubscribe-cleanup
-    /// semantics); otherwise every message from the identity matches
-    /// (delete-by-sender). `list_id` further scopes bulk mail to one
-    /// normalized List-Id — the pertinence constraint for the unsubscribe
-    /// sender fallback, so sibling lists from the same sender are untouched.
-    Sender {
+    /// Every message from one exact sender identity (email + display name),
+    /// used by delete-by-sender and move-by-sender.
+    Sender { email: String, name: String },
+    /// RFC 8058 mail from one exact sender email. A `list_id` further scopes
+    /// matches to one normalized List-Id so sibling lists from the same sender
+    /// are untouched.
+    SubscriptionSender {
         email: String,
-        name: String,
-        bulk_only: bool,
         list_id: Option<String>,
     },
     /// Messages whose first parsed Header From address has this exact
@@ -4247,12 +4187,10 @@ enum CleanupIdentity {
         raw: String,
         normalized: String,
     },
-    /// Exact-sender fallback. `list_id` carries the target's single normalized
-    /// List-Id when the message has one that DKIM did not authenticate: the
-    /// sender identity is verified, so conjoining it with that List-Id scopes
-    /// the delete to the one list actually unsubscribed from without trusting
-    /// the (spoofable) List-Id alone. `None` when the message carries no
-    /// usable List-Id at all — sender + bulk-mail is then the only criterion.
+    /// Sender-email fallback. Every match must have the exact canonical sender
+    /// email plus List-Unsubscribe-Post. `list_id` carries the target's single
+    /// normalized List-Id when present, conjoining it with the sender email so
+    /// an unauthenticated, spoofable List-Id never selects a delete alone.
     Sender {
         list_id: Option<String>,
     },
@@ -4312,9 +4250,6 @@ fn cleanup_policy_allows(cleanup: CleanupPolicy, unsubscribe_succeeded: bool) ->
     unsubscribe_succeeded || cleanup.when == CleanupWhen::Always
 }
 
-/// From a set of candidate UIDs, fetch FROM + List-Unsubscribe/Post headers and
-/// return only those that match the exact sender AND have either List-Unsubscribe
-/// or List-Unsubscribe-Post (i.e. bulk/marketing mail).
 /// Confirm which candidate UIDs actually carry the exact List-Id. IMAP HEADER
 /// search is substring-only (and enumeration candidates are everything), so
 /// this fetch is the authority before any deletion; stale UIDs simply do not
@@ -4341,11 +4276,55 @@ where
     )
 }
 
-async fn filter_sender_bulk_mail<T>(
+async fn candidate_sender_uids<T>(
+    session: &mut async_imap::Session<T>,
+    email: &str,
+) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let sender_has_idn = domain::domain_from_address(email)
+        .is_some_and(|domain| domain.split('.').any(|label| label.starts_with("xn--")));
+    let criteria = if sender_has_idn {
+        // The public sender identity uses an IDNA A-label, while the header may
+        // contain the equivalent EAI U-label. Enumerate non-deleted messages,
+        // then confirm the canonical address from fetched headers.
+        SearchCriteria {
+            deleted: Some(false),
+            ..Default::default()
+        }
+    } else {
+        SearchCriteria {
+            from: Some(email.to_string()),
+            deleted: Some(false),
+            ..Default::default()
+        }
+    };
+    let query = imap_client::build_search_query_pub(&criteria)?;
+    imap_client::search_uids(session, &query).await
+}
+
+/// A sender-fallback message must carry RFC 8058's POST header, match the
+/// canonical sender email, and satisfy the optional normalized List-Id scope.
+fn subscription_sender_header_matches(
+    header_bytes: &[u8],
+    target_email: &str,
+    constrain_list_id: Option<&str>,
+) -> bool {
+    let header_str = String::from_utf8_lossy(header_bytes);
+    if imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe-Post").is_none()
+        || !row_list_id_matches(&header_str, constrain_list_id)
+    {
+        return false;
+    }
+
+    parser::parse_sender_date(header_bytes).is_ok_and(|(email, _, _, _)| email == target_email)
+}
+
+async fn filter_subscription_sender_mail<T>(
     session: &mut async_imap::Session<T>,
     candidate_uids: &[u32],
     target_email: &str,
-    target_name: &str,
     constrain_list_id: Option<&str>,
     cancel: Option<&CancelFn>,
 ) -> Result<Vec<u32>>
@@ -4378,29 +4357,7 @@ where
                 None => continue,
             };
             let header_bytes = fetch.header().unwrap_or(&[]);
-            let header_str = String::from_utf8_lossy(header_bytes);
-
-            // Must have List-Unsubscribe OR List-Unsubscribe-Post
-            let has_unsub =
-                imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe").is_some();
-            let has_unsub_post =
-                imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe-Post")
-                    .is_some();
-            if !has_unsub && !has_unsub_post {
-                continue;
-            }
-
-            // Pertinence constraint: when the cleanup identity carries a
-            // List-Id, only that list's mail qualifies.
-            if !row_list_id_matches(&header_str, constrain_list_id) {
-                continue;
-            }
-
-            // Must match exact sender
-            if let Ok((email, name, _, _)) = parser::parse_sender_date(header_bytes)
-                && email == target_email
-                && name == target_name
-            {
+            if subscription_sender_header_matches(header_bytes, target_email, constrain_list_id) {
                 exact.push(uid);
             }
         }
@@ -4831,7 +4788,7 @@ mod tests {
                 list_id: Some("news.example.com".to_string()),
             })
         );
-        // No usable List-Id at all → sender + bulk-mail is the only criterion.
+        // No usable List-Id → sender email + List-Unsubscribe-Post.
         assert_eq!(
             select_unsubscribe_cleanup_identity(None, false, false, "sender@example.com", fallback),
             Ok(CleanupIdentity::Sender { list_id: None })
@@ -4862,6 +4819,58 @@ mod tests {
         assert!(row_list_id_matches(matching, Some("news.example.com")));
         assert!(!row_list_id_matches(sibling, Some("news.example.com")));
         assert!(!row_list_id_matches(missing, Some("news.example.com")));
+    }
+
+    #[test]
+    fn subscription_sender_match_ignores_display_name() {
+        let headers = b"From: Changed Name <sender@example.com>\r\n\
+            List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+            List-Id: News <news.example.com>\r\n\r\n";
+
+        assert!(subscription_sender_header_matches(
+            headers,
+            "sender@example.com",
+            Some("news.example.com")
+        ));
+    }
+
+    #[test]
+    fn subscription_sender_match_requires_list_unsubscribe_post() {
+        let headers = b"From: News <sender@example.com>\r\n\
+            List-Unsubscribe: <https://example.com/unsubscribe>\r\n\
+            List-Id: News <news.example.com>\r\n\r\n";
+
+        assert!(!subscription_sender_header_matches(
+            headers,
+            "sender@example.com",
+            Some("news.example.com")
+        ));
+    }
+
+    #[test]
+    fn subscription_sender_match_rejects_a_sibling_list_id() {
+        let headers = b"From: News <sender@example.com>\r\n\
+            List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+            List-Id: Other <other.example.com>\r\n\r\n";
+
+        assert!(!subscription_sender_header_matches(
+            headers,
+            "sender@example.com",
+            Some("news.example.com")
+        ));
+    }
+
+    #[test]
+    fn subscription_sender_match_rejects_a_different_email() {
+        let headers = b"From: News <other@example.com>\r\n\
+            List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+            List-Id: News <news.example.com>\r\n\r\n";
+
+        assert!(!subscription_sender_header_matches(
+            headers,
+            "sender@example.com",
+            Some("news.example.com")
+        ));
     }
 
     /// Fast test for the early validation error in create_draft.
@@ -5582,18 +5591,18 @@ mod tests {
         );
     }
 
-    /// End-to-end sender-fallback sweep with the pertinence constraint: both
-    /// candidates are bulk mail from the exact sender, but only the one whose
-    /// List-Id matches the constraint is deleted — the sibling list survives.
+    /// End-to-end sender-fallback sweep with the pertinence constraint.
     #[tokio::test]
     async fn delete_sweep_sender_fallback_is_scoped_to_the_constrained_list_id() {
-        let (mut session, server) = scripted_sweep_session(" 11 12", |tag| {
-            let matching = "From: News <sender@example.com>\r\nList-Unsubscribe: <https://x.example/u>\r\nList-Id: News <news.example.com>\r\n\r\n";
-            let sibling = "From: News <sender@example.com>\r\nList-Unsubscribe: <https://x.example/u>\r\nList-Id: Other <other.example.com>\r\n\r\n";
+        let (mut session, server) = scripted_sweep_session(" 11 12 13", |tag| {
+            let matching = "From: Changed Name <sender@example.com>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\nList-Id: News <news.example.com>\r\n\r\n";
+            let sibling = "From: News <sender@example.com>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\nList-Id: Other <other.example.com>\r\n\r\n";
+            let no_post = "From: News <sender@example.com>\r\nList-Unsubscribe: <https://x.example/u>\r\nList-Id: News <news.example.com>\r\n\r\n";
             format!(
-                "* 1 FETCH (UID 11 BODY[HEADER] {{{}}}\r\n{matching})\r\n* 2 FETCH (UID 12 BODY[HEADER] {{{}}}\r\n{sibling})\r\n{tag} OK FETCH completed\r\n",
+                "* 1 FETCH (UID 11 BODY[HEADER] {{{}}}\r\n{matching})\r\n* 2 FETCH (UID 12 BODY[HEADER] {{{}}}\r\n{sibling})\r\n* 3 FETCH (UID 13 BODY[HEADER] {{{}}}\r\n{no_post})\r\n{tag} OK FETCH completed\r\n",
                 matching.len(),
-                sibling.len()
+                sibling.len(),
+                no_post.len()
             )
         })
         .await;
@@ -5604,10 +5613,8 @@ mod tests {
             .matching_sweep_loop(
                 &mut session,
                 "test-account",
-                &DeleteSelector::Sender {
+                &DeleteSelector::SubscriptionSender {
                     email: "sender@example.com".to_string(),
-                    name: "News".to_string(),
-                    bulk_only: true,
                     list_id: Some("news.example.com".to_string()),
                 },
                 &["INBOX".to_string()],
@@ -5637,8 +5644,8 @@ mod tests {
             "deletes only the constrained match: {commands:?}"
         );
         assert!(
-            !joined.contains("UID STORE 11,12"),
-            "the sibling list's UID 12 must survive the sweep: {commands:?}"
+            !joined.contains("UID STORE 11,12") && !joined.contains("UID STORE 11,12,13"),
+            "the sibling-list and missing-POST messages must survive: {commands:?}"
         );
     }
 }

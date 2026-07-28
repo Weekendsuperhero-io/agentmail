@@ -114,17 +114,17 @@ impl AgentMailServer {
             format!(
                 "Help me clean up mailing list clutter in account \"{}\". \
                  Step 1: Use top_subscriptions with mailbox and limit omitted to get the default account-wide page of 10 \
-                 of bulk-mail senders. Results are grouped by sender and sorted by advertised one-click \
+                 of bulk-mail sender addresses. Results are grouped by normalized sender email and sorted by advertised one-click \
                  syntax first, then count; execution still requires live DKIM verification. \
-                 Step 2: Present each row's address, display name, count, advertisedOneClick, and nested \
+                 Step 2: Present each row's address, count, advertisedOneClick, and nested \
                  sample {{mailbox, uidValidity, uid, resourceUri}}. Ask me to approve each unsubscribe POST. \
                  Step 3: For each one I explicitly approve, call unsubscribe_message with sample.uid as uid, \
-                 sample.uidValidity as expectedUidValidity, sample.mailbox as mailbox, and confirmOneClick=true. Leave \
-                 deleteMatching=false unless I separately approve deleting matching mail. If I approve \
-                 cleanup, set deleteMatching=true; it matches an exact normalized List-Id only \
-                 when that header is covered by the same passing DKIM signature. Keep \
-                 deleteOnUnsubscribeFailure=false and allowPermanentFallback=false unless I separately \
-                 and explicitly authorize those higher-risk policies.",
+                 sample.uidValidity as expectedUidValidity, sample.mailbox as mailbox, and confirmOneClick=true. Omit cleanup \
+                 unless I separately approve deleting matching mail. If I approve cleanup, use \
+                 cleanup {{when: \"afterSuccess\", identity: \"listIdOrSender\", deletion: \"trash\"}}. This prefers a \
+                 DKIM-authenticated List-Id; its sender fallback requires exact sender email + List-Unsubscribe-Post + \
+                 the sample's List-Id when it has one. Never use when=\"always\", deletion=\"trashThenPermanent\", or \
+                 deletion=\"permanent\" unless I separately and explicitly authorize that higher-risk policy.",
                 params.0.account
             ),
         )]
