@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-07-22T00:00
+updated: 2026-08-04T00:00
 ---
 # agentmail
 
@@ -266,6 +266,7 @@ Provider documentation:
 | Gmail | [XOAUTH2 mechanism + IMAP example](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol) | [OAuth for native apps](https://developers.google.com/identity/protocols/oauth2/native-app); scope `https://mail.google.com/`; token endpoint `https://oauth2.googleapis.com/token` |
 | Yahoo Mail | [Yahoo mail integration developer docs](https://senders.yahooinc.com/developer/documentation) (XOAUTH2 + IMAP ID + UID Mode) | [Yahoo OAuth 2.0 guide](https://developer.yahoo.com/oauth2/guide/); auth `https://api.login.yahoo.com/oauth2/request_auth`, token `https://api.login.yahoo.com/oauth2/get_token`. **Mail scopes require an approved registered app** (partner process) |
 | AOL Mail | Same infrastructure and docs as Yahoo (`imap.aol.com`) | AOL identity endpoints mirror Yahoo at `api.login.aol.com`; same approval requirement |
+| iCloud Mail | Apple documents [account authorization for supported third-party apps](https://support.apple.com/en-us/121539), but no public IMAP XOAUTH2 protocol or client-registration contract | No public iCloud Mail OAuth scope/token flow; use an [app-specific password](https://support.apple.com/en-us/102525) unless Apple makes the app eligible for its supported-app authorization |
 
 (URLs are the canonical entry points; providers occasionally move pages —
 search the page title if one 404s.)
@@ -288,7 +289,23 @@ agentmail set-password --account gmail
 
 ### iCloud Mail setup
 
-iCloud uses your Apple ID with an [app-specific password](https://support.apple.com/en-us/102654). The IMAP login is your iCloud username (not full email):
+Apple now lets certain **supported** third-party apps request access to iCloud
+Mail through an Apple Account authorization sheet. However, the public Xcode
+[Sign in with Apple documentation](https://developer.apple.com/documentation/xcode/configuring-sign-in-with-apple)
+is for creating or signing in to an account in the app; its published scopes
+are only contact information such as
+[email and full name](https://developer.apple.com/documentation/authenticationservices/asauthorization/scope),
+not mailbox access. Apple's separate Account & Organizational Data Sharing
+OAuth documentation publishes only the
+[`edu.users.read` and `edu.classes.read` scopes](https://developer.apple.com/documentation/AccountOrganizationalDataSharing/Request-an-authorization).
+
+Consequently, Apple's public developer documentation does not currently give
+AgentMail a self-service iCloud Mail OAuth registration, Mail scope, token
+refresh contract, or IMAP XOAUTH2 mapping. Until Apple supplies that integration
+to AgentMail as a supported app, use the documented
+[app-specific password](https://support.apple.com/en-us/102525). The IMAP login
+is usually your iCloud username; try the full address if the short username is
+not accepted:
 
 ```toml
 [accounts.icloud]
@@ -392,8 +409,8 @@ Opens a web UI to exercise all advertised tools, 6 prompts, and task calls inter
 
 ## MCP Tools
 
-29 tools cover account discovery, mailbox management, message reading, search,
-bulk operations, recovery, flag management, and composition. 17 long-running tools support
+31 tools cover account discovery, mailbox management, message reading, search,
+bulk operations, recovery, evidence archiving, flag management, and composition. 19 long-running tools support
 optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/tasks)
 (SEP-1686) for asynchronous execution.
 
@@ -414,6 +431,8 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 | `list_pending_moves`  | List durable COPY-fallback MOVE operations awaiting recovery or review                |
 | `find_attachments`     | Scan for messages with attachments (multipart/mixed or multipart/related)              |
 | `download_attachments` | Download attachments from a message to disk                                           |
+| `download_message_source` | Save exact RFC822 bytes to disk with SHA-256 and local DKIM verification             |
+| `download_thread`      | Save a caller-selected UID set plus a JSON evidence manifest                           |
 | `delete_messages`      | Delete messages by UID (up to 500 per call, moves to Trash or expunges)               |
 | `delete_by_sender`     | Delete all messages from an exact sender identity, optionally across all mailboxes    |
 | `delete_by_domain`     | Delete messages from one exact canonical sender domain                               |
@@ -470,8 +489,9 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - The `top_*` tools share a persistent, live-validated UID/header cache. Each invocation uses `EXAMINE` before reuse. An unchanged `UIDVALIDITY`/`UIDNEXT`/message-count tuple is a hit; a proven append fetches only new UIDs; deletions and mixed changes reconcile UID membership while reusing unchanged header rows. A changed or missing `UIDVALIDITY` prevents unsafe UID reuse. If discovery enumerates folders, results dedupe by Message-ID and exclude your own configured email and aliases.
 - Every discovery result that can lead to a UID action carries the complete
   `(mailbox, uidValidity, uid)` identity and a canonical `resourceUri`.
-  `delete_messages`, `move_message`, `download_attachments`, `add_flags`,
-  `remove_flags`, `move_subscription`, and `unsubscribe_message` require
+  `delete_messages`, `move_message`, `download_attachments`,
+  `download_message_source`, `download_thread`, `add_flags`, `remove_flags`,
+  `move_subscription`, and `unsubscribe_message` require
   `expectedUidValidity` and refuse the action if a live `EXAMINE` observes
   another UID epoch.
   `delete_by_sender` instead takes the exact sender identity (`email` +
@@ -490,6 +510,15 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   When the sample has one usable List-Id, matches must also have that exact
   List-Id. The destination mailbox is excluded from the sweep.
 - The action-time DKIM source fetch is preceded by `RFC822.SIZE`, capped at 64 MiB, and fetched with a bounded IMAP partial. This per-source safety bound does not limit matching-message cleanup counts.
+- `download_message_source` saves exact RFC822 bytes directly from IMAP to a
+  private file inside `AGENTMAIL_FILE_ROOT`; the bytes do not cross model
+  context. It uses `BODY.PEEK[]`, validates UIDVALIDITY, refuses overwrite, and
+  returns SHA-256, parsed message metadata, and a DNS-backed local DKIM result.
+  `download_thread` applies the same rules to a caller-selected set of up to
+  100 UIDs and writes a JSON manifest. It does not discover thread membership.
+  SPF is omitted because independent SPF evaluation needs delivery-time SMTP
+  client IP, HELO, and envelope-sender inputs that are not present in an RFC822
+  archive.
 - RFC 8058 requests accept exactly one parsed HTTPS URI, reject credentials, fragments, HTTP alternatives, private/link-local/loopback destinations, mixed public/private DNS answers, proxies, retries, and redirects, and require a direct 2xx response. The resolved public addresses are pinned for the request.
 - Matching-message cleanup is one optional `cleanup {when, identity, deletion}` object; omitting it means unsubscribe only. Defaults are fail-safe: `when: "afterSuccess"` (a failed unsubscribe never triggers cleanup unless `"always"` is explicit), `deletion: "trash"` (never permanent unless `"trashThenPermanent"` or `"permanent"` is explicit). Cleanup matches the normalized RFC 2919 List-Id only when the same passing DKIM signature covered that single List-Id; otherwise `identity: "listIdOrSender"` (default) requires exact normalized sender email plus `List-Unsubscribe-Post`, and also requires the target's normalized List-Id whenever the sampled message has one. Display names never affect this fallback.
 - Account-wide destructive operations use a separate mutation plan: they enumerate selectable storage mailboxes and never issue writes through `\All`, `\Flagged`, or `\Important` aggregate views. An explicitly supplied mailbox is always honored.
@@ -633,7 +662,7 @@ Argument autocompletion (`completion/complete`) is supported for the prompts and
 ```
 agentmail (binary crate: agentmail-mcp)
   ├── serve                → MCP stdio server (tokio + rmcp)
-  │                          29 tools + 6 prompts, tasks, progress notifications
+  │                          31 tools + 6 prompts, tasks, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
   ├── create-mailbox       → CLI
@@ -657,7 +686,7 @@ agentmail (binary crate: agentmail-mcp)
 src/ (library + binary)
   ├── lib.rs          → Public API facade (25+ async methods)
   ├── main.rs         → CLI dispatch (clap), account configuration
-  ├── mcp/            → MCP server: 29 tools, 6 prompts, tasks, resources, completions
+  ├── mcp/            → MCP server: 31 tools, 6 prompts, tasks, resources, completions
   ├── config.rs       → TOML config loading, default account resolution
   ├── credentials.rs  → Password resolution (env → config secret → default keyring)
   ├── connection.rs   → IMAP connection pool (provider-aware per-account cap)
@@ -667,6 +696,7 @@ src/ (library + binary)
   ├── mailbox_catalog.rs → Bounded 5-minute mailbox-layout catalog
   ├── scan_plan.rs     → Pure discovery/mutation mailbox selection policy
   ├── parser.rs       → RFC822 → MessageInfo (via mail-parser), attachment extraction
+  ├── authentication.rs → Local DNS-backed DKIM evidence for archived messages
   ├── draft.rs        → RFC822 composition (via lettre)
   ├── content.rs      → HTML→markdown conversion, context window trimming
   ├── provider.rs     → Email provider presets (Gmail, iCloud, Yahoo, Fastmail)

@@ -29,7 +29,6 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use base64::Engine;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -44,7 +43,8 @@ fn b64url(bytes: &[u8]) -> String {
 
 fn random_b64url(len: usize) -> String {
     let mut buf = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut buf);
+    // rand 0.10: `thread_rng().fill_bytes` became top-level `rand::fill`.
+    rand::fill(&mut buf[..]);
     b64url(&buf)
 }
 

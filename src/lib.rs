@@ -12,6 +12,7 @@ pub mod scan_cache;
 pub mod secret;
 pub mod types;
 
+mod authentication;
 mod domain;
 mod header_cache;
 mod mailbox_catalog;
@@ -579,6 +580,29 @@ impl Agentmail {
             .await;
         session.release().await;
         result
+    }
+
+    /// The mailbox's current UIDVALIDITY — the `{uidValidity}` epoch every
+    /// `email://` resource URI carries.
+    ///
+    /// `STATUS (UIDVALIDITY …)` rather than SELECT/EXAMINE on purpose: it is a
+    /// single round trip and does NOT change the connection's selected mailbox,
+    /// so resolving it (for a completion, say) can never disturb a read that is
+    /// already in flight on that session.
+    pub(crate) async fn mailbox_uid_validity(&self, account: &str, mailbox: &str) -> Result<u32> {
+        if !self.pool.config().accounts.contains_key(account) {
+            return Err(AgentmailError::AccountNotFound(account.to_string()));
+        }
+        let mailbox_name = mailbox.to_string();
+        let status = self
+            .pool
+            .with_session_retry(account, async move |session| {
+                // `false`: we want UIDVALIDITY only, so there's no reason to ask
+                // for HIGHESTMODSEQ and risk the CONDSTORE fallback round trip.
+                imap_client::mailbox_status(session, &mailbox_name, false).await
+            })
+            .await?;
+        imap_client::require_uid_validity(mailbox, status.uid_validity)
     }
 
     /// Create a new mailbox on the server.
@@ -3703,6 +3727,109 @@ impl Agentmail {
         Ok(raw)
     }
 
+    /// Fetch one exact RFC822 message with `BODY.PEEK[]`, locally verify its
+    /// DKIM signatures, and save the original bytes without overwriting.
+    ///
+    /// Filesystem confinement belongs to the caller: the MCP layer resolves
+    /// `output_dir` through its internal `mcp::file_access` policy before calling this
+    /// method. `filename` must nevertheless be one plain path component so a
+    /// non-MCP caller cannot accidentally escape its chosen directory.
+    pub async fn download_message_source(
+        &self,
+        mailbox: &str,
+        account: &str,
+        uid: u32,
+        expected_uid_validity: u32,
+        output_dir: &std::path::Path,
+        filename: &str,
+        cancel: Option<&CancelFn>,
+    ) -> Result<DownloadedMessageSource> {
+        validate_plain_filename(filename)?;
+        imap_client::check_cancel(cancel)?;
+        let raw = self
+            .get_message_source_bytes_with_limit(
+                mailbox,
+                account,
+                uid,
+                expected_uid_validity,
+                imap_client::MAX_TRANSIENT_MESSAGE_BYTES as u32,
+            )
+            .await?;
+        imap_client::check_cancel(cancel)?;
+
+        let mailbox_for_parse = mailbox.to_string();
+        let account_for_parse = account.to_string();
+        let (raw, sha256, metadata) = tokio::task::spawn_blocking(move || {
+            use sha2::{Digest as _, Sha256};
+
+            // sha2 0.11 digests are `hybrid_array::Array`, which dropped the
+            // `LowerHex` impl GenericArray had — hex-encode byte-wise (same
+            // pattern as `runtime_bootstrap::sha256_bytes`).
+            let sha256 = Sha256::digest(&raw)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let metadata = parser::parse_rfc822(
+                &raw,
+                uid,
+                Vec::new(),
+                u32::try_from(raw.len()).ok(),
+                &mailbox_for_parse,
+                &account_for_parse,
+                false,
+                false,
+            )
+            .ok();
+            (raw, sha256, metadata)
+        })
+        .await
+        .map_err(|error| {
+            AgentmailError::Other(format!("message archive analysis task failed: {error}"))
+        })?;
+
+        let dkim = authentication::verify_dkim(&raw, cancel).await?;
+        imap_client::check_cancel(cancel)?;
+        let path = output_dir.join(filename);
+        write_new_private_file(&path, &raw).await?;
+        let path = tokio::fs::canonicalize(&path).await.map_err(|error| {
+            AgentmailError::Other(format!(
+                "saved message source but could not resolve '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+        let message_id = metadata
+            .as_ref()
+            .and_then(|message| message.message_id.clone());
+        let date = metadata.as_ref().and_then(|message| message.date);
+        let from_header = metadata
+            .as_ref()
+            .map(|message| message.sender.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let subject = metadata
+            .as_ref()
+            .map(|message| message.subject.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        Ok(DownloadedMessageSource {
+            account: account.to_string(),
+            mailbox: mailbox.to_string(),
+            uid_validity: expected_uid_validity,
+            uid,
+            path: path.display().to_string(),
+            bytes: raw.len(),
+            sha256,
+            message_id,
+            date,
+            from_header,
+            subject,
+            downloaded_at: chrono::Utc::now(),
+            dkim,
+        })
+    }
+
     /// Get the exact RFC822 header block after validating the message epoch.
     pub async fn get_message_headers(
         &self,
@@ -4748,6 +4875,67 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+/// Require a caller-supplied filename to be one portable path component.
+pub(crate) fn validate_plain_filename(filename: &str) -> Result<()> {
+    use std::path::{Component, Path};
+
+    if filename.is_empty() || filename.trim() != filename || filename.len() > 240 {
+        return Err(AgentmailError::Other(
+            "archive filename must be 1..=240 bytes with no surrounding whitespace".to_string(),
+        ));
+    }
+    let mut components = Path::new(filename).components();
+    if !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || filename.contains(['/', '\\'])
+        || sanitize_filename(filename) != filename
+    {
+        return Err(AgentmailError::Other(format!(
+            "archive filename '{filename}' must be one portable filename with no path separators or reserved characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Create, durably write, and close one private file. Any ordinary write error
+/// removes the incomplete file; `create_new` is the no-overwrite boundary.
+pub(crate) async fn write_new_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AgentmailError::Other(format!(
+                "refusing to overwrite existing message archive '{}'",
+                path.display()
+            ))
+        } else {
+            AgentmailError::Other(format!(
+                "failed to create message archive '{}': {error}",
+                path.display()
+            ))
+        }
+    })?;
+    let result = async {
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await
+    }
+    .await;
+    if let Err(error) = result {
+        drop(file);
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(AgentmailError::Other(format!(
+            "failed to write message archive '{}': {error}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Apple Mail flag color helpers (RFC draft-eggert-mailflagcolors-00)
 // ---------------------------------------------------------------------------
@@ -4791,6 +4979,51 @@ pub fn bits_to_color(flags: &[String]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_filename_requires_one_portable_component() {
+        assert!(validate_plain_filename("42.eml").is_ok());
+        assert!(validate_plain_filename("Exhibit E - 01.eml").is_ok());
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../42.eml",
+            "nested/42.eml",
+            "a\\b.eml",
+            "bad:name.eml",
+        ] {
+            assert!(
+                validate_plain_filename(invalid).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_write_is_private_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("agentmail-eml-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.expect("temp dir");
+        let path = dir.join("42.eml");
+        write_new_private_file(&path, b"first")
+            .await
+            .expect("first create");
+        let error = write_new_private_file(&path, b"second")
+            .await
+            .expect_err("overwrite must fail");
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(tokio::fs::read(&path).await.expect("read"), b"first");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        tokio::fs::remove_dir_all(dir).await.expect("cleanup");
+    }
 
     #[test]
     fn next_offset_handles_full_final_partial_and_past_end_pages() {

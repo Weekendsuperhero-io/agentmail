@@ -879,6 +879,49 @@ pub struct DownloadAttachmentsResponse {
     pub downloaded: Vec<DownloadedFile>,
 }
 
+/// Result of a local DKIM verification against the sender's DNS-published key.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct DkimVerification {
+    /// `pass`, `fail`, `neutral`, `permError`, `tempError`, or `none`.
+    pub result: String,
+    /// Signing domain from the selected signature, when one was parseable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Human-readable detail for non-pass and multi-signature outcomes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// UTC time at which AgentMail performed the DNS-backed verification.
+    pub checked_at: DateTime<Utc>,
+}
+
+/// One exact RFC822 message saved server-side for archival or evidence use.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct DownloadedMessageSource {
+    pub account: String,
+    pub mailbox: String,
+    pub uid_validity: u32,
+    pub uid: u32,
+    /// Absolute path of the newly created `.eml` file.
+    pub path: String,
+    pub bytes: usize,
+    /// Lowercase hexadecimal SHA-256 of the exact bytes written to `path`.
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<DateTime<Utc>>,
+    #[serde(rename = "from", skip_serializing_if = "Option::is_none")]
+    pub from_header: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub downloaded_at: DateTime<Utc>,
+    pub dkim: DkimVerification,
+}
+
 /// Response for get_message_source.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

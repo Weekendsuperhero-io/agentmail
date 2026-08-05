@@ -1556,6 +1556,107 @@ impl DownloadAttachmentsOutput {
 
 impl WireOutput for DownloadAttachmentsOutput {}
 
+/// SPF cannot be recomputed from a stored RFC822 message alone: the SMTP
+/// client IP and envelope sender are inputs. This optional field is reserved
+/// for a future trusted delivery-metadata source; AgentMail never promotes an
+/// untrusted `Authentication-Results` header into a local verification claim.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct SpfEvidenceOutput {
+    pub(super) result: String,
+    pub(super) source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct DkimEvidenceOutput {
+    pub(super) result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) detail: Option<String>,
+    pub(super) checked_at: String,
+}
+
+impl From<crate::DkimVerification> for DkimEvidenceOutput {
+    fn from(value: crate::DkimVerification) -> Self {
+        Self {
+            result: value.result,
+            domain: value.domain,
+            detail: value.detail,
+            checked_at: value.checked_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct DownloadMessageSourceOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    #[schemars(range(min = 1))]
+    pub(super) uid_validity: u32,
+    #[schemars(range(min = 1))]
+    pub(super) uid: u32,
+    pub(super) path: String,
+    pub(super) bytes: usize,
+    pub(super) sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) date: Option<String>,
+    #[serde(rename = "from", skip_serializing_if = "Option::is_none")]
+    pub(super) from_header: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
+    pub(super) downloaded_at: String,
+    pub(super) dkim: DkimEvidenceOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) spf: Option<SpfEvidenceOutput>,
+}
+
+impl From<crate::DownloadedMessageSource> for DownloadMessageSourceOutput {
+    fn from(value: crate::DownloadedMessageSource) -> Self {
+        Self {
+            account: value.account,
+            mailbox: value.mailbox,
+            uid_validity: value.uid_validity,
+            uid: value.uid,
+            path: value.path,
+            bytes: value.bytes,
+            sha256: value.sha256,
+            message_id: value.message_id,
+            date: value.date.map(|date| date.to_rfc3339()),
+            from_header: value.from_header,
+            subject: value.subject,
+            downloaded_at: value.downloaded_at.to_rfc3339(),
+            dkim: value.dkim.into(),
+            spf: None,
+        }
+    }
+}
+
+impl WireOutput for DownloadMessageSourceOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DownloadThreadOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    #[schemars(range(min = 1))]
+    pub(super) uid_validity: u32,
+    pub(super) created_at: String,
+    pub(super) manifest_path: String,
+    pub(super) messages: Vec<DownloadMessageSourceOutput>,
+}
+
+impl WireOutput for DownloadThreadOutput {}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]

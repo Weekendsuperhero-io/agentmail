@@ -5,9 +5,9 @@ use super::args::*;
 use super::wire::{
     AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteByDomainOutput,
     DeleteBySenderOutput, DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput,
-    MoveByDomainOutput, MoveBySenderOutput, MoveListIdOutput, MoveMessageOutput,
-    MoveSubscriptionOutput, ReconcileMovesOutput, RemoveFlagsOutput, UnsubscribeMessageOutput,
-    compact_result, tool_error_result,
+    DownloadMessageSourceOutput, DownloadThreadOutput, MoveByDomainOutput, MoveBySenderOutput,
+    MoveListIdOutput, MoveMessageOutput, MoveSubscriptionOutput, ReconcileMovesOutput,
+    RemoveFlagsOutput, UnsubscribeMessageOutput, compact_result, tool_error_result,
 };
 use super::{make_cancel_fn, make_progress_fn};
 use crate::{
@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_DRAFT_ATTACHMENTS: usize = 20;
 const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_DRAFT_ATTACHMENT_TOTAL_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_THREAD_MESSAGES: usize = 100;
 
 /// Map the flat `permanent` tool argument to a `DeleteMode`.
 fn delete_mode(permanent: bool) -> DeleteMode {
@@ -53,6 +54,34 @@ fn cleanup_policy(spec: UnsubscribeCleanupSpec) -> CleanupPolicy {
             CleanupDeletionArg::Permanent => CleanupDeletion::Permanent,
         },
     }
+}
+
+fn archive_filename(uid: u32, requested: Option<&str>) -> Result<String, McpError> {
+    let filename = requested.map_or_else(|| format!("{uid}.eml"), str::to_string);
+    crate::validate_plain_filename(&filename)
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+    Ok(filename)
+}
+
+async fn archive_target_exists(
+    output_dir: &std::path::Path,
+    filenames: &[String],
+) -> Result<Option<std::path::PathBuf>, McpError> {
+    for filename in filenames {
+        let path = output_dir.join(filename);
+        if tokio::fs::try_exists(&path).await.map_err(|error| {
+            McpError::internal_error(
+                format!(
+                    "failed to inspect archive target '{}': {error}",
+                    path.display()
+                ),
+                None,
+            )
+        })? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 #[tool_router(router = write_tools_router, vis = "pub(super)")]
@@ -266,6 +295,173 @@ impl AgentMailServer {
             )),
             Err(e) => Ok(tool_error_result(&e)),
         }
+    }
+
+    #[tool(
+        name = "download_message_source",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadMessageSourceOutput>().expect("valid download_message_source output schema"),
+        description = "Save one exact RFC822 message source directly from IMAP to disk without passing the bytes through model context. Requires mailbox, uid, and expectedUidValidity from one discovery result. Uses BODY.PEEK[] so the message is not marked read, refuses files above 64 MiB, confines outputDir to AGENTMAIL_FILE_ROOT, and never overwrites. Returns the absolute path, byte count, SHA-256, Message-ID/date/from/subject metadata, and a contemporaneous local DKIM verification against DNS. SPF is omitted because it cannot be independently recomputed from an archived RFC822 message without SMTP connection and envelope data.",
+        annotations(
+            title = "Download Message Source",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn download_message_source_tool(
+        &self,
+        ct: CancellationToken,
+        Parameters(args): Parameters<DownloadMessageSourceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        let filename = archive_filename(args.uid, args.filename.as_deref())?;
+        let output_dir = self
+            .file_access
+            .confine_dir(args.output_dir.as_deref())
+            .map_err(|reason| McpError::invalid_params(reason, None))?;
+        let cancel = make_cancel_fn(ct);
+
+        match self
+            .agentmail
+            .download_message_source(
+                &args.mailbox,
+                &args.account,
+                args.uid,
+                args.expected_uid_validity,
+                &output_dir,
+                &filename,
+                Some(&cancel),
+            )
+            .await
+        {
+            Ok(data) => compact_result(DownloadMessageSourceOutput::from(data)),
+            Err(error) => Ok(tool_error_result(&error)),
+        }
+    }
+
+    #[tool(
+        name = "download_thread",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadThreadOutput>().expect("valid download_thread output schema"),
+        description = "Save a caller-supplied set of one to 100 exact RFC822 sources from the same mailbox UIDVALIDITY epoch directly to disk as {uid}.eml, then write a JSON evidence manifest. This tool does not discover thread membership; pass the UIDs selected by prior discovery. Bytes never pass through model context. Every source uses BODY.PEEK[], is capped at 64 MiB, receives SHA-256 plus parsed envelope metadata and local DNS-backed DKIM verification, and is created without overwrite inside AGENTMAIL_FILE_ROOT. SPF is omitted because an archived message lacks the SMTP inputs required for independent verification. Returns the manifest path and its complete message entries.",
+        annotations(
+            title = "Download Message Thread",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn download_thread_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<DownloadThreadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        if args.uids.is_empty() || args.uids.len() > MAX_THREAD_MESSAGES {
+            return Err(McpError::invalid_params(
+                format!("uids must contain 1..={MAX_THREAD_MESSAGES} values"),
+                None,
+            ));
+        }
+        if args.uids.contains(&0) {
+            return Err(McpError::invalid_params("uids must be non-zero", None));
+        }
+        let unique = args.uids.iter().copied().collect::<hashbrown::HashSet<_>>();
+        if unique.len() != args.uids.len() {
+            return Err(McpError::invalid_params(
+                "uids must not contain duplicates",
+                None,
+            ));
+        }
+        let manifest_filename = archive_filename(
+            0,
+            Some(args.manifest_filename.as_deref().unwrap_or("manifest.json")),
+        )?;
+        let output_dir = self
+            .file_access
+            .confine_dir(args.output_dir.as_deref())
+            .map_err(|reason| McpError::invalid_params(reason, None))?;
+        let source_filenames = args
+            .uids
+            .iter()
+            .map(|uid| format!("{uid}.eml"))
+            .collect::<Vec<_>>();
+        let mut all_filenames = source_filenames.clone();
+        all_filenames.push(manifest_filename.clone());
+        if let Some(path) = archive_target_exists(&output_dir, &all_filenames).await? {
+            return Ok(tool_error_result(&crate::AgentmailError::Other(format!(
+                "refusing to overwrite existing thread archive '{}'",
+                path.display()
+            ))));
+        }
+
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        let mut messages = Vec::with_capacity(args.uids.len());
+        for (index, (uid, filename)) in args.uids.iter().zip(&source_filenames).enumerate() {
+            let downloaded = self
+                .agentmail
+                .download_message_source(
+                    &args.mailbox,
+                    &args.account,
+                    *uid,
+                    args.expected_uid_validity,
+                    &output_dir,
+                    filename,
+                    Some(&cancel),
+                )
+                .await;
+            let downloaded = match downloaded {
+                Ok(downloaded) => downloaded,
+                Err(error) => {
+                    progress.finish().await;
+                    let error = crate::AgentmailError::Other(format!(
+                        "thread archive stopped after {} of {} messages: {error}",
+                        messages.len(),
+                        args.uids.len()
+                    ));
+                    return Ok(tool_error_result(&error));
+                }
+            };
+            messages.push(DownloadMessageSourceOutput::from(downloaded));
+            if let Some(callback) = progress.callback() {
+                callback((index + 1) as u64, args.uids.len() as u64);
+            }
+        }
+
+        let manifest_path = output_dir.join(&manifest_filename);
+        let output = DownloadThreadOutput {
+            account: args.account,
+            mailbox: args.mailbox,
+            uid_validity: args.expected_uid_validity,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            manifest_path: manifest_path.display().to_string(),
+            messages,
+        };
+        let mut manifest = serde_json::to_vec_pretty(&output).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to serialize thread manifest: {error}"),
+                None,
+            )
+        })?;
+        manifest.push(b'\n');
+        if let Err(error) = crate::write_new_private_file(&manifest_path, &manifest).await {
+            progress.finish().await;
+            let error = crate::AgentmailError::Other(format!(
+                "all {} message sources were saved, but the manifest write failed: {error}",
+                output.messages.len()
+            ));
+            return Ok(tool_error_result(&error));
+        }
+        progress.finish().await;
+        compact_result(output)
     }
 
     #[tool(

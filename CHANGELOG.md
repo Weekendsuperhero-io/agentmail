@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-07-22T00:00
+updated: 2026-08-04T00:00
 ---
 # Changelog
 
@@ -10,6 +10,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Added
+
+- **Evidence-grade RFC822 archive tools** — `download_message_source` writes one
+  exact `BODY.PEEK[]` result directly to a create-new private file, returning
+  its SHA-256, parsed message metadata, and a contemporaneous DNS-backed local
+  DKIM result. `download_thread` applies the same contract to a caller-selected
+  set of up to 100 UIDs and creates a JSON manifest.
+
+### Security
+
+- **Archive write confinement** — message source and manifest filenames must be
+  portable basenames, output directories are confined to
+  `AGENTMAIL_FILE_ROOT`, existing files are never overwritten, every UID is
+  guarded by live UIDVALIDITY, and downloads do not mark messages seen.
+- **SPF evidence boundary** — archive output does not promote an untrusted
+  `Authentication-Results` header to a local SPF verdict because stored RFC822
+  bytes lack the delivery-time SMTP peer, HELO, and envelope-sender inputs.
 
 ## [0.4.0] - 2026-07-22
 

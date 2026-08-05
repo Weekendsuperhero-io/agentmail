@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-07-18T00:00
+updated: 2026-08-04T00:00
 ---
 # Agentmail MCP — Tool & Prompt Reference
 
@@ -20,7 +20,7 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
   required; nothing defaults to INBOX, because a UID and
   `expectedUidValidity` are only meaningful with the mailbox they came from.
 
-## Tools (29)
+## Tools (31)
 
 ### Discovery & Connection
 
@@ -269,7 +269,9 @@ override its root; cache errors fall back to live IMAP.
 | 24  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
 | 25  | `create_draft`         | Compose RFC822 to Drafts folder (to/cc/bcc required; creates Drafts mailbox if missing). Supports optional local file attachments. Returns the draft identity when recoverable. |                                          |
 | 26  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
-| 27  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional matching-message cleanup via the nested `cleanup {when, identity, deletion}` object (omitted = unsubscribe only). | `destructive`, `open_world`, `taskable`  |
+| 27  | `download_message_source` | Save exact RFC822 bytes directly to disk with SHA-256, metadata, and local DNS-backed DKIM evidence. | `open_world`, `taskable`                 |
+| 28  | `download_thread`      | Save a caller-selected set of up to 100 UIDs plus a JSON evidence manifest. Does not discover thread membership. | `open_world`, `taskable`                 |
+| 29  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional matching-message cleanup via the nested `cleanup {when, identity, deletion}` object (omitted = unsubscribe only). | `destructive`, `open_world`, `taskable`  |
 
 **`permanent` flag (delete tools):** default false moves to Trash when a Trash mailbox exists, else permanently deletes. When true, flags `\Deleted` + UID EXPUNGE directly, bypassing Trash — irreversible. Permanent delete requires the server to advertise UIDPLUS; on servers without it the call is refused (plain EXPUNGE would purge unrelated `\Deleted` messages).
 
@@ -302,7 +304,8 @@ default). The following arguments are required together with
 `expectedUidValidity`:
 
 - `delete_messages`: one or more UIDs discovered in one mailbox epoch.
-- `move_message`, `download_attachments`, `add_flags`, and `remove_flags`:
+- `move_message`, `download_attachments`, `download_message_source`,
+  `download_thread`, `add_flags`, and `remove_flags`:
   the UID from a current discovery result.
 - `unsubscribe_message`: the `sample` from `top_subscriptions`.
 - `move_subscription`: the same nested `sample`, plus the destination mailbox.
@@ -480,6 +483,36 @@ new draft's nonzero `uid`/`uidValidity` and a UIDVALIDITY-safe `resourceUri`.
   "downloaded": [{ "index", "filename", "path", "contentType", "size" }] }
 ```
 
+**download_message_source**
+
+```json
+{ "account", "mailbox", "uidValidity", "uid", "path", "bytes", "sha256",
+  "messageId?", "date?", "from?", "subject?", "downloadedAt",
+  "dkim": { "result", "domain?", "detail?", "checkedAt" }, "spf?" }
+```
+
+The tool fetches the complete message with `BODY.PEEK[]` only after a live
+UIDVALIDITY check and `RFC822.SIZE` preflight, with a 64 MiB per-message cap.
+It writes a private create-new file under `AGENTMAIL_FILE_ROOT`, so neither an
+existing file nor a path outside the sandbox can be overwritten. SHA-256 and
+DKIM are computed from the exact saved bytes. DKIM is verified locally against
+current DNS; an `Authentication-Results` header is not accepted as proof. SPF
+is omitted because an RFC822 archive lacks the SMTP client IP, HELO, and
+envelope sender needed to independently recompute it.
+
+**download_thread**
+
+```json
+{ "account", "mailbox", "uidValidity", "createdAt", "manifestPath",
+  "messages": [DownloadMessageSourceOutput] }
+```
+
+This bulk convenience tool accepts one to 100 unique UIDs already selected by
+the caller, saves them as `{uid}.eml`, and writes the complete response as a
+JSON manifest. It does not discover or infer thread membership. All UIDs must
+belong to the same mailbox and UIDVALIDITY epoch; existing source or manifest
+filenames cause a no-overwrite failure.
+
 **unsubscribe_message**
 
 Required action identity and consent:
@@ -549,8 +582,8 @@ message ceiling and continues to mutate in 500-UID batches.
 
 | #   | Tool           | Description                                                                          | Annotations |
 | --- | -------------- | ------------------------------------------------------------------------------------ | ----------- |
-| 28  | `add_flags`    | Add flags and/or set Apple Mail `color` (a color-name string; union semantics). Colors: red, orange, yellow, green, blue, purple, gray. | `idempotent` |
-| 29  | `remove_flags` | Remove specific flags and/or clear the Apple Mail color with `clearColor: true`. Others preserved. | `idempotent` |
+| 30  | `add_flags`    | Add flags and/or set Apple Mail `color` (a color-name string; union semantics). Colors: red, orange, yellow, green, blue, purple, gray. | `idempotent` |
+| 31  | `remove_flags` | Remove specific flags and/or clear the Apple Mail color with `clearColor: true`. Others preserved. | `idempotent` |
 
 #### Output Schemas
 
@@ -578,7 +611,7 @@ Returns the full updated flag set after the operation.
 
 The tools listed below support `execution.taskSupport = "optional"` — clients can invoke them normally (synchronous with progress notifications) or as background tasks (enqueue, poll, retrieve result).
 
-**Taskable tools:** `list_flags`, `find_attachments`, `top_senders`, `top_domains`, `top_subscriptions`, `top_mailing_lists`, `delete_messages`, `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `move_list_id`, `move_by_sender`, `move_by_domain`, `move_subscription`, `reconcile_moves`, `download_attachments`, `unsubscribe_message`
+**Taskable tools:** `list_flags`, `find_attachments`, `top_senders`, `top_domains`, `top_subscriptions`, `top_mailing_lists`, `delete_messages`, `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `move_list_id`, `move_by_sender`, `move_by_domain`, `move_subscription`, `reconcile_moves`, `download_attachments`, `download_message_source`, `download_thread`, `unsubscribe_message`
 
 **Destructive task serialization:** Destructive tasks (`delete_messages`, `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `reconcile_moves`, and `unsubscribe_message`) targeting the same account are serialized — each waits for the previous destructive task to finish before starting. Non-destructive tasks run concurrently without restriction.
 
@@ -645,9 +678,11 @@ fetching. A missing UID, unavailable UIDVALIDITY, changed epoch, or
 out-of-range attachment index returns resource-not-found. Body, info, and
 attachment reads may transiently fetch at most 64 MiB before rendering the
 bounded view; oversized headers/source representations fail with guidance to
-use the narrower resource or attachment tools. `/source` returns an MCP
+use the narrower resource or filesystem-writing tools. `/source` returns an MCP
 resource `blob` whose field value is base64, preserving the original RFC822
-bytes without lossy UTF-8 conversion.
+bytes without lossy UTF-8 conversion. For evidence archives or complete sources
+that should not traverse model context, use `download_message_source` or
+`download_thread` instead.
 
 **Error codes for `resources/read`:**
 
