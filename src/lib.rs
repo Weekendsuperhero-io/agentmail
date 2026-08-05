@@ -3762,7 +3762,13 @@ impl Agentmail {
         let (raw, sha256, metadata) = tokio::task::spawn_blocking(move || {
             use sha2::{Digest as _, Sha256};
 
-            let sha256 = format!("{:x}", Sha256::digest(&raw));
+            // sha2 0.11 digests are `hybrid_array::Array`, which dropped the
+            // `LowerHex` impl GenericArray had — hex-encode byte-wise (same
+            // pattern as `runtime_bootstrap::sha256_bytes`).
+            let sha256 = Sha256::digest(&raw)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             let metadata = parser::parse_rfc822(
                 &raw,
                 uid,
