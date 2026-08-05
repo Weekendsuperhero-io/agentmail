@@ -307,13 +307,13 @@ async fn initialize_reports_capabilities_and_identity() {
 }
 
 #[tokio::test]
-async fn tools_list_has_29_annotated_tools() {
+async fn tools_list_has_31_annotated_tools() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        29,
+        31,
         "tool count drifted — update docs and tests"
     );
 
@@ -345,6 +345,55 @@ async fn tools_list_has_29_annotated_tools() {
         assert!(
             tool["outputSchema"]["properties"].is_object(),
             "tool `{name}` outputSchema must declare object properties: {tool:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn message_archive_tools_expose_evidence_fields_and_safety_contracts() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let source = find_tool(tools, "download_message_source");
+    assert_eq!(source["execution"]["taskSupport"], json!("optional"));
+    assert_eq!(source["annotations"]["destructiveHint"], json!(false));
+    let source_output = source["outputSchema"]["properties"]
+        .as_object()
+        .expect("download source output properties");
+    for field in [
+        "path",
+        "bytes",
+        "sha256",
+        "messageId",
+        "date",
+        "from",
+        "subject",
+        "downloadedAt",
+        "dkim",
+        "spf",
+    ] {
+        assert!(
+            source_output.contains_key(field),
+            "download_message_source must expose `{field}`: {source:#}"
+        );
+    }
+
+    let thread = find_tool(tools, "download_thread");
+    assert_eq!(thread["execution"]["taskSupport"], json!("optional"));
+    assert!(
+        thread["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("does not discover thread membership")),
+        "download_thread must describe its caller-selected UID semantics: {thread:#}"
+    );
+    let thread_output = thread["outputSchema"]["properties"]
+        .as_object()
+        .expect("download thread output properties");
+    for field in ["manifestPath", "messages", "uidValidity"] {
+        assert!(
+            thread_output.contains_key(field),
+            "download_thread must expose `{field}`: {thread:#}"
         );
     }
 }
@@ -570,6 +619,51 @@ async fn invalid_params_yields_32602() {
 }
 
 #[tokio::test]
+async fn message_archive_rejects_unsafe_names_and_ambiguous_uid_sets_before_imap() {
+    let mut client = McpClient::start().await;
+    let unsafe_name = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "download_message_source",
+                "arguments": {
+                    "account": "dummy",
+                    "mailbox": "INBOX",
+                    "uid": 1,
+                    "expectedUidValidity": 1,
+                    "filename": "../escape.eml"
+                }
+            }),
+        )
+        .await;
+    assert_eq!(
+        unsafe_name["error"]["code"],
+        json!(-32602),
+        "path traversal must fail before IMAP access: {unsafe_name:#}"
+    );
+
+    let duplicates = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "download_thread",
+                "arguments": {
+                    "account": "dummy",
+                    "mailbox": "INBOX",
+                    "uids": [7, 7],
+                    "expectedUidValidity": 1
+                }
+            }),
+        )
+        .await;
+    assert_eq!(
+        duplicates["error"]["code"],
+        json!(-32602),
+        "duplicate UIDs must fail before filesystem or IMAP access: {duplicates:#}"
+    );
+}
+
+#[tokio::test]
 async fn uid_actions_require_a_nonzero_expected_uidvalidity() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
@@ -583,6 +677,8 @@ async fn uid_actions_require_a_nonzero_expected_uidvalidity() {
         "move_message",
         "unsubscribe_message",
         "download_attachments",
+        "download_message_source",
+        "download_thread",
         "add_flags",
         "remove_flags",
     ] {
@@ -1733,6 +1829,8 @@ async fn mailbox_argument_follows_one_idiom() {
         "search_messages",
         "delete_messages",
         "download_attachments",
+        "download_message_source",
+        "download_thread",
         "unsubscribe_message",
         "move_subscription",
         "add_flags",

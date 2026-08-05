@@ -2,7 +2,7 @@
 
 ## Overview
 
-Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 28 tools and 6 prompts for reading, searching, composing, organizing, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
+Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 31 tools and 6 prompts for reading, searching, composing, organizing, archiving, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
 
 MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | rmcp 2.2
 
@@ -20,7 +20,7 @@ graph TB
     end
 
     subgraph "agentmail-mcp (in-process)"
-        MCP[AgentMailServer<br/>28 tools, 6 prompts, tasks]
+        MCP[AgentMailServer<br/>31 tools, 6 prompts, tasks]
         MK[Agentmail Facade]
         POOL[ConnectionPool<br/>provider-aware cap/account]
         CRED[Credential Resolver]
@@ -197,6 +197,8 @@ timeout/drop, and every `Secret` debug representation is redacted.
 | `remove_flags`         | Remove flags and/or clear Apple Mail color                        |
 | `unsubscribe_message`  | RFC 8058 one-click unsubscribe + bulk delete matching bulk mail   |
 | `download_attachments` | Extract attachments to disk                                       |
+| `download_message_source` | Save exact RFC822 bytes with integrity and DKIM evidence        |
+| `download_thread`      | Save a caller-selected UID set plus a JSON evidence manifest      |
 
 ## MCP Prompts (6)
 
@@ -240,6 +242,11 @@ Email content flows through a pipeline:
 - **Pure IMAP, no Mail.app** — cross-platform, works with any IMAP provider
 - **Connection pooling** — provider-aware per-account caps avoid login-rate-limit bursts while allowing parallelism where safe
 - **BODY.PEEK throughout** — reading never has side effects
+- **Evidence archives are tools, not resources** — exact RFC822 bytes flow
+  directly from IMAP to create-new private files under `AGENTMAIL_FILE_ROOT`;
+  model-context resources remain bounded views. Archives include SHA-256 and
+  local DNS-backed DKIM results. SPF is omitted without trusted delivery-time
+  SMTP inputs
 - **Password and XOAUTH2 authentication** — app passwords remain simple for standalone use; OAuth refresh/consent stays in an external token helper
 - **Config file for standalone, runtime injection for in-process** — same library code, different config sources
 - **Passwords in OS keyring, never in DB** — proper security, no key management burden

@@ -672,8 +672,74 @@ pub(super) struct DownloadAttachmentsArgs {
         description = "UIDVALIDITY paired with the UID. The download fails if the mailbox UID epoch changed."
     )]
     pub(super) expected_uid_validity: u32,
-    #[schemars(description = "Directory to save attachments to. Defaults to current directory.")]
+    #[schemars(
+        description = "Directory inside AGENTMAIL_FILE_ROOT. Defaults to the sandbox root."
+    )]
     pub(super) output_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for saving one exact RFC822 message source to disk.")]
+pub(super) struct DownloadMessageSourceArgs {
+    #[schemars(
+        description = "Mailbox containing the message (required) — the same mailbox that produced expectedUidValidity."
+    )]
+    pub(super) mailbox: String,
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(range(min = 1), description = "Non-zero IMAP UID of the message.")]
+    pub(super) uid: u32,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY paired with the UID. The download fails before writing if the mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
+    #[schemars(
+        description = "Directory inside AGENTMAIL_FILE_ROOT. Defaults to the sandbox root."
+    )]
+    pub(super) output_dir: Option<String>,
+    #[schemars(
+        description = "Optional portable basename for the saved source. Defaults to {uid}.eml. Path separators, traversal, and reserved filename characters are rejected."
+    )]
+    pub(super) filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    description = "Arguments for saving a bounded set of exact RFC822 message sources and one JSON evidence manifest."
+)]
+pub(super) struct DownloadThreadArgs {
+    #[schemars(
+        description = "Mailbox containing every UID (required) — the same mailbox that produced expectedUidValidity."
+    )]
+    pub(super) mailbox: String,
+    #[schemars(
+        description = "Account name (required). Use list_accounts to discover valid names."
+    )]
+    pub(super) account: String,
+    #[schemars(
+        length(min = 1, max = 100),
+        inner(range(min = 1)),
+        description = "One to 100 unique, non-zero IMAP UIDs from the same mailbox UIDVALIDITY epoch. Each source is saved as {uid}.eml."
+    )]
+    pub(super) uids: Vec<u32>,
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY paired with every UID. The operation stops if the mailbox UID epoch changed."
+    )]
+    pub(super) expected_uid_validity: u32,
+    #[schemars(
+        description = "Directory inside AGENTMAIL_FILE_ROOT. Defaults to the sandbox root."
+    )]
+    pub(super) output_dir: Option<String>,
+    #[schemars(
+        description = "Optional portable basename for the JSON manifest. Defaults to manifest.json. Existing files are never overwritten."
+    )]
+    pub(super) manifest_filename: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

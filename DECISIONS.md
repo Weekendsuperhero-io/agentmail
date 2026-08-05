@@ -4,6 +4,63 @@ Architectural decisions, deferred work, and rationale for future reference.
 
 ---
 
+## 0.5.0 — Evidence Archives Are Filesystem Tools
+
+### Decision
+
+Keep `/source` as a bounded MCP resource for context use, and provide
+`download_message_source` plus `download_thread` for exact RFC822 evidence
+archives. The tools move bytes directly from IMAP to files under
+`AGENTMAIL_FILE_ROOT`; the model never has to read and re-emit those bytes.
+
+Each saved message is fetched with `BODY.PEEK[]` after a live UIDVALIDITY and
+size check, created without overwrite, and accompanied by SHA-256, parsed
+metadata, and a local DNS-backed DKIM result. The bulk tool accepts a
+caller-selected UID set; its name is convenience terminology, not server-side
+thread discovery.
+
+SPF remains absent unless a future trusted delivery-metadata source provides
+the SMTP peer IP, HELO, and envelope sender. A message's own
+`Authentication-Results` header is not independent verification.
+
+### Rationale
+
+MCP resources are deliberately delivered through model context. They cannot
+provide a reliable byte-for-byte transfer to disk when the model must re-emit
+their content. A server-side filesystem side effect preserves the original
+octets and supports a verifiable manifest.
+
+---
+
+## 0.5.0 — iCloud Mail OAuth Remains Provider-Gated
+
+### Decision
+
+Do not implement or advertise a self-service Apple/iCloud Mail OAuth flow from
+Sign in with Apple. Continue to document app-specific passwords unless Apple
+onboards AgentMail into its supported third-party app authorization program
+and supplies the required Mail integration contract.
+
+### Rationale
+
+Apple Support documents [Apple Account authorization for supported third-party
+Mail apps](https://support.apple.com/en-us/121539), but Apple's public manual
+[iCloud Mail server settings](https://support.apple.com/en-us/102525) still use
+an app-specific password. The Xcode
+[Sign in with Apple capability](https://developer.apple.com/documentation/xcode/configuring-sign-in-with-apple)
+authenticates a user to the developer's app, and its published scopes expose
+[contact information](https://developer.apple.com/documentation/authenticationservices/asauthorization/scope),
+not mailbox access. Apple's public Account & Organizational Data Sharing OAuth
+authorization publishes only
+[`edu.users.read` and `edu.classes.read`](https://developer.apple.com/documentation/AccountOrganizationalDataSharing/Request-an-authorization).
+
+Those sources do not publish an iCloud Mail client-registration path, Mail
+scope, refresh contract, or IMAP XOAUTH2 bearer-token mapping that AgentMail can
+implement independently. Existing generic XOAUTH2 support remains usable only
+when a provider or external helper supplies a valid access token.
+
+---
+
 ## 0.2.1 — Microsoft Graph API Support
 
 ### Decision

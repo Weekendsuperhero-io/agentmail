@@ -324,6 +324,7 @@ impl ServerHandler for AgentMailServer {
              unsubscribe_message requires explicit confirmOneClick=true. Optional matching-message cleanup is the nested cleanup {when, identity, deletion} object (omit it to only unsubscribe); it prefers the DKIM-authenticated List-Id, otherwise requires exact sender email + List-Unsubscribe-Post + the sample's List-Id when present, stops after a failed POST unless when=\"always\", and never silently escalates a Trash failure to permanent deletion unless deletion=\"trashThenPermanent\". \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
              find_attachments returns mailbox-safe {mailbox, uidValidity, uid, date, resourceUri} hits; pass that identity to download_attachments. \
+             Use download_message_source when exact RFC822 bytes must be saved to disk without crossing model context; use download_thread for a caller-selected UID set plus a JSON integrity manifest. Both validate UIDVALIDITY, use BODY.PEEK[], refuse overwrite, return SHA-256 and local DKIM results, and confine writes to AGENTMAIL_FILE_ROOT. \
              Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), plus /headers (exact headers), /source (bounded raw RFC822), /info (JSON metadata: subject, sender, date, flags, size, attachment inventory), and /attachments/{index} (one attachment as a blob with its own content type, 4 MiB limit). Percent-encode account and mailbox, including '/' in mailbox names as %2F. \
              Read /info first to discover attachment indices; each attachment carries the canonical filename {uid}_{index}_{name} — the same name download_attachments writes to disk. \
              All reads use BODY.PEEK to avoid marking messages as read.",
@@ -733,7 +734,7 @@ mod tests {
         let tools = AgentMailServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            29,
+            31,
             "tool count drifted — update docs and tests"
         );
         for tool in &tools {
@@ -778,6 +779,8 @@ mod tests {
         for name in [
             "delete_messages",
             "download_attachments",
+            "download_message_source",
+            "download_thread",
             "move_message",
             "unsubscribe_message",
             "add_flags",
@@ -802,11 +805,11 @@ mod tests {
                 serde_json::json!(1),
                 "tool `{name}` must reject UIDVALIDITY zero in its schema"
             );
-            if name == "delete_messages" {
+            if matches!(name, "delete_messages" | "download_thread") {
                 assert_eq!(
                     schema["properties"]["uids"]["items"]["minimum"],
                     serde_json::json!(1),
-                    "delete_messages must reject UID zero in its schema"
+                    "tool `{name}` must reject UID zero in its schema"
                 );
             } else {
                 assert_eq!(

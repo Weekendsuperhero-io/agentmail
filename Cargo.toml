@@ -63,6 +63,7 @@ schemars = { version = "1.2", features = ["chrono04"] }
 keyring-core = "1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-native-tls = "0.3"
@@ -101,5 +102,4 @@ unnested_or_patterns = "warn"
 proptest = "1"
 mail-parser = "0.11"
 # oauth_token example only (loopback PKCE flow to mint an access token).
-sha2 = "0.10"
 rand = "0.8"

@@ -628,7 +628,15 @@ impl AgentMailServer {
                         names
                     }
                 }
-                // uidValidity, uid, sender, to, subject: not enumerable.
+                // One value, not a list — but a value we can only name once the
+                // earlier blanks are known, which is exactly what `context`
+                // carries. Template-only: a prompt argument named uidValidity
+                // has no mailbox to resolve against.
+                "uidValidity" if is_email_template => {
+                    self.complete_uid_validity(&request.argument.value, request.context.as_ref())
+                        .await
+                }
+                // uid, sender, to, subject: not enumerable.
                 _ => Vec::new(),
             }
         } else {
@@ -650,22 +658,89 @@ impl AgentMailServer {
             .collect()
     }
 
-    async fn complete_mailbox(&self, prefix: &str, ctx: Option<&CompletionContext>) -> Vec<String> {
-        let account = ctx
-            .and_then(|c| c.get_argument("account").cloned())
+    /// The mailbox's current UIDVALIDITY, as a one-element list.
+    ///
+    /// Enumerable ONLY because the earlier blanks arrive as `context.arguments`:
+    /// a client that fills `{account}` and `{mailbox}` first tells us exactly
+    /// which mailbox to STATUS. Without a mailbox there is nothing to resolve
+    /// and the list is empty — the same contract `complete_mailbox` follows for
+    /// a missing account.
+    ///
+    /// This used to return nothing ("not enumerable"), which was true before
+    /// completion context existed: there was no way to know which mailbox the
+    /// caller meant.
+    async fn complete_uid_validity(
+        &self,
+        prefix: &str,
+        ctx: Option<&CompletionContext>,
+    ) -> Vec<String> {
+        let Some(mailbox) = ctx.and_then(|c| c.get_argument("mailbox").cloned()) else {
+            return Vec::new();
+        };
+        let Some(account) = self.completion_account(ctx) else {
+            return Vec::new();
+        };
+        // Both values came back from THIS server percent-encoded (the template
+        // arms above encode what the client substitutes into the URI), so decode
+        // before handing them to IMAP. A value that isn't encoded decodes to
+        // itself, so this is safe for a hand-typed one too.
+        let account = decode_segment(&account).unwrap_or(account);
+        let mailbox = decode_segment(&mailbox).unwrap_or(mailbox);
+        match self
+            .agentmail
+            .mailbox_uid_validity(&account, &mailbox)
+            .await
+        {
+            Ok(uid_validity) => uid_validity_completions(uid_validity, prefix),
+            // Unreachable server, unknown mailbox, a server that withholds
+            // UIDVALIDITY: offer nothing rather than a guess. The user can
+            // still type the epoch by hand.
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The account a completion is scoped to: the one already filled in, else
+    /// the configured default.
+    fn completion_account(&self, ctx: Option<&CompletionContext>) -> Option<String> {
+        ctx.and_then(|c| c.get_argument("account").cloned())
             .or_else(|| {
                 self.agentmail
                     .config()
                     .default_account()
                     .map(str::to_string)
-            });
-        let Some(account) = account else {
+            })
+    }
+
+    async fn complete_mailbox(&self, prefix: &str, ctx: Option<&CompletionContext>) -> Vec<String> {
+        let Some(account) = self.completion_account(ctx) else {
             return Vec::new();
         };
+        // A context value echoed back from OUR template suggestions is
+        // percent-encoded; an unencoded one decodes to itself. Ordinary
+        // `user@host` account names need no escaping (`@` isn't in `SEGMENT`),
+        // which is why this went unnoticed — but one containing a space or `%`
+        // would look up as a nonexistent account and silently offer nothing.
+        let account = decode_segment(&account).unwrap_or(account);
         match self.agentmail.cached_mailbox_layout(&account).await {
             Ok(entries) => mailbox_completions(&entries, prefix),
             Err(_) => Vec::new(),
         }
+    }
+}
+
+/// Candidate list for a resolved UIDVALIDITY: the value itself, filtered by
+/// what the user has typed so far.
+///
+/// A mailbox has exactly ONE current epoch, so this is a one-or-zero list — the
+/// filter exists because a suggestion contradicting the input is worse than no
+/// suggestion (the client would show a value the user is visibly not typing).
+/// Pure, so the IMAP round trip stays at the edge and this stays testable.
+fn uid_validity_completions(uid_validity: u32, prefix: &str) -> Vec<String> {
+    let value = uid_validity.to_string();
+    if value.starts_with(prefix) {
+        vec![value]
+    } else {
+        Vec::new()
     }
 }
 
@@ -702,6 +777,39 @@ mod tests {
         let values = mailbox_completions(&entries, "in");
 
         assert_eq!(values, ["INBOX", "Invoices/2026"]);
+    }
+
+    /// `{uidValidity}` used to complete to nothing ("not enumerable"), which
+    /// was true before completion context existed — there was no way to know
+    /// which mailbox the caller meant. With `{account}`/`{mailbox}` arriving as
+    /// `context.arguments` there is exactly one right answer, so we offer it.
+    #[test]
+    fn uid_validity_completion_offers_the_single_current_epoch() {
+        assert_eq!(uid_validity_completions(9001, ""), ["9001"]);
+        assert_eq!(uid_validity_completions(9001, "90"), ["9001"]);
+        assert_eq!(uid_validity_completions(9001, "9001"), ["9001"]);
+    }
+
+    /// A value the user is visibly not typing is worse than no suggestion.
+    #[test]
+    fn uid_validity_completion_respects_the_typed_prefix() {
+        assert!(uid_validity_completions(9001, "7").is_empty());
+        assert!(uid_validity_completions(9001, "9002").is_empty());
+    }
+
+    /// The mailbox reaching `complete_uid_validity` through `context.arguments`
+    /// is whatever the client substituted into the URI — and for these
+    /// templates that's the percent-encoded form THIS server suggested. It has
+    /// to decode back to the real IMAP name or the STATUS lookup misses.
+    #[test]
+    fn encoded_context_values_decode_back_to_imap_names() {
+        let suggested = encode_segment("[Gmail]/All Mail");
+        // `/` and the space escape; brackets aren't in `SEGMENT` and pass through.
+        assert_eq!(suggested, "[Gmail]%2FAll%20Mail");
+        assert_eq!(decode_segment(&suggested).unwrap(), "[Gmail]/All Mail");
+        // An unencoded value decodes to itself, so the same path is safe for a
+        // hand-typed mailbox.
+        assert_eq!(decode_segment("INBOX").unwrap(), "INBOX");
     }
 
     #[test]
