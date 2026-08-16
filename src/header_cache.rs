@@ -2670,6 +2670,190 @@ mod tests {
             .join(format!("{name}.sqlite3"))
     }
 
+    /// UIDVALIDITY every `publish_test_rows` snapshot is published under.
+    const PUBLISHED_UID_VALIDITY: u32 = 7;
+
+    /// Arrange a published two-row snapshot and return the triple a server must
+    /// report for it to be a cache hit: `(uid_validity, uid_next, exists)`.
+    async fn published_inbox(cache: &HeaderCache) -> (u32, u32, u32) {
+        publish_test_rows(
+            cache,
+            "INBOX",
+            vec![
+                rank_row(
+                    1,
+                    "a@example.com",
+                    "A",
+                    Some(1),
+                    Some("<a@x>"),
+                    None,
+                    false,
+                    false,
+                ),
+                rank_row(
+                    2,
+                    "b@example.com",
+                    "B",
+                    Some(2),
+                    Some("<b@x>"),
+                    None,
+                    false,
+                    false,
+                ),
+            ],
+        )
+        .await;
+        (PUBLISHED_UID_VALIDITY, 3, 2)
+    }
+
+    /// `stable_uid_search` brackets its SEARCH with two EXAMINEs, and both are
+    /// load-bearing: the SEARCH runs against the SELECTED mailbox, so the first
+    /// establishes the selection and the second re-reads that same open epoch
+    /// to prove nothing shifted underneath it. STATUS would do neither. Now
+    /// that "prefer STATUS" is a pattern in this file, pin these so a later
+    /// consistency sweep cannot quietly convert them and break UID stability
+    /// detection.
+    #[tokio::test]
+    async fn stable_uid_search_opens_the_mailbox_on_both_sides_of_the_search() {
+        let (mut session, server) = imap_client::test_support::scripted_session(|tag, command| {
+            if command.contains("EXAMINE") {
+                Some(imap_client::test_support::examine_reply(tag, 7, 3, 2))
+            } else if command.contains("UID SEARCH") {
+                Some(format!("* SEARCH 1 2\r\n{tag} OK UID SEARCH completed\r\n"))
+            } else {
+                None
+            }
+        })
+        .await;
+
+        let (status, uids, stable) =
+            stable_uid_search(&mut session, "INBOX", SearchScope::All, None)
+                .await
+                .expect("an unchanging mailbox yields a stable snapshot");
+
+        assert_eq!(uids, [1, 2]);
+        assert!(stable, "an identical before/after snapshot is stable");
+        assert_eq!(status.uid_validity, Some(7));
+
+        drop(session);
+        let commands = server.commands().await;
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("EXAMINE")).count(),
+            2,
+            "the search is bracketed by two mailbox opens: {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("STATUS ")),
+            "a selected-mailbox read cannot be replaced by STATUS: {commands:?}"
+        );
+    }
+
+    /// The STATUS probe earns its keep only if a warm hit costs ONE round trip
+    /// and never opens the mailbox. On an account with no aggregate `\All`
+    /// mailbox, discovery enumerates every mailbox, so a mailbox open here is
+    /// paid once per mailbox per scan.
+    #[tokio::test]
+    async fn a_warm_complete_snapshot_probes_with_status_and_never_examines() {
+        let cache = HeaderCache::at_path(test_path("warm-hit-probe"));
+        let (uid_validity, uid_next, exists) = published_inbox(&cache).await;
+
+        let (mut session, server) =
+            imap_client::test_support::scripted_session(move |tag, command| {
+                if command.contains("STATUS ") {
+                    Some(imap_client::test_support::status_reply(
+                        tag,
+                        "INBOX",
+                        uid_validity,
+                        uid_next,
+                        exists,
+                    ))
+                } else {
+                    // Hang up on anything else, so an unexpected mailbox open
+                    // fails the test rather than silently costing a round trip.
+                    None
+                }
+            })
+            .await;
+
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let state = cache
+            .sync_cached(path, &mut session, &test_key("INBOX"), None, None, None)
+            .await
+            .expect("a complete published snapshot is a cache hit");
+
+        assert_eq!(state.uid_validity, uid_validity);
+        assert_eq!(state.exists, exists);
+
+        drop(session);
+        let commands = server.commands().await;
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("STATUS ")).count(),
+            1,
+            "a warm hit is one probe: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.contains("EXAMINE") || c.contains("SELECT")),
+            "a warm hit must not open the mailbox: {commands:?}"
+        );
+    }
+
+    /// A disagreeing triple must fall through to the authoritative read. This
+    /// pins the ORDER (probe, then open) and that the probe is not repeated —
+    /// not that the resync completes; the scripted server hangs up once the
+    /// EXAMINE lands, because scripting a full resync would test the sync, not
+    /// the probe.
+    #[tokio::test]
+    async fn a_stale_triple_probes_then_opens_the_mailbox() {
+        let cache = HeaderCache::at_path(test_path("stale-triple-probe"));
+        let (uid_validity, _, exists) = published_inbox(&cache).await;
+        // UIDNEXT has moved on the server: new mail arrived since publication.
+        let moved_uid_next = 9;
+
+        let (mut session, server) =
+            imap_client::test_support::scripted_session(move |tag, command| {
+                if command.contains("STATUS ") {
+                    Some(imap_client::test_support::status_reply(
+                        tag,
+                        "INBOX",
+                        uid_validity,
+                        moved_uid_next,
+                        exists,
+                    ))
+                } else if command.contains("EXAMINE") {
+                    Some(imap_client::test_support::examine_reply(
+                        tag,
+                        uid_validity,
+                        moved_uid_next,
+                        exists,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .await;
+
+        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
+        let _ = cache
+            .sync_cached(path, &mut session, &test_key("INBOX"), None, None, None)
+            .await;
+
+        drop(session);
+        let commands = server.commands().await;
+        let probe = commands.iter().position(|c| c.contains("STATUS "));
+        let open = commands.iter().position(|c| c.contains("EXAMINE"));
+        assert!(
+            matches!((probe, open), (Some(probe), Some(open)) if probe < open),
+            "the cheap probe runs before the mailbox is opened: {commands:?}"
+        );
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("STATUS ")).count(),
+            1,
+            "a miss costs exactly one extra probe: {commands:?}"
+        );
+    }
+
     /// Pruning a stale ranking sample removes the projection row AND its
     /// membership marker together, so the covered==membership completeness
     /// yardstick still hits and the survivor is the only remaining sample.
