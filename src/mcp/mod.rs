@@ -304,7 +304,7 @@ impl ServerHandler for AgentMailServer {
              Start with list_accounts to discover configured accounts. \
              list_mailboxes requires one account and returns selectable mailboxes only, paginated with a default of 100. \
              get_messages and search_messages return metadata only, newest-first, with the mailbox UIDVALIDITY and a UIDVALIDITY-safe resourceUri for each row. \
-             Read resourceUri for markdown content; append /headers for exact headers, /source for bounded raw RFC822, /info for JSON metadata with the attachment inventory, or /attachments/{index} for one attachment blob. \
+             Every row's resourceUri also rides the result as a resource_link, next to a link to that message's /info; /info carries the sibling headers and source URIs plus the attachment inventory, so follow links rather than building URIs by hand. \
              Manage email: delete_messages, delete_by_sender, delete_by_domain, delete_list_id, move_message, move_list_id, move_by_sender, move_by_domain, move_subscription, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
              Bulk filing: move_list_id, move_by_sender, move_by_domain, and move_subscription move every exact match to an existing destination mailbox in one call — never loop move_message per UID for that. \
              top_senders, top_domains, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
@@ -326,7 +326,7 @@ impl ServerHandler for AgentMailServer {
              find_attachments returns mailbox-safe {mailbox, uidValidity, uid, date, resourceUri} hits; pass that identity to download_attachments. \
              Use download_message_source when exact RFC822 bytes must be saved to disk without crossing model context; use download_thread for a caller-selected UID set plus a JSON integrity manifest. Both validate UIDVALIDITY, use BODY.PEEK[], refuse overwrite, return SHA-256 and local DKIM results, and confine writes to AGENTMAIL_FILE_ROOT. \
              Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), plus /headers (exact headers), /source (bounded raw RFC822), /info (JSON metadata: subject, sender, date, flags, size, attachment inventory), and /attachments/{index} (one attachment as a blob with its own content type, 4 MiB limit). Percent-encode account and mailbox, including '/' in mailbox names as %2F. \
-             Read /info first to discover attachment indices; each attachment carries the canonical filename {uid}_{index}_{name} — the same name download_attachments writes to disk. \
+             An attachment's canonical filename in /info is {uid}_{index}_{name} — the same name download_attachments writes to disk. \
              All reads use BODY.PEEK to avoid marking messages as read.",
         )
     }

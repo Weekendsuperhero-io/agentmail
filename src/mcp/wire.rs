@@ -42,9 +42,97 @@ where
             None,
         )
     })?;
-    let mut result = CallToolResult::success(vec![ContentBlock::text(fallback)]);
+    // Links come AFTER the JSON: hosts that render only the first content
+    // block must still see the complete page (same reasoning as the fallback).
+    let mut content = vec![ContentBlock::text(fallback)];
+    content.extend(message_resource_links(&structured));
+
+    let mut result = CallToolResult::success(content);
     result.structured_content = Some(structured);
     Ok(result)
+}
+
+/// Every `resourceUri` in a tool result, in row order, deduplicated.
+///
+/// Walking our OWN output for a known field name is legitimate in a way that
+/// walking an arbitrary backend's output would not be: every `resource_uri`
+/// field in this module is built by [`message_resource_uri`], so the name and
+/// the meaning are ours to guarantee. That is what lets one chokepoint cover
+/// `get_messages`, `search_messages`, `find_attachments` and the nested
+/// `sample` rows of the ranking tools without per-tool plumbing.
+fn collect_resource_uris(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if key == "resourceUri"
+                    && let Some(uri) = child.as_str()
+                {
+                    if !out.iter().any(|seen| seen == uri) {
+                        out.push(uri.to_string());
+                    }
+                    continue;
+                }
+                collect_resource_uris(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_resource_uris(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Turn each message URI in a result into TWO `ResourceLink` blocks: the
+/// markdown body, and the `/info` metadata hub.
+///
+/// Why two and not one, and not five (AMXSF-333 A2):
+///
+/// * The body is the common case — one hop to read the message.
+/// * `/info` is what makes the OTHER representations discoverable. It already
+///   returns a structured `resources: { body, headers, source }` block plus a
+///   `resourceUri` per attachment, so linking it hands the agent the whole
+///   navigation graph. Without it the only routes to headers/source/attachments
+///   are `resources/templates/list` — which the reference harness never calls
+///   (D33) — or the "append /headers" prose in each tool description, i.e.
+///   string concatenation as an API.
+/// * Linking all five per row would put ~250 blocks in a default 50-row page,
+///   almost all never followed, which is exactly the context bloat these
+///   metadata-only tools exist to avoid.
+///
+/// STRICTLY ADDITIVE: the JSON `resourceUri` field stays — it is in the
+/// declared `outputSchema` and existing consumers read it.
+fn message_resource_links(structured: &serde_json::Value) -> Vec<ContentBlock> {
+    use super::resources::{
+        EMAIL_BODY_MIME, EMAIL_BODY_NAME, EMAIL_BODY_TITLE, EMAIL_INFO_MIME, EMAIL_INFO_NAME,
+        EMAIL_INFO_TITLE,
+    };
+    use rmcp::model::Resource;
+
+    let mut uris = Vec::new();
+    collect_resource_uris(structured, &mut uris);
+    uris.into_iter()
+        .flat_map(|uri| {
+            let info = format!("{uri}/info");
+            [
+                ContentBlock::ResourceLink(
+                    Resource::new(uri, EMAIL_BODY_NAME)
+                        .with_title(EMAIL_BODY_TITLE)
+                        .with_mime_type(EMAIL_BODY_MIME),
+                ),
+                ContentBlock::ResourceLink(
+                    Resource::new(info, EMAIL_INFO_NAME)
+                        .with_title(EMAIL_INFO_TITLE)
+                        .with_description(
+                            "Metadata plus the sibling headers/source URIs and the \
+                             attachment inventory for this message.",
+                        )
+                        .with_mime_type(EMAIL_INFO_MIME),
+                ),
+            ]
+        })
+        .collect()
 }
 
 /// Convert an operational failure into an `isError` tool RESULT, not a JSON-RPC
@@ -1868,6 +1956,79 @@ mod tests {
         assert_eq!(
             message_resource_uri("work account", "Archive/2026", 77, 42),
             "email://work%20account/Archive%2F2026/77/42"
+        );
+    }
+
+    /// AMXSF-333 A2. A row's `resourceUri` is a plain JSON string — nothing
+    /// structural says "this is a readable resource", so a client has to know
+    /// the field is spelled `resourceUri` to follow it. The `ResourceLink`
+    /// blocks make that edge part of the protocol.
+    #[test]
+    fn a_row_with_a_resource_uri_emits_body_and_info_links() {
+        let uri = message_resource_uri("work", "INBOX", 77, 42);
+        let structured = serde_json::json!({
+            "messages": [ { "uid": 42, "resourceUri": uri } ]
+        });
+
+        let links: Vec<_> = message_resource_links(&structured)
+            .into_iter()
+            .map(|block| match block {
+                ContentBlock::ResourceLink(resource) => resource,
+                other => panic!("expected a ResourceLink, got {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(links.len(), 2, "one body link and one /info link per row");
+        assert_eq!(links[0].uri, uri);
+        assert_eq!(links[0].mime_type.as_deref(), Some("text/markdown"));
+        assert_eq!(links[1].uri, format!("{uri}/info"));
+        assert_eq!(links[1].mime_type.as_deref(), Some("application/json"));
+    }
+
+    /// One chokepoint covers every tool: the walk finds URIs wherever they sit,
+    /// including the ranking tools' NESTED `sample` rows, and never links the
+    /// same message twice.
+    #[test]
+    fn links_cover_nested_rows_and_deduplicate() {
+        let first = message_resource_uri("work", "INBOX", 77, 1);
+        let second = message_resource_uri("work", "INBOX", 77, 2);
+        let structured = serde_json::json!({
+            "senders": [
+                { "address": "a@example.com", "sample": { "resourceUri": first } },
+                { "address": "b@example.com", "sample": { "resourceUri": second } },
+                // Same message sampled twice — one pair of links, not two.
+                { "address": "c@example.com", "sample": { "resourceUri": first } },
+            ]
+        });
+
+        let mut uris = Vec::new();
+        collect_resource_uris(&structured, &mut uris);
+        assert_eq!(uris, vec![first, second], "row order, deduplicated");
+        assert_eq!(message_resource_links(&structured).len(), 4);
+    }
+
+    /// A result with no message rows gets no links — write tools and
+    /// `list_accounts` must not grow content blocks.
+    #[test]
+    fn a_result_without_message_rows_emits_no_links() {
+        let structured = serde_json::json!({ "accounts": [ { "name": "work" } ] });
+        assert!(message_resource_links(&structured).is_empty());
+    }
+
+    /// The links are ADDITIVE: the JSON stays first and complete, because it
+    /// is the declared `outputSchema` and some hosts render only `content[0]`.
+    #[test]
+    fn links_do_not_displace_the_json_fallback() {
+        let result = compact_result(ListAccountsOutput {
+            accounts: vec![AccountOutput {
+                name: "work".to_string(),
+                is_default: true,
+            }],
+        })
+        .expect("result should serialize");
+        assert!(
+            result.content[0].as_text().is_some(),
+            "the complete JSON must remain the FIRST content block",
         );
     }
 

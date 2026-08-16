@@ -822,15 +822,22 @@ impl HeaderCache {
             full_header_mode |= loaded.header_fields_filtered;
             let state = loaded.mailbox;
             let expected_account_revision = loaded.account_revision;
-            let live_status = examine_status(session, &key.mailbox).await?;
+            // Cheap probe first. STATUS answers the freshness triple in one
+            // round trip without opening the mailbox, so a warm complete
+            // snapshot is served having issued no EXAMINE at all. That is the
+            // entire per-mailbox cost of a repeat scan on an account with no
+            // aggregate `\All` mailbox, where discovery enumerates every
+            // mailbox rather than scanning one (see `scan_plan`).
+            //
+            // RFC 9051 discourages STATUS on the CURRENTLY SELECTED mailbox as
+            // redundant, and nothing here tracks which mailbox that is. The
+            // redundancy is harmless: the server answers from its live view of
+            // the mailbox either way, and any disagreement drops through to the
+            // resync path below, which re-reads authoritatively with EXAMINE.
+            let probe = imap_client::mailbox_status(session, &key.mailbox, false).await?;
 
             if let Some(state) = state
-                && is_cache_hit(
-                    state,
-                    &live_status,
-                    expected_account_revision,
-                    uid_mode.is_some(),
-                )
+                && is_cache_hit(state, &probe, expected_account_revision, uid_mode.is_some())
             {
                 let covered = load_covered_count(Arc::clone(&path), key.clone(), state).await?;
                 // Completeness yardstick. On a normal server EXISTS is the true
@@ -884,6 +891,12 @@ impl HeaderCache {
                     );
                 }
             }
+
+            // Past here the mailbox has to be open anyway: the sync below
+            // searches and fetches against the selected mailbox, and the values
+            // that drive it must come from that same opened epoch rather than
+            // from the probe above.
+            let live_status = examine_status(session, &key.mailbox).await?;
 
             let Some(uid_validity) = live_status.uid_validity else {
                 return Err(CacheError::Invariant(format!(
