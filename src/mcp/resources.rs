@@ -36,6 +36,19 @@ pub(super) const EMAIL_INFO_TEMPLATE: &str = "email://{account}/{mailbox}/{uidVa
 pub(super) const EMAIL_ATTACHMENT_TEMPLATE: &str =
     "email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}";
 
+// Identity of the two representations tool results LINK to (`wire.rs`
+// `message_resource_links`). Shared with `email_resource_templates` below so a
+// link and the template it instantiates cannot disagree about what a URI is —
+// agreement is structural, and the LITERAL values are pinned on both sides by
+// `the_linked_representations_advertise_their_published_identity` here and
+// `a_row_with_a_resource_uri_emits_body_and_info_links` in `wire.rs`.
+pub(super) const EMAIL_BODY_NAME: &str = "email-message";
+pub(super) const EMAIL_BODY_TITLE: &str = "Email message (markdown)";
+pub(super) const EMAIL_BODY_MIME: &str = "text/markdown";
+pub(super) const EMAIL_INFO_NAME: &str = "email-message-info";
+pub(super) const EMAIL_INFO_TITLE: &str = "Email message info (JSON metadata)";
+pub(super) const EMAIL_INFO_MIME: &str = "application/json";
+
 const MAX_BODY_CHARS: usize = 100_000;
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
@@ -184,8 +197,8 @@ pub(super) fn parse_email_uri(uri: &str) -> Result<EmailResourceUri, String> {
 
 pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
     vec![
-        ResourceTemplate::new(EMAIL_BODY_TEMPLATE, "email-message")
-            .with_title("Email message (markdown)")
+        ResourceTemplate::new(EMAIL_BODY_TEMPLATE, EMAIL_BODY_NAME)
+            .with_title(EMAIL_BODY_TITLE)
             .with_description(
                 "A single email rendered as markdown. Percent-encode the account and \
                  mailbox segments; a '/' inside a mailbox name must be encoded as %2F. \
@@ -193,7 +206,7 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  and the UIDVALIDITY + UID identity from a current discovery result. \
                  Markdown output is limited to 100,000 characters.",
             )
-            .with_mime_type("text/markdown"),
+            .with_mime_type(EMAIL_BODY_MIME),
         ResourceTemplate::new(EMAIL_HEADERS_TEMPLATE, "email-message-headers")
             .with_title("Email message headers (exact RFC822 syntax)")
             .with_description(
@@ -209,8 +222,8 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  headers, or attachment APIs for larger messages.",
             )
             .with_mime_type("message/rfc822"),
-        ResourceTemplate::new(EMAIL_INFO_TEMPLATE, "email-message-info")
-            .with_title("Email message info (JSON metadata)")
+        ResourceTemplate::new(EMAIL_INFO_TEMPLATE, EMAIL_INFO_NAME)
+            .with_title(EMAIL_INFO_TITLE)
             .with_description(
                 "Compact JSON metadata for a live message: subject, sender, \
                  recipients, date, flags, size, and the attachment inventory — \
@@ -219,7 +232,7 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  /attachments/{index} resource URI — plus sibling body, headers, \
                  and source resource URIs. Read this before fetching attachments.",
             )
-            .with_mime_type("application/json"),
+            .with_mime_type(EMAIL_INFO_MIME),
         ResourceTemplate::new(EMAIL_ATTACHMENT_TEMPLATE, "email-message-attachment")
             .with_title("Email attachment (binary)")
             .with_description(
@@ -1047,6 +1060,56 @@ mod tests {
         let capped = cap_chars(&value, MAX_BODY_CHARS);
 
         assert_eq!(capped.chars().count(), MAX_BODY_CHARS);
+    }
+
+    /// The advertised identity of the two representations tool results LINK to.
+    ///
+    /// Agreement between a link and its template is structural — both read the
+    /// same constants — so asserting `constant == constant` would be
+    /// tautological. What is worth pinning is the LITERAL wire contract: an
+    /// agent that met a message through `templates/list` and one that met it
+    /// through a `ResourceLink` must see the same name, title and mimeType,
+    /// and those strings are part of what we publish. `wire.rs` asserts the
+    /// same literals on the link side.
+    #[test]
+    fn the_linked_representations_advertise_their_published_identity() {
+        let templates = email_resource_templates();
+        let body = templates
+            .iter()
+            .find(|t| t.uri_template == EMAIL_BODY_TEMPLATE)
+            .expect("body template");
+        let info = templates
+            .iter()
+            .find(|t| t.uri_template == EMAIL_INFO_TEMPLATE)
+            .expect("info template");
+
+        assert_eq!(body.name, "email-message");
+        assert_eq!(body.title.as_deref(), Some("Email message (markdown)"));
+        assert_eq!(body.mime_type.as_deref(), Some("text/markdown"));
+        assert_eq!(info.name, "email-message-info");
+        assert_eq!(
+            info.title.as_deref(),
+            Some("Email message info (JSON metadata)")
+        );
+        assert_eq!(info.mime_type.as_deref(), Some("application/json"));
+    }
+
+    /// `wire.rs` builds the `/info` link by APPENDING to the body URI rather
+    /// than re-deriving it from parts. That is only correct while `/info` is
+    /// literally the body URI plus one segment — pin it against the canonical
+    /// builder so a future URI-shape change breaks here rather than silently
+    /// producing dead links in every tool result.
+    #[test]
+    fn the_info_uri_is_the_body_uri_plus_one_segment() {
+        let body = format_email_uri("work account", "Archive/2026", 77, 42);
+        let info = format_email_uri_for_kind(
+            "work account",
+            "Archive/2026",
+            77,
+            42,
+            EmailResourceKind::Info,
+        );
+        assert_eq!(info, format!("{body}/info"));
     }
 
     #[test]

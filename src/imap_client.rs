@@ -25,6 +25,12 @@ use crate::types::*;
 pub enum ImapTransport {
     Tls(Box<TlsStream<TcpStream>>),
     Deflate(Pin<Box<DeflateStream<ImapTransport>>>),
+    /// An in-memory pipe to a scripted server. Test builds only — it exists so
+    /// callers typed against the concrete [`ImapSession`] (the header cache's
+    /// sync path, above all) can be driven without a TLS stack. See
+    /// [`test_support`].
+    #[cfg(test)]
+    Duplex(tokio::io::DuplexStream),
 }
 
 impl AsyncRead for ImapTransport {
@@ -36,6 +42,8 @@ impl AsyncRead for ImapTransport {
         match self.get_mut() {
             Self::Tls(stream) => Pin::new(stream).poll_read(context, buffer),
             Self::Deflate(stream) => stream.as_mut().poll_read(context, buffer),
+            #[cfg(test)]
+            Self::Duplex(stream) => Pin::new(stream).poll_read(context, buffer),
         }
     }
 }
@@ -49,6 +57,8 @@ impl AsyncWrite for ImapTransport {
         match self.get_mut() {
             Self::Tls(stream) => Pin::new(stream).poll_write(context, buffer),
             Self::Deflate(stream) => stream.as_mut().poll_write(context, buffer),
+            #[cfg(test)]
+            Self::Duplex(stream) => Pin::new(stream).poll_write(context, buffer),
         }
     }
 
@@ -56,6 +66,8 @@ impl AsyncWrite for ImapTransport {
         match self.get_mut() {
             Self::Tls(stream) => Pin::new(stream).poll_flush(context),
             Self::Deflate(stream) => stream.as_mut().poll_flush(context),
+            #[cfg(test)]
+            Self::Duplex(stream) => Pin::new(stream).poll_flush(context),
         }
     }
 
@@ -63,11 +75,119 @@ impl AsyncWrite for ImapTransport {
         match self.get_mut() {
             Self::Tls(stream) => Pin::new(stream).poll_shutdown(context),
             Self::Deflate(stream) => stream.as_mut().poll_shutdown(context),
+            #[cfg(test)]
+            Self::Duplex(stream) => Pin::new(stream).poll_shutdown(context),
         }
     }
 }
 
 pub type ImapSession = Session<ImapTransport>;
+
+/// Scripted in-memory IMAP servers for tests in any module.
+///
+/// The helpers inside `imap_client`'s own test module produce
+/// `Session<DuplexStream>`, which is fine for functions generic over the
+/// transport but unusable for anything typed against the concrete
+/// [`ImapSession`] — notably `header_cache`'s sync path. These build a real
+/// `ImapSession` over [`ImapTransport::Duplex`] instead, and hand back the
+/// command log so a test can assert on the round trips a code path actually
+/// makes, not just on its return value.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{ImapSession, ImapTransport};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// A running scripted server. Drop the session, then call
+    /// [`ScriptedServer::commands`] to collect every line the client sent.
+    pub(crate) struct ScriptedServer {
+        handle: tokio::task::JoinHandle<Vec<String>>,
+    }
+
+    impl ScriptedServer {
+        /// Every command line the client sent, in order.
+        pub(crate) async fn commands(self) -> Vec<String> {
+            self.handle.await.expect("scripted server should finish")
+        }
+    }
+
+    /// Open a logged-in [`ImapSession`] against a server driven by `respond`.
+    ///
+    /// `respond(tag, command_line)` returns the raw bytes to reply with, or
+    /// `None` to hang up — which reaches the client as a broken pipe and is the
+    /// right answer for "this code path should never send this command". LOGIN
+    /// is answered automatically so responders only describe what they are
+    /// actually testing.
+    pub(crate) async fn scripted_session<F>(respond: F) -> (ImapSession, ScriptedServer)
+    where
+        F: Fn(&str, &str) -> Option<String> + Send + 'static,
+    {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let Some(tag) = command.split_whitespace().next().map(str::to_string) else {
+                    continue;
+                };
+                commands.push(command.clone());
+                let reply = if command.contains(" LOGIN ") {
+                    Some(format!("{tag} OK LOGIN completed\r\n"))
+                } else {
+                    respond(&tag, &command)
+                };
+                let Some(reply) = reply else { break };
+                if writer.write_all(reply.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            commands
+        });
+
+        let client = async_imap::Client::new(ImapTransport::Duplex(client_stream));
+        let session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .expect("scripted login should succeed");
+        (session, ScriptedServer { handle })
+    }
+
+    /// An `EXAMINE` reply carrying the mailbox triple.
+    pub(crate) fn examine_reply(
+        tag: &str,
+        uid_validity: u32,
+        uid_next: u32,
+        exists: u32,
+    ) -> String {
+        format!(
+            "* FLAGS (\\Seen \\Deleted)\r\n\
+             * {exists} EXISTS\r\n\
+             * 0 RECENT\r\n\
+             * OK [UIDVALIDITY {uid_validity}] UIDs valid\r\n\
+             * OK [UIDNEXT {uid_next}] Predicted next UID\r\n\
+             {tag} OK [READ-ONLY] EXAMINE completed\r\n"
+        )
+    }
+
+    /// A `STATUS` reply carrying the same triple.
+    pub(crate) fn status_reply(
+        tag: &str,
+        mailbox: &str,
+        uid_validity: u32,
+        uid_next: u32,
+        messages: u32,
+    ) -> String {
+        format!(
+            "* STATUS \"{mailbox}\" (UIDVALIDITY {uid_validity} UIDNEXT {uid_next} MESSAGES {messages})\r\n\
+             {tag} OK STATUS completed\r\n"
+        )
+    }
+}
 
 /// Callback for reporting progress: `(completed, total)`.
 pub type ProgressFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
@@ -1285,16 +1405,25 @@ where
     Ok(windowed)
 }
 
-/// Return UID membership metadata for compatibility callers that maintain
-/// their own synchronization state.
+/// Return UID membership metadata without opening the mailbox.
+///
+/// `STATUS` is the cheap freshness probe: it answers the
+/// UIDVALIDITY/UIDNEXT/MESSAGES triple in one round trip and leaves the
+/// selected mailbox alone, where `EXAMINE` makes the server open the mailbox
+/// and emit its full untagged block. Prefer this whenever the answer might
+/// mean "nothing to do"; reach for [`examine`] only once the mailbox has to be
+/// selected for a SEARCH or FETCH anyway.
 ///
 /// When `with_highest_modseq` is true (server advertises CONDSTORE), also
 /// requests `HIGHESTMODSEQ`. Falls back without it if the server replies BAD.
-pub async fn mailbox_status(
-    session: &mut ImapSession,
+pub async fn mailbox_status<T>(
+    session: &mut Session<T>,
     mailbox: &str,
     with_highest_modseq: bool,
-) -> Result<crate::scan_cache::MailboxStatus> {
+) -> Result<crate::scan_cache::MailboxStatus>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
     let items = if with_highest_modseq {
         "(UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ)"
     } else {
@@ -4745,6 +4874,144 @@ mod tests {
         assert!(enabled.is_empty());
         drop(session);
         server.await.expect("scripted server should finish");
+    }
+
+    /// Scripted server for [`mailbox_status`]. Any command other than LOGIN or
+    /// STATUS panics, so a probe that opens the mailbox fails loudly rather
+    /// than quietly costing a round trip. When `reject_modseq` is set, a STATUS
+    /// carrying HIGHESTMODSEQ is answered BAD to exercise the fallback.
+    async fn scripted_status_session(
+        reject_modseq: bool,
+    ) -> (Session<DuplexStream>, tokio::task::JoinHandle<Vec<String>>) {
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let mut commands = Vec::new();
+            loop {
+                let mut command = String::new();
+                if reader.read_line(&mut command).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = command.split_whitespace().next().unwrap().to_string();
+                commands.push(command.clone());
+                if command.contains(" LOGIN ") {
+                    writer
+                        .write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else if command.contains("STATUS ") {
+                    if reject_modseq && command.contains("HIGHESTMODSEQ") {
+                        writer
+                            .write_all(format!("{tag} BAD unsupported STATUS item\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    let modseq = if command.contains("HIGHESTMODSEQ") {
+                        " HIGHESTMODSEQ 42"
+                    } else {
+                        ""
+                    };
+                    writer
+                        .write_all(
+                            format!(
+                                "* STATUS \"INBOX\" (UIDVALIDITY 7 UIDNEXT 91 MESSAGES 12{modseq})\r\n{tag} OK STATUS completed\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    panic!("unexpected command: {command:?}");
+                }
+            }
+            commands
+        });
+        let client = async_imap::Client::new(client_stream);
+        let session = client
+            .login("test-user", "test-password")
+            .await
+            .map_err(|(error, _)| error)
+            .unwrap();
+        (session, server)
+    }
+
+    #[tokio::test]
+    async fn mailbox_status_reads_the_triple_without_opening_the_mailbox() {
+        let (mut session, server) = scripted_status_session(false).await;
+
+        let status = mailbox_status(&mut session, "INBOX", false)
+            .await
+            .expect("STATUS should answer the freshness triple");
+
+        assert_eq!(status.uid_validity, Some(7));
+        assert_eq!(status.uid_next, Some(91));
+        assert_eq!(status.exists, 12);
+        assert_eq!(status.highest_modseq, None);
+
+        drop(session);
+        let commands = server.await.expect("scripted server should finish");
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("STATUS ")).count(),
+            1,
+            "the probe is one round trip: {commands:?}"
+        );
+        // The whole point of preferring STATUS: a freshness check must not make
+        // the server open the mailbox, and must not disturb the selected one.
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.contains("EXAMINE") || c.contains("SELECT")),
+            "a freshness probe must not open the mailbox: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_status_reports_highestmodseq_when_the_server_supplies_it() {
+        let (mut session, server) = scripted_status_session(false).await;
+
+        let status = mailbox_status(&mut session, "INBOX", true)
+            .await
+            .expect("a CONDSTORE server answers the extended probe");
+
+        assert_eq!(status.highest_modseq, Some(42));
+
+        drop(session);
+        let commands = server.await.expect("scripted server should finish");
+        assert!(
+            commands.iter().any(|c| c.contains("HIGHESTMODSEQ")),
+            "the extended probe asks for it: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_status_falls_back_when_the_server_rejects_highestmodseq() {
+        let (mut session, server) = scripted_status_session(true).await;
+
+        let status = mailbox_status(&mut session, "INBOX", true)
+            .await
+            .expect("a BAD on HIGHESTMODSEQ falls back to the base triple");
+
+        assert_eq!(status.uid_validity, Some(7));
+        assert_eq!(status.highest_modseq, None);
+
+        drop(session);
+        let commands = server.await.expect("scripted server should finish");
+        let statuses: Vec<&String> = commands.iter().filter(|c| c.contains("STATUS ")).collect();
+        assert_eq!(
+            statuses.len(),
+            2,
+            "the rejected probe is retried exactly once: {statuses:?}"
+        );
+        assert!(
+            statuses[0].contains("HIGHESTMODSEQ"),
+            "the first attempt asks for it: {statuses:?}"
+        );
+        assert!(
+            !statuses[1].contains("HIGHESTMODSEQ"),
+            "the retry drops it: {statuses:?}"
+        );
     }
 
     async fn scripted_cleanup_session(
