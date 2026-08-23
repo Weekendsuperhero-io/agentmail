@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-08-04T00:00
+updated: 2026-08-23T00:00
 ---
 # agentmail
 
@@ -409,8 +409,8 @@ Opens a web UI to exercise all advertised tools, 6 prompts, and task calls inter
 
 ## MCP Tools
 
-31 tools cover account discovery, mailbox management, message reading, search,
-bulk operations, recovery, evidence archiving, flag management, and composition. 19 long-running tools support
+37 tools cover account discovery, mailbox management, message reading, search,
+bulk operations, recovery, evidence archiving, flag management, and composition. AgentMail saves drafts but never sends mail. 22 long-running tools support
 optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/tasks)
 (SEP-1686) for asynchronous execution.
 
@@ -419,6 +419,8 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 | `list_accounts`        | Return configured account names (use this first)                                      |
 | `list_mailboxes`       | Paginate selectable mailboxes with counts and registered special-use roles             |
 | `create_mailbox`       | Create a new mailbox (folder) on the server                                           |
+| `rename_mailbox`       | Preview, then confirm a guarded mailbox rename                                        |
+| `delete_mailbox`       | Preview, then confirm guarded mailbox deletion                                        |
 | `check_connection`     | Test IMAP connectivity for an account                                                 |
 | `list_capabilities`    | List IMAP server capabilities (IDLE, MOVE, etc.)                                      |
 | `get_messages`         | Paginated metadata discovery, newest-first, with safe body resource URIs              |
@@ -433,6 +435,8 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 | `download_attachments` | Download attachments from a message to disk                                           |
 | `download_message_source` | Save exact RFC822 bytes to disk with SHA-256 and local DKIM verification             |
 | `download_thread`      | Save a caller-selected UID set plus a JSON evidence manifest                           |
+| `preview_thread_record` | Discover an exact cross-mailbox Message-ID graph and return its confirmation digest   |
+| `export_thread_record` | Confirm and export that graph as PDF, exact EML sources, and an integrity manifest     |
 | `delete_messages`      | Delete messages by UID (up to 500 per call, moves to Trash or expunges)               |
 | `delete_by_sender`     | Delete all messages from an exact sender identity, optionally across all mailboxes    |
 | `delete_by_domain`     | Delete messages from one exact canonical sender domain                               |
@@ -443,7 +447,9 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 | `move_subscription`    | Move the exact bulk-mail subscription represented by a `top_subscriptions` sample     |
 | `move_message`         | Move a message between mailboxes via IMAP MOVE                                        |
 | `reconcile_moves`      | Safely resume one or all pending COPY-fallback MOVE operations                        |
-| `create_draft`         | Compose RFC822 draft and append to Drafts folder                                      |
+| `create_draft`         | Save a draft with To/Cc/Bcc/Reply-To, threading headers, and attachments              |
+| `create_reply_draft`   | Derive reply or reply-all recipients and RFC threading headers from a live message     |
+| `update_draft`         | Atomically replace a draft using RFC 8508 REPLACE; never sends                        |
 | `unsubscribe_message`  | DKIM-verified RFC 8058 unsubscribe; optional List-Id cleanup is off by default          |
 | `add_flags`            | Add flags and/or set Apple Mail color on a message (union semantics)                  |
 | `remove_flags`         | Remove flags and/or clear Apple Mail color from a message                             |
@@ -497,6 +503,11 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   `delete_by_sender` instead takes the exact sender identity (`email` +
   `name`, from a ranking row) and confirms it live in each mailbox, so it
   carries no sample UID or epoch guard.
+- `rename_mailbox` and `delete_mailbox` are preview-then-confirm operations.
+  Both refuse INBOX and any mailbox referenced by pending MOVE recovery.
+  A changed live message count invalidates confirmation, and special-use or
+  descendant-bearing mailboxes require separate acknowledgement. Deleting a
+  non-empty mailbox requires its own acknowledgement as well.
 - `top_subscriptions` returns a nested `sample` identity, not an unsubscribe
   URL or raw list-action header. `unsubscribe_message` additionally requires
   explicit `confirmOneClick=true`. Its `advertisedOneClick` field describes
@@ -511,7 +522,7 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   List-Id. The destination mailbox is excluded from the sweep.
 - The action-time DKIM source fetch is preceded by `RFC822.SIZE`, capped at 64 MiB, and fetched with a bounded IMAP partial. This per-source safety bound does not limit matching-message cleanup counts.
 - `download_message_source` saves exact RFC822 bytes directly from IMAP to a
-  private file inside `AGENTMAIL_FILE_ROOT`; the bytes do not cross model
+  private file inside the active agent session workspace; the bytes do not cross model
   context. It uses `BODY.PEEK[]`, validates UIDVALIDITY, refuses overwrite, and
   returns SHA-256, parsed message metadata, and a DNS-backed local DKIM result.
   `download_thread` applies the same rules to a caller-selected set of up to
@@ -519,13 +530,36 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   SPF is omitted because independent SPF evaluation needs delivery-time SMTP
   client IP, HELO, and envelope-sender inputs that are not present in an RFC822
   archive.
+- Embedded AgentMail accepts the workspace root only as trusted request
+  metadata from Agent Muse (`io.agentmuse/workspaceRoot`) on direct and
+  task-augmented calls. Missing or invalid metadata fails closed. Standalone
+  `agentmail serve` instead uses `AGENTMAIL_FILE_ROOT` (falling back to
+  `~/.agentmail/files`). Caller-supplied output directories are confined below
+  that root; a process-wide environment variable is never used for embedded
+  sessions.
+- `preview_thread_record` follows only exact normalized `Message-ID`,
+  `In-Reply-To`, and `References` relationships across eligible mailboxes;
+  subject similarity is never evidence of membership. `export_thread_record`
+  re-runs discovery and requires the exact preview digest, then writes a
+  private no-overwrite bundle with a styled PDF, one exact `.eml` per selected
+  storage identity, and a JSON integrity manifest. It reopens, parses, and
+  hash-checks artifacts before returning `recorded: true` and
+  `submittable: true`. Those flags mean the packet is complete and can be
+  handed to a recipient; they make no claim about legal admissibility.
 - RFC 8058 requests accept exactly one parsed HTTPS URI, reject credentials, fragments, HTTP alternatives, private/link-local/loopback destinations, mixed public/private DNS answers, proxies, retries, and redirects, and require a direct 2xx response. The resolved public addresses are pinned for the request.
 - Matching-message cleanup is one optional `cleanup {when, identity, deletion}` object; omitting it means unsubscribe only. Defaults are fail-safe: `when: "afterSuccess"` (a failed unsubscribe never triggers cleanup unless `"always"` is explicit), `deletion: "trash"` (never permanent unless `"trashThenPermanent"` or `"permanent"` is explicit). Cleanup matches the normalized RFC 2919 List-Id only when the same passing DKIM signature covered that single List-Id; otherwise `identity: "listIdOrSender"` (default) requires exact normalized sender email plus `List-Unsubscribe-Post`, and also requires the target's normalized List-Id whenever the sampled message has one. Display names never affect this fallback.
 - Account-wide destructive operations use a separate mutation plan: they enumerate selectable storage mailboxes and never issue writes through `\All`, `\Flagged`, or `\Important` aggregate views. An explicitly supplied mailbox is always honored.
 - `delete_by_sender`, `delete_list_id`, and unsubscribe matching have no total-message ceiling; server mutations are split into 500-UID wire batches. Only the MCP `delete_messages` tool limits an explicitly supplied UID array to 500 per call.
 - `search_messages` supports date range (`since`/`before`, YYYY-MM-DD) and size (`larger_than`/`smaller_than`, bytes) for "older than" / "bigger than" cleanup, plus AND-combined case-insensitive substring text filters. `delete_list_id` matches the List-Id exactly (not as a substring).
 - On Gmail, deletes route through `[Gmail]/Trash` (in-place expunge only removes a label); `permanent` also goes to Trash, which Gmail purges on its own.
-- Non-ASCII `search_messages` text is sent with `CHARSET UTF-8`. Drafts include `Date` and `Message-ID` headers.
+- Non-ASCII `search_messages` text is sent with `CHARSET UTF-8`. Drafts include
+  `Date`, `Message-ID`, and Apple Mail draft markers. Bcc is retained in the
+  saved draft, Reply-To is supported, and reply drafts use RFC
+  `In-Reply-To`/`References` headers. `update_draft` requires server-advertised
+  RFC 8508 REPLACE and deliberately refuses an APPEND+DELETE emulation. A lost
+  draft-APPEND completion is reconciled on a fresh connection with the
+  generated Message-ID; an unprovable outcome tells the caller to inspect
+  Drafts instead of inviting a duplicate-producing retry.
 - Tool calls return one compact text summary for compatibility plus one
   authoritative `structuredContent` object. The full JSON value is not repeated
   in the text content block.
@@ -629,24 +663,46 @@ unchanged destination `UIDNEXT` proves the ambiguous attempt created nothing.
 | `unsubscribe-cleanup` | Identify lists, obtain consent, then run verified unsubscribe and optional cleanup |
 | `list-id-cleanup`     | Identify mailing lists by List-Id and bulk-delete entire lists                     |
 
+### Apple Mail draft acceptance (manual)
+
+After changing draft composition or replacement, validate against a real test
+account in Apple Mail:
+
+1. Create a draft through AgentMail, open it in Apple Mail, click Send, and
+   confirm the draft disappears and exactly one copy appears in Sent.
+2. Create another draft, update it through AgentMail, then repeat the same
+   open-and-send check.
+
+This is intentionally a manual outward-facing acceptance test. The automated
+suite verifies wire format, threading, Bcc retention, Apple markers, and UUID
+preservation without sending mail.
+
 ## MCP Resources
 
-Single messages are addressable as resources — the read-one-message primitive that complements the paginated tools:
+`resources/list` exposes one annotated `email://{account}` root per configured
+account. Reading it returns selectable mailbox resource URIs; reading a mailbox
+URI returns paged newest-first message metadata and canonical message URIs.
+Single messages are then addressable without constructing an identity by hand:
 
 | URI template                                                        | MIME type             | Content                                  |
 | ------------------------------------------------------------------- | --------------------- | ---------------------------------------- |
+| `email://{account}/{mailbox}{?offset,limit}`                        | `application/json`    | Paged message metadata, default 25/max 50 |
 | `email://{account}/{mailbox}/{uidValidity}/{uid}`                   | `text/markdown`       | Normalized body view, capped at 100K chars |
 | `email://{account}/{mailbox}/{uidValidity}/{uid}/headers`           | `text/rfc822-headers` | Exact RFC822 header block, maximum 64 KiB |
 | `email://{account}/{mailbox}/{uidValidity}/{uid}/source`            | `message/rfc822`      | Lossless base64 MCP blob, maximum 256 KiB |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/info`              | `application/json`    | Metadata, sibling URIs, and attachment inventory |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}` | per MIME part       | One attachment blob, maximum 4 MiB       |
 
 Encoding rules: `account` and `mailbox` are percent-encoded URI segments — a
 `/` inside a mailbox name must be encoded as `%2F`, for example
 `email://work/Archive%2F2024/3857529045/1234`. Both UID values must be non-zero.
 Every read validates the live UIDVALIDITY before fetching; a stale identity is
 reported as resource-not-found rather than reading a recycled UID. Get current
-URIs from `get_messages`, `search_messages`, `find_attachments`, or the
-`top_*` tools. `resources/list` is intentionally empty because discovery is
-template-based. The `/source` representation uses the MCP resource `blob`
+URIs from the account/mailbox resources, `get_messages`, `search_messages`,
+`find_attachments`, or the `top_*` tools. Account, mailbox, body, info, header,
+source, and attachment resources carry MCP audience/priority annotations so a
+host can decide whether to present them to the user, the assistant, or both.
+The `/source` representation uses the MCP resource `blob`
 field, whose value is base64, so arbitrary RFC822 octets are preserved without
 lossy UTF-8 conversion.
 
@@ -662,7 +718,7 @@ Argument autocompletion (`completion/complete`) is supported for the prompts and
 ```
 agentmail (binary crate: agentmail-mcp)
   ├── serve                → MCP stdio server (tokio + rmcp)
-  │                          31 tools + 6 prompts, tasks, progress notifications
+  │                          37 tools + 6 prompts, tasks, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
   ├── create-mailbox       → CLI
@@ -686,7 +742,7 @@ agentmail (binary crate: agentmail-mcp)
 src/ (library + binary)
   ├── lib.rs          → Public API facade (25+ async methods)
   ├── main.rs         → CLI dispatch (clap), account configuration
-  ├── mcp/            → MCP server: 31 tools, 6 prompts, tasks, resources, completions
+  ├── mcp/            → MCP server: 37 tools, 6 prompts, tasks, resources, completions
   ├── config.rs       → TOML config loading, default account resolution
   ├── credentials.rs  → Password resolution (env → config secret → default keyring)
   ├── connection.rs   → IMAP connection pool (provider-aware per-account cap)

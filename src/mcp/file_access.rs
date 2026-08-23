@@ -10,9 +10,9 @@
 //! canonicalized, so a symlink pointing outside the root fails the prefix
 //! check).
 //!
-//! The root is `AGENTMAIL_FILE_ROOT` when set, else `~/.agentmail/files`. An
-//! operator who wants the agent to reach a wider tree sets the env explicitly —
-//! deny-by-default, widen-on-purpose.
+//! Standalone mode uses `AGENTMAIL_FILE_ROOT` (or `~/.agentmail/files`). The
+//! embedded server instead receives the active session workspace in trusted
+//! request metadata and builds a fresh policy for that request.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -38,7 +38,6 @@ impl FileAccessPolicy {
     }
 
     /// Build a policy with an explicit root (tests / embedders).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_root(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -81,8 +80,7 @@ impl FileAccessPolicy {
 
     fn escape_error(&self, requested: &str) -> String {
         format!(
-            "path '{requested}' is outside the allowed file sandbox ({}); \
-             move the file into that directory or set AGENTMAIL_FILE_ROOT to widen access",
+            "path '{requested}' is outside the allowed workspace root ({})",
             self.root.display()
         )
     }
@@ -173,7 +171,7 @@ mod tests {
         let err = policy
             .confine_read(outside.to_str().unwrap())
             .expect_err("out-of-root read must be rejected");
-        assert!(err.contains("outside the allowed file sandbox"), "{err}");
+        assert!(err.contains("outside the allowed workspace root"), "{err}");
 
         // `..` traversal is rejected lexically.
         let err = policy
@@ -190,7 +188,7 @@ mod tests {
             let err = policy
                 .confine_read("sneaky")
                 .expect_err("symlink escape must be rejected");
-            assert!(err.contains("outside the allowed file sandbox"), "{err}");
+            assert!(err.contains("outside the allowed workspace root"), "{err}");
         }
 
         let _ = std::fs::remove_file(&outside);
@@ -214,7 +212,7 @@ mod tests {
         let err = policy
             .confine_dir(Some(outside.to_str().unwrap()))
             .expect_err("out-of-root write dir must be rejected");
-        assert!(err.contains("outside the allowed file sandbox"), "{err}");
+        assert!(err.contains("outside the allowed workspace root"), "{err}");
 
         // `..` is rejected.
         let err = policy

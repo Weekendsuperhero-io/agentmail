@@ -31,11 +31,14 @@ type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 /// the previous destructive task to finish before starting.
 pub(super) const DESTRUCTIVE_TOOLS: &[&str] = &[
     "delete_messages",
+    "delete_mailbox",
     "delete_by_sender",
     "delete_by_domain",
     "delete_list_id",
     "unsubscribe_message",
     "reconcile_moves",
+    "rename_mailbox",
+    "update_draft",
 ];
 
 /// Try to extract the `account` field from a tool call's JSON arguments.

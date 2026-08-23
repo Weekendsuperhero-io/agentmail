@@ -239,6 +239,15 @@ pub(super) struct CreateDraftArgs {
     #[schemars(description = "Bcc recipient email addresses.")]
     pub(super) bcc: Vec<String>,
     #[serde(default)]
+    #[schemars(description = "Reply-To header addresses for responses to this draft.")]
+    pub(super) reply_to: Vec<String>,
+    #[serde(default)]
+    #[schemars(description = "Message-ID this draft replies to. Angle brackets are optional.")]
+    pub(super) in_reply_to: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Ordered ancestor Message-IDs for the References header.")]
+    pub(super) references: Vec<String>,
+    #[serde(default)]
     #[schemars(
         length(max = 20),
         description = "Attachments to include (maximum 20 files, 25 MiB each, 40 MiB aggregate). Each entry requires a local filesystem 'path'. 'filename' and 'contentType' are optional and will be inferred when omitted."
@@ -262,6 +271,75 @@ pub(super) struct DraftAttachmentArg {
         description = "MIME content type (e.g. 'application/pdf'). Inferred from extension when omitted."
     )]
     pub(super) content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) enum ReplyModeArg {
+    Reply,
+    ReplyAll,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for creating a reply or reply-all draft from a live message.")]
+pub(super) struct CreateReplyDraftArgs {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    #[schemars(range(min = 1))]
+    pub(super) uid: u32,
+    #[schemars(range(min = 1))]
+    pub(super) expected_uid_validity: u32,
+    pub(super) mode: ReplyModeArg,
+    #[serde(default)]
+    #[schemars(description = "Optional subject override. Defaults to a single Re: prefix.")]
+    pub(super) subject: Option<String>,
+    #[serde(default)]
+    pub(super) body: String,
+    #[serde(default)]
+    #[schemars(description = "Explicit Bcc recipients. Bcc is never inferred from the source.")]
+    pub(super) bcc: Vec<String>,
+    #[serde(default)]
+    #[schemars(description = "Reply-To header addresses for the new draft.")]
+    pub(super) reply_to: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 20))]
+    pub(super) attachments: Vec<DraftAttachmentArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Complete replacement specification for one live IMAP draft.")]
+pub(super) struct UpdateDraftArgs {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    #[schemars(range(min = 1))]
+    pub(super) uid: u32,
+    #[schemars(range(min = 1))]
+    pub(super) expected_uid_validity: u32,
+    #[serde(default)]
+    pub(super) subject: String,
+    #[serde(default)]
+    pub(super) body: String,
+    #[serde(default)]
+    pub(super) to: Vec<String>,
+    #[serde(default)]
+    pub(super) cc: Vec<String>,
+    #[serde(default)]
+    pub(super) bcc: Vec<String>,
+    #[serde(default)]
+    pub(super) reply_to: Vec<String>,
+    #[serde(default)]
+    pub(super) in_reply_to: Option<String>,
+    #[serde(default)]
+    pub(super) references: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 20),
+        description = "Complete replacement attachment list. Omitted means no attachments; partial preservation is intentionally unsupported."
+    )]
+    pub(super) attachments: Vec<DraftAttachmentArg>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -655,6 +733,63 @@ pub(super) struct CreateMailboxArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for previewing or confirming a guarded mailbox rename.")]
+pub(super) struct RenameMailboxArgs {
+    #[schemars(description = "Account name (required).")]
+    pub(super) account: String,
+    #[schemars(description = "Existing mailbox name.")]
+    pub(super) mailbox: String,
+    #[schemars(description = "New mailbox name. The destination must not already exist.")]
+    pub(super) new_mailbox: String,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "False returns a live preflight only. Set true to perform the rename."
+    )]
+    pub(super) confirm_rename: bool,
+    #[schemars(
+        description = "Exact messageCount from the latest preflight; required when confirmRename=true."
+    )]
+    pub(super) expected_message_count: Option<u32>,
+    #[serde(default = "default_false")]
+    #[schemars(description = "Acknowledge renaming a special-use mailbox.")]
+    pub(super) confirm_special_use: bool,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "Acknowledge that the mailbox has descendants whose paths may change."
+    )]
+    pub(super) confirm_descendants: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for previewing or confirming a guarded mailbox delete.")]
+pub(super) struct DeleteMailboxArgs {
+    #[schemars(description = "Account name (required).")]
+    pub(super) account: String,
+    #[schemars(description = "Mailbox name to delete.")]
+    pub(super) mailbox: String,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "False returns a live preflight only. Set true to perform the delete."
+    )]
+    pub(super) confirm_delete: bool,
+    #[schemars(
+        description = "Exact messageCount from the latest preflight; required when confirmDelete=true."
+    )]
+    pub(super) expected_message_count: Option<u32>,
+    #[serde(default = "default_false")]
+    #[schemars(description = "Acknowledge deleting a non-empty mailbox.")]
+    pub(super) confirm_non_empty: bool,
+    #[serde(default = "default_false")]
+    #[schemars(description = "Acknowledge deleting a special-use mailbox.")]
+    pub(super) confirm_special_use: bool,
+    #[serde(default = "default_false")]
+    #[schemars(description = "Acknowledge that the mailbox has descendants.")]
+    pub(super) confirm_descendants: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for downloading message attachments to disk.")]
 pub(super) struct DownloadAttachmentsArgs {
     #[schemars(
@@ -673,7 +808,7 @@ pub(super) struct DownloadAttachmentsArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Directory inside AGENTMAIL_FILE_ROOT. Defaults to the sandbox root."
+        description = "Directory inside the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). Defaults to that workspace root."
     )]
     pub(super) output_dir: Option<String>,
 }
@@ -698,7 +833,7 @@ pub(super) struct DownloadMessageSourceArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Directory inside AGENTMAIL_FILE_ROOT. Defaults to the sandbox root."
+        description = "Directory inside the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). Defaults to that workspace root."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -733,13 +868,59 @@ pub(super) struct DownloadThreadArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Directory inside AGENTMAIL_FILE_ROOT. Defaults to the sandbox root."
+        description = "Directory inside the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). Defaults to that workspace root."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
         description = "Optional portable basename for the JSON manifest. Defaults to manifest.json. Existing files are never overwritten."
     )]
     pub(super) manifest_filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    description = "Seed identity for previewing an exact cross-mailbox RFC Message-ID graph."
+)]
+pub(super) struct PreviewThreadRecordArgs {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    #[schemars(range(min = 1))]
+    pub(super) uid: u32,
+    #[schemars(range(min = 1))]
+    pub(super) expected_uid_validity: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    description = "Confirmed export of an exact thread preview as PDF, RFC822 sources, and an integrity manifest."
+)]
+pub(super) struct ExportThreadRecordArgs {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    #[schemars(range(min = 1))]
+    pub(super) uid: u32,
+    #[schemars(range(min = 1))]
+    pub(super) expected_uid_validity: u32,
+    #[schemars(
+        length(min = 64, max = 64),
+        description = "Exact selectionDigest from the latest preview_thread_record result. The export re-discovers the graph and refuses any drift."
+    )]
+    pub(super) selection_digest: String,
+    #[schemars(
+        length(min = 1, max = 4000),
+        description = "User-supplied explanation of why the record is being prepared. Printed on the PDF cover and preserved in the manifest."
+    )]
+    pub(super) purpose: String,
+    #[schemars(
+        description = "Directory inside the active session workspace. Defaults to the workspace root."
+    )]
+    pub(super) output_dir: Option<String>,
+    #[schemars(
+        description = "Optional portable directory name for the new bundle. Existing paths are never overwritten."
+    )]
+    pub(super) bundle_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

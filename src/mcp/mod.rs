@@ -18,9 +18,9 @@ use rmcp::{
         CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
         CompleteRequestParams, CompleteResult, CreateTaskResult, GetTaskParams,
         GetTaskPayloadParams, GetTaskPayloadResult, GetTaskResult, Implementation,
-        ListResourceTemplatesResult, ListTasksResult, Meta, PaginatedRequestParams,
-        ProgressNotificationParam, ReadResourceRequestParams, ReadResourceResult,
-        RelatedTaskMetadata, ServerCapabilities, ServerInfo, TasksCapability,
+        ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, Meta,
+        PaginatedRequestParams, ProgressNotificationParam, ReadResourceRequestParams,
+        ReadResourceResult, RelatedTaskMetadata, ServerCapabilities, ServerInfo, TasksCapability,
     },
     prompt_handler,
     service::RequestContext,
@@ -30,6 +30,7 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 
 const PREWARM_CONCURRENCY: usize = 3;
 const PREWARM_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub const WORKSPACE_ROOT_META_KEY: &str = "io.agentmuse/workspaceRoot";
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -194,6 +195,7 @@ fn to_mcp_error(e: &crate::AgentmailError) -> McpError {
         E::Imap(_)
         | E::Tls(_)
         | E::Io(_)
+        | E::ImapTimeout { .. }
         | E::JournalSqlite(_)
         | E::Parse(_)
         | E::NotConnected
@@ -254,7 +256,7 @@ pub struct AgentMailServer {
     task_manager: Arc<parking_lot::Mutex<TaskManager>>,
     /// Sandbox for LLM-supplied filesystem paths (attachment reads, download
     /// writes). See [`file_access::FileAccessPolicy`].
-    file_access: file_access::FileAccessPolicy,
+    file_access: Option<file_access::FileAccessPolicy>,
 }
 
 impl AgentMailServer {
@@ -262,8 +264,44 @@ impl AgentMailServer {
         Self {
             agentmail: Arc::new(agentmail),
             task_manager: Arc::new(parking_lot::Mutex::new(TaskManager::new())),
-            file_access: file_access::FileAccessPolicy::from_env(),
+            file_access: Some(file_access::FileAccessPolicy::from_env()),
         }
+    }
+
+    fn new_embedded(agentmail: crate::Agentmail) -> Self {
+        Self {
+            agentmail: Arc::new(agentmail),
+            task_manager: Arc::new(parking_lot::Mutex::new(TaskManager::new())),
+            file_access: None,
+        }
+    }
+
+    fn file_access_for_request(
+        &self,
+        meta: &Meta,
+    ) -> Result<file_access::FileAccessPolicy, McpError> {
+        if let Some(policy) = &self.file_access {
+            return Ok(policy.clone());
+        }
+        let root = meta
+            .get(WORKSPACE_ROOT_META_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "this embedded AgentMail file operation requires an active session workspace",
+                    None,
+                )
+            })?;
+        let root = std::path::Path::new(root);
+        if !root.is_absolute() {
+            return Err(McpError::invalid_params(
+                "the active session workspace must be an absolute path",
+                None,
+            ));
+        }
+        Ok(file_access::FileAccessPolicy::with_root(root))
     }
 
     /// Combined tool router — referenced by `#[tool_handler]`'s default
@@ -300,12 +338,14 @@ impl ServerHandler for AgentMailServer {
             concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENTMAIL_BUILD_SHA"), ")"),
         ))
         .with_instructions(
-            "AgentMail is a full-featured IMAP email client. \
+            "AgentMail is an IMAP read, organize, draft, and record server. It never sends mail. \
              Start with list_accounts to discover configured accounts. \
              list_mailboxes requires one account and returns selectable mailboxes only, paginated with a default of 100. \
              get_messages and search_messages return metadata only, newest-first, with the mailbox UIDVALIDITY and a UIDVALIDITY-safe resourceUri for each row. \
              Every row's resourceUri also rides the result as a resource_link, next to a link to that message's /info; /info carries the sibling headers and source URIs plus the attachment inventory, so follow links rather than building URIs by hand. \
-             Manage email: delete_messages, delete_by_sender, delete_by_domain, delete_list_id, move_message, move_list_id, move_by_sender, move_by_domain, move_subscription, create_draft (supports attachments), create_mailbox, unsubscribe_message. \
+             Manage email: delete_messages, delete_by_sender, delete_by_domain, delete_list_id, move_message, move_list_id, move_by_sender, move_by_domain, move_subscription, create_mailbox, rename_mailbox, delete_mailbox, and unsubscribe_message. Compose without sending via create_draft, create_reply_draft, and update_draft; drafts support Reply-To, Bcc, attachments, and RFC threading headers. \
+             Rename and delete mailboxes are guarded preview-then-confirm operations. INBOX and mailboxes referenced by pending MOVE recovery are never eligible; non-empty, special-use, and descendant-bearing mailboxes require separate acknowledgements. \
+             update_draft requires RFC 8508 REPLACE and refuses an APPEND+DELETE fallback, because a transport failure at that boundary can leave duplicate drafts. \
              Bulk filing: move_list_id, move_by_sender, move_by_domain, and move_subscription move every exact match to an existing destination mailbox in one call — never loop move_message per UID for that. \
              top_senders, top_domains, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
              Ranked tools use live offset pages with a maximum of 100; top_domains defaults to 20 rows and the other ranked tools default to 10. Pages may shift when mail changes. \
@@ -324,8 +364,10 @@ impl ServerHandler for AgentMailServer {
              unsubscribe_message requires explicit confirmOneClick=true. Optional matching-message cleanup is the nested cleanup {when, identity, deletion} object (omit it to only unsubscribe); it prefers the DKIM-authenticated List-Id, otherwise requires exact sender email + List-Unsubscribe-Post + the sample's List-Id when present, stops after a failed POST unless when=\"always\", and never silently escalates a Trash failure to permanent deletion unless deletion=\"trashThenPermanent\". \
              list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
              find_attachments returns mailbox-safe {mailbox, uidValidity, uid, date, resourceUri} hits; pass that identity to download_attachments. \
-             Use download_message_source when exact RFC822 bytes must be saved to disk without crossing model context; use download_thread for a caller-selected UID set plus a JSON integrity manifest. Both validate UIDVALIDITY, use BODY.PEEK[], refuse overwrite, return SHA-256 and local DKIM results, and confine writes to AGENTMAIL_FILE_ROOT. \
-             Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), plus /headers (exact headers), /source (bounded raw RFC822), /info (JSON metadata: subject, sender, date, flags, size, attachment inventory), and /attachments/{index} (one attachment as a blob with its own content type, 4 MiB limit). Percent-encode account and mailbox, including '/' in mailbox names as %2F. \
+             Use download_message_source when exact RFC822 bytes must be saved to disk without crossing model context; use download_thread for a caller-selected UID set plus a JSON integrity manifest. Both validate UIDVALIDITY, use BODY.PEEK[], refuse overwrite, return SHA-256 and local DKIM results, and confine writes to the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). \
+             For a self-contained thread record, call preview_thread_record on one live message, review the exact Message-ID/In-Reply-To/References graph and selectionDigest, then pass that digest and a purpose explanation to export_thread_record. Export re-discovers and refuses drift, writes private PDF/EML/manifest artifacts, and reports recorded/submittable only after reopening and integrity checks; those flags describe packet completeness, not legal admissibility. \
+             resources/list exposes one annotated email://{account} catalog root per account. Read an account root for annotated mailbox URIs, then read email://{account}/{mailbox}{?offset,limit} for paged message metadata and canonical message URIs. \
+             Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), plus /headers (exact headers), /source (bounded raw RFC822), /info (JSON metadata: subject, sender, date, flags, size, attachment inventory), and /attachments/{index} (one attachment as a blob with its own content type, 4 MiB limit). Resources carry audience and priority annotations; percent-encode account and mailbox, including '/' in mailbox names as %2F. \
              An attachment's canonical filename in /info is {uid}_{index}_{name} — the same name download_attachments writes to disk. \
              All reads use BODY.PEEK to avoid marking messages as read.",
         )
@@ -338,6 +380,16 @@ impl ServerHandler for AgentMailServer {
     ) -> Result<ListResourceTemplatesResult, McpError> {
         Ok(ListResourceTemplatesResult::with_all_items(
             resources::email_resource_templates(),
+        ))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(
+            resources::account_resources(self.agentmail.account_names()),
         ))
     }
 
@@ -532,7 +584,7 @@ where
         build = env!("AGENTMAIL_BUILD_SHA"),
         "agentmail MCP server starting"
     );
-    let server = AgentMailServer::new(mk);
+    let server = AgentMailServer::new_embedded(mk);
     let service = server.serve(transport).await.inspect_err(|e| {
         eprintln!("agentmail: server error: {}", e);
     })?;
@@ -734,7 +786,7 @@ mod tests {
         let tools = AgentMailServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            31,
+            37,
             "tool count drifted — update docs and tests"
         );
         for tool in &tools {
