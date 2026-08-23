@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_imap::Session;
 use async_imap::extensions::compress::DeflateStream;
 use futures::StreamExt;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
 use tracing::{debug, warn};
@@ -266,10 +266,9 @@ where
     match tokio::time::timeout(limit, future).await {
         Ok(Ok(val)) => Ok(val),
         Ok(Err(e)) => Err(e.into()),
-        Err(_elapsed) => Err(AgentmailError::Other(format!(
-            "IMAP operation timed out after {}s",
-            limit.as_secs()
-        ))),
+        Err(_elapsed) => Err(AgentmailError::ImapTimeout {
+            seconds: limit.as_secs(),
+        }),
     }
 }
 
@@ -1188,6 +1187,23 @@ pub async fn list_mailbox_names(session: &mut ImapSession) -> Result<Vec<String>
 /// Create a new mailbox on the server.
 pub async fn create_mailbox(session: &mut ImapSession, mailbox_name: &str) -> Result<()> {
     imap_timeout(session.create(mailbox_name)).await?;
+    Ok(())
+}
+
+/// Rename one mailbox. The caller owns preflight, mutation serialization, and
+/// post-error reconciliation because a lost tagged response is ambiguous.
+pub async fn rename_mailbox(
+    session: &mut ImapSession,
+    mailbox_name: &str,
+    new_mailbox_name: &str,
+) -> Result<()> {
+    imap_timeout(session.rename(mailbox_name, new_mailbox_name)).await?;
+    Ok(())
+}
+
+/// Delete one mailbox. The caller owns guarded confirmation and reconciliation.
+pub async fn delete_mailbox(session: &mut ImapSession, mailbox_name: &str) -> Result<()> {
+    imap_timeout(session.delete(mailbox_name)).await?;
     Ok(())
 }
 
@@ -3067,6 +3083,124 @@ pub async fn append_draft(
 ) -> Result<()> {
     imap_timeout(session.append(drafts_mailbox, Some(r"(\Draft)"), None, rfc822_message)).await?;
     Ok(())
+}
+
+fn append_uid_identity(
+    uid_validity: u32,
+    members: &[async_imap::imap_proto::UidSetMember],
+) -> Result<Option<(u32, u32)>> {
+    let uids = expand_uid_members(members)?;
+    match uids.as_slice() {
+        [uid] => Ok(Some((uid_validity, *uid))),
+        [] => Ok(None),
+        _ => Err(AgentmailError::Parse(
+            "server returned more than one UID for a single-message REPLACE".to_string(),
+        )),
+    }
+}
+
+fn quote_imap_string(value: &str) -> Result<String> {
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(AgentmailError::Other(
+            "mailbox name contains an invalid control character".to_string(),
+        ));
+    }
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+/// Atomically replace a draft using RFC 8508 UID REPLACE.
+///
+/// The caller must verify the `REPLACE` capability and the target's `\Draft`
+/// flag before invoking this function. No APPEND+DELETE fallback is provided:
+/// that sequence is observably non-atomic and can leave duplicate drafts.
+pub async fn replace_draft(
+    session: &mut ImapSession,
+    drafts_mailbox: &str,
+    uid: u32,
+    expected_uid_validity: u32,
+    rfc822_message: &[u8],
+) -> Result<Option<(u32, u32)>> {
+    use async_imap::imap_proto::{Response, ResponseCode, Status};
+
+    select_with_expected_uid_validity(session, drafts_mailbox, expected_uid_validity).await?;
+    let mailbox = quote_imap_string(drafts_mailbox)?;
+    let command = format!(
+        "UID REPLACE {uid} {mailbox} (\\Draft) {{{}}}",
+        rfc822_message.len()
+    );
+    let tag = imap_timeout(session.run_command(command)).await?;
+
+    loop {
+        let response = imap_timeout(session.read_response())
+            .await?
+            .ok_or(AgentmailError::NotConnected)?;
+        match response.parsed() {
+            Response::Continue { .. } => break,
+            Response::Done {
+                tag: done,
+                status,
+                information,
+                ..
+            } if done == &tag => {
+                return Err(match status {
+                    Status::No => AgentmailError::Imap(async_imap::error::Error::No(format!(
+                        "REPLACE rejected before literal: {information:?}"
+                    ))),
+                    Status::Bad => AgentmailError::Imap(async_imap::error::Error::Bad(format!(
+                        "REPLACE rejected before literal: {information:?}"
+                    ))),
+                    other => AgentmailError::Other(format!(
+                        "REPLACE ended before literal with {other:?}: {information:?}"
+                    )),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    imap_timeout(session.get_mut().write_all(rfc822_message)).await?;
+    imap_timeout(session.get_mut().write_all(b"\r\n")).await?;
+    imap_timeout(session.get_mut().flush()).await?;
+
+    let mut identity = None;
+    loop {
+        let response = imap_timeout(session.read_response())
+            .await?
+            .ok_or(AgentmailError::NotConnected)?;
+        match response.parsed() {
+            Response::Data {
+                status: Status::Ok,
+                code: Some(ResponseCode::AppendUid(uid_validity, members)),
+                ..
+            } => identity = append_uid_identity(*uid_validity, members)?,
+            Response::Done {
+                tag: done,
+                status,
+                code,
+                information,
+            } if done == &tag => {
+                if let Some(ResponseCode::AppendUid(uid_validity, members)) = code {
+                    identity = append_uid_identity(*uid_validity, members)?;
+                }
+                return match status {
+                    Status::Ok => Ok(identity),
+                    Status::No => Err(AgentmailError::Imap(async_imap::error::Error::No(format!(
+                        "REPLACE rejected: code={code:?}, info={information:?}"
+                    )))),
+                    Status::Bad => Err(AgentmailError::Imap(async_imap::error::Error::Bad(
+                        format!("REPLACE rejected: code={code:?}, info={information:?}"),
+                    ))),
+                    other => Err(AgentmailError::Other(format!(
+                        "REPLACE completed with unexpected status {other:?}: code={code:?}, info={information:?}"
+                    ))),
+                };
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Locate a just-APPENDed message by Message-ID, returning the mailbox

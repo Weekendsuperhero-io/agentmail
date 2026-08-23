@@ -819,6 +819,42 @@ pub struct CreateMailboxResponse {
     pub already_exists: bool,
 }
 
+/// Live mailbox facts returned before a rename or delete.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct MailboxMutationPreflight {
+    pub message_count: u32,
+    pub roles: Vec<String>,
+    pub descendants: Vec<String>,
+    pub confirmations_required: Vec<String>,
+}
+
+/// Response for guarded mailbox rename.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameMailboxResponse {
+    pub account: String,
+    pub mailbox: String,
+    pub new_mailbox: String,
+    pub preview: bool,
+    pub renamed: bool,
+    pub preflight: MailboxMutationPreflight,
+}
+
+/// Response for guarded mailbox deletion.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteMailboxResponse {
+    pub account: String,
+    pub mailbox: String,
+    pub preview: bool,
+    pub deleted: bool,
+    pub already_missing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<MailboxMutationPreflight>,
+}
+
 /// Recipients for a draft email.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -827,6 +863,7 @@ pub struct DraftRecipients {
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
+    pub reply_to: Vec<String>,
 }
 
 /// Attachment data for creating drafts (internal; bytes already loaded).
@@ -846,6 +883,13 @@ pub struct CreateDraftResponse {
     pub drafts_mailbox: String,
     pub subject: String,
     pub recipients: DraftRecipients,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+    pub threading_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     #[serde(default)]
     pub attachments: Vec<String>,
     /// UIDVALIDITY of the drafts mailbox when the new draft's identity could
@@ -853,6 +897,28 @@ pub struct CreateDraftResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid_validity: Option<u32>,
     /// UID of the created draft, when recoverable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+}
+
+/// Which recipients a reply draft should include.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyMode {
+    Reply,
+    ReplyAll,
+}
+
+/// Response for an atomic RFC 8508 draft replacement.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDraftResponse {
+    pub updated: bool,
+    pub account: String,
+    pub drafts_mailbox: String,
+    pub previous_uid_validity: u32,
+    pub previous_uid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid_validity: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
 }
@@ -920,6 +986,85 @@ pub struct DownloadedMessageSource {
     pub subject: Option<String>,
     pub downloaded_at: DateTime<Utc>,
     pub dkim: DkimVerification,
+}
+
+/// One exact storage identity selected for a thread record.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct ThreadRecordMessage {
+    pub identity: MailboxMessageIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<DateTime<Utc>>,
+    pub from: String,
+    pub subject: String,
+    /// Exact RFC header relationships that caused this identity to be selected.
+    pub selection_basis: Vec<String>,
+}
+
+/// Preview of the exact Message-ID graph that an evidence-record export will use.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRecordPreviewResponse {
+    pub account: String,
+    pub seed: MailboxMessageIdentity,
+    pub strategy: String,
+    pub rationale: String,
+    pub messages: Vec<ThreadRecordMessage>,
+    pub selection_digest: String,
+    pub confirmation_required: bool,
+    pub truncated: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// One immutable RFC822 source entry in a completed thread-record bundle.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct ThreadRecordFile {
+    pub identity: MailboxMessageIdentity,
+    pub filename: String,
+    pub bytes: usize,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<DateTime<Utc>>,
+    #[serde(rename = "from", skip_serializing_if = "Option::is_none")]
+    pub from_header: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub dkim: DkimVerification,
+}
+
+/// Completed, structurally verified evidence-record bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRecordExportResponse {
+    /// True only after all EML files, the PDF, and the manifest were reopened,
+    /// parsed where applicable, and hash-checked.
+    pub recorded: bool,
+    /// Means the packet is organized as a submission record, not that a court
+    /// or other recipient has accepted it or that it is legally admissible.
+    pub submittable: bool,
+    pub submission_explanation: String,
+    pub account: String,
+    pub purpose: String,
+    pub selection_digest: String,
+    pub message_count: usize,
+    pub bundle_path: String,
+    pub pdf_path: String,
+    pub manifest_path: String,
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub limitations: Vec<String>,
 }
 
 /// Response for get_message_source.

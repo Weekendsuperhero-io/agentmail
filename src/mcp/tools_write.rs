@@ -4,15 +4,16 @@ use super::AgentMailServer;
 use super::args::*;
 use super::wire::{
     AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteByDomainOutput,
-    DeleteBySenderOutput, DeleteListIdOutput, DeleteMessagesOutput, DownloadAttachmentsOutput,
-    DownloadMessageSourceOutput, DownloadThreadOutput, MoveByDomainOutput, MoveBySenderOutput,
-    MoveListIdOutput, MoveMessageOutput, MoveSubscriptionOutput, ReconcileMovesOutput,
-    RemoveFlagsOutput, UnsubscribeMessageOutput, compact_result, tool_error_result,
+    DeleteBySenderOutput, DeleteListIdOutput, DeleteMailboxOutput, DeleteMessagesOutput,
+    DownloadAttachmentsOutput, DownloadMessageSourceOutput, DownloadThreadOutput,
+    MoveByDomainOutput, MoveBySenderOutput, MoveListIdOutput, MoveMessageOutput,
+    MoveSubscriptionOutput, ReconcileMovesOutput, RemoveFlagsOutput, RenameMailboxOutput,
+    UnsubscribeMessageOutput, UpdateDraftOutput, compact_result, tool_error_result,
 };
 use super::{make_cancel_fn, make_progress_fn};
 use crate::{
     CleanupDeletion, CleanupIdentityMode, CleanupPolicy, CleanupWhen, DeleteMode, DraftAttachment,
-    UnsubscribeOptions,
+    ReplyMode, UnsubscribeOptions,
 };
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
@@ -27,6 +28,345 @@ const MAX_DRAFT_ATTACHMENTS: usize = 20;
 const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_DRAFT_ATTACHMENT_TOTAL_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_THREAD_MESSAGES: usize = 100;
+const MAX_RECORD_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RECORD_PDF_BODY_CHARS: usize = 500_000;
+
+async fn create_private_dir(path: &std::path::Path) -> crate::Result<()> {
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = tokio::fs::DirBuilder::new();
+    builder.create(path).await.map_err(|error| {
+        crate::AgentmailError::Other(format!(
+            "failed to create thread-record directory '{}': {error}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn checked_record_bytes(total: u64, next: usize) -> crate::Result<u64> {
+    let total = total.checked_add(next as u64).ok_or_else(|| {
+        crate::AgentmailError::Other("thread-record bundle size overflow".to_string())
+    })?;
+    if total > MAX_RECORD_BUNDLE_BYTES {
+        return Err(crate::AgentmailError::Other(format!(
+            "thread-record bundle exceeds the {MAX_RECORD_BUNDLE_BYTES}-byte limit"
+        )));
+    }
+    Ok(total)
+}
+
+async fn export_thread_record(
+    server: &AgentMailServer,
+    args: &ExportThreadRecordArgs,
+    output_dir: &std::path::Path,
+    on_progress: Option<&crate::ProgressFn>,
+    cancel: Option<&crate::CancelFn>,
+) -> crate::Result<crate::ThreadRecordExportResponse> {
+    crate::imap_client::check_cancel(cancel)?;
+    let preview = server
+        .agentmail
+        .preview_thread_record(
+            args.mailbox.trim(),
+            &args.account,
+            args.uid,
+            args.expected_uid_validity,
+            None,
+            cancel,
+        )
+        .await?;
+    if preview.truncated {
+        return Err(crate::AgentmailError::Other(
+            "thread preview is truncated; refusing to label an incomplete selection as recorded"
+                .to_string(),
+        ));
+    }
+    if preview.selection_digest != args.selection_digest {
+        return Err(crate::AgentmailError::Other(format!(
+            "thread selection changed after preview (expected {}, now {}); review a fresh preview before exporting",
+            args.selection_digest, preview.selection_digest
+        )));
+    }
+
+    let purpose = args.purpose.trim();
+    if purpose.is_empty() || purpose.chars().count() > 4_000 {
+        return Err(crate::AgentmailError::Other(
+            "purpose must contain 1..=4000 characters".to_string(),
+        ));
+    }
+    let bundle_name = args.bundle_name.clone().unwrap_or_else(|| {
+        format!(
+            "agentmail-thread-record-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        )
+    });
+    crate::validate_plain_filename(&bundle_name)?;
+    let final_path = output_dir.join(&bundle_name);
+    if tokio::fs::try_exists(&final_path).await.map_err(|error| {
+        crate::AgentmailError::Other(format!(
+            "failed to inspect thread-record destination '{}': {error}",
+            final_path.display()
+        ))
+    })? {
+        return Err(crate::AgentmailError::Other(format!(
+            "refusing to overwrite existing thread-record destination '{}'",
+            final_path.display()
+        )));
+    }
+    let temporary_path =
+        output_dir.join(format!(".{bundle_name}.partial-{}", uuid::Uuid::new_v4()));
+    create_private_dir(&temporary_path).await?;
+
+    let result = async {
+        let sources_path = temporary_path.join("sources");
+        create_private_dir(&sources_path).await?;
+        let mut files = Vec::with_capacity(preview.messages.len());
+        let mut presentations = Vec::with_capacity(preview.messages.len());
+        let mut total_bytes = 0_u64;
+        let presentation_char_limit =
+            MAX_RECORD_PDF_BODY_CHARS / preview.messages.len().max(1);
+
+        for (index, selected) in preview.messages.iter().enumerate() {
+            crate::imap_client::check_cancel(cancel)?;
+            let filename = format!(
+                "message-{:03}-{}-{}.eml",
+                index + 1,
+                selected.identity.uid_validity,
+                selected.identity.uid
+            );
+            let downloaded = server
+                .agentmail
+                .download_message_source(
+                    &selected.identity.mailbox,
+                    &args.account,
+                    selected.identity.uid,
+                    selected.identity.uid_validity,
+                    &sources_path,
+                    &filename,
+                    cancel,
+                )
+                .await?;
+            total_bytes = checked_record_bytes(total_bytes, downloaded.bytes)?;
+            let raw = tokio::fs::read(&downloaded.path).await.map_err(|error| {
+                crate::AgentmailError::Other(format!(
+                    "saved RFC822 source could not be reopened '{}': {error}",
+                    downloaded.path
+                ))
+            })?;
+            let reopened_hash = crate::record::sha256_bytes(&raw);
+            if raw.len() != downloaded.bytes || reopened_hash != downloaded.sha256 {
+                return Err(crate::AgentmailError::Other(format!(
+                    "saved RFC822 source failed its reopen/hash check: {filename}"
+                )));
+            }
+            let uid = selected.identity.uid;
+            let presentation = tokio::task::spawn_blocking(move || {
+                crate::record::analyze_message(&raw, uid, presentation_char_limit)
+            })
+            .await
+            .map_err(|error| {
+                crate::AgentmailError::Other(format!(
+                    "RFC822 presentation analysis task failed: {error}"
+                ))
+            })??;
+            presentations.push(presentation);
+            files.push(crate::ThreadRecordFile {
+                identity: selected.identity.clone(),
+                filename: format!("sources/{filename}"),
+                bytes: downloaded.bytes,
+                sha256: downloaded.sha256,
+                message_id: downloaded.message_id,
+                date: downloaded.date,
+                from_header: downloaded.from_header,
+                subject: downloaded.subject,
+                dkim: downloaded.dkim,
+            });
+            if let Some(progress) = on_progress {
+                progress((index + 1) as u64, preview.messages.len() as u64);
+            }
+        }
+
+        let mut limitations = vec![
+            "Thread membership uses exact RFC Message-ID, In-Reply-To, and References values; it does not infer relationships from similar subjects."
+                .to_string(),
+            "The PDF is a readable presentation. The complete, integrity-bearing content is preserved in the hashed RFC822 (.eml) sources."
+                .to_string(),
+            "DKIM was checked against DNS at export time. SPF cannot be independently recomputed from archived message bytes because the SMTP connection and envelope inputs are absent."
+                .to_string(),
+            "Recorded and submittable describe this bundle's structure and verification, not legal admissibility, authenticity findings, or acceptance by any recipient."
+                .to_string(),
+        ];
+        for warning in &preview.warnings {
+            limitations.push(format!("Discovery warning: {warning}"));
+        }
+        if presentations.iter().any(|message| message.body_truncated) {
+            limitations.push(
+                "At least one body was shortened in the PDF presentation; its complete bytes remain in the corresponding hashed .eml source."
+                    .to_string(),
+            );
+        }
+        let generated_at = chrono::Utc::now().to_rfc3339();
+        let pdf_preview = preview.clone();
+        let pdf_files = files.clone();
+        let pdf_presentations = presentations.clone();
+        let pdf_limitations = limitations.clone();
+        let pdf_purpose = purpose.to_string();
+        let pdf_generated_at = generated_at.clone();
+        let pdf = tokio::task::spawn_blocking(move || {
+            crate::record::render_thread_record_pdf(
+                &pdf_purpose,
+                &pdf_generated_at,
+                &pdf_preview,
+                &pdf_files,
+                &pdf_presentations,
+                &pdf_limitations,
+            )
+        })
+        .await
+        .map_err(|error| {
+            crate::AgentmailError::Other(format!("PDF render task failed: {error}"))
+        })??;
+        total_bytes = checked_record_bytes(total_bytes, pdf.len())?;
+        let pdf_filename = "thread-record.pdf";
+        let pdf_temporary_path = temporary_path.join(pdf_filename);
+        crate::write_new_private_file(&pdf_temporary_path, &pdf).await?;
+        let reopened_pdf = tokio::fs::read(&pdf_temporary_path).await.map_err(|error| {
+            crate::AgentmailError::Other(format!(
+                "generated PDF could not be reopened '{}': {error}",
+                pdf_temporary_path.display()
+            ))
+        })?;
+        let pdf_sha256 = crate::record::sha256_bytes(&reopened_pdf);
+        let expected_pdf_sha256 = crate::record::sha256_bytes(&pdf);
+        if reopened_pdf.len() != pdf.len() || pdf_sha256 != expected_pdf_sha256 {
+            return Err(crate::AgentmailError::Other(
+                "generated PDF failed its reopen/hash check".to_string(),
+            ));
+        }
+        let pdf_pages = tokio::task::spawn_blocking(move || {
+            crate::record::verify_pdf(&reopened_pdf)
+        })
+        .await
+        .map_err(|error| {
+            crate::AgentmailError::Other(format!("PDF verification task failed: {error}"))
+        })??;
+
+        let submission_explanation = "Structurally ready to submit as a record because it contains a purpose statement, deterministic selection rationale, exact RFC822 sources, live storage identities, SHA-256 hashes, DKIM results, a readable chronology, an attachment inventory, and explicit limitations. The receiving authority still determines acceptance and legal admissibility.".to_string();
+        let manifest = serde_json::json!({
+            "schemaVersion": "agentmail.thread-record.v1",
+            "recorded": true,
+            "submittable": true,
+            "submissionExplanation": &submission_explanation,
+            "generatedAt": &generated_at,
+            "purpose": purpose,
+            "account": args.account,
+            "selection": &preview,
+            "artifacts": {
+                "presentationPdf": {
+                    "filename": pdf_filename,
+                    "bytes": pdf.len(),
+                    "sha256": pdf_sha256,
+                    "pages": pdf_pages,
+                },
+                "sources": &files,
+            },
+            "limitations": &limitations,
+        });
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+            crate::AgentmailError::Other(format!(
+                "failed to serialize thread-record manifest: {error}"
+            ))
+        })?;
+        manifest_bytes.push(b'\n');
+        total_bytes = checked_record_bytes(total_bytes, manifest_bytes.len())?;
+        let manifest_filename = "manifest.json";
+        let manifest_temporary_path = temporary_path.join(manifest_filename);
+        crate::write_new_private_file(&manifest_temporary_path, &manifest_bytes).await?;
+        let reopened_manifest = tokio::fs::read(&manifest_temporary_path)
+            .await
+            .map_err(|error| {
+                crate::AgentmailError::Other(format!(
+                    "thread-record manifest could not be reopened: {error}"
+                ))
+            })?;
+        if crate::record::sha256_bytes(&reopened_manifest)
+            != crate::record::sha256_bytes(&manifest_bytes)
+        {
+            return Err(crate::AgentmailError::Other(
+                "thread-record manifest failed its reopen/hash check".to_string(),
+            ));
+        }
+        let parsed_manifest: serde_json::Value = serde_json::from_slice(&reopened_manifest)
+            .map_err(|error| {
+                crate::AgentmailError::Other(format!(
+                    "thread-record manifest failed to parse after writing: {error}"
+                ))
+            })?;
+        let manifest_sources = parsed_manifest["artifacts"]["sources"]
+            .as_array()
+            .map_or(0, Vec::len);
+        if parsed_manifest["recorded"] != serde_json::Value::Bool(true)
+            || parsed_manifest["submittable"] != serde_json::Value::Bool(true)
+            || parsed_manifest["selection"]["selectionDigest"]
+                != serde_json::Value::String(args.selection_digest.clone())
+            || manifest_sources != preview.messages.len()
+        {
+            return Err(crate::AgentmailError::Other(
+                "thread-record manifest failed its structural verification".to_string(),
+            ));
+        }
+
+        if tokio::fs::try_exists(&final_path).await.map_err(|error| {
+            crate::AgentmailError::Other(format!(
+                "failed to recheck thread-record destination '{}': {error}",
+                final_path.display()
+            ))
+        })? {
+            return Err(crate::AgentmailError::Other(format!(
+                "thread-record destination appeared during export; refusing to overwrite '{}'",
+                final_path.display()
+            )));
+        }
+        tokio::fs::rename(&temporary_path, &final_path)
+            .await
+            .map_err(|error| {
+                crate::AgentmailError::Other(format!(
+                    "failed to publish verified thread-record bundle '{}': {error}",
+                    final_path.display()
+                ))
+            })?;
+        let final_path = tokio::fs::canonicalize(&final_path).await.map_err(|error| {
+            crate::AgentmailError::Other(format!(
+                "published thread-record bundle could not be resolved: {error}"
+            ))
+        })?;
+        Ok(crate::ThreadRecordExportResponse {
+            recorded: true,
+            submittable: true,
+            submission_explanation,
+            account: args.account.clone(),
+            purpose: purpose.to_string(),
+            selection_digest: args.selection_digest.clone(),
+            message_count: preview.messages.len(),
+            bundle_path: final_path.display().to_string(),
+            pdf_path: final_path.join(pdf_filename).display().to_string(),
+            manifest_path: final_path.join(manifest_filename).display().to_string(),
+            total_bytes,
+            limitations,
+        })
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_dir_all(&temporary_path).await;
+    }
+    result
+}
 
 /// Map the flat `permanent` tool argument to a `DeleteMode`.
 fn delete_mode(permanent: bool) -> DeleteMode {
@@ -34,6 +374,13 @@ fn delete_mode(permanent: bool) -> DeleteMode {
         DeleteMode::Permanent
     } else {
         DeleteMode::TrashFirst
+    }
+}
+
+fn reply_mode(mode: ReplyModeArg) -> ReplyMode {
+    match mode {
+        ReplyModeArg::Reply => ReplyMode::Reply,
+        ReplyModeArg::ReplyAll => ReplyMode::ReplyAll,
     }
 }
 
@@ -84,6 +431,137 @@ async fn archive_target_exists(
     Ok(None)
 }
 
+async fn load_draft_attachments(
+    file_access: &super::file_access::FileAccessPolicy,
+    attachments: &[DraftAttachmentArg],
+) -> Result<Vec<DraftAttachment>, McpError> {
+    if attachments.len() > MAX_DRAFT_ATTACHMENTS {
+        return Err(McpError::invalid_params(
+            format!("attachments supports at most {MAX_DRAFT_ATTACHMENTS} files"),
+            None,
+        ));
+    }
+
+    let mut preflight = Vec::with_capacity(attachments.len());
+    let mut preflight_total = 0_u64;
+    for (index, attachment) in attachments.iter().enumerate() {
+        let safe_path = file_access
+            .confine_read(&attachment.path)
+            .map_err(|reason| {
+                McpError::invalid_params(format!("attachment #{}: {reason}", index + 1), None)
+            })?;
+        let file = tokio::fs::File::open(&safe_path).await.map_err(|error| {
+            McpError::invalid_params(
+                format!(
+                    "Failed to open attachment #{} at '{}': {error}",
+                    index + 1,
+                    attachment.path
+                ),
+                None,
+            )
+        })?;
+        let metadata = file.metadata().await.map_err(|error| {
+            McpError::invalid_params(
+                format!(
+                    "Failed to inspect attachment #{} at '{}': {error}",
+                    index + 1,
+                    attachment.path
+                ),
+                None,
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(McpError::invalid_params(
+                format!("attachment #{} is not a regular file", index + 1),
+                None,
+            ));
+        }
+        let size = metadata.len();
+        if size > MAX_DRAFT_ATTACHMENT_BYTES {
+            return Err(McpError::invalid_params(
+                format!(
+                    "attachment #{} is {size} bytes; maximum per file is {MAX_DRAFT_ATTACHMENT_BYTES} bytes",
+                    index + 1
+                ),
+                None,
+            ));
+        }
+        preflight_total = preflight_total
+            .checked_add(size)
+            .ok_or_else(|| McpError::invalid_params("attachment aggregate size overflow", None))?;
+        if preflight_total > MAX_DRAFT_ATTACHMENT_TOTAL_BYTES {
+            return Err(McpError::invalid_params(
+                format!(
+                    "attachments total {preflight_total} bytes; aggregate maximum is {MAX_DRAFT_ATTACHMENT_TOTAL_BYTES} bytes"
+                ),
+                None,
+            ));
+        }
+        preflight.push((size, file));
+    }
+
+    let mut loaded = Vec::with_capacity(attachments.len());
+    let mut loaded_total = 0_u64;
+    for (index, (attachment, (preflight_size, file))) in
+        attachments.iter().zip(preflight).enumerate()
+    {
+        let mut data = Vec::with_capacity(preflight_size as usize);
+        file.take(MAX_DRAFT_ATTACHMENT_BYTES + 1)
+            .read_to_end(&mut data)
+            .await
+            .map_err(|error| {
+                McpError::invalid_params(
+                    format!(
+                        "Failed to read attachment #{} at '{}': {error}",
+                        index + 1,
+                        attachment.path
+                    ),
+                    None,
+                )
+            })?;
+        if data.len() as u64 > MAX_DRAFT_ATTACHMENT_BYTES {
+            return Err(McpError::invalid_params(
+                format!(
+                    "attachment #{} grew beyond the {MAX_DRAFT_ATTACHMENT_BYTES}-byte limit while being read",
+                    index + 1
+                ),
+                None,
+            ));
+        }
+        loaded_total = loaded_total
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| McpError::invalid_params("attachment aggregate size overflow", None))?;
+        if loaded_total > MAX_DRAFT_ATTACHMENT_TOTAL_BYTES {
+            return Err(McpError::invalid_params(
+                format!(
+                    "attachments grew beyond the {MAX_DRAFT_ATTACHMENT_TOTAL_BYTES}-byte aggregate limit while being read"
+                ),
+                None,
+            ));
+        }
+        let filename = attachment
+            .filename
+            .clone()
+            .or_else(|| {
+                std::path::Path::new(&attachment.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("attachment-{}", index + 1));
+        let content_type = attachment
+            .content_type
+            .clone()
+            .unwrap_or_else(|| guess_content_type(&filename));
+        loaded.push(DraftAttachment {
+            filename,
+            content_type,
+            data,
+        });
+    }
+    Ok(loaded)
+}
+
 #[tool_router(router = write_tools_router, vis = "pub(super)")]
 impl AgentMailServer {
     #[tool(
@@ -111,6 +589,81 @@ impl AgentMailServer {
         {
             Ok(data) => compact_result(CreateMailboxOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "rename_mailbox",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<RenameMailboxOutput>().expect("valid rename_mailbox output schema"),
+        description = "Preview or confirm a guarded mailbox rename. The first call returns live message count, special-use roles, descendants, and exact confirmations. The confirmed call requires expectedMessageCount from that preview, refuses INBOX and pending MOVE journals, and re-lists after an ambiguous transport outcome.",
+        annotations(
+            title = "Rename Mailbox",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn rename_mailbox_tool(
+        &self,
+        Parameters(args): Parameters<RenameMailboxArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() || args.new_mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "mailbox and newMailbox are required",
+                None,
+            ));
+        }
+        match self
+            .agentmail
+            .rename_mailbox(
+                &args.account,
+                args.mailbox.trim(),
+                args.new_mailbox.trim(),
+                args.confirm_rename,
+                args.expected_message_count,
+                args.confirm_special_use,
+                args.confirm_descendants,
+            )
+            .await
+        {
+            Ok(data) => compact_result(RenameMailboxOutput::from(data)),
+            Err(error) => Ok(tool_error_result(&error)),
+        }
+    }
+
+    #[tool(
+        name = "delete_mailbox",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteMailboxOutput>().expect("valid delete_mailbox output schema"),
+        description = "Preview or confirm guarded mailbox deletion. The first call returns live message count, special-use roles, descendants, and required confirmations. A confirmed delete requires the exact preview count plus separate acknowledgements for non-empty, special-use, or descendant-bearing mailboxes. INBOX and mailboxes referenced by pending MOVE journals are always blocked; an already-missing mailbox is an idempotent success.",
+        annotations(
+            title = "Delete Mailbox",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    async fn delete_mailbox_tool(
+        &self,
+        Parameters(args): Parameters<DeleteMailboxArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        match self
+            .agentmail
+            .delete_mailbox(
+                &args.account,
+                args.mailbox.trim(),
+                args.confirm_delete,
+                args.expected_message_count,
+                args.confirm_non_empty,
+                args.confirm_special_use,
+                args.confirm_descendants,
+            )
+            .await
+        {
+            Ok(data) => compact_result(DeleteMailboxOutput::from(data)),
+            Err(error) => Ok(tool_error_result(&error)),
         }
     }
 
@@ -264,6 +817,7 @@ impl AgentMailServer {
     )]
     async fn download_attachments_tool(
         &self,
+        meta: Meta,
         Parameters(args): Parameters<DownloadAttachmentsArgs>,
     ) -> Result<CallToolResult, McpError> {
         if args.mailbox.trim().is_empty() {
@@ -273,7 +827,8 @@ impl AgentMailServer {
         // prompt-injection payload must not be able to write attacker bytes
         // into a sensitive directory (e.g. ~/.ssh). Absolute/`..` escapes are
         // rejected; the default lands in the sandbox root.
-        let output_dir = match self.file_access.confine_dir(args.output_dir.as_deref()) {
+        let file_access = self.file_access_for_request(&meta)?;
+        let output_dir = match file_access.confine_dir(args.output_dir.as_deref()) {
             Ok(dir) => dir,
             Err(reason) => return Err(McpError::invalid_params(reason, None)),
         };
@@ -300,7 +855,7 @@ impl AgentMailServer {
     #[tool(
         name = "download_message_source",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadMessageSourceOutput>().expect("valid download_message_source output schema"),
-        description = "Save one exact RFC822 message source directly from IMAP to disk without passing the bytes through model context. Requires mailbox, uid, and expectedUidValidity from one discovery result. Uses BODY.PEEK[] so the message is not marked read, refuses files above 64 MiB, confines outputDir to AGENTMAIL_FILE_ROOT, and never overwrites. Returns the absolute path, byte count, SHA-256, Message-ID/date/from/subject metadata, and a contemporaneous local DKIM verification against DNS. SPF is omitted because it cannot be independently recomputed from an archived RFC822 message without SMTP connection and envelope data.",
+        description = "Save one exact RFC822 message source directly from IMAP to disk without passing the bytes through model context. Requires mailbox, uid, and expectedUidValidity from one discovery result. Uses BODY.PEEK[] so the message is not marked read, refuses files above 64 MiB, confines outputDir to the active session workspace (standalone server: AGENTMAIL_FILE_ROOT), and never overwrites. Returns the absolute path, byte count, SHA-256, Message-ID/date/from/subject metadata, and a contemporaneous local DKIM verification against DNS. SPF is omitted because it cannot be independently recomputed from an archived RFC822 message without SMTP connection and envelope data.",
         annotations(
             title = "Download Message Source",
             read_only_hint = false,
@@ -311,6 +866,7 @@ impl AgentMailServer {
     )]
     async fn download_message_source_tool(
         &self,
+        meta: Meta,
         ct: CancellationToken,
         Parameters(args): Parameters<DownloadMessageSourceArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -319,7 +875,7 @@ impl AgentMailServer {
         }
         let filename = archive_filename(args.uid, args.filename.as_deref())?;
         let output_dir = self
-            .file_access
+            .file_access_for_request(&meta)?
             .confine_dir(args.output_dir.as_deref())
             .map_err(|reason| McpError::invalid_params(reason, None))?;
         let cancel = make_cancel_fn(ct);
@@ -345,7 +901,7 @@ impl AgentMailServer {
     #[tool(
         name = "download_thread",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadThreadOutput>().expect("valid download_thread output schema"),
-        description = "Save a caller-supplied set of one to 100 exact RFC822 sources from the same mailbox UIDVALIDITY epoch directly to disk as {uid}.eml, then write a JSON evidence manifest. This tool does not discover thread membership; pass the UIDs selected by prior discovery. Bytes never pass through model context. Every source uses BODY.PEEK[], is capped at 64 MiB, receives SHA-256 plus parsed envelope metadata and local DNS-backed DKIM verification, and is created without overwrite inside AGENTMAIL_FILE_ROOT. SPF is omitted because an archived message lacks the SMTP inputs required for independent verification. Returns the manifest path and its complete message entries.",
+        description = "Save a caller-supplied set of one to 100 exact RFC822 sources from the same mailbox UIDVALIDITY epoch directly to disk as {uid}.eml, then write a JSON evidence manifest. This tool does not discover thread membership; pass the UIDs selected by prior discovery. Bytes never pass through model context. Every source uses BODY.PEEK[], is capped at 64 MiB, receives SHA-256 plus parsed envelope metadata and local DNS-backed DKIM verification, and is created without overwrite inside the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). SPF is omitted because an archived message lacks the SMTP inputs required for independent verification. Returns the manifest path and its complete message entries.",
         annotations(
             title = "Download Message Thread",
             read_only_hint = false,
@@ -385,7 +941,7 @@ impl AgentMailServer {
             Some(args.manifest_filename.as_deref().unwrap_or("manifest.json")),
         )?;
         let output_dir = self
-            .file_access
+            .file_access_for_request(&meta)?
             .confine_dir(args.output_dir.as_deref())
             .map_err(|reason| McpError::invalid_params(reason, None))?;
         let source_filenames = args
@@ -465,6 +1021,56 @@ impl AgentMailServer {
     }
 
     #[tool(
+        name = "export_thread_record",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::ThreadRecordExportResponse>().expect("valid export_thread_record output schema"),
+        description = "After preview_thread_record, export that exact confirmed selection into the active session workspace as a private bundle containing a styled, page-numbered PDF; one immutable RFC822 .eml source per selected storage identity; and a JSON integrity manifest. Re-discovers the graph and refuses selectionDigest drift, never overwrites, caps each source at 64 MiB and the bundle at 512 MiB, verifies DKIM against DNS, then reopens/parses/hash-checks every artifact before returning recorded=true and submittable=true. Those flags describe packet completeness, not legal admissibility. This tool never sends or mutates mail.",
+        annotations(
+            title = "Export Verified Thread Record",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn export_thread_record_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<ExportThreadRecordArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        if args.selection_digest.len() != 64
+            || !args
+                .selection_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(McpError::invalid_params(
+                "selectionDigest must be a 64-character lowercase SHA-256 value from preview_thread_record",
+                None,
+            ));
+        }
+        let output_dir = self
+            .file_access_for_request(&meta)?
+            .confine_dir(args.output_dir.as_deref())
+            .map_err(|reason| McpError::invalid_params(reason, None))?;
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        let result =
+            export_thread_record(self, &args, &output_dir, progress.callback(), Some(&cancel))
+                .await;
+        progress.finish().await;
+        match result {
+            Ok(data) => compact_result(data),
+            Err(error) => Ok(tool_error_result(&error)),
+        }
+    }
+
+    #[tool(
         name = "create_draft",
         output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>().expect("valid create_draft output schema"),
         description = "Create and save a complete RFC822 draft. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Requires at least one to, cc, or bcc recipient. Subject and body are optional; attachments may reference local file paths. Returns the new draft's uid, uidValidity, and resourceUri when the server allows recovering them.",
@@ -476,6 +1082,7 @@ impl AgentMailServer {
     )]
     async fn create_draft_tool(
         &self,
+        meta: Meta,
         Parameters(args): Parameters<CreateDraftArgs>,
     ) -> Result<CallToolResult, McpError> {
         if args.to.is_empty() && args.cc.is_empty() && args.bcc.is_empty() {
@@ -484,147 +1091,120 @@ impl AgentMailServer {
                 None,
             ));
         }
-        if args.attachments.len() > MAX_DRAFT_ATTACHMENTS {
-            return Err(McpError::invalid_params(
-                format!("attachments supports at most {MAX_DRAFT_ATTACHMENTS} files"),
-                None,
-            ));
-        }
-
-        // Resolve and stat every attachment before reading the first byte, so
-        // an oversized aggregate cannot leave a large partially loaded draft.
-        let mut preflight = Vec::with_capacity(args.attachments.len());
-        let mut preflight_total = 0_u64;
-        for (index, attachment) in args.attachments.iter().enumerate() {
-            let safe_path = self
-                .file_access
-                .confine_read(&attachment.path)
-                .map_err(|reason| {
-                    McpError::invalid_params(format!("attachment #{}: {reason}", index + 1), None)
-                })?;
-            let file = tokio::fs::File::open(&safe_path).await.map_err(|error| {
-                McpError::invalid_params(
-                    format!(
-                        "Failed to open attachment #{} at '{}': {error}",
-                        index + 1,
-                        attachment.path
-                    ),
-                    None,
-                )
-            })?;
-            let metadata = file.metadata().await.map_err(|error| {
-                McpError::invalid_params(
-                    format!(
-                        "Failed to inspect attachment #{} at '{}': {error}",
-                        index + 1,
-                        attachment.path
-                    ),
-                    None,
-                )
-            })?;
-            if !metadata.is_file() {
-                return Err(McpError::invalid_params(
-                    format!("attachment #{} is not a regular file", index + 1),
-                    None,
-                ));
-            }
-            let size = metadata.len();
-            if size > MAX_DRAFT_ATTACHMENT_BYTES {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "attachment #{} is {size} bytes; maximum per file is {MAX_DRAFT_ATTACHMENT_BYTES} bytes",
-                        index + 1
-                    ),
-                    None,
-                ));
-            }
-            preflight_total = preflight_total.checked_add(size).ok_or_else(|| {
-                McpError::invalid_params("attachment aggregate size overflow", None)
-            })?;
-            if preflight_total > MAX_DRAFT_ATTACHMENT_TOTAL_BYTES {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "attachments total {preflight_total} bytes; aggregate maximum is {MAX_DRAFT_ATTACHMENT_TOTAL_BYTES} bytes"
-                    ),
-                    None,
-                ));
-            }
-            preflight.push((size, file));
-        }
-
-        let mut loaded: Vec<DraftAttachment> = Vec::with_capacity(args.attachments.len());
-        let mut loaded_total = 0_u64;
-        for (i, (a, (preflight_size, file))) in args.attachments.iter().zip(preflight).enumerate() {
-            let mut data = Vec::with_capacity(preflight_size as usize);
-            file.take(MAX_DRAFT_ATTACHMENT_BYTES + 1)
-                .read_to_end(&mut data)
-                .await
-                .map_err(|error| {
-                    McpError::invalid_params(
-                        format!(
-                            "Failed to read attachment #{} at '{}': {error}",
-                            i + 1,
-                            a.path
-                        ),
-                        None,
-                    )
-                })?;
-            if data.len() as u64 > MAX_DRAFT_ATTACHMENT_BYTES {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "attachment #{} grew beyond the {MAX_DRAFT_ATTACHMENT_BYTES}-byte limit while being read",
-                        i + 1
-                    ),
-                    None,
-                ));
-            }
-            loaded_total = loaded_total.checked_add(data.len() as u64).ok_or_else(|| {
-                McpError::invalid_params("attachment aggregate size overflow", None)
-            })?;
-            if loaded_total > MAX_DRAFT_ATTACHMENT_TOTAL_BYTES {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "attachments grew beyond the {MAX_DRAFT_ATTACHMENT_TOTAL_BYTES}-byte aggregate limit while being read"
-                    ),
-                    None,
-                ));
-            }
-            let filename = a
-                .filename
-                .clone()
-                .or_else(|| {
-                    std::path::Path::new(&a.path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| format!("attachment-{}", i + 1));
-            let content_type = a
-                .content_type
-                .clone()
-                .unwrap_or_else(|| guess_content_type(&filename));
-            loaded.push(DraftAttachment {
-                filename,
-                content_type,
-                data,
-            });
-        }
+        let file_access = self.file_access_for_request(&meta)?;
+        let loaded = load_draft_attachments(&file_access, &args.attachments).await?;
 
         match self
             .agentmail
-            .create_draft(
+            .create_draft_with_headers(
                 &args.account,
                 args.subject.trim(),
                 &args.body,
                 &args.to,
                 &args.cc,
                 &args.bcc,
+                &args.reply_to,
+                args.in_reply_to.as_deref(),
+                &args.references,
                 &loaded,
+                None,
             )
             .await
         {
             Ok(data) => compact_result(CreateDraftOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "create_reply_draft",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>().expect("valid create_reply_draft output schema"),
+        description = "Create a reply or reply-all draft from one live message identity. Requires mailbox, uid, and expectedUidValidity from the same discovery result. Uses Reply-To before From, excludes the account's own primary address and aliases, adds RFC In-Reply-To and References when the source has Message-ID, never infers Bcc, and saves only to Drafts; it never sends mail.",
+        annotations(
+            title = "Create Reply Draft",
+            read_only_hint = false,
+            destructive_hint = false
+        )
+    )]
+    async fn create_reply_draft_tool(
+        &self,
+        meta: Meta,
+        Parameters(args): Parameters<CreateReplyDraftArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        let file_access = self.file_access_for_request(&meta)?;
+        let loaded = load_draft_attachments(&file_access, &args.attachments).await?;
+        match self
+            .agentmail
+            .create_reply_draft(
+                &args.account,
+                args.mailbox.trim(),
+                args.uid,
+                args.expected_uid_validity,
+                reply_mode(args.mode),
+                args.subject.as_deref(),
+                &args.body,
+                &args.bcc,
+                &args.reply_to,
+                &loaded,
+            )
+            .await
+        {
+            Ok(data) => compact_result(CreateDraftOutput::from(data)),
+            Err(error) => Ok(tool_error_result(&error)),
+        }
+    }
+
+    #[tool(
+        name = "update_draft",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<UpdateDraftOutput>().expect("valid update_draft output schema"),
+        description = "Atomically replace one live IMAP draft with a complete new draft specification. Requires mailbox, uid, and expectedUidValidity; verifies the target still has the \\Draft flag and requires RFC 8508 REPLACE. Refuses to emulate replacement with APPEND+DELETE, because that can duplicate drafts. Attachments are a complete replacement list, and this tool never sends mail.",
+        annotations(
+            title = "Update Draft Atomically",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn update_draft_tool(
+        &self,
+        meta: Meta,
+        Parameters(args): Parameters<UpdateDraftArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        if args.to.is_empty() && args.cc.is_empty() && args.bcc.is_empty() {
+            return Err(McpError::invalid_params(
+                "At least one recipient (to, cc, or bcc) is required",
+                None,
+            ));
+        }
+        let file_access = self.file_access_for_request(&meta)?;
+        let loaded = load_draft_attachments(&file_access, &args.attachments).await?;
+        match self
+            .agentmail
+            .update_draft(
+                &args.account,
+                args.mailbox.trim(),
+                args.uid,
+                args.expected_uid_validity,
+                args.subject.trim(),
+                &args.body,
+                &args.to,
+                &args.cc,
+                &args.bcc,
+                &args.reply_to,
+                args.in_reply_to.as_deref(),
+                &args.references,
+                &loaded,
+            )
+            .await
+        {
+            Ok(data) => compact_result(UpdateDraftOutput::from(data)),
+            Err(error) => Ok(tool_error_result(&error)),
         }
     }
 
@@ -1145,5 +1725,26 @@ mod tests {
             "application/octet-stream"
         );
         assert_eq!(guess_content_type("README"), "application/octet-stream");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn thread_record_directories_are_private_when_created() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "agentmail-private-record-dir-{}",
+            uuid::Uuid::new_v4()
+        ));
+        super::create_private_dir(&path)
+            .await
+            .expect("create private dir");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        std::fs::remove_dir(&path).expect("cleanup private dir");
     }
 }

@@ -1,7 +1,9 @@
-//! MCP resources: addressable single-message reads via `email://` URIs.
+//! MCP resources: navigable account/mailbox catalogs and addressable messages.
 //!
-//! Five URI templates are exposed. Every URI carries the complete IMAP
-//! message identity so a delayed read cannot silently use a recycled UID:
+//! Six URI templates are exposed. The mailbox template is a paged discovery
+//! view; every message URI carries the complete IMAP identity so a delayed
+//! read cannot silently use a recycled UID:
+//! - `email://{account}/{mailbox}{?offset,limit}` — newest message metadata
 //! - `email://{account}/{mailbox}/{uidValidity}/{uid}` — markdown body
 //! - `email://{account}/{mailbox}/{uidValidity}/{uid}/headers` — exact headers
 //! - `email://{account}/{mailbox}/{uidValidity}/{uid}/source` — raw RFC822
@@ -23,9 +25,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CompleteRequestParams, CompleteResult, CompletionContext, CompletionInfo, ReadResourceResult,
-    ResourceContents, ResourceTemplate,
+    Annotations, CompleteRequestParams, CompleteResult, CompletionContext, CompletionInfo,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role,
 };
+
+pub(super) const EMAIL_MAILBOX_TEMPLATE: &str = "email://{account}/{mailbox}{?offset,limit}";
 
 pub(super) const EMAIL_BODY_TEMPLATE: &str = "email://{account}/{mailbox}/{uidValidity}/{uid}";
 pub(super) const EMAIL_HEADERS_TEMPLATE: &str =
@@ -35,6 +39,9 @@ pub(super) const EMAIL_SOURCE_TEMPLATE: &str =
 pub(super) const EMAIL_INFO_TEMPLATE: &str = "email://{account}/{mailbox}/{uidValidity}/{uid}/info";
 pub(super) const EMAIL_ATTACHMENT_TEMPLATE: &str =
     "email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}";
+
+const DEFAULT_MAILBOX_PAGE_LIMIT: usize = 25;
+const MAX_MAILBOX_PAGE_LIMIT: usize = 50;
 
 // Identity of the two representations tool results LINK to (`wire.rs`
 // `message_resource_links`). Shared with `email_resource_templates` below so a
@@ -77,6 +84,126 @@ const SEGMENT: &AsciiSet = &CONTROLS
 
 pub(super) fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, SEGMENT).to_string()
+}
+
+pub(super) fn assistant_annotations(priority: f32) -> Annotations {
+    Annotations::default()
+        .with_audience(vec![Role::Assistant])
+        .with_priority(priority)
+}
+
+pub(super) fn user_and_assistant_annotations(priority: f32) -> Annotations {
+    Annotations::default()
+        .with_audience(vec![Role::User, Role::Assistant])
+        .with_priority(priority)
+}
+
+pub(super) fn account_resource_uri(account: &str) -> String {
+    format!("email://{}", encode_segment(account))
+}
+
+fn mailbox_resource_uri(account: &str, mailbox: &str) -> String {
+    format!(
+        "email://{}/{}",
+        encode_segment(account),
+        encode_segment(mailbox)
+    )
+}
+
+pub(super) fn account_resources(accounts: impl IntoIterator<Item = String>) -> Vec<Resource> {
+    accounts
+        .into_iter()
+        .map(|account| {
+            Resource::new(account_resource_uri(&account), format!("{account} mail"))
+                .with_title(format!("AgentMail account: {account}"))
+                .with_description(
+                    "Selectable mailbox catalog. Read this resource to discover mailbox resource URIs.",
+                )
+                .with_mime_type("application/json")
+                .with_annotations(assistant_annotations(0.8))
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MailboxIndexUri {
+    account: String,
+    mailbox: String,
+    offset: usize,
+    limit: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CatalogResourceUri {
+    Account(String),
+    Mailbox(MailboxIndexUri),
+}
+
+fn parse_catalog_uri(uri: &str) -> Result<Option<CatalogResourceUri>, String> {
+    let Some(rest) = uri.strip_prefix("email://") else {
+        return Ok(None);
+    };
+    let (path, query) = rest
+        .split_once('?')
+        .map_or((rest, None), |(path, query)| (path, Some(query)));
+    let segments: Vec<&str> = path.split('/').collect();
+    match segments.as_slice() {
+        [account] if query.is_none() => {
+            let account = decode_segment(account)
+                .ok_or_else(|| format!("invalid account segment in {uri}"))?;
+            Ok(Some(CatalogResourceUri::Account(account)))
+        }
+        [account, mailbox] => {
+            let account = decode_segment(account)
+                .ok_or_else(|| format!("invalid account segment in {uri}"))?;
+            let mailbox = decode_segment(mailbox)
+                .ok_or_else(|| format!("invalid mailbox segment in {uri}"))?;
+            let mut offset = 0usize;
+            let mut limit = DEFAULT_MAILBOX_PAGE_LIMIT;
+            let mut saw_offset = false;
+            let mut saw_limit = false;
+            if let Some(query) = query.filter(|query| !query.is_empty()) {
+                for pair in query.split('&') {
+                    let (key, value) = pair
+                        .split_once('=')
+                        .ok_or_else(|| format!("invalid mailbox resource query in {uri}"))?;
+                    match key {
+                        "offset" if !saw_offset => {
+                            offset = value.parse().map_err(|_| {
+                                format!("offset must be an unsigned integer in {uri}")
+                            })?;
+                            saw_offset = true;
+                        }
+                        "limit" if !saw_limit => {
+                            limit = value.parse().map_err(|_| {
+                                format!("limit must be an unsigned integer in {uri}")
+                            })?;
+                            saw_limit = true;
+                        }
+                        "offset" | "limit" => {
+                            return Err(format!("duplicate query parameter in {uri}"));
+                        }
+                        _ => return Err(format!("unsupported query parameter '{key}' in {uri}")),
+                    }
+                }
+            }
+            if offset > 1_000_000 {
+                return Err(format!("offset exceeds 1000000 in {uri}"));
+            }
+            if !(1..=MAX_MAILBOX_PAGE_LIMIT).contains(&limit) {
+                return Err(format!(
+                    "limit must be between 1 and {MAX_MAILBOX_PAGE_LIMIT} in {uri}"
+                ));
+            }
+            Ok(Some(CatalogResourceUri::Mailbox(MailboxIndexUri {
+                account,
+                mailbox,
+                offset,
+                limit,
+            })))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn decode_segment(s: &str) -> Option<String> {
@@ -197,6 +324,13 @@ pub(super) fn parse_email_uri(uri: &str) -> Result<EmailResourceUri, String> {
 
 pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
     vec![
+        ResourceTemplate::new(EMAIL_MAILBOX_TEMPLATE, "email-mailbox")
+            .with_title("Email mailbox (newest messages)")
+            .with_description(
+                "A selectable mailbox index ordered newest-first. Read an account root first to discover exact mailbox URIs. Optional offset and limit paginate metadata; limit defaults to 25 and is capped at 50.",
+            )
+            .with_mime_type("application/json")
+            .with_annotations(assistant_annotations(0.8)),
         ResourceTemplate::new(EMAIL_BODY_TEMPLATE, EMAIL_BODY_NAME)
             .with_title(EMAIL_BODY_TITLE)
             .with_description(
@@ -206,14 +340,16 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  and the UIDVALIDITY + UID identity from a current discovery result. \
                  Markdown output is limited to 100,000 characters.",
             )
-            .with_mime_type(EMAIL_BODY_MIME),
+            .with_mime_type(EMAIL_BODY_MIME)
+            .with_annotations(assistant_annotations(0.8)),
         ResourceTemplate::new(EMAIL_HEADERS_TEMPLATE, "email-message-headers")
             .with_title("Email message headers (exact RFC822 syntax)")
             .with_description(
                 "The exact RFC822 header block for a live message identity, preserving \
                  field names, order, folding, and line endings. Output is limited to 64 KiB.",
             )
-            .with_mime_type("text/rfc822-headers"),
+            .with_mime_type("text/rfc822-headers")
+            .with_annotations(assistant_annotations(0.5)),
         ResourceTemplate::new(EMAIL_SOURCE_TEMPLATE, "email-message-source")
             .with_title("Email message (raw RFC822 source)")
             .with_description(
@@ -221,7 +357,8 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  and MIME structure. Output is limited to 256 KiB; use the markdown, \
                  headers, or attachment APIs for larger messages.",
             )
-            .with_mime_type("message/rfc822"),
+            .with_mime_type("message/rfc822")
+            .with_annotations(assistant_annotations(0.2)),
         ResourceTemplate::new(EMAIL_INFO_TEMPLATE, EMAIL_INFO_NAME)
             .with_title(EMAIL_INFO_TITLE)
             .with_description(
@@ -232,7 +369,8 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  /attachments/{index} resource URI — plus sibling body, headers, \
                  and source resource URIs. Read this before fetching attachments.",
             )
-            .with_mime_type(EMAIL_INFO_MIME),
+            .with_mime_type(EMAIL_INFO_MIME)
+            .with_annotations(assistant_annotations(0.5)),
         ResourceTemplate::new(EMAIL_ATTACHMENT_TEMPLATE, "email-message-attachment")
             .with_title("Email attachment (binary)")
             .with_description(
@@ -241,8 +379,17 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                  content type. Discover indices, names, and sizes via the /info \
                  resource. Attachments above 4 MiB are refused — use the \
                  download_attachments tool to save large files to disk.",
-            ),
+            )
+            .with_annotations(user_and_assistant_annotations(0.8)),
     ]
+}
+
+fn json_contents(uri: &str, value: &serde_json::Value) -> Result<ReadResourceResult, McpError> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    Ok(ReadResourceResult::new(vec![
+        ResourceContents::text(text, uri).with_mime_type("application/json"),
+    ]))
 }
 
 /// Render a message as a markdown document: subject heading, metadata list,
@@ -449,6 +596,89 @@ impl AgentMailServer {
         &self,
         uri: &str,
     ) -> Result<ReadResourceResult, McpError> {
+        if let Some(catalog) =
+            parse_catalog_uri(uri).map_err(|error| McpError::invalid_params(error, None))?
+        {
+            return match catalog {
+                CatalogResourceUri::Account(account) => {
+                    let entries = self
+                        .agentmail
+                        .cached_mailbox_layout(&account)
+                        .await
+                        .map_err(|error| to_mcp_error(&error))?;
+                    let mailboxes: Vec<_> = entries
+                        .iter()
+                        .filter(|entry| entry.is_selectable())
+                        .map(|entry| {
+                            serde_json::json!({
+                                "name": entry.path,
+                                "delimiter": entry.delimiter,
+                                "roles": entry.roles,
+                                "noInferiors": entry.no_inferiors,
+                                "resourceUri": mailbox_resource_uri(&account, &entry.path),
+                            })
+                        })
+                        .collect();
+                    json_contents(
+                        uri,
+                        &serde_json::json!({
+                            "account": account,
+                            "mailboxCount": mailboxes.len(),
+                            "mailboxes": mailboxes,
+                        }),
+                    )
+                }
+                CatalogResourceUri::Mailbox(parsed) => {
+                    let response = self
+                        .agentmail
+                        .get_messages(
+                            &parsed.mailbox,
+                            &parsed.account,
+                            parsed.offset,
+                            parsed.limit,
+                            false,
+                            false,
+                        )
+                        .await
+                        .map_err(|error| to_mcp_error(&error))?;
+                    let next_offset = (response.offset + response.messages.len() < response.total)
+                        .then_some(response.offset + response.messages.len());
+                    let messages: Vec<_> = response
+                        .messages
+                        .into_iter()
+                        .map(|message| {
+                            serde_json::json!({
+                                "uid": message.uid,
+                                "subject": message.subject,
+                                "sender": message.sender,
+                                "date": message.date.map(|date| date.to_rfc3339()),
+                                "flags": message.flags,
+                                "size": message.size,
+                                "resourceUri": format_email_uri(
+                                    &parsed.account,
+                                    &parsed.mailbox,
+                                    response.uid_validity,
+                                    message.uid,
+                                ),
+                            })
+                        })
+                        .collect();
+                    json_contents(
+                        uri,
+                        &strip_nulls(serde_json::json!({
+                            "account": parsed.account,
+                            "mailbox": parsed.mailbox,
+                            "uidValidity": response.uid_validity,
+                            "offset": response.offset,
+                            "limit": response.limit,
+                            "total": response.total,
+                            "nextOffset": next_offset,
+                            "messages": messages,
+                        })),
+                    )
+                }
+            };
+        }
         let parsed = parse_email_uri(uri).map_err(|e| McpError::invalid_params(e, None))?;
 
         match parsed.kind {
@@ -1120,12 +1350,20 @@ mod tests {
         assert_eq!(
             uris,
             [
+                EMAIL_MAILBOX_TEMPLATE,
                 EMAIL_BODY_TEMPLATE,
                 EMAIL_HEADERS_TEMPLATE,
                 EMAIL_SOURCE_TEMPLATE,
                 EMAIL_INFO_TEMPLATE,
                 EMAIL_ATTACHMENT_TEMPLATE,
             ]
+        );
+        assert_eq!(
+            templates[0]
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.priority),
+            Some(0.8)
         );
     }
 

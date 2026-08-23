@@ -8,6 +8,7 @@ pub mod imap_client;
 pub mod mcp;
 pub mod parser;
 pub mod provider;
+pub(crate) mod record;
 pub mod scan_cache;
 pub mod secret;
 pub mod types;
@@ -42,6 +43,8 @@ const MAX_PAGE_OFFSET: usize = 1_000_000;
 const MAX_PAGE_LIMIT: usize = 100;
 const MAX_MAILBOX_PAGE_LIMIT: usize = 500;
 const MAX_SUBSCRIPTION_SAMPLE_HEADER_BYTES: usize = 256 * 1024;
+const MAX_THREAD_RECORD_MESSAGES: usize = 100;
+const MAX_THREAD_RECORD_HEADER_BYTES: usize = 256 * 1024;
 
 /// High-level facade for IMAP operations.
 /// Owns the connection pool and configuration.
@@ -616,7 +619,10 @@ impl Agentmail {
 
         // Check if mailbox already exists (make CREATE idempotent)
         let names = imap_client::list_mailbox_names(session.session()).await?;
-        if names.iter().any(|n| n.eq_ignore_ascii_case(mailbox_name)) {
+        if names
+            .iter()
+            .any(|name| mailbox_names_equal(name, mailbox_name))
+        {
             session.release().await;
             self.invalidate_mailbox_catalog(account);
             return Ok(CreateMailboxResponse {
@@ -642,6 +648,207 @@ impl Agentmail {
             mailbox: mailbox_name.to_string(),
             created: true,
             already_exists: false,
+        })
+    }
+
+    /// Preview or perform a guarded mailbox rename.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rename_mailbox(
+        &self,
+        account: &str,
+        mailbox_name: &str,
+        new_mailbox_name: &str,
+        confirm_rename: bool,
+        expected_message_count: Option<u32>,
+        confirm_special_use: bool,
+        confirm_descendants: bool,
+    ) -> Result<RenameMailboxResponse> {
+        let _mutation_guard = self.lock_account_mutation(account).await;
+        let mut session = self.pool.acquire(account).await?;
+        let layout = imap_client::list_mailbox_layout(session.session()).await?;
+        let entry = find_mailbox_layout(&layout, mailbox_name)
+            .ok_or_else(|| AgentmailError::MailboxNotFound(mailbox_name.to_string()))?;
+        if mailbox_names_equal(&entry.path, "INBOX") {
+            return Err(AgentmailError::Other(
+                "INBOX cannot be renamed through AgentMail".to_string(),
+            ));
+        }
+        if find_mailbox_layout(&layout, new_mailbox_name).is_some() {
+            return Err(AgentmailError::Other(format!(
+                "destination mailbox '{new_mailbox_name}' already exists"
+            )));
+        }
+        self.ensure_mailbox_not_in_pending_move(account, entry)
+            .await?;
+        let preflight = mailbox_mutation_preflight(
+            session.session(),
+            entry,
+            &layout,
+            MailboxMutationKind::Rename,
+        )
+        .await?;
+        if !confirm_rename {
+            session.release().await;
+            return Ok(RenameMailboxResponse {
+                account: account.to_string(),
+                mailbox: entry.path.clone(),
+                new_mailbox: new_mailbox_name.to_string(),
+                preview: true,
+                renamed: false,
+                preflight,
+            });
+        }
+        require_expected_message_count(expected_message_count, preflight.message_count)?;
+        if !preflight.roles.is_empty() && !confirm_special_use {
+            return Err(AgentmailError::Other(
+                "mailbox has special-use roles; repeat with confirmSpecialUse=true".to_string(),
+            ));
+        }
+        if !preflight.descendants.is_empty() && !confirm_descendants {
+            return Err(AgentmailError::Other(
+                "mailbox has descendants; repeat with confirmDescendants=true".to_string(),
+            ));
+        }
+
+        self.fence_header_cache_mutation(account).await;
+        self.invalidate_mailbox_catalog(account);
+        let rename_result =
+            imap_client::rename_mailbox(session.session(), &entry.path, new_mailbox_name).await;
+        self.invalidate_mailbox_catalog(account);
+        let renamed = match rename_result {
+            Ok(()) => true,
+            Err(error) if error.is_connection_error() => {
+                drop(session);
+                let (fresh_session, refreshed) = self
+                    .mailbox_layout_after_ambiguous_mutation(account, "rename", &error)
+                    .await?;
+                session = fresh_session;
+                let old_exists = find_mailbox_layout(&refreshed, &entry.path).is_some();
+                let new_exists = find_mailbox_layout(&refreshed, new_mailbox_name).is_some();
+                if !old_exists && new_exists {
+                    true
+                } else if old_exists && !new_exists {
+                    return Err(error);
+                } else {
+                    return Err(AgentmailError::Other(format!(
+                        "rename outcome is ambiguous after transport failure: oldExists={old_exists}, newExists={new_exists}; inspect list_mailboxes before retrying"
+                    )));
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        self.fence_header_cache_mutation(account).await;
+        self.invalidate_mailbox_catalog(account);
+        session.release().await;
+        Ok(RenameMailboxResponse {
+            account: account.to_string(),
+            mailbox: entry.path.clone(),
+            new_mailbox: new_mailbox_name.to_string(),
+            preview: false,
+            renamed,
+            preflight,
+        })
+    }
+
+    /// Preview or perform a guarded mailbox delete.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_mailbox(
+        &self,
+        account: &str,
+        mailbox_name: &str,
+        confirm_delete: bool,
+        expected_message_count: Option<u32>,
+        confirm_non_empty: bool,
+        confirm_special_use: bool,
+        confirm_descendants: bool,
+    ) -> Result<DeleteMailboxResponse> {
+        let _mutation_guard = self.lock_account_mutation(account).await;
+        let mut session = self.pool.acquire(account).await?;
+        let layout = imap_client::list_mailbox_layout(session.session()).await?;
+        let Some(entry) = find_mailbox_layout(&layout, mailbox_name) else {
+            session.release().await;
+            self.invalidate_mailbox_catalog(account);
+            return Ok(DeleteMailboxResponse {
+                account: account.to_string(),
+                mailbox: mailbox_name.to_string(),
+                preview: false,
+                deleted: false,
+                already_missing: true,
+                preflight: None,
+            });
+        };
+        if mailbox_names_equal(&entry.path, "INBOX") {
+            return Err(AgentmailError::Other(
+                "INBOX cannot be deleted through AgentMail".to_string(),
+            ));
+        }
+        self.ensure_mailbox_not_in_pending_move(account, entry)
+            .await?;
+        let preflight = mailbox_mutation_preflight(
+            session.session(),
+            entry,
+            &layout,
+            MailboxMutationKind::Delete,
+        )
+        .await?;
+        if !confirm_delete {
+            session.release().await;
+            return Ok(DeleteMailboxResponse {
+                account: account.to_string(),
+                mailbox: entry.path.clone(),
+                preview: true,
+                deleted: false,
+                already_missing: false,
+                preflight: Some(preflight),
+            });
+        }
+        require_expected_message_count(expected_message_count, preflight.message_count)?;
+        if preflight.message_count > 0 && !confirm_non_empty {
+            return Err(AgentmailError::Other(
+                "mailbox is non-empty; repeat with confirmNonEmpty=true".to_string(),
+            ));
+        }
+        if !preflight.roles.is_empty() && !confirm_special_use {
+            return Err(AgentmailError::Other(
+                "mailbox has special-use roles; repeat with confirmSpecialUse=true".to_string(),
+            ));
+        }
+        if !preflight.descendants.is_empty() && !confirm_descendants {
+            return Err(AgentmailError::Other(
+                "mailbox has descendants; repeat with confirmDescendants=true".to_string(),
+            ));
+        }
+
+        self.fence_header_cache_mutation(account).await;
+        self.invalidate_mailbox_catalog(account);
+        let delete_result = imap_client::delete_mailbox(session.session(), &entry.path).await;
+        self.invalidate_mailbox_catalog(account);
+        let deleted = match delete_result {
+            Ok(()) => true,
+            Err(error) if error.is_connection_error() => {
+                drop(session);
+                let (fresh_session, refreshed) = self
+                    .mailbox_layout_after_ambiguous_mutation(account, "delete", &error)
+                    .await?;
+                session = fresh_session;
+                if find_mailbox_layout(&refreshed, &entry.path).is_none() {
+                    true
+                } else {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        self.fence_header_cache_mutation(account).await;
+        self.invalidate_mailbox_catalog(account);
+        session.release().await;
+        Ok(DeleteMailboxResponse {
+            account: account.to_string(),
+            mailbox: entry.path.clone(),
+            preview: false,
+            deleted,
+            already_missing: false,
+            preflight: Some(preflight),
         })
     }
 
@@ -3028,7 +3235,7 @@ impl Agentmail {
             return Err(AgentmailError::Other("destination is required".to_string()));
         }
         if let Some(mbox) = mailbox
-            && mbox.eq_ignore_ascii_case(destination)
+            && mailbox_names_equal(mbox, destination)
         {
             return Err(AgentmailError::Other(
                 "destination equals the source mailbox; nothing to move".to_string(),
@@ -3047,7 +3254,7 @@ impl Agentmail {
         let names = imap_client::list_mailbox_names(session.session()).await?;
         if !names
             .iter()
-            .any(|name| name.eq_ignore_ascii_case(destination))
+            .any(|name| mailbox_names_equal(name, destination))
         {
             session.release().await;
             return Err(AgentmailError::Other(format!(
@@ -3067,7 +3274,7 @@ impl Agentmail {
                 // Never sweep the destination itself: the just-moved messages
                 // still match the selector and would be "moved" onto
                 // themselves pass after pass.
-                .filter(|mbox| !mbox.eq_ignore_ascii_case(destination))
+                .filter(|mbox| !mailbox_names_equal(mbox, destination))
                 .collect(),
         };
         self.matching_sweep(
@@ -3468,7 +3675,10 @@ impl Agentmail {
 
         // Validate destination mailbox exists
         let names = imap_client::list_mailbox_names(session.session()).await?;
-        if !names.iter().any(|n| n.eq_ignore_ascii_case(destination)) {
+        if !names
+            .iter()
+            .any(|name| mailbox_names_equal(name, destination))
+        {
             session.release().await;
             return Err(AgentmailError::Other(format!(
                 "Destination mailbox '{}' does not exist",
@@ -3533,63 +3743,64 @@ impl Agentmail {
         bcc: &[String],
         attachments: &[crate::types::DraftAttachment],
     ) -> Result<CreateDraftResponse> {
-        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
-            return Err(AgentmailError::Other(
-                "At least one recipient (to, cc, or bcc) is required".to_string(),
-            ));
-        }
-        let recipient_count = to
-            .len()
-            .checked_add(cc.len())
-            .and_then(|count| count.checked_add(bcc.len()))
-            .ok_or_else(|| AgentmailError::Other("draft recipient count overflow".to_string()))?;
-        if recipient_count > MAX_DRAFT_RECIPIENTS {
-            return Err(AgentmailError::Other(format!(
-                "draft has {recipient_count} recipients; maximum is {MAX_DRAFT_RECIPIENTS}"
-            )));
-        }
-        if body.len() > MAX_DRAFT_BODY_BYTES {
-            return Err(AgentmailError::Other(format!(
-                "draft body is {} bytes; maximum is {MAX_DRAFT_BODY_BYTES}",
-                body.len()
-            )));
-        }
-        if attachments.len() > MAX_DRAFT_ATTACHMENTS {
-            return Err(AgentmailError::Other(format!(
-                "draft has {} attachments; maximum is {MAX_DRAFT_ATTACHMENTS}",
-                attachments.len()
-            )));
-        }
-        let mut attachment_bytes = 0usize;
-        for attachment in attachments {
-            if attachment.data.len() > MAX_DRAFT_ATTACHMENT_BYTES {
-                return Err(AgentmailError::Other(format!(
-                    "draft attachment '{}' is {} bytes; per-file maximum is {MAX_DRAFT_ATTACHMENT_BYTES}",
-                    attachment.filename,
-                    attachment.data.len()
-                )));
-            }
-            attachment_bytes = attachment_bytes
-                .checked_add(attachment.data.len())
-                .ok_or_else(|| {
-                    AgentmailError::Other("draft attachment size overflow".to_string())
-                })?;
-        }
-        if attachment_bytes > MAX_DRAFT_ATTACHMENTS_TOTAL_BYTES {
-            return Err(AgentmailError::Other(format!(
-                "draft attachments total {attachment_bytes} bytes; maximum is {MAX_DRAFT_ATTACHMENTS_TOTAL_BYTES}"
-            )));
-        }
+        self.create_draft_with_headers(
+            account,
+            subject,
+            body,
+            to,
+            cc,
+            bcc,
+            &[],
+            None,
+            &[],
+            attachments,
+            None,
+        )
+        .await
+    }
+
+    /// Create a draft with Reply-To and RFC threading headers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_draft_with_headers(
+        &self,
+        account: &str,
+        subject: &str,
+        body: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        reply_to: &[String],
+        in_reply_to: Option<&str>,
+        references: &[String],
+        attachments: &[crate::types::DraftAttachment],
+        warning: Option<String>,
+    ) -> Result<CreateDraftResponse> {
+        validate_draft_payload(body, to, cc, bcc, reply_to, attachments)?;
 
         let _mutation_guard = self.lock_account_mutation(account).await;
 
-        let acct_config = self
+        let account_config = self
             .pool
             .account_config(account)
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
-        let from = &acct_config.username;
-
-        let rfc822 = draft::compose_draft(subject, body, to, cc, bcc, Some(from), attachments)?;
+        let from = account_config
+            .canonical_email()
+            .unwrap_or_else(|| account_config.username.clone());
+        let rfc822 = draft::compose_draft_with_headers(
+            subject,
+            body,
+            to,
+            cc,
+            bcc,
+            Some(&from),
+            attachments,
+            draft::DraftHeaderOptions {
+                reply_to,
+                in_reply_to,
+                references,
+                apple_uuid: uuid::Uuid::new_v4(),
+            },
+        )?;
         if rfc822.len() > MAX_DRAFT_MIME_BYTES {
             return Err(AgentmailError::Other(format!(
                 "composed draft is {} bytes; maximum is {MAX_DRAFT_MIME_BYTES}",
@@ -3612,26 +3823,11 @@ impl Agentmail {
             .is_ok();
         self.invalidate_mailbox_catalog(account);
 
-        let append_result =
-            imap_client::append_draft(session.session(), &drafts_name, &rfc822).await;
+        let identity = self
+            .append_draft_with_recovery(account, &drafts_name, &rfc822, session)
+            .await;
         self.invalidate_mailbox_catalog(account);
-        append_result?;
-        imap_client::sync(session.session()).await?;
-
-        // Best-effort identity recovery: async-imap does not expose UIDPLUS
-        // APPENDUID, so search the drafts mailbox for the Message-ID that
-        // compose_draft generated. A recovery failure leaves the identity
-        // fields unset without failing the successful create.
-        let identity = match draft::extract_message_id(&rfc822) {
-            Some(message_id) => {
-                imap_client::find_uid_by_message_id(session.session(), &drafts_name, &message_id)
-                    .await
-                    .ok()
-                    .flatten()
-            }
-            None => None,
-        };
-        session.release().await;
+        let identity = identity?;
 
         let attached_names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
 
@@ -3644,8 +3840,250 @@ impl Agentmail {
                 to: to.to_vec(),
                 cc: cc.to_vec(),
                 bcc: bcc.to_vec(),
+                reply_to: reply_to.to_vec(),
             },
+            in_reply_to: in_reply_to.map(str::to_string),
+            references: references.to_vec(),
+            threading_applied: in_reply_to.is_some(),
+            warning,
             attachments: attached_names,
+            uid_validity: identity.map(|(uid_validity, _)| uid_validity),
+            uid: identity.map(|(_, uid)| uid),
+        })
+    }
+
+    /// Create a reply or reply-all draft from one live message identity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_reply_draft(
+        &self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        expected_uid_validity: u32,
+        mode: ReplyMode,
+        subject: Option<&str>,
+        body: &str,
+        bcc: &[String],
+        reply_to: &[String],
+        attachments: &[DraftAttachment],
+    ) -> Result<CreateDraftResponse> {
+        let response = self
+            .get_messages_by_uid(
+                mailbox,
+                account,
+                &[uid],
+                expected_uid_validity,
+                false,
+                false,
+            )
+            .await?;
+        let source = response
+            .messages
+            .into_iter()
+            .next()
+            .ok_or(AgentmailError::MessageNotFound(uid))?;
+        let own = self.own_addresses(account);
+        let reply_target = if source.reply_to.trim().is_empty() {
+            source.sender.clone()
+        } else {
+            source.reply_to.clone()
+        };
+        let mut seen = hashbrown::HashSet::new();
+        let mut to = Vec::new();
+        push_reply_recipient(&mut to, &mut seen, &own, &reply_target);
+        let mut cc = Vec::new();
+        if mode == ReplyMode::ReplyAll {
+            for recipient in &source.to {
+                push_reply_recipient(&mut to, &mut seen, &own, recipient);
+            }
+            for recipient in &source.cc {
+                push_reply_recipient(&mut cc, &mut seen, &own, recipient);
+            }
+        }
+        if to.is_empty() && mode == ReplyMode::Reply {
+            for recipient in source.to.iter().chain(&source.cc) {
+                push_reply_recipient(&mut to, &mut seen, &own, recipient);
+                if !to.is_empty() {
+                    break;
+                }
+            }
+        }
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(AgentmailError::Other(
+                "the source message has no reply recipient outside this account".to_string(),
+            ));
+        }
+
+        let subject = subject
+            .map(str::trim)
+            .filter(|subject| !subject.is_empty())
+            .map_or_else(|| reply_subject(&source.subject), str::to_string);
+        let mut references = source.references;
+        let (in_reply_to, warning) = match source.message_id {
+            Some(message_id) => {
+                if !references.iter().any(|reference| reference == &message_id) {
+                    references.push(message_id.clone());
+                }
+                (Some(message_id), None)
+            }
+            None => (
+                None,
+                Some(
+                    "source message has no Message-ID; recipients and subject were prepared, but RFC thread headers could not be applied"
+                        .to_string(),
+                ),
+            ),
+        };
+        self.create_draft_with_headers(
+            account,
+            &subject,
+            body,
+            &to,
+            &cc,
+            bcc,
+            reply_to,
+            in_reply_to.as_deref(),
+            &references,
+            attachments,
+            warning,
+        )
+        .await
+    }
+
+    /// Atomically replace one live `\Draft` using RFC 8508 UID REPLACE.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_draft(
+        &self,
+        account: &str,
+        drafts_mailbox: &str,
+        uid: u32,
+        expected_uid_validity: u32,
+        subject: &str,
+        body: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        reply_to: &[String],
+        in_reply_to: Option<&str>,
+        references: &[String],
+        attachments: &[DraftAttachment],
+    ) -> Result<UpdateDraftResponse> {
+        validate_draft_payload(body, to, cc, bcc, reply_to, attachments)?;
+        let _mutation_guard = self.lock_account_mutation(account).await;
+        let account_config = self
+            .pool
+            .account_config(account)
+            .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
+        let from = account_config
+            .canonical_email()
+            .unwrap_or_else(|| account_config.username.clone());
+        let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
+        if !caps.has("REPLACE") {
+            session.release().await;
+            return Err(AgentmailError::Other(
+                "server does not advertise RFC 8508 REPLACE; refusing a non-atomic APPEND+DELETE fallback"
+                    .to_string(),
+            ));
+        }
+
+        imap_client::examine_with_expected_uid_validity(
+            session.session(),
+            drafts_mailbox,
+            expected_uid_validity,
+        )
+        .await?;
+        let current = imap_client::fetch_by_uids(
+            session.session(),
+            &[uid],
+            drafts_mailbox,
+            account,
+            false,
+            false,
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
+        if !current
+            .flags
+            .iter()
+            .any(|flag| flag.eq_ignore_ascii_case("\\Draft"))
+        {
+            return Err(AgentmailError::Other(format!(
+                "mailbox '{drafts_mailbox}' UID {uid} is not marked \\Draft; refusing replacement"
+            )));
+        }
+        let current_source = imap_client::get_message_source_bounded(
+            session.session(),
+            drafts_mailbox,
+            uid,
+            expected_uid_validity,
+            MAX_DRAFT_MIME_BYTES,
+        )
+        .await?;
+        let apple_uuid =
+            draft::extract_apple_uuid(&current_source).unwrap_or_else(uuid::Uuid::new_v4);
+        let replacement = draft::compose_draft_with_headers(
+            subject,
+            body,
+            to,
+            cc,
+            bcc,
+            Some(&from),
+            attachments,
+            draft::DraftHeaderOptions {
+                reply_to,
+                in_reply_to,
+                references,
+                apple_uuid,
+            },
+        )?;
+        if replacement.len() > MAX_DRAFT_MIME_BYTES {
+            return Err(AgentmailError::Other(format!(
+                "composed draft is {} bytes; maximum is {MAX_DRAFT_MIME_BYTES}",
+                replacement.len()
+            )));
+        }
+
+        self.fence_header_cache_mutation(account).await;
+        self.invalidate_mailbox_catalog(account);
+        let identity = match imap_client::replace_draft(
+            session.session(),
+            drafts_mailbox,
+            uid,
+            expected_uid_validity,
+            &replacement,
+        )
+        .await
+        {
+            Ok(identity) => identity,
+            Err(error) if error.is_connection_error() => {
+                return Err(AgentmailError::Other(format!(
+                    "draft replacement outcome is ambiguous after the IMAP connection failed; inspect the Drafts mailbox before retrying: {error}"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        let identity = match (identity, draft::extract_message_id(&replacement)) {
+            (Some(identity), _) => Some(identity),
+            (None, Some(message_id)) => {
+                imap_client::find_uid_by_message_id(session.session(), drafts_mailbox, &message_id)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            (None, None) => None,
+        };
+        self.fence_header_cache_mutation(account).await;
+        self.invalidate_mailbox_catalog(account);
+        session.release().await;
+        Ok(UpdateDraftResponse {
+            updated: true,
+            account: account.to_string(),
+            drafts_mailbox: drafts_mailbox.to_string(),
+            previous_uid_validity: expected_uid_validity,
+            previous_uid: uid,
             uid_validity: identity.map(|(uid_validity, _)| uid_validity),
             uid: identity.map(|(_, uid)| uid),
         })
@@ -3851,6 +4289,231 @@ impl Agentmail {
         .await?;
         session.release().await;
         Ok(String::from_utf8_lossy(&headers).into_owned())
+    }
+
+    /// Discover the bounded, exact RFC Message-ID graph around one live
+    /// message. Subject similarity is intentionally never used: every
+    /// selected identity must match `Message-ID`, `In-Reply-To`, or one token
+    /// in `References` exactly after harmless angle-bracket normalization.
+    pub async fn preview_thread_record(
+        &self,
+        mailbox: &str,
+        account: &str,
+        uid: u32,
+        expected_uid_validity: u32,
+        on_progress: Option<&ProgressFn>,
+        cancel: Option<&CancelFn>,
+    ) -> Result<ThreadRecordPreviewResponse> {
+        Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
+        let mut session = self.pool.acquire(account).await?;
+        imap_client::check_cancel(cancel)?;
+        let seed_headers = imap_client::get_message_headers_bounded(
+            session.session(),
+            mailbox,
+            uid,
+            expected_uid_validity,
+            MAX_THREAD_RECORD_HEADER_BYTES,
+        )
+        .await?;
+        let seed_info = parser::parse_rfc822(
+            &seed_headers,
+            uid,
+            Vec::new(),
+            u32::try_from(seed_headers.len()).ok(),
+            mailbox,
+            account,
+            false,
+            false,
+        )?;
+        let seed_identity = MailboxMessageIdentity {
+            mailbox: mailbox.to_string(),
+            uid_validity: expected_uid_validity,
+            uid,
+        };
+        let seed = thread_record_message(
+            seed_identity.clone(),
+            seed_info,
+            vec!["seed identity supplied by the caller".to_string()],
+        );
+
+        let mailboxes = self
+            .account_scan_mailboxes(
+                account,
+                session.session(),
+                scan_plan::ScanPurpose::Discovery,
+            )
+            .await?;
+        let mut messages = vec![seed.clone()];
+        let mut seen_messages: hashbrown::HashSet<(String, u32, u32)> = hashbrown::HashSet::new();
+        seen_messages.insert(thread_identity_key(&seed.identity));
+        let mut known_ids = hashbrown::HashSet::new();
+        let mut pending_ids = std::collections::VecDeque::new();
+        queue_thread_ids(&seed, &mut known_ids, &mut pending_ids);
+        let mut warnings = Vec::new();
+        let mut truncated = false;
+
+        'graph: while let Some(query_id) = pending_ids.pop_front() {
+            imap_client::check_cancel(cancel)?;
+            for candidate_mailbox in &mailboxes {
+                imap_client::check_cancel(cancel)?;
+                let selected = match imap_client::examine(session.session(), candidate_mailbox)
+                    .await
+                {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        push_record_warning(
+                            &mut warnings,
+                            format!(
+                                "skipped mailbox '{candidate_mailbox}' during thread discovery: {error}"
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                let candidate_uid_validity = match imap_client::require_uid_validity(
+                    candidate_mailbox,
+                    selected.uid_validity,
+                ) {
+                    Ok(uid_validity) => uid_validity,
+                    Err(error) => {
+                        push_record_warning(
+                            &mut warnings,
+                            format!(
+                                "skipped mailbox '{candidate_mailbox}' during thread discovery: {error}"
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                let mut candidate_uids = hashbrown::HashSet::new();
+                let mut search_failed = false;
+                for header in ["Message-ID", "In-Reply-To", "References"] {
+                    match imap_client::search_by_header(
+                        session.session(),
+                        header,
+                        thread_search_value(&query_id),
+                    )
+                    .await
+                    {
+                        Ok(uids) => candidate_uids.extend(uids),
+                        Err(error) => {
+                            push_record_warning(
+                                &mut warnings,
+                                format!(
+                                    "skipped mailbox '{candidate_mailbox}' query for {header}: {error}"
+                                ),
+                            );
+                            search_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if search_failed {
+                    continue;
+                }
+
+                let mut candidate_uids = candidate_uids.into_iter().collect::<Vec<_>>();
+                candidate_uids.sort_unstable();
+                for candidate_uid in candidate_uids {
+                    let identity = MailboxMessageIdentity {
+                        mailbox: candidate_mailbox.clone(),
+                        uid_validity: candidate_uid_validity,
+                        uid: candidate_uid,
+                    };
+                    if seen_messages.contains(&thread_identity_key(&identity)) {
+                        continue;
+                    }
+                    let headers = match imap_client::get_message_headers_bounded(
+                        session.session(),
+                        candidate_mailbox,
+                        candidate_uid,
+                        candidate_uid_validity,
+                        MAX_THREAD_RECORD_HEADER_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(headers) => headers,
+                        Err(error) => {
+                            push_record_warning(
+                                &mut warnings,
+                                format!(
+                                    "skipped {candidate_mailbox} UID {candidate_uid} during exact-header confirmation: {error}"
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    let info = match parser::parse_rfc822(
+                        &headers,
+                        candidate_uid,
+                        Vec::new(),
+                        u32::try_from(headers.len()).ok(),
+                        candidate_mailbox,
+                        account,
+                        false,
+                        false,
+                    ) {
+                        Ok(info) => info,
+                        Err(error) => {
+                            push_record_warning(
+                                &mut warnings,
+                                format!(
+                                    "skipped {candidate_mailbox} UID {candidate_uid} because its headers could not be parsed: {error}"
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    let basis = thread_match_basis(&info, &query_id);
+                    if basis.is_empty() {
+                        continue;
+                    }
+                    if messages.len() == MAX_THREAD_RECORD_MESSAGES {
+                        truncated = true;
+                        break 'graph;
+                    }
+                    let message = thread_record_message(identity.clone(), info, basis);
+                    seen_messages.insert(thread_identity_key(&identity));
+                    queue_thread_ids(&message, &mut known_ids, &mut pending_ids);
+                    messages.push(message);
+                    if let Some(progress) = on_progress {
+                        progress(messages.len() as u64, MAX_THREAD_RECORD_MESSAGES as u64);
+                    }
+                }
+            }
+        }
+        session.release().await;
+
+        messages.sort_by(|left, right| {
+            left.date
+                .cmp(&right.date)
+                .then_with(|| left.identity.mailbox.cmp(&right.identity.mailbox))
+                .then_with(|| left.identity.uid.cmp(&right.identity.uid))
+        });
+        if known_ids.is_empty() {
+            warnings.push(
+                "the seed has no Message-ID, In-Reply-To, or References values; the exact graph contains only the seed identity"
+                    .to_string(),
+            );
+        }
+        if truncated {
+            warnings.push(format!(
+                "the exact header graph exceeded {MAX_THREAD_RECORD_MESSAGES} storage identities; export is blocked until the selection is narrowed"
+            ));
+        }
+        let selection_digest = thread_selection_digest(account, &seed_identity, &messages)?;
+        Ok(ThreadRecordPreviewResponse {
+            account: account.to_string(),
+            seed: seed_identity,
+            strategy: "exact-rfc-message-id-graph".to_string(),
+            rationale: "Selected only live storage identities connected by exact Message-ID, In-Reply-To, or References values; subject similarity was not used."
+                .to_string(),
+            messages,
+            selection_digest,
+            confirmation_required: true,
+            truncated,
+            warnings,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -4226,6 +4889,138 @@ impl Agentmail {
         Ok(plan.mailboxes)
     }
 
+    async fn ensure_mailbox_not_in_pending_move(
+        &self,
+        account: &str,
+        mailbox: &imap_client::MailboxLayout,
+    ) -> Result<()> {
+        if !self.mutation_journal.is_persistent() {
+            return Ok(());
+        }
+        let account_key = self.mutation_account_key(account)?;
+        let pending = self.mutation_journal.list_pending(&account_key).await?;
+        let delimiter = mailbox.delimiter.as_deref();
+        if let Some(operation) = pending.into_iter().find(|operation| {
+            mailbox_is_same_or_descendant(&operation.source_mailbox, &mailbox.path, delimiter)
+                || mailbox_is_same_or_descendant(&operation.destination, &mailbox.path, delimiter)
+        }) {
+            return Err(AgentmailError::Other(format!(
+                "mailbox '{}' is referenced by pending move {}; reconcile that operation before renaming or deleting the mailbox",
+                mailbox.path, operation.operation_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reconnect after a mailbox command lost its tagged completion. The old
+    /// connection is never reused: after EOF or timeout its parser may still
+    /// be waiting for bytes from the abandoned command.
+    async fn mailbox_layout_after_ambiguous_mutation(
+        &self,
+        account: &str,
+        operation: &str,
+        original_error: &AgentmailError,
+    ) -> Result<(connection::PooledSession, Vec<imap_client::MailboxLayout>)> {
+        let mut session = self.pool.acquire(account).await.map_err(|error| {
+            AgentmailError::Other(format!(
+                "{operation} outcome is ambiguous after '{original_error}', and a fresh connection for reconciliation failed: {error}; inspect list_mailboxes before retrying"
+            ))
+        })?;
+        let layout = imap_client::list_mailbox_layout(session.session())
+            .await
+            .map_err(|error| {
+                AgentmailError::Other(format!(
+                    "{operation} outcome is ambiguous after '{original_error}', and a fresh mailbox listing failed: {error}; inspect list_mailboxes before retrying"
+                ))
+            })?;
+        Ok((session, layout))
+    }
+
+    /// APPEND one uniquely identified draft and reconcile a lost completion on
+    /// a fresh connection. A generated Message-ID is the idempotency key: its
+    /// presence proves the ambiguous APPEND reached the mailbox, while a
+    /// failed recovery remains explicitly ambiguous instead of inviting a
+    /// duplicate-producing blind retry.
+    async fn append_draft_with_recovery(
+        &self,
+        account: &str,
+        drafts_mailbox: &str,
+        rfc822: &[u8],
+        mut session: connection::PooledSession,
+    ) -> Result<Option<(u32, u32)>> {
+        let message_id = draft::extract_message_id(rfc822);
+        match imap_client::append_draft(session.session(), drafts_mailbox, rfc822).await {
+            Ok(()) => {
+                let identity = match message_id {
+                    Some(message_id) => {
+                        imap_client::find_uid_by_message_id(
+                            session.session(),
+                            drafts_mailbox,
+                            &message_id,
+                        )
+                        .await
+                    }
+                    None => Ok(None),
+                };
+                match identity {
+                    Ok(identity) => {
+                        session.release().await;
+                        Ok(identity)
+                    }
+                    Err(error) => {
+                        // APPEND already returned tagged OK, so identity lookup
+                        // is best-effort. Never put a timed-out parser back in
+                        // the pool merely because the draft itself succeeded.
+                        tracing::warn!(
+                            target: "agentmail",
+                            account,
+                            mailbox = drafts_mailbox,
+                            error = %error,
+                            "draft was appended, but its UID identity could not be recovered"
+                        );
+                        drop(session);
+                        Ok(None)
+                    }
+                }
+            }
+            Err(error) if error.is_connection_error() => {
+                drop(session);
+                let Some(message_id) = message_id else {
+                    return Err(AgentmailError::Other(format!(
+                        "draft APPEND outcome is ambiguous after {error}; the generated message had no recoverable Message-ID, so inspect Drafts before retrying"
+                    )));
+                };
+                let mut fresh = self.pool.acquire(account).await.map_err(|recovery_error| {
+                    AgentmailError::Other(format!(
+                        "draft APPEND outcome is ambiguous after {error}, and a fresh recovery connection failed: {recovery_error}; inspect Drafts before retrying"
+                    ))
+                })?;
+                match imap_client::find_uid_by_message_id(
+                    fresh.session(),
+                    drafts_mailbox,
+                    &message_id,
+                )
+                .await
+                {
+                    Ok(Some(identity)) => {
+                        fresh.release().await;
+                        Ok(Some(identity))
+                    }
+                    Ok(None) => {
+                        fresh.release().await;
+                        Err(AgentmailError::Other(format!(
+                            "draft APPEND outcome is ambiguous after {error}; a fresh Message-ID search found no matching draft, but inspect Drafts before retrying"
+                        )))
+                    }
+                    Err(recovery_error) => Err(AgentmailError::Other(format!(
+                        "draft APPEND outcome is ambiguous after {error}, and Message-ID recovery failed: {recovery_error}; inspect Drafts before retrying"
+                    ))),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolve this account's Trash and Drafts mailbox names from the bounded
     /// mailbox-layout catalog. One cold `LIST` resolves both roles.
     async fn special_mailboxes(
@@ -4294,6 +5089,329 @@ impl Agentmail {
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum MailboxMutationKind {
+    Rename,
+    Delete,
+}
+
+fn normalize_thread_message_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    let inner = value
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(value)
+        .trim();
+    if inner.is_empty()
+        || !inner.is_ascii()
+        || inner
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(format!("<{inner}>"))
+}
+
+fn thread_search_value(message_id: &str) -> &str {
+    message_id
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(message_id)
+}
+
+fn thread_identity_key(identity: &MailboxMessageIdentity) -> (String, u32, u32) {
+    (
+        identity.mailbox.clone(),
+        identity.uid_validity,
+        identity.uid,
+    )
+}
+
+fn thread_record_message(
+    identity: MailboxMessageIdentity,
+    info: MessageInfo,
+    selection_basis: Vec<String>,
+) -> ThreadRecordMessage {
+    ThreadRecordMessage {
+        identity,
+        message_id: info.message_id,
+        in_reply_to: info.in_reply_to,
+        references: info.references,
+        date: info.date,
+        from: info.sender,
+        subject: info.subject,
+        selection_basis,
+    }
+}
+
+fn queue_thread_ids(
+    message: &ThreadRecordMessage,
+    known_ids: &mut hashbrown::HashSet<String>,
+    pending_ids: &mut std::collections::VecDeque<String>,
+) {
+    for value in message
+        .message_id
+        .iter()
+        .chain(message.in_reply_to.iter())
+        .chain(message.references.iter())
+    {
+        if let Some(value) = normalize_thread_message_id(value)
+            && known_ids.insert(value.clone())
+        {
+            pending_ids.push_back(value);
+        }
+    }
+}
+
+fn thread_match_basis(message: &MessageInfo, query_id: &str) -> Vec<String> {
+    let mut basis = Vec::new();
+    if message
+        .message_id
+        .as_deref()
+        .and_then(normalize_thread_message_id)
+        .as_deref()
+        == Some(query_id)
+    {
+        basis.push(format!("Message-ID equals {query_id}"));
+    }
+    if message
+        .in_reply_to
+        .as_deref()
+        .and_then(normalize_thread_message_id)
+        .as_deref()
+        == Some(query_id)
+    {
+        basis.push(format!("In-Reply-To equals {query_id}"));
+    }
+    if message
+        .references
+        .iter()
+        .filter_map(|value| normalize_thread_message_id(value))
+        .any(|value| value == query_id)
+    {
+        basis.push(format!("References contains {query_id}"));
+    }
+    basis
+}
+
+fn push_record_warning(warnings: &mut Vec<String>, warning: String) {
+    const MAX_WARNINGS: usize = 20;
+    if warnings.len() < MAX_WARNINGS && !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
+}
+
+fn thread_selection_digest(
+    account: &str,
+    seed: &MailboxMessageIdentity,
+    messages: &[ThreadRecordMessage],
+) -> Result<String> {
+    use sha2::{Digest as _, Sha256};
+
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "schema": "agentmail.thread-selection.v1",
+        "account": account,
+        "seed": seed,
+        "strategy": "exact-rfc-message-id-graph",
+        "messages": messages,
+    }))
+    .map_err(|error| {
+        AgentmailError::Other(format!("failed to serialize thread selection: {error}"))
+    })?;
+    Ok(Sha256::digest(canonical)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn mailbox_names_equal(left: &str, right: &str) -> bool {
+    left == right || (left.eq_ignore_ascii_case("INBOX") && right.eq_ignore_ascii_case("INBOX"))
+}
+
+fn find_mailbox_layout<'a>(
+    layout: &'a [imap_client::MailboxLayout],
+    requested: &str,
+) -> Option<&'a imap_client::MailboxLayout> {
+    layout
+        .iter()
+        .find(|entry| mailbox_names_equal(&entry.path, requested))
+}
+
+fn mailbox_is_same_or_descendant(candidate: &str, parent: &str, delimiter: Option<&str>) -> bool {
+    if mailbox_names_equal(candidate, parent) {
+        return true;
+    }
+    let Some(delimiter) = delimiter.filter(|delimiter| !delimiter.is_empty()) else {
+        return false;
+    };
+    candidate
+        .strip_prefix(parent)
+        .is_some_and(|suffix| suffix.starts_with(delimiter))
+}
+
+async fn mailbox_mutation_preflight(
+    session: &mut imap_client::ImapSession,
+    mailbox: &imap_client::MailboxLayout,
+    layout: &[imap_client::MailboxLayout],
+    kind: MailboxMutationKind,
+) -> Result<MailboxMutationPreflight> {
+    let message_count = if mailbox.is_selectable() {
+        imap_client::mailbox_status(session, &mailbox.path, false)
+            .await?
+            .exists
+    } else {
+        0
+    };
+    let mut descendants: Vec<String> = layout
+        .iter()
+        .filter(|entry| {
+            entry.path != mailbox.path
+                && mailbox_is_same_or_descendant(
+                    &entry.path,
+                    &mailbox.path,
+                    mailbox.delimiter.as_deref(),
+                )
+        })
+        .map(|entry| entry.path.clone())
+        .collect();
+    descendants.sort();
+    let mut confirmations_required = vec![
+        match kind {
+            MailboxMutationKind::Rename => "confirmRename=true".to_string(),
+            MailboxMutationKind::Delete => "confirmDelete=true".to_string(),
+        },
+        format!("expectedMessageCount={message_count}"),
+    ];
+    if matches!(kind, MailboxMutationKind::Delete) && message_count > 0 {
+        confirmations_required.push("confirmNonEmpty=true".to_string());
+    }
+    if !mailbox.roles.is_empty() {
+        confirmations_required.push("confirmSpecialUse=true".to_string());
+    }
+    if !descendants.is_empty() {
+        confirmations_required.push("confirmDescendants=true".to_string());
+    }
+    Ok(MailboxMutationPreflight {
+        message_count,
+        roles: mailbox.roles.clone(),
+        descendants,
+        confirmations_required,
+    })
+}
+
+fn require_expected_message_count(expected: Option<u32>, actual: u32) -> Result<()> {
+    match expected {
+        Some(expected) if expected == actual => Ok(()),
+        Some(expected) => Err(AgentmailError::Other(format!(
+            "mailbox message count changed: expected {expected}, current count is {actual}; preview again before confirming"
+        ))),
+        None => Err(AgentmailError::Other(format!(
+            "expectedMessageCount is required for mutation; preview reported {actual}"
+        ))),
+    }
+}
+
+fn canonical_recipient_address(value: &str) -> Option<String> {
+    let value = value.trim();
+    let candidate = value
+        .rfind('<')
+        .and_then(|start| value.get(start + 1..))
+        .and_then(|tail| tail.strip_suffix('>'))
+        .unwrap_or(value)
+        .trim();
+    crate::config::canonicalize_email(candidate)
+}
+
+fn push_reply_recipient(
+    output: &mut Vec<String>,
+    seen: &mut hashbrown::HashSet<String>,
+    own: &hashbrown::HashSet<String>,
+    recipient: &str,
+) {
+    let recipient = recipient.trim();
+    if recipient.is_empty() {
+        return;
+    }
+    let identity =
+        canonical_recipient_address(recipient).unwrap_or_else(|| recipient.to_ascii_lowercase());
+    if own.contains(&identity) || !seen.insert(identity) {
+        return;
+    }
+    output.push(recipient.to_string());
+}
+
+fn reply_subject(subject: &str) -> String {
+    let subject = subject.trim();
+    if subject
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("re:"))
+    {
+        subject.to_string()
+    } else if subject.is_empty() {
+        "Re:".to_string()
+    } else {
+        format!("Re: {subject}")
+    }
+}
+
+fn validate_draft_payload(
+    body: &str,
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    reply_to: &[String],
+    attachments: &[DraftAttachment],
+) -> Result<()> {
+    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        return Err(AgentmailError::Other(
+            "At least one recipient (to, cc, or bcc) is required".to_string(),
+        ));
+    }
+    let recipient_count = to
+        .len()
+        .checked_add(cc.len())
+        .and_then(|count| count.checked_add(bcc.len()))
+        .and_then(|count| count.checked_add(reply_to.len()))
+        .ok_or_else(|| AgentmailError::Other("draft recipient count overflow".to_string()))?;
+    if recipient_count > MAX_DRAFT_RECIPIENTS {
+        return Err(AgentmailError::Other(format!(
+            "draft has {recipient_count} recipients; maximum is {MAX_DRAFT_RECIPIENTS}"
+        )));
+    }
+    if body.len() > MAX_DRAFT_BODY_BYTES {
+        return Err(AgentmailError::Other(format!(
+            "draft body is {} bytes; maximum is {MAX_DRAFT_BODY_BYTES}",
+            body.len()
+        )));
+    }
+    if attachments.len() > MAX_DRAFT_ATTACHMENTS {
+        return Err(AgentmailError::Other(format!(
+            "draft has {} attachments; maximum is {MAX_DRAFT_ATTACHMENTS}",
+            attachments.len()
+        )));
+    }
+    let mut total = 0usize;
+    for attachment in attachments {
+        if attachment.data.len() > MAX_DRAFT_ATTACHMENT_BYTES {
+            return Err(AgentmailError::Other(format!(
+                "draft attachment '{}' is {} bytes; per-file maximum is {MAX_DRAFT_ATTACHMENT_BYTES}",
+                attachment.filename,
+                attachment.data.len()
+            )));
+        }
+        total = total
+            .checked_add(attachment.data.len())
+            .ok_or_else(|| AgentmailError::Other("draft attachment size overflow".to_string()))?;
+    }
+    if total > MAX_DRAFT_ATTACHMENTS_TOTAL_BYTES {
+        return Err(AgentmailError::Other(format!(
+            "draft attachments total {total} bytes; maximum is {MAX_DRAFT_ATTACHMENTS_TOTAL_BYTES}"
+        )));
+    }
+    Ok(())
+}
 
 /// What a delete sweep matches. The discovery predicate is the only thing that
 /// differs across the list-id, exact-sender, and unsubscribe-cleanup deletes;
@@ -4979,6 +6097,39 @@ pub fn bits_to_color(flags: &[String]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_inbox_is_case_insensitive_for_mailbox_mutations() {
+        assert!(mailbox_names_equal("INBOX", "inbox"));
+        assert!(!mailbox_names_equal("Archive", "archive"));
+    }
+
+    #[test]
+    fn reply_subject_adds_exactly_one_prefix() {
+        assert_eq!(reply_subject("Status"), "Re: Status");
+        assert_eq!(reply_subject("re: Status"), "re: Status");
+        assert_eq!(reply_subject("  RE: Status  "), "RE: Status");
+    }
+
+    #[test]
+    fn exact_thread_matching_normalizes_brackets_but_not_substrings() {
+        let raw = b"From: sender@example.com\r\nSubject: update\r\nMessage-ID: <child@example.com>\r\nIn-Reply-To: <parent@example.com>\r\nReferences: <root@example.com> <parent@example.com>\r\n\r\n";
+        let message = parser::parse_rfc822(raw, 1, Vec::new(), None, "INBOX", "work", false, false)
+            .expect("parse headers");
+        assert_eq!(
+            thread_match_basis(&message, "<parent@example.com>"),
+            vec![
+                "In-Reply-To equals <parent@example.com>".to_string(),
+                "References contains <parent@example.com>".to_string(),
+            ]
+        );
+        assert!(thread_match_basis(&message, "<rent@example.com>").is_empty());
+        assert_eq!(
+            normalize_thread_message_id("parent@example.com").as_deref(),
+            Some("<parent@example.com>")
+        );
+        assert!(normalize_thread_message_id("bad id@example.com").is_none());
+    }
 
     #[test]
     fn archive_filename_requires_one_portable_component() {

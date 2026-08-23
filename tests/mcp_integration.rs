@@ -307,13 +307,13 @@ async fn initialize_reports_capabilities_and_identity() {
 }
 
 #[tokio::test]
-async fn tools_list_has_31_annotated_tools() {
+async fn tools_list_has_37_annotated_tools() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        31,
+        37,
         "tool count drifted — update docs and tests"
     );
 
@@ -830,36 +830,46 @@ async fn discovery_outputs_have_safe_complete_message_identities() {
 }
 
 #[tokio::test]
-async fn resources_templates_list_five_uidvalidity_safe_templates() {
+async fn resources_templates_list_six_annotated_templates() {
     let mut client = McpClient::start().await;
     let resp = client.request("resources/templates/list", json!({})).await;
     let templates = resp["result"]["resourceTemplates"]
         .as_array()
         .expect("resourceTemplates array");
-    assert_eq!(templates.len(), 5, "template count drifted: {templates:#?}");
+    assert_eq!(templates.len(), 6, "template count drifted: {templates:#?}");
 
-    let body = &templates[0];
+    let mailbox = &templates[0];
+    assert_eq!(
+        mailbox["uriTemplate"].as_str(),
+        Some("email://{account}/{mailbox}{?offset,limit}")
+    );
+    assert_eq!(mailbox["annotations"]["priority"].as_f64(), Some(0.8));
+    assert_eq!(mailbox["annotations"]["audience"], json!(["assistant"]));
+
+    let body = &templates[1];
     assert_eq!(
         body["uriTemplate"].as_str(),
         Some("email://{account}/{mailbox}/{uidValidity}/{uid}")
     );
     assert_eq!(body["mimeType"].as_str(), Some("text/markdown"));
 
-    let headers = &templates[1];
+    assert_eq!(body["annotations"]["priority"].as_f64(), Some(0.8));
+
+    let headers = &templates[2];
     assert_eq!(
         headers["uriTemplate"].as_str(),
         Some("email://{account}/{mailbox}/{uidValidity}/{uid}/headers")
     );
     assert_eq!(headers["mimeType"].as_str(), Some("text/rfc822-headers"));
 
-    let source = &templates[2];
+    let source = &templates[3];
     assert_eq!(
         source["uriTemplate"].as_str(),
         Some("email://{account}/{mailbox}/{uidValidity}/{uid}/source")
     );
     assert_eq!(source["mimeType"].as_str(), Some("message/rfc822"));
 
-    let info = &templates[3];
+    let info = &templates[4];
     assert_eq!(
         info["uriTemplate"].as_str(),
         Some("email://{account}/{mailbox}/{uidValidity}/{uid}/info")
@@ -873,7 +883,7 @@ async fn resources_templates_list_five_uidvalidity_safe_templates() {
         "info template should advertise the attachment inventory"
     );
 
-    let attachment = &templates[4];
+    let attachment = &templates[5];
     assert_eq!(
         attachment["uriTemplate"].as_str(),
         Some("email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}")
@@ -889,12 +899,14 @@ async fn resources_templates_list_five_uidvalidity_safe_templates() {
             .contains("download_attachments"),
         "attachment template should point large files at download_attachments"
     );
+    assert_eq!(
+        attachment["annotations"]["audience"],
+        json!(["user", "assistant"])
+    );
 }
 
 #[tokio::test]
-async fn resources_list_is_empty() {
-    // Discovery is template-only; this also pins that resources/list is
-    // served (not method_not_found) now that the capability is advertised.
+async fn resources_list_exposes_annotated_account_roots() {
     let mut client = McpClient::start().await;
     let resp = client.request("resources/list", json!({})).await;
     assert!(
@@ -904,14 +916,19 @@ async fn resources_list_is_empty() {
     let resources = resp["result"]["resources"]
         .as_array()
         .expect("resources array");
-    assert!(resources.is_empty(), "expected empty list: {resources:#?}");
+    assert_eq!(resources.len(), 1, "account roots drifted: {resources:#?}");
+    assert_eq!(resources[0]["uri"].as_str(), Some("email://dummy"));
+    assert_eq!(resources[0]["annotations"]["priority"].as_f64(), Some(0.8));
+    assert_eq!(
+        resources[0]["annotations"]["audience"],
+        json!(["assistant"])
+    );
 }
 
 #[tokio::test]
 async fn resources_read_malformed_uri_is_32602() {
     let mut client = McpClient::start().await;
     for uri in [
-        "email://dummy/INBOX",
         "email://dummy/INBOX/1",
         "email://dummy/INBOX/0/1",
         "email://dummy/INBOX/1/0",

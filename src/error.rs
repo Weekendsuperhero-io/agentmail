@@ -11,6 +11,12 @@ pub enum AgentmailError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A timed-out IMAP command leaves the connection's parser state unsafe
+    /// to reuse. For a mutation, it also means the server-side outcome may be
+    /// unknown even though no tagged completion reached the client.
+    #[error("IMAP operation timed out after {seconds}s")]
+    ImapTimeout { seconds: u64 },
+
     #[error("mutation journal database error: {0}")]
     JournalSqlite(#[from] rusqlite::Error),
 
@@ -82,7 +88,10 @@ impl AgentmailError {
                 e,
                 async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost
             ),
-            AgentmailError::Io(_) | AgentmailError::Tls(_) | AgentmailError::NotConnected => true,
+            AgentmailError::Io(_)
+            | AgentmailError::Tls(_)
+            | AgentmailError::ImapTimeout { .. }
+            | AgentmailError::NotConnected => true,
             _ => false,
         }
     }
@@ -112,6 +121,7 @@ mod tests {
             .is_connection_error()
         );
         assert!(AgentmailError::NotConnected.is_connection_error());
+        assert!(AgentmailError::ImapTimeout { seconds: 90 }.is_connection_error());
 
         // Server rejection / client errors → NOT retryable.
         assert!(

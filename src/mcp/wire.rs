@@ -23,6 +23,9 @@ const MAX_LIST_SENDER_PREVIEW: usize = 5;
 /// channels.
 pub(super) trait WireOutput: Serialize {}
 
+impl WireOutput for crate::ThreadRecordPreviewResponse {}
+impl WireOutput for crate::ThreadRecordExportResponse {}
+
 /// Construct a structured value plus the same complete JSON in a text block.
 ///
 /// Some MCP hosts still render only `content`, so truncating or summarizing
@@ -106,7 +109,7 @@ fn collect_resource_uris(value: &serde_json::Value, out: &mut Vec<String>) {
 fn message_resource_links(structured: &serde_json::Value) -> Vec<ContentBlock> {
     use super::resources::{
         EMAIL_BODY_MIME, EMAIL_BODY_NAME, EMAIL_BODY_TITLE, EMAIL_INFO_MIME, EMAIL_INFO_NAME,
-        EMAIL_INFO_TITLE,
+        EMAIL_INFO_TITLE, assistant_annotations,
     };
     use rmcp::model::Resource;
 
@@ -119,7 +122,8 @@ fn message_resource_links(structured: &serde_json::Value) -> Vec<ContentBlock> {
                 ContentBlock::ResourceLink(
                     Resource::new(uri, EMAIL_BODY_NAME)
                         .with_title(EMAIL_BODY_TITLE)
-                        .with_mime_type(EMAIL_BODY_MIME),
+                        .with_mime_type(EMAIL_BODY_MIME)
+                        .with_annotations(assistant_annotations(0.8)),
                 ),
                 ContentBlock::ResourceLink(
                     Resource::new(info, EMAIL_INFO_NAME)
@@ -128,7 +132,8 @@ fn message_resource_links(structured: &serde_json::Value) -> Vec<ContentBlock> {
                             "Metadata plus the sibling headers/source URIs and the \
                              attachment inventory for this message.",
                         )
-                        .with_mime_type(EMAIL_INFO_MIME),
+                        .with_mime_type(EMAIL_INFO_MIME)
+                        .with_annotations(assistant_annotations(0.5)),
                 ),
             ]
         })
@@ -1547,11 +1552,89 @@ impl WireOutput for CreateMailboxOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct MailboxMutationPreflightOutput {
+    pub(super) message_count: u32,
+    pub(super) roles: Vec<String>,
+    pub(super) descendants: Vec<String>,
+    pub(super) confirmations_required: Vec<String>,
+}
+
+impl From<crate::MailboxMutationPreflight> for MailboxMutationPreflightOutput {
+    fn from(value: crate::MailboxMutationPreflight) -> Self {
+        Self {
+            message_count: value.message_count,
+            roles: value.roles,
+            descendants: value.descendants,
+            confirmations_required: value.confirmations_required,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RenameMailboxOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    pub(super) new_mailbox: String,
+    pub(super) preview: bool,
+    pub(super) renamed: bool,
+    pub(super) preflight: MailboxMutationPreflightOutput,
+}
+
+impl From<crate::RenameMailboxResponse> for RenameMailboxOutput {
+    fn from(value: crate::RenameMailboxResponse) -> Self {
+        Self {
+            account: value.account,
+            mailbox: value.mailbox,
+            new_mailbox: value.new_mailbox,
+            preview: value.preview,
+            renamed: value.renamed,
+            preflight: value.preflight.into(),
+        }
+    }
+}
+
+impl WireOutput for RenameMailboxOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DeleteMailboxOutput {
+    pub(super) account: String,
+    pub(super) mailbox: String,
+    pub(super) preview: bool,
+    pub(super) deleted: bool,
+    pub(super) already_missing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) preflight: Option<MailboxMutationPreflightOutput>,
+}
+
+impl From<crate::DeleteMailboxResponse> for DeleteMailboxOutput {
+    fn from(value: crate::DeleteMailboxResponse) -> Self {
+        Self {
+            account: value.account,
+            mailbox: value.mailbox,
+            preview: value.preview,
+            deleted: value.deleted,
+            already_missing: value.already_missing,
+            preflight: value.preflight.map(Into::into),
+        }
+    }
+}
+
+impl WireOutput for DeleteMailboxOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct CreateDraftOutput {
     pub(super) created: bool,
     pub(super) account: String,
     pub(super) drafts_mailbox: String,
     pub(super) attachment_count: usize,
+    pub(super) reply_to_count: usize,
+    pub(super) threading_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) warning: Option<String>,
     /// UIDVALIDITY of the drafts mailbox, when the server let the new
     /// draft's identity be recovered after APPEND.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1582,6 +1665,9 @@ impl From<crate::CreateDraftResponse> for CreateDraftOutput {
             account: value.account,
             drafts_mailbox: value.drafts_mailbox,
             attachment_count: value.attachments.len(),
+            reply_to_count: value.recipients.reply_to.len(),
+            threading_applied: value.threading_applied,
+            warning: value.warning,
             uid_validity: value.uid_validity,
             uid: value.uid,
             resource_uri,
@@ -1590,6 +1676,52 @@ impl From<crate::CreateDraftResponse> for CreateDraftOutput {
 }
 
 impl WireOutput for CreateDraftOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct UpdateDraftOutput {
+    pub(super) updated: bool,
+    pub(super) account: String,
+    pub(super) drafts_mailbox: String,
+    #[schemars(range(min = 1))]
+    pub(super) previous_uid_validity: u32,
+    #[schemars(range(min = 1))]
+    pub(super) previous_uid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub(super) uid_validity: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub(super) uid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resource_uri: Option<String>,
+}
+
+impl From<crate::UpdateDraftResponse> for UpdateDraftOutput {
+    fn from(value: crate::UpdateDraftResponse) -> Self {
+        let resource_uri = match (value.uid_validity, value.uid) {
+            (Some(uid_validity), Some(uid)) => Some(message_resource_uri(
+                &value.account,
+                &value.drafts_mailbox,
+                uid_validity,
+                uid,
+            )),
+            _ => None,
+        };
+        Self {
+            updated: value.updated,
+            account: value.account,
+            drafts_mailbox: value.drafts_mailbox,
+            previous_uid_validity: value.previous_uid_validity,
+            previous_uid: value.previous_uid,
+            uid_validity: value.uid_validity,
+            uid: value.uid,
+            resource_uri,
+        }
+    }
+}
+
+impl WireOutput for UpdateDraftOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

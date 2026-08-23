@@ -423,4 +423,45 @@ impl AgentMailServer {
             Err(e) => Ok(tool_error_result(&e)),
         }
     }
+
+    #[tool(
+        name = "preview_thread_record",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::ThreadRecordPreviewResponse>().expect("valid preview_thread_record output schema"),
+        description = "Preview the exact, bounded cross-mailbox RFC Message-ID graph around one live message. Requires mailbox, uid, and expectedUidValidity from the same discovery result. Selection uses only exact Message-ID, In-Reply-To, and References relationships—never subject similarity—and returns every exact storage identity plus a confirmation digest. No files are written.",
+        annotations(
+            title = "Preview Thread Record",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        execution(task_support = "optional")
+    )]
+    async fn preview_thread_record_tool(
+        &self,
+        meta: Meta,
+        client: Peer<RoleServer>,
+        ct: CancellationToken,
+        Parameters(args): Parameters<PreviewThreadRecordArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.mailbox.trim().is_empty() {
+            return Err(McpError::invalid_params("mailbox is required", None));
+        }
+        let progress = make_progress_fn(&meta, &client);
+        let cancel = make_cancel_fn(ct);
+        let result = self
+            .agentmail
+            .preview_thread_record(
+                args.mailbox.trim(),
+                &args.account,
+                args.uid,
+                args.expected_uid_validity,
+                progress.callback(),
+                Some(&cancel),
+            )
+            .await;
+        progress.finish().await;
+        match result {
+            Ok(data) => compact_result(data),
+            Err(error) => Ok(tool_error_result(&error)),
+        }
+    }
 }
