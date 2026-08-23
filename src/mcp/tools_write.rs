@@ -1711,7 +1711,7 @@ fn guess_content_type(filename: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_private_dir, guess_content_type};
+    use super::guess_content_type;
 
     #[test]
     fn guess_content_type_maps_known_extensions_and_falls_back() {
@@ -1736,7 +1736,9 @@ mod tests {
             "agentmail-private-record-dir-{}",
             uuid::Uuid::new_v4()
         ));
-        create_private_dir(&path).await.expect("create private dir");
+        super::create_private_dir(&path)
+            .await
+            .expect("create private dir");
         let mode = std::fs::metadata(&path)
             .expect("metadata")
             .permissions()
