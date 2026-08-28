@@ -29,15 +29,47 @@ fn main() {
     // resolve HEAD to its ref file and watch that directly. `packed-refs` covers
     // a packed (loose-file-absent) ref; a detached HEAD has no `ref:` line and
     // is covered by the HEAD watch itself.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/packed-refs");
+    //
+    // RESOLVE THE GITDIR FIRST. `.git` is a DIRECTORY only in a standalone
+    // clone. When this crate is consumed as a SUBMODULE — which is how the app
+    // consumes it — `.git` is a FILE holding `gitdir: ../.git/modules/<name>`,
+    // so `.git/HEAD` names a path that does not exist.
+    //
+    // Cargo treats a `rerun-if-changed` target that is missing as PERMANENTLY
+    // DIRTY, so this build script re-ran on every single cargo invocation, and
+    // `agentmail` is a workspace dependency of both `app-api` and `src-tauri`.
+    // Every `cargo test`/`build`/`run` in the app therefore recompiled
+    // agentmail -> app-api -> agent before doing anything else. Measured on CI
+    // run 33214508616: a smoke step that should have been a no-op spent 1m42s
+    // recompiling, and `cargo report rebuilds` named the cause outright —
+    // "agentmail@0.5.0 build-script (run): file missing: agentmail-mcp\.git/HEAD,
+    // impact: 4 dependent units rebuilt". It also capped the value of caching
+    // workspace crates, since the two most expensive crates were invalidated
+    // every run no matter what the cache held.
+    //
+    // The SHA above was never affected: it shells out to `git`, which resolves
+    // the indirection itself. Only these watches assumed a directory.
+    let git_dir = match std::fs::read_to_string(".git") {
+        // Submodule/worktree: `.git` is a file pointing elsewhere. The path is
+        // relative to THIS directory, and cargo resolves rerun-if-changed
+        // relative to the manifest dir, so it can be emitted as-is.
+        Ok(pointer) => pointer
+            .strip_prefix("gitdir:")
+            .map(|p| p.trim().to_string())
+            .unwrap_or_else(|| ".git".to_string()),
+        // Standalone clone: `.git` is a directory, so reading it as a file
+        // fails and the original behaviour is correct.
+        Err(_) => ".git".to_string(),
+    };
+    println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    println!("cargo:rerun-if-changed={git_dir}/packed-refs");
     // A single flat `if let` over a combinator chain: portable to any toolchain
     // (no `let`-chain, so edition/MSRV-independent) AND not a nested `if`, so it
     // does not trip clippy's `collapsible_if`.
-    if let Some(reference) = std::fs::read_to_string(".git/HEAD")
+    if let Some(reference) = std::fs::read_to_string(format!("{git_dir}/HEAD"))
         .ok()
         .and_then(|head| head.strip_prefix("ref: ").map(|r| r.trim().to_string()))
     {
-        println!("cargo:rerun-if-changed=.git/{reference}");
+        println!("cargo:rerun-if-changed={git_dir}/{reference}");
     }
 }
