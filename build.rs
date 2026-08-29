@@ -5,6 +5,32 @@
 //! the standalone repo); no git → "unknown".
 
 fn main() {
+    // AGENTMAIL_SHA short-circuits every git call AND every file watch below.
+    //
+    // The watches are correct locally and pathological in CI. `rerun-if-changed`
+    // is compared by MTIME - `[build] fingerprint = "content"` explicitly does
+    // not cover build scripts - and a CI checkout rewrites `HEAD`'s mtime on
+    // every run. So this build script re-ran every time, and because `agentmail`
+    // is a workspace dependency of both `app-api` and `src-tauri` it dragged 33
+    // dependent units with it (consuming repo, CI run 33230223593).
+    //
+    // An env var is compared by VALUE, so the fingerprint is stable across
+    // checkouts and still changes the moment the submodule pointer moves. The
+    // caller passes this crate's OWN commit, not the superproject's:
+    //
+    //     AGENTMAIL_SHA=$(git -C agentmail-mcp rev-parse --short=9 HEAD)
+    //
+    // Unset - a normal local build - and everything below behaves as before.
+    if let Ok(sha) = std::env::var("AGENTMAIL_SHA") {
+        let sha = sha.trim();
+        if !sha.is_empty() {
+            println!("cargo:rustc-env=AGENTMAIL_BUILD_SHA={sha}");
+            println!("cargo:rerun-if-env-changed=AGENTMAIL_SHA");
+            return;
+        }
+    }
+    println!("cargo:rerun-if-env-changed=AGENTMAIL_SHA");
+
     let sha = std::process::Command::new("git")
         .args(["rev-parse", "--short=9", "HEAD"])
         .output()
