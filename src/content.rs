@@ -24,6 +24,53 @@ pub fn plain_to_markdown(value: &str) -> String {
     collapse_blank_lines(value)
 }
 
+/// The one inline style the rendered part carries.
+///
+/// Mail clients strip `<style>` blocks and never fetch external CSS, so
+/// anything not inline is decoration only some readers see. A font stack, a
+/// size and a line height are what a client's own "rich text" composer applies;
+/// colours, widths and backgrounds are left alone so the reader's theme — and
+/// dark mode in particular — still governs.
+const EMAIL_BODY_STYLE: &str = "font-family:-apple-system,BlinkMacSystemFont,\
+     'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5";
+
+/// Render a Markdown draft body into the `text/html` half of a
+/// `multipart/alternative` message.
+///
+/// Raw HTML in the source is ESCAPED, never emitted. A draft body is
+/// agent-authored text, so treating `<...>` inside it as markup would let a
+/// tool call decide what runs in a recipient's mail client. `pulldown_cmark`
+/// surfaces raw HTML as its own events, and mapping those to TEXT is
+/// deliberate over dropping them: a literal `<b>` reaches the reader as the
+/// characters that were written, rather than silently disappearing. There is
+/// no sanitiser to keep in step with, because no markup ever passes through.
+///
+/// Extensions are limited to tables and strikethrough — the GFM constructs that
+/// mean something in correspondence. Smart punctuation is deliberately OFF: it
+/// would rewrite quotes and dashes in the HTML part while the plain part kept
+/// the originals, and the two halves of an `alternative` must say the same
+/// thing.
+pub fn markdown_to_email_html(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+
+    let events = Parser::new_ext(markdown, options).map(|event| match event {
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        other => other,
+    });
+
+    let mut rendered = String::with_capacity(markdown.len() + 256);
+    pulldown_cmark::html::push_html(&mut rendered, events);
+
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"></head>\n\
+         <body style=\"{EMAIL_BODY_STYLE}\">\n{rendered}</body>\n</html>\n"
+    )
+}
+
 /// Truncate text to `max_chars` on a char boundary.
 ///
 /// Returns `(truncated_text, was_truncated)`.

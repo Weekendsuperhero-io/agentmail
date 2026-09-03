@@ -25,7 +25,7 @@ impl AgentMailServer {
                  First, call list_mailboxes with this account to see selectable folders, message totals, and unread counts. \
                  Then use top_senders with mailbox and limit omitted so its account-wide default page of 10 ranks the top senders by volume. \
                  Finally, show the 10 most recent unread INBOX messages using search_messages with mailbox=\"INBOX\", read=false, and limit=10. \
-                 Search results are metadata-only; read a row's UIDVALIDITY-safe resourceUri only when more content is needed.",
+                 Search results are metadata-only; follow a row's resource_link only when more content is needed.",
                 params.0.account
             ),
         )]
@@ -66,8 +66,8 @@ impl AgentMailServer {
             Role::User,
             format!(
                 "Find all messages with attachments in mailbox \"{}\" for account \"{}\". \
-                 Use find_attachments with limit=10. Each hit has mailbox, uidValidity, uid, date, and resourceUri. \
-                 Show those safe identities and dates; read resourceUri for any hit whose sender or subject I ask to inspect. \
+                 Use find_attachments with limit=10. Each hit has mailbox, uidValidity, uid, and date, and rides the result as a resource_link. \
+                 Show those safe identities and dates; follow the link for any hit whose sender or subject I ask to inspect. \
                  If I approve a download, call download_attachments with the hit's mailbox and uid, mapping uidValidity \
                  to expectedUidValidity so a recycled UID cannot target another message.",
                 mailbox, params.0.account
@@ -117,7 +117,7 @@ impl AgentMailServer {
                  of bulk-mail sender addresses. Results are grouped by normalized sender email and sorted by advertised one-click \
                  syntax first, then count; execution still requires live DKIM verification. \
                  Step 2: Present each row's address, count, advertisedOneClick, and nested \
-                 sample {{mailbox, uidValidity, uid, resourceUri}}. Offer either filing with move_subscription \
+                 sample {{mailbox, uidValidity, uid}} with its resource_link. Offer either filing with move_subscription \
                  or an unsubscribe POST; ask me to approve each action and destination. For filing, map the sample \
                  to mailbox, expectedUidValidity, and uid; move_subscription derives the live exact sender and \
                  optional List-Id scope and moves matching bulk mail account-wide. \
@@ -153,7 +153,7 @@ impl AgentMailServer {
                  mailing list regardless of sender — useful for lists like GitHub notifications where \
                  multiple senders share one List-Id. \
                  Step 2: Present me with the ranked list so I can see which lists have the most messages. \
-                 Show listId, display name, message count, senderCount, the bounded sender preview, and safe sample resourceUri. \
+                 Show listId, display name, message count, senderCount, the bounded sender preview, and the safe sample identity. \
                  Step 3: For each list I approve, call delete_list_id with its listId value to remove \
                  all messages from that mailing list across all mailboxes.",
                 params.0.account

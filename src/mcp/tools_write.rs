@@ -3,11 +3,11 @@
 use super::AgentMailServer;
 use super::args::*;
 use super::wire::{
-    AddFlagsOutput, CreateDraftOutput, CreateMailboxOutput, DeleteByDomainOutput,
+    CreateDraftOutput, CreateMailboxOutput, DeleteByDomainOutput,
     DeleteBySenderOutput, DeleteListIdOutput, DeleteMailboxOutput, DeleteMessagesOutput,
     DownloadAttachmentsOutput, DownloadMessageSourceOutput, DownloadThreadOutput,
     MoveByDomainOutput, MoveBySenderOutput, MoveListIdOutput, MoveMessageOutput,
-    MoveSubscriptionOutput, ReconcileMovesOutput, RemoveFlagsOutput, RenameMailboxOutput,
+    MoveSubscriptionOutput, ReconcileMovesOutput, RenameMailboxOutput, UpdateFlagsOutput,
     UnsubscribeMessageOutput, UpdateDraftOutput, compact_result, tool_error_result,
 };
 use super::{make_cancel_fn, make_progress_fn};
@@ -431,16 +431,44 @@ async fn archive_target_exists(
     Ok(None)
 }
 
+/// Map the tool's opt-OUT flag to the composer's body format.
+///
+/// Rendering is the default because an author writing `**bold**` means
+/// emphasis, and a reader seeing literal asterisks is the failure. The flag
+/// exists for the cases where plain text IS the wire format.
+fn body_format(plain_text_only: bool) -> crate::draft::BodyFormat {
+    if plain_text_only {
+        crate::draft::BodyFormat::PlainOnly
+    } else {
+        crate::draft::BodyFormat::MarkdownAndHtml
+    }
+}
+
+/// Read a draft's attachments off disk, through the session's sandbox.
+///
+/// The sandbox is resolved ONLY when there is a file to read. A draft with no
+/// attachments touches no path, so requiring a workspace for one rejected plain
+/// text drafts in every session that had none — `create_draft`,
+/// `create_reply_draft` and `update_draft` all resolved the policy
+/// unconditionally, and an agent asked to save a reply got
+/// `-32602 … requires an active session workspace` and fell back to opening a
+/// `mailto:` link (2026-09-03). Composing a message is not a file operation;
+/// only attaching to one is.
 async fn load_draft_attachments(
-    file_access: &super::file_access::FileAccessPolicy,
+    server: &AgentMailServer,
+    meta: &Meta,
     attachments: &[DraftAttachmentArg],
 ) -> Result<Vec<DraftAttachment>, McpError> {
+    if attachments.is_empty() {
+        return Ok(Vec::new());
+    }
     if attachments.len() > MAX_DRAFT_ATTACHMENTS {
         return Err(McpError::invalid_params(
             format!("attachments supports at most {MAX_DRAFT_ATTACHMENTS} files"),
             None,
         ));
     }
+    let file_access = server.file_access_for_request(meta)?;
 
     let mut preflight = Vec::with_capacity(attachments.len());
     let mut preflight_total = 0_u64;
@@ -806,7 +834,7 @@ impl AgentMailServer {
     #[tool(
         name = "download_attachments",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadAttachmentsOutput>().expect("valid download_attachments output schema"),
-        description = "Download all attachments from one message to disk. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Files are saved as {uid}_{originalname}. Returns paths, content types, and sizes.",
+        description = "Download all attachments from one message to disk. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Each file is saved as {uid}_{index}_{name} with the name sanitized — the same canonical filename /info reports for that part. Omit outputDir to write into the session workspace. Returns paths, content types, and sizes.",
         annotations(
             title = "Download Attachments",
             read_only_hint = false,
@@ -1073,7 +1101,7 @@ impl AgentMailServer {
     #[tool(
         name = "create_draft",
         output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>().expect("valid create_draft output schema"),
-        description = "Create and save a complete RFC822 draft. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Requires at least one to, cc, or bcc recipient. Subject and body are optional; attachments may reference local file paths. Returns the new draft's uid, uidValidity, and resourceUri when the server allows recovering them.",
+        description = "Create and save a draft — a fresh message, or a reply to a live one. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Compose fresh by giving recipients: at least one of to, cc or bcc. Reply instead by giving replyToMessage {mailbox, uid, expectedUidValidity, mode} from a discovery result — that derives the recipients (Reply-To before From, excluding this account's own addresses and aliases), a Re: subject you may override, and the RFC In-Reply-To/References headers; to, cc, inReplyTo and references must then be omitted, and bcc is still never inferred. Subject and body are optional; attachments may reference local file paths. The body is read as Markdown and sent as multipart/alternative — the text exactly as written, plus an HTML rendering — so **bold**, lists, links and tables arrive formatted rather than as literal syntax. Raw HTML in the body is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part. Returns the new draft's uid and uidValidity when the server allows recovering them, and links the draft as a resource_link. A draft's UID is NOT durable — re-saving it (here, or in any other mail client) appends a new message and expunges the old one, and some servers discard an APPENDed draft outright. Re-read the link from a fresh get_messages rather than reusing one from an earlier turn. This tool never sends mail.",
         annotations(
             title = "Create Draft",
             read_only_hint = false,
@@ -1085,14 +1113,60 @@ impl AgentMailServer {
         meta: Meta,
         Parameters(args): Parameters<CreateDraftArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let loaded = load_draft_attachments(self, &meta, &args.attachments).await?;
+
+        // Replying: the source message supplies the recipients, the subject and
+        // the threading headers. Passing them TOO is refused rather than
+        // silently ignored or merged — two sources for one field is how a reply
+        // quietly goes to the wrong people.
+        if let Some(source) = args.reply_to_message.clone() {
+            for (field, populated) in [
+                ("to", !args.to.is_empty()),
+                ("cc", !args.cc.is_empty()),
+                ("inReplyTo", args.in_reply_to.is_some()),
+                ("references", !args.references.is_empty()),
+            ] {
+                if populated {
+                    return Err(McpError::invalid_params(
+                        format!("`{field}` is derived from replyToMessage — omit it"),
+                        None,
+                    ));
+                }
+            }
+            if source.mailbox.trim().is_empty() {
+                return Err(McpError::invalid_params(
+                    "replyToMessage.mailbox is required",
+                    None,
+                ));
+            }
+            return match self
+                .agentmail
+                .create_reply_draft(
+                    &args.account,
+                    source.mailbox.trim(),
+                    source.uid,
+                    source.expected_uid_validity,
+                    reply_mode(source.mode),
+                    Some(args.subject.trim()).filter(|subject| !subject.is_empty()),
+                    &args.body,
+                    &args.bcc,
+                    &args.reply_to,
+                    &loaded,
+                    body_format(args.plain_text_only),
+                )
+                .await
+            {
+                Ok(data) => compact_result(CreateDraftOutput::from(data)),
+                Err(error) => Ok(tool_error_result(&error)),
+            };
+        }
+
         if args.to.is_empty() && args.cc.is_empty() && args.bcc.is_empty() {
             return Err(McpError::invalid_params(
-                "At least one recipient (to, cc, or bcc) is required",
+                "At least one recipient (to, cc, or bcc) is required, or replyToMessage to derive them",
                 None,
             ));
         }
-        let file_access = self.file_access_for_request(&meta)?;
-        let loaded = load_draft_attachments(&file_access, &args.attachments).await?;
 
         match self
             .agentmail
@@ -1108,6 +1182,7 @@ impl AgentMailServer {
                 &args.references,
                 &loaded,
                 None,
+                body_format(args.plain_text_only),
             )
             .await
         {
@@ -1117,50 +1192,9 @@ impl AgentMailServer {
     }
 
     #[tool(
-        name = "create_reply_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>().expect("valid create_reply_draft output schema"),
-        description = "Create a reply or reply-all draft from one live message identity. Requires mailbox, uid, and expectedUidValidity from the same discovery result. Uses Reply-To before From, excludes the account's own primary address and aliases, adds RFC In-Reply-To and References when the source has Message-ID, never infers Bcc, and saves only to Drafts; it never sends mail.",
-        annotations(
-            title = "Create Reply Draft",
-            read_only_hint = false,
-            destructive_hint = false
-        )
-    )]
-    async fn create_reply_draft_tool(
-        &self,
-        meta: Meta,
-        Parameters(args): Parameters<CreateReplyDraftArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        if args.mailbox.trim().is_empty() {
-            return Err(McpError::invalid_params("mailbox is required", None));
-        }
-        let file_access = self.file_access_for_request(&meta)?;
-        let loaded = load_draft_attachments(&file_access, &args.attachments).await?;
-        match self
-            .agentmail
-            .create_reply_draft(
-                &args.account,
-                args.mailbox.trim(),
-                args.uid,
-                args.expected_uid_validity,
-                reply_mode(args.mode),
-                args.subject.as_deref(),
-                &args.body,
-                &args.bcc,
-                &args.reply_to,
-                &loaded,
-            )
-            .await
-        {
-            Ok(data) => compact_result(CreateDraftOutput::from(data)),
-            Err(error) => Ok(tool_error_result(&error)),
-        }
-    }
-
-    #[tool(
         name = "update_draft",
         output_schema = rmcp::handler::server::tool::schema_for_output::<UpdateDraftOutput>().expect("valid update_draft output schema"),
-        description = "Atomically replace one live IMAP draft with a complete new draft specification. Requires mailbox, uid, and expectedUidValidity; verifies the target still has the \\Draft flag and requires RFC 8508 REPLACE. Refuses to emulate replacement with APPEND+DELETE, because that can duplicate drafts. Attachments are a complete replacement list, and this tool never sends mail.",
+        description = "Replace one live IMAP draft with a complete new draft specification. Requires mailbox, uid, and expectedUidValidity; verifies the target still has the \\Draft flag. Uses RFC 8508 REPLACE where the server has it and otherwise emulates it, so this succeeds on servers without REPLACE (Gmail and iCloud among them) — do not hand-roll create_draft + delete_messages. Returns the NEW uid and uidValidity: a replaced draft always has a new identity, so discard the old one. A `warning` field appears only if the superseded draft could not be removed. Attachments are a complete replacement list, and this tool never sends mail. The body is read as Markdown and sent as multipart/alternative (the text as written plus an HTML rendering); raw HTML in it is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part.",
         annotations(
             title = "Update Draft Atomically",
             read_only_hint = false,
@@ -1182,8 +1216,7 @@ impl AgentMailServer {
                 None,
             ));
         }
-        let file_access = self.file_access_for_request(&meta)?;
-        let loaded = load_draft_attachments(&file_access, &args.attachments).await?;
+        let loaded = load_draft_attachments(self, &meta, &args.attachments).await?;
         match self
             .agentmail
             .update_draft(
@@ -1200,6 +1233,7 @@ impl AgentMailServer {
                 args.in_reply_to.as_deref(),
                 &args.references,
                 &loaded,
+                body_format(args.plain_text_only),
             )
             .await
         {
@@ -1548,118 +1582,74 @@ impl AgentMailServer {
     }
 
     #[tool(
-        name = "add_flags",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<AddFlagsOutput>().expect("valid add_flags output schema"),
-        description = "Add flags and/or set an Apple Mail color on a message identified by mailbox, uid, and expectedUidValidity. The update fails before mutation if the mailbox UID epoch changed. Flags use union semantics, preserving existing flags. Cannot set \\Deleted (use delete_messages) or \\Recent (read-only).",
+        name = "update_flags",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<UpdateFlagsOutput>().expect("valid update_flags output schema"),
+        description = "Add flags, remove flags, and set or clear the Apple Mail color on one message — in a single call. Requires mailbox, uid, and expectedUidValidity; fails before any change if the mailbox UID epoch moved. Adding and removing in ONE call is the point: doing them as two calls opens two epoch windows and can leave the first applied and the second refused. Order is remove, then color, then add, so a flag named in both lists ends up SET. Unnamed flags are never touched. Cannot set or remove \\Deleted (use delete_messages) or \\Recent (read-only). Returns the message's complete resulting flag set.",
         annotations(
-            title = "Add Flags / Set Color",
+            title = "Update Flags / Color",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
         )
     )]
-    async fn add_flags_tool(
+    async fn update_flags_tool(
         &self,
-        Parameters(args): Parameters<AddFlagsArgs>,
+        Parameters(args): Parameters<UpdateFlagsArgs>,
     ) -> Result<CallToolResult, McpError> {
         if args.mailbox.trim().is_empty() {
             return Err(McpError::invalid_params("mailbox is required", None));
         }
-        if args.flags.is_empty() && args.color.is_none() {
+        if args.add.is_empty() && args.remove.is_empty() && args.color.is_none() {
             return Err(McpError::invalid_params(
-                "At least one flag or a color is required",
+                "At least one of add, remove, or color is required",
                 None,
             ));
         }
-        // Guard dangerous flags
-        for flag in &args.flags {
-            let lower = flag.to_lowercase();
-            if lower == "\\deleted" {
-                return Err(McpError::invalid_params(
-                    "Cannot set \\Deleted via add_flags — use delete_messages instead",
-                    None,
-                ));
-            }
-            if lower == "\\recent" {
-                return Err(McpError::invalid_params(
-                    "Cannot set \\Recent — it is a read-only server flag",
-                    None,
-                ));
+        // `\\Deleted` and `\\Recent` are refused in BOTH directions: deletion has
+        // its own tool with its own disposal policy, and `\\Recent` is the
+        // server's to set.
+        for (field, flags) in [("add", &args.add), ("remove", &args.remove)] {
+            for flag in flags.iter() {
+                match flag.to_lowercase().as_str() {
+                    "\\deleted" => {
+                        return Err(McpError::invalid_params(
+                            format!("Cannot {field} \\Deleted via update_flags — use delete_messages instead"),
+                            None,
+                        ));
+                    }
+                    "\\recent" => {
+                        return Err(McpError::invalid_params(
+                            "Cannot change \\Recent — it is a read-only server flag",
+                            None,
+                        ));
+                    }
+                    _ => {}
+                }
             }
         }
+        let color = match args.color.as_deref().map(str::trim) {
+            None => crate::FlagColorChange::Leave,
+            Some(name) if name.eq_ignore_ascii_case("none") => crate::FlagColorChange::Clear,
+            Some(name) => crate::FlagColorChange::Set(name.to_string()),
+        };
         match self
             .agentmail
-            .add_flags(
+            .update_flags(
                 &args.mailbox,
                 &args.account,
                 args.uid,
                 args.expected_uid_validity,
-                &args.flags,
-                args.color.as_deref(),
+                &args.add,
+                &args.remove,
+                color,
             )
             .await
         {
-            Ok(data) => compact_result(AddFlagsOutput::new(data, args.expected_uid_validity)),
+            Ok(data) => compact_result(UpdateFlagsOutput::new(data, args.expected_uid_validity)),
             Err(e) => Ok(tool_error_result(&e)),
         }
     }
 
-    #[tool(
-        name = "remove_flags",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<RemoveFlagsOutput>().expect("valid remove_flags output schema"),
-        description = "Remove flags and/or clear Apple Mail color from a message identified by mailbox, uid, and expectedUidValidity. The update fails before mutation if the mailbox UID epoch changed. Only specified flags are removed; all others remain. Set clearColor=true to clear \\Flagged plus $MailFlagBit keywords. Cannot remove \\Deleted or \\Recent.",
-        annotations(
-            title = "Remove Flags / Clear Color",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
-    )]
-    async fn remove_flags_tool(
-        &self,
-        Parameters(args): Parameters<RemoveFlagsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        if args.mailbox.trim().is_empty() {
-            return Err(McpError::invalid_params("mailbox is required", None));
-        }
-        if args.flags.is_empty() && !args.clear_color {
-            return Err(McpError::invalid_params(
-                "At least one flag or clearColor=true is required",
-                None,
-            ));
-        }
-        // Guard dangerous flags
-        for flag in &args.flags {
-            let lower = flag.to_lowercase();
-            if lower == "\\deleted" {
-                return Err(McpError::invalid_params(
-                    "Cannot remove \\Deleted via remove_flags — use delete_messages instead",
-                    None,
-                ));
-            }
-            if lower == "\\recent" {
-                return Err(McpError::invalid_params(
-                    "Cannot remove \\Recent — it is a read-only server flag",
-                    None,
-                ));
-            }
-        }
-        match self
-            .agentmail
-            .remove_flags(
-                &args.mailbox,
-                &args.account,
-                args.uid,
-                args.expected_uid_validity,
-                &args.flags,
-                args.clear_color,
-            )
-            .await
-        {
-            Ok(data) => compact_result(RemoveFlagsOutput::new(data, args.expected_uid_validity)),
-            Err(e) => Ok(tool_error_result(&e)),
-        }
-    }
 }
 
 /// Guess a MIME type from a filename extension. Falls back to application/octet-stream.
@@ -1712,6 +1702,41 @@ fn guess_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::guess_content_type;
+
+    /// Composing a message is not a filesystem operation. The embedded server
+    /// has no ambient sandbox — it takes one from the session workspace in
+    /// `_meta` — so resolving that policy for a draft with NOTHING to attach
+    /// made `create_draft` / `create_reply_draft` / `update_draft` fail with
+    /// `-32602 … requires an active session workspace` in any session that had
+    /// none. Red before green: resolve eagerly here and this returns an error
+    /// for an empty attachment list.
+    #[tokio::test]
+    async fn a_draft_with_no_attachments_needs_no_workspace() {
+        let server = super::AgentMailServer::new_embedded(
+            crate::Agentmail::builder(crate::Config::empty()).build(),
+        );
+        // An EMPTY meta is exactly a session that never got a workspace root.
+        let meta = rmcp::model::Meta::new();
+
+        let loaded = super::load_draft_attachments(&server, &meta, &[])
+            .await
+            .expect("a draft with no attachments must not require a workspace");
+        assert!(loaded.is_empty(), "nothing to attach, nothing loaded");
+
+        // …but the moment a file IS named, the sandbox is mandatory again.
+        let attached = [super::DraftAttachmentArg {
+            path: "/etc/passwd".to_string(),
+            filename: None,
+            content_type: None,
+        }];
+        let error = super::load_draft_attachments(&server, &meta, &attached)
+            .await
+            .expect_err("reading a file without a workspace must still refuse");
+        assert!(
+            error.message.contains("workspace"),
+            "the refusal must still name the missing workspace: {error:?}"
+        );
+    }
 
     #[test]
     fn guess_content_type_maps_known_extensions_and_falls_back() {

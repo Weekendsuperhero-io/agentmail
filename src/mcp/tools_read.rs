@@ -35,7 +35,7 @@ impl AgentMailServer {
     #[tool(
         name = "list_accounts",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ListAccountsOutput>().expect("valid list_accounts output schema"),
-        description = "Return configured IMAP account names. Use this first to discover valid account selectors.",
+        description = "Return configured IMAP account names, each with whether it is the default. The names themselves are already in every tool's `account` enum and are listed as email://{account} resources — call this only when the DEFAULT matters or to confirm what is configured, not to discover a selector.",
         annotations(
             title = "List Accounts",
             read_only_hint = true,
@@ -101,7 +101,7 @@ impl AgentMailServer {
     #[tool(
         name = "list_capabilities",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ListCapabilitiesOutput>().expect("valid list_capabilities output schema"),
-        description = "List IMAP server capabilities for an account. Shows supported extensions like IDLE, MOVE, CONDSTORE, etc.",
+        description = "List the IMAP extensions this account's server advertises. Several change how other tools behave: REPLACE (RFC 8508) lets update_draft swap a draft atomically instead of emulating it, UIDPLUS allows a targeted UID EXPUNGE, MOVE avoids COPY-then-delete reconciliation, APPENDLIMIT caps a single draft, SPECIAL-USE lets Drafts and Trash be found by role rather than by name, and UIDONLY/MESSAGELIMIT put the account in RFC 9586 UID Mode.",
         annotations(title = "List IMAP Capabilities", read_only_hint = true)
     )]
     async fn list_capabilities_tool(
@@ -117,7 +117,7 @@ impl AgentMailServer {
     #[tool(
         name = "get_messages",
         output_schema = rmcp::handler::server::tool::schema_for_output::<GetMessagesOutput>().expect("valid get_messages output schema"),
-        description = "Fetch a metadata-only page of messages from one required mailbox, newest-first. Returns account, mailbox, UIDVALIDITY, pagination data (offset, limit, total, nextOffset), and compact rows with UID, subject, sender, date, flags, size, and a UIDVALIDITY-safe resourceUri. Read resourceUri for markdown content, append /headers for exact headers, or append /source for bounded raw RFC822. Get mailbox names from list_mailboxes. Defaults: offset=0, limit=25 (max 50).",
+        description = "Fetch a metadata-only page of messages from one required mailbox, newest-first. Returns account, mailbox, UIDVALIDITY, pagination data (offset, limit, total, nextOffset), and compact rows with UID, subject, sender, date, flags, and size. Every row's message rides the result as a resource_link — the markdown body, plus that message's /info for exact headers, bounded raw RFC822 source, and the attachment inventory. Follow those links; the result carries no URI in its JSON and building one by hand is unsupported. Get mailbox names from list_mailboxes. Defaults: offset=0, limit=25 (max 50).",
         annotations(title = "Get Messages", read_only_hint = true)
     )]
     async fn get_messages_tool(
@@ -142,7 +142,7 @@ impl AgentMailServer {
     #[tool(
         name = "search_messages",
         output_schema = rmcp::handler::server::tool::schema_for_output::<SearchMessagesOutput>().expect("valid search_messages output schema"),
-        description = "Search one required mailbox with filters: senderContains, subjectContains, toContains, query (IMAP full-text), read, flagged, headerKey/headerValueContains, since/before (YYYY-MM-DD), and largerThan/smallerThan (bytes). Filters are AND-combined. Returns metadata-only results newest-first with the mailbox UIDVALIDITY, pagination data (offset, limit, total, nextOffset), and one UIDVALIDITY-safe resourceUri per row; read that resource for content or append /headers or /source. Get mailbox names from list_mailboxes. Defaults: offset=0, limit=25 (max 50).",
+        description = "Search one required mailbox with filters: senderContains, subjectContains, toContains, query (IMAP full-text), read, flagged, headerKey/headerValueContains, since/before (YYYY-MM-DD), and largerThan/smallerThan (bytes). Filters are AND-combined. Returns metadata-only results newest-first with the mailbox UIDVALIDITY and pagination data (offset, limit, total, nextOffset). Every row's message rides the result as a resource_link — the markdown body, plus that message's /info for headers, source, and attachments. Follow those links; the result carries no URI in its JSON. Get mailbox names from list_mailboxes. Defaults: offset=0, limit=25 (max 50).",
         annotations(title = "Search Messages", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -227,7 +227,7 @@ impl AgentMailServer {
     #[tool(
         name = "find_attachments",
         output_schema = rmcp::handler::server::tool::schema_for_output::<FindAttachmentsOutput>().expect("valid find_attachments output schema"),
-        description = "Find messages with attachments (multipart/mixed or multipart/related), newest-first. Each hit includes mailbox, UIDVALIDITY, UID, date, and resourceUri so account-wide UID collisions are unambiguous. Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without excluded or virtual views. Defaults: offset=0, limit=25 (max 100). To save files, pass a hit's mailbox, uid, and uidValidity as expectedUidValidity to download_attachments.",
+        description = "Find messages with attachments (multipart/mixed or multipart/related), newest-first. Each hit includes mailbox, UIDVALIDITY, UID, and date so account-wide UID collisions are unambiguous, and rides the result as a resource_link. Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without excluded or virtual views. Defaults: offset=0, limit=25 (max 100). To save files, pass a hit's mailbox, uid, and uidValidity as expectedUidValidity to download_attachments.",
         annotations(title = "Find Attachments", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -263,7 +263,7 @@ impl AgentMailServer {
     #[tool(
         name = "top_senders",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopSendersOutput>().expect("valid top_senders output schema"),
-        description = "List the senders who email you most, by message count. Omit mailbox for account-wide discovery: one selectable \\All mailbox is scanned alone when available; otherwise selectable storage mailboxes are enumerated, virtual/excluded views are skipped, and Message-ID deduplicates across folders. Excludes your own address and groups by exact address + display name. Every row has a safe nested sample {mailbox, uidValidity, uid, resourceUri} for inspection; pass its exact address and displayName to delete_by_sender or move_by_sender. Live offset pagination defaults to 10 rows (max 100).",
+        description = "List the senders who email you most, by message count. Omit mailbox for account-wide discovery: one selectable \\All mailbox is scanned alone when available; otherwise selectable storage mailboxes are enumerated, virtual/excluded views are skipped, and Message-ID deduplicates across folders. Excludes your own address and groups by exact address + display name. Every row has a safe nested sample {mailbox, uidValidity, uid} for inspection, linked from the result as a resource_link; pass its exact address and displayName to delete_by_sender or move_by_sender. Live offset pagination defaults to 10 rows (max 100).",
         annotations(title = "Top Senders", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -335,7 +335,7 @@ impl AgentMailServer {
     #[tool(
         name = "top_subscriptions",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopSubscriptionsOutput>().expect("valid top_subscriptions output schema"),
-        description = "List bulk/marketing subscriptions by message count. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Rows are grouped only by normalized sender email; display names and List-Id values do not split a sender's row. Rows are sorted by advertised one-click syntax, then count. Each has a nested sample {mailbox, uidValidity, uid, resourceUri} and, when available, the sample message's decoded subject — what this subscription's mail actually looks like. Map the sample to move_subscription to file exact bulk-mail matches without an unsubscribe request, or to unsubscribe_message for a consented verified unsubscribe. advertisedOneClick is syntactic only—the unsubscribe action re-fetches the complete message and verifies DKIM. Live offset pagination defaults to 10 rows (max 100).",
+        description = "List bulk/marketing subscriptions by message count. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Rows are grouped only by normalized sender email; display names and List-Id values do not split a sender's row. Rows are sorted by advertised one-click syntax, then count. Each has a nested sample {mailbox, uidValidity, uid}, linked from the result as a resource_link, and, when available, the sample message's decoded subject — what this subscription's mail actually looks like. Map the sample to move_subscription to file exact bulk-mail matches without an unsubscribe request, or to unsubscribe_message for a consented verified unsubscribe. advertisedOneClick is syntactic only—the unsubscribe action re-fetches the complete message and verifies DKIM. Live offset pagination defaults to 10 rows (max 100).",
         annotations(title = "Top Subscriptions", read_only_hint = true),
         execution(task_support = "optional")
     )]
