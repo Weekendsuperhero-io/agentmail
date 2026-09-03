@@ -34,16 +34,63 @@ pub fn plain_to_markdown(value: &str) -> String {
 const EMAIL_BODY_STYLE: &str = "font-family:-apple-system,BlinkMacSystemFont,\
      'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5";
 
+/// URL schemes a rendered link or image may use.
+///
+/// An allowlist, not a denylist: the set of schemes that can execute is open
+/// (`javascript:`, `data:`, `vbscript:`, whatever a client adds next), while the
+/// set that belongs in mail is closed and short.
+const SAFE_URL_SCHEMES: [&str; 4] = ["http", "https", "mailto", "tel"];
+
+/// Whether a link or image destination is safe to make clickable.
+///
+/// A destination with NO scheme is relative and cannot execute, so it passes.
+/// One with a scheme must name a member of [`SAFE_URL_SCHEMES`].
+///
+/// ASCII whitespace and control characters are stripped before the scheme is
+/// read, because clients strip them too: `java\tscript:alert(1)` and
+/// `java\nscript:alert(1)` are `javascript:` by the time anything acts on them,
+/// and a checker that reads the raw string sees a scheme called `java`.
+fn is_safe_url(dest: &str) -> bool {
+    let collapsed: String = dest
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
+        .collect();
+    // A `:` after any of these is inside a path, query or fragment, not a
+    // scheme — `foo/bar:baz` is relative.
+    let scheme_end = collapsed.find([':', '/', '?', '#']);
+    match scheme_end {
+        Some(end) if collapsed.as_bytes()[end] == b':' => {
+            let scheme = collapsed[..end].to_ascii_lowercase();
+            SAFE_URL_SCHEMES.contains(&scheme.as_str())
+        }
+        // No scheme at all, or a delimiter that ends the scheme-shaped prefix
+        // before any `:` — relative either way.
+        _ => true,
+    }
+}
+
 /// Render a Markdown draft body into the `text/html` half of a
 /// `multipart/alternative` message.
 ///
-/// Raw HTML in the source is ESCAPED, never emitted. A draft body is
-/// agent-authored text, so treating `<...>` inside it as markup would let a
-/// tool call decide what runs in a recipient's mail client. `pulldown_cmark`
-/// surfaces raw HTML as its own events, and mapping those to TEXT is
-/// deliberate over dropping them: a literal `<b>` reaches the reader as the
-/// characters that were written, rather than silently disappearing. There is
-/// no sanitiser to keep in step with, because no markup ever passes through.
+/// Two things are refused, and they are different problems:
+///
+/// **Raw HTML is ESCAPED, never emitted.** A draft body is agent-authored text,
+/// so treating `<...>` inside it as markup would let a tool call decide what
+/// runs in a recipient's mail client. `pulldown_cmark` surfaces raw HTML as its
+/// own events, and mapping those to TEXT is deliberate over dropping them: a
+/// literal `<b>` reaches the reader as the characters that were written, rather
+/// than silently disappearing. Because no markup passes through, there is no
+/// HTML sanitiser to keep in step with — the passthrough is off at the source.
+///
+/// **Unsafe URL schemes lose their link.** `push_html` escapes a destination
+/// for HTML but does not filter its scheme, so `[click](javascript:alert(1))`
+/// renders as a working `<a href="javascript:...">` (verified, 2026-09-03).
+/// Escaping raw HTML does nothing about this: the markup here is ours, and the
+/// payload rides an attribute we generated. A link or image whose destination
+/// fails the `is_safe_url` check is unwrapped — the TEXT survives, the
+/// destination does not become clickable — and nothing is lost overall,
+/// because the plain half of the `alternative` still carries the author's
+/// Markdown verbatim.
 ///
 /// Extensions are limited to tables and strikethrough — the GFM constructs that
 /// mean something in correspondence. Smart punctuation is deliberately OFF: it
@@ -51,15 +98,35 @@ const EMAIL_BODY_STYLE: &str = "font-family:-apple-system,BlinkMacSystemFont,\
 /// the originals, and the two halves of an `alternative` must say the same
 /// thing.
 pub fn markdown_to_email_html(markdown: &str) -> String {
-    use pulldown_cmark::{Event, Options, Parser};
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
 
-    let events = Parser::new_ext(markdown, options).map(|event| match event {
-        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
-        other => other,
+    // Markdown links and images do not nest, so at most one of each can be open
+    // — a flag is enough to pair a suppressed Start with its End.
+    let mut in_unsafe_link = false;
+    let mut in_unsafe_image = false;
+    let events = Parser::new_ext(markdown, options).filter_map(move |event| match event {
+        Event::Html(raw) | Event::InlineHtml(raw) => Some(Event::Text(raw)),
+        Event::Start(Tag::Link { ref dest_url, .. }) if !is_safe_url(dest_url) => {
+            in_unsafe_link = true;
+            None
+        }
+        Event::End(TagEnd::Link) if in_unsafe_link => {
+            in_unsafe_link = false;
+            None
+        }
+        Event::Start(Tag::Image { ref dest_url, .. }) if !is_safe_url(dest_url) => {
+            in_unsafe_image = true;
+            None
+        }
+        Event::End(TagEnd::Image) if in_unsafe_image => {
+            in_unsafe_image = false;
+            None
+        }
+        other => Some(other),
     });
 
     let mut rendered = String::with_capacity(markdown.len() + 256);
@@ -215,4 +282,98 @@ fn skip_markdown_link(chars: &[char], start: usize) -> Option<usize> {
     }
     let close_paren = chars[after + 1..].iter().position(|&c| c == ')')?;
     Some(after + 1 + close_paren + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_url, markdown_to_email_html};
+
+    /// The scheme allowlist. `javascript:` is the obvious one; `data:` carries
+    /// a whole document, and a client that honours it is running author-chosen
+    /// HTML. Whitespace and control characters are stripped first because
+    /// clients strip them too — a checker reading the raw string would see a
+    /// scheme called `java` and wave `java\tscript:` through.
+    #[test]
+    fn only_mail_shaped_url_schemes_are_clickable() {
+        for safe in [
+            "https://example.org/a?b=1",
+            "http://example.org",
+            "HTTPS://EXAMPLE.ORG",
+            "mailto:someone@example.org",
+            "tel:+15551234",
+            "/relative/path",
+            "#fragment",
+            "relative/path:with-colon",
+            "",
+        ] {
+            assert!(is_safe_url(safe), "`{safe}` should be clickable");
+        }
+        for unsafe_url in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "java\tscript:alert(1)",
+            "java\nscript:alert(1)",
+            " javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                !is_safe_url(unsafe_url),
+                "`{unsafe_url}` must not be a link"
+            );
+        }
+    }
+
+    /// Two DIFFERENT injection routes, both closed. Raw HTML never reaches the
+    /// output because passthrough is off at the parser; an unsafe destination
+    /// never becomes an attribute because the link is unwrapped. Escaping raw
+    /// HTML does nothing for the second — that markup is ours, and the payload
+    /// rides an `href` we generated.
+    #[test]
+    fn neither_raw_html_nor_an_unsafe_scheme_survives_rendering() {
+        let html = markdown_to_email_html(
+            "[click](javascript:alert(1))\n\n\
+             ![img](data:text/html,<script>alert(2)</script>)\n\n\
+             <script>alert(3)</script>\n\n\
+             <img src=x onerror=alert(4)>\n",
+        );
+
+        assert!(
+            !html.contains("javascript:") && !html.contains("data:text/html"),
+            "an unsafe destination must not reach an attribute: {html}"
+        );
+        // Assert on the TAG, not the substring: `onerror` also appears inside
+        // the escaped text, where it is inert. What matters is that no `<` ever
+        // opens an author-supplied element.
+        assert!(
+            !html.contains("<script") && !html.contains("<img src=x"),
+            "author markup must never be emitted as markup: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;alert(3)&lt;/script&gt;")
+                && html.contains("&lt;img src=x onerror=alert(4)&gt;"),
+            "…and must arrive escaped rather than deleted: {html}"
+        );
+        // Unwrapped, not deleted: the words survive, only the link does not.
+        assert!(html.contains("click") && html.contains("img"), "{html}");
+    }
+
+    /// The filter must not cost ordinary mail its links and images.
+    #[test]
+    fn safe_links_and_images_render_untouched() {
+        let html = markdown_to_email_html(
+            "[ok](https://example.org/a?b=1&c=2) and [mail](mailto:a@b.co)\n\n\
+             ![pic](https://example.org/p.png)\n\n\
+             <https://autolink.example>\n",
+        );
+        for expected in [
+            "<a href=\"https://example.org/a?b=1&amp;c=2\">ok</a>",
+            "<a href=\"mailto:a@b.co\">mail</a>",
+            "<img src=\"https://example.org/p.png\" alt=\"pic\" />",
+            "<a href=\"https://autolink.example\">",
+        ] {
+            assert!(html.contains(expected), "missing {expected} in {html}");
+        }
+    }
 }

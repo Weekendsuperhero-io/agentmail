@@ -175,7 +175,9 @@ Apple Mail's "Make Rich Text" is a different thing again: it sends HTML, which
 is why formatted mail *looks* like RTF in a Mac client while nothing RTF is on
 the wire.
 
-### Raw HTML is escaped, never emitted
+### Two injection routes, closed differently
+
+**Raw HTML is escaped, never emitted.**
 
 A draft body is author-supplied text arriving through a tool call. Treating
 `<...>` in it as markup would let the caller decide what runs in a recipient's
@@ -185,6 +187,28 @@ someone wrote is its own failure. There is no sanitiser to keep in step with,
 because no author markup ever passes through. Smart punctuation stays OFF: it
 would rewrite quotes and dashes in the HTML half while the plain half kept the
 originals, and the two halves of an alternative must say the same thing.
+
+**Unsafe URL schemes lose their link.** `push_html` escapes a destination for
+HTML but does not filter its scheme, so `[click](javascript:alert(1))` rendered
+as a working `<a href="javascript:...">` — verified against the real renderer,
+not assumed. Escaping raw HTML does nothing about this: the markup is OURS and
+the payload rides an attribute we generated, which is why a review finding aimed
+at "sanitize the HTML output" would have missed it. `is_safe_url` allowlists
+`http`, `https`, `mailto` and `tel` (plus relative destinations, which cannot
+execute); anything else has its link or image UNWRAPPED — the text survives, the
+destination does not become clickable. Nothing is lost overall: the plain half of
+the `alternative` still carries the author's Markdown verbatim.
+
+The allowlist reads schemes after stripping ASCII whitespace and control
+characters, because clients strip them too — `java\tscript:` is `javascript:` by
+the time anything acts on it, and a checker reading the raw string sees a scheme
+called `java`.
+
+An HTML sanitiser (`ammonia` or similar) was NOT added. It cleans HTML we do not
+produce: passthrough is off at the parser, so there is no author markup to
+sanitise, and it would not have caught the scheme hole either — a sanitiser that
+did would be a second, larger source of truth for a rule this file states in
+twenty lines.
 
 ### Shape
 

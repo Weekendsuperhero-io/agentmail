@@ -545,6 +545,11 @@ author-supplied text, and treating `<...>` in it as markup would let a tool call
 decide what runs in a recipient's mail client. Nothing is dropped: a literal
 `<b>` reaches the reader as the characters that were typed.
 
+Link and image destinations are limited to `http`, `https`, `mailto`, `tel` and
+relative URLs. A `javascript:` or `data:` destination has its link **unwrapped**
+— the text still appears, it just is not clickable — and the plain half of the
+message carries the original Markdown either way, so nothing is lost.
+
 Pass `plainTextOnly: true` (`create_draft`, `update_draft`) for a single
 unrendered `text/plain` part — for a plain-text-only
 recipient, a mailing list, or a body that must not be reinterpreted. AgentMail
