@@ -388,18 +388,23 @@ impl ServerHandler for AgentMailServer {
         // which requests may be task-augmented.
         capabilities.tasks = Some(TasksCapability::server_default());
         ServerInfo::new(capabilities)
-        // Without this the server announces itself as "rmcp" — rmcp's
-        // Implementation::from_build_env() bakes in its own crate name.
-        // Version carries the build SHA so `initialize` responses and logs
-        // identify the exact running build — deploy skew (an app compiled
-        // from a stale agentmail checkout) becomes visible instead of being
-        // inferred from behavioral fingerprints.
-        .with_server_info(Implementation::new(
-            "agentmail",
-            concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENTMAIL_BUILD_SHA"), ")"),
-        ))
-        .with_instructions(
-            "# AgentMail\n\
+            // Without this the server announces itself as "rmcp" — rmcp's
+            // Implementation::from_build_env() bakes in its own crate name.
+            // Version carries the build SHA so `initialize` responses and logs
+            // identify the exact running build — deploy skew (an app compiled
+            // from a stale agentmail checkout) becomes visible instead of being
+            // inferred from behavioral fingerprints.
+            .with_server_info(Implementation::new(
+                "agentmail",
+                concat!(
+                    env!("CARGO_PKG_VERSION"),
+                    " (",
+                    env!("AGENTMAIL_BUILD_SHA"),
+                    ")"
+                ),
+            ))
+            .with_instructions(
+                "# AgentMail\n\
              \n\
              Read, organize, draft and archive IMAP mail. **This server never sends.**\n\
              Drafts are saved to the server; nothing is transmitted to a recipient.\n\
@@ -578,7 +583,7 @@ impl ServerHandler for AgentMailServer {
              \n\
              `list_flags` resolves Apple Mail `$MailFlagBit` colors to names: red, orange,\n\
              yellow, green, blue, purple, gray.",
-        )
+            )
     }
 
     async fn list_resource_templates(
@@ -886,7 +891,9 @@ mod tests {
                 )
             })
             .collect();
-        AgentMailServer::new_embedded(crate::Agentmail::new(crate::Config::from_accounts(accounts)))
+        AgentMailServer::new_embedded(crate::Agentmail::new(crate::Config::from_accounts(
+            accounts,
+        )))
     }
 
     fn account_enum(tool: &rmcp::model::Tool) -> Option<Vec<String>> {

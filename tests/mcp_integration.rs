@@ -2110,7 +2110,9 @@ async fn create_draft_absorbs_the_reply_form() {
     let tools = resp["result"]["tools"].as_array().expect("tools array");
 
     assert!(
-        !tools.iter().any(|t| t["name"] == json!("create_reply_draft")),
+        !tools
+            .iter()
+            .any(|t| t["name"] == json!("create_reply_draft")),
         "create_reply_draft was merged into create_draft"
     );
 

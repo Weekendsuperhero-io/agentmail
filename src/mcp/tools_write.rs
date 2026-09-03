@@ -3,12 +3,12 @@
 use super::AgentMailServer;
 use super::args::*;
 use super::wire::{
-    CreateDraftOutput, CreateMailboxOutput, DeleteByDomainOutput,
-    DeleteBySenderOutput, DeleteListIdOutput, DeleteMailboxOutput, DeleteMessagesOutput,
-    DownloadAttachmentsOutput, DownloadMessageSourceOutput, DownloadThreadOutput,
-    MoveByDomainOutput, MoveBySenderOutput, MoveListIdOutput, MoveMessageOutput,
-    MoveSubscriptionOutput, ReconcileMovesOutput, RenameMailboxOutput, UpdateFlagsOutput,
-    UnsubscribeMessageOutput, UpdateDraftOutput, compact_result, tool_error_result,
+    CreateDraftOutput, CreateMailboxOutput, DeleteByDomainOutput, DeleteBySenderOutput,
+    DeleteListIdOutput, DeleteMailboxOutput, DeleteMessagesOutput, DownloadAttachmentsOutput,
+    DownloadMessageSourceOutput, DownloadThreadOutput, MoveByDomainOutput, MoveBySenderOutput,
+    MoveListIdOutput, MoveMessageOutput, MoveSubscriptionOutput, ReconcileMovesOutput,
+    RenameMailboxOutput, UnsubscribeMessageOutput, UpdateDraftOutput, UpdateFlagsOutput,
+    compact_result, tool_error_result,
 };
 use super::{make_cancel_fn, make_progress_fn};
 use crate::{
@@ -1613,7 +1613,9 @@ impl AgentMailServer {
                 match flag.to_lowercase().as_str() {
                     "\\deleted" => {
                         return Err(McpError::invalid_params(
-                            format!("Cannot {field} \\Deleted via update_flags — use delete_messages instead"),
+                            format!(
+                                "Cannot {field} \\Deleted via update_flags — use delete_messages instead"
+                            ),
                             None,
                         ));
                     }
@@ -1649,7 +1651,6 @@ impl AgentMailServer {
             Err(e) => Ok(tool_error_result(&e)),
         }
     }
-
 }
 
 /// Guess a MIME type from a filename extension. Falls back to application/octet-stream.

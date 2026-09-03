@@ -2781,8 +2781,16 @@ impl Agentmail {
         let color = color.map_or(FlagColorChange::Leave, |name| {
             FlagColorChange::Set(name.to_string())
         });
-        self.update_flags(mailbox, account, uid, expected_uid_validity, flags, &[], color)
-            .await
+        self.update_flags(
+            mailbox,
+            account,
+            uid,
+            expected_uid_validity,
+            flags,
+            &[],
+            color,
+        )
+        .await
     }
 
     /// Remove flags and/or clear the Apple Mail color from one message.
@@ -2802,8 +2810,16 @@ impl Agentmail {
         } else {
             FlagColorChange::Leave
         };
-        self.update_flags(mailbox, account, uid, expected_uid_validity, &[], flags, color)
-            .await
+        self.update_flags(
+            mailbox,
+            account,
+            uid,
+            expected_uid_validity,
+            &[],
+            flags,
+            color,
+        )
+        .await
     }
 
     /// Add and remove flags on one message in a SINGLE UIDVALIDITY window.
@@ -6926,10 +6942,8 @@ mod tests {
         );
 
         // No UIDPLUS: permanent mode would reach a plain EXPUNGE.
-        let plain = imap_client::ServerCaps::from_strings([
-            "IMAP4REV1".to_string(),
-            "MOVE".to_string(),
-        ]);
+        let plain =
+            imap_client::ServerCaps::from_strings(["IMAP4REV1".to_string(), "MOVE".to_string()]);
         assert_eq!(
             discard_mode_for(&plain),
             DeleteMode::TrashFirst,

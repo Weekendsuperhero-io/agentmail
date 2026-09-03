@@ -722,11 +722,7 @@ impl From<crate::TopSendersResponse> for TopSendersOutput {
 
 impl WireOutput for TopSendersOutput {
     fn resource_uris(&self) -> Vec<String> {
-        dedup(
-            self.senders
-                .iter()
-                .map(|row| row.sample.uri(&self.account)),
-        )
+        dedup(self.senders.iter().map(|row| row.sample.uri(&self.account)))
     }
 }
 
@@ -797,11 +793,7 @@ impl From<crate::TopDomainsResponse> for TopDomainsOutput {
 
 impl WireOutput for TopDomainsOutput {
     fn resource_uris(&self) -> Vec<String> {
-        dedup(
-            self.domains
-                .iter()
-                .map(|row| row.sample.uri(&self.account)),
-        )
+        dedup(self.domains.iter().map(|row| row.sample.uri(&self.account)))
     }
 }
 
@@ -2162,7 +2154,11 @@ mod tests {
             offset: 0,
             limit: 10,
             next_offset: None,
-            senders: vec![row("a@example.com", 1), row("b@example.com", 2), row("c@example.com", 1)],
+            senders: vec![
+                row("a@example.com", 1),
+                row("b@example.com", 2),
+                row("c@example.com", 1),
+            ],
         };
 
         let first = message_resource_uri("work", "INBOX", 77, 1);
@@ -2228,7 +2224,10 @@ mod tests {
                 !json.contains("resourceUri") && !json.contains("email://"),
                 "{channel} still leaks a raw URI: {json}"
             );
-            assert!(json.contains("\"uid\":42"), "{channel} lost its rows: {json}");
+            assert!(
+                json.contains("\"uid\":42"),
+                "{channel} lost its rows: {json}"
+            );
         }
 
         // The schema must not promise the field either.
