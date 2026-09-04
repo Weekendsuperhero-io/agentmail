@@ -311,9 +311,70 @@ impl AgentMailServer {
     }
 }
 
+/// Constrain every `account` argument in a tool's input schema to the accounts
+/// this server actually has.
+///
+/// One level deep on purpose: `account` is a top-level string on every tool
+/// that takes one, and a blind recursive walk would also rewrite an `account`
+/// field that happened to appear inside some future nested object with a
+/// different meaning.
+fn patch_account_enum(schema: &mut serde_json::Map<String, serde_json::Value>, allowed: &[String]) {
+    let Some(serde_json::Value::Object(account)) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.as_object_mut())
+        .and_then(|properties| properties.get_mut("account"))
+    else {
+        return;
+    };
+    account.insert(
+        "enum".to_string(),
+        serde_json::Value::Array(
+            allowed
+                .iter()
+                .map(|name| serde_json::Value::String(name.clone()))
+                .collect(),
+        ),
+    );
+}
+
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for AgentMailServer {
+    /// The tool list, with the LIVE account names patched into every `account`
+    /// argument as a JSON Schema `enum`.
+    ///
+    /// The configured accounts are the one thing about this server's schema
+    /// that cannot be known at compile time, and they are also the first thing
+    /// every tool needs. Without them a model has no way to learn a valid
+    /// selector except to call `list_accounts` — which is what agents did, once
+    /// per session, before touching mail, even though the accounts were already
+    /// visible as `email://{account}` resources. A resource an agent must read
+    /// and interpret is not the same affordance as a value in the schema of the
+    /// argument that needs it. (Same technique the bridge uses for `subagent`'s
+    /// runtime `composer_id` enum — RULES §8b.)
+    ///
+    /// Skipped when no account is configured: an empty `enum` is a parameter
+    /// nothing can satisfy, which is worse than an unconstrained string.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        let mut tools = Self::tool_router().list_all();
+        let accounts = self.agentmail.account_names();
+        if !accounts.is_empty() {
+            for tool in &mut tools {
+                let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
+                patch_account_enum(schema, &accounts);
+            }
+        }
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut capabilities = ServerCapabilities::builder()
             .enable_tools()
@@ -327,50 +388,202 @@ impl ServerHandler for AgentMailServer {
         // which requests may be task-augmented.
         capabilities.tasks = Some(TasksCapability::server_default());
         ServerInfo::new(capabilities)
-        // Without this the server announces itself as "rmcp" — rmcp's
-        // Implementation::from_build_env() bakes in its own crate name.
-        // Version carries the build SHA so `initialize` responses and logs
-        // identify the exact running build — deploy skew (an app compiled
-        // from a stale agentmail checkout) becomes visible instead of being
-        // inferred from behavioral fingerprints.
-        .with_server_info(Implementation::new(
-            "agentmail",
-            concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENTMAIL_BUILD_SHA"), ")"),
-        ))
-        .with_instructions(
-            "AgentMail is an IMAP read, organize, draft, and record server. It never sends mail. \
-             Start with list_accounts to discover configured accounts. \
-             list_mailboxes requires one account and returns selectable mailboxes only, paginated with a default of 100. \
-             get_messages and search_messages return metadata only, newest-first, with the mailbox UIDVALIDITY and a UIDVALIDITY-safe resourceUri for each row. \
-             Every row's resourceUri also rides the result as a resource_link, next to a link to that message's /info; /info carries the sibling headers and source URIs plus the attachment inventory, so follow links rather than building URIs by hand. \
-             Manage email: delete_messages, delete_by_sender, delete_by_domain, delete_list_id, move_message, move_list_id, move_by_sender, move_by_domain, move_subscription, create_mailbox, rename_mailbox, delete_mailbox, and unsubscribe_message. Compose without sending via create_draft, create_reply_draft, and update_draft; drafts support Reply-To, Bcc, attachments, and RFC threading headers. \
-             Rename and delete mailboxes are guarded preview-then-confirm operations. INBOX and mailboxes referenced by pending MOVE recovery are never eligible; non-empty, special-use, and descendant-bearing mailboxes require separate acknowledgements. \
-             update_draft requires RFC 8508 REPLACE and refuses an APPEND+DELETE fallback, because a transport failure at that boundary can leave duplicate drafts. \
-             Bulk filing: move_list_id, move_by_sender, move_by_domain, and move_subscription move every exact match to an existing destination mailbox in one call — never loop move_message per UID for that. \
-             top_senders, top_domains, top_subscriptions, top_mailing_lists, list_flags, and find_attachments accept an optional mailbox — omit it to scan the entire account. \
-             Ranked tools use live offset pages with a maximum of 100; top_domains defaults to 20 rows and the other ranked tools default to 10. Pages may shift when mail changes. \
-             On providers with a visible-window limit (Yahoo/AOL), rankings and account-wide delete/move sweeps cover the ENTIRE mailbox via RFC 9586 UID Mode when a persistent cache is available; without it, sweeps repeat passes as older mail backfills into view. \
-             If an action reports Message not found for a ranking sample, the message was deleted since the scan — re-run the ranking for a fresh sample instead of retrying the same UID. \
-             Account-wide discovery uses one selectable All mailbox when available; otherwise it skips Trash, Junk, Spam, Drafts, and virtual aggregate views. Destructive scans never write through aggregate views. \
-             Every action that consumes a UID requires the same mailbox and non-zero expectedUidValidity returned during discovery, and fails closed if the mailbox UID epoch changed. \
-             Ranking/action parity: top_senders → move_by_sender or delete_by_sender; top_domains → move_by_domain or delete_by_domain; top_mailing_lists → move_list_id or delete_list_id; top_subscriptions → move_subscription for filing or unsubscribe_message for a verified unsubscribe. \
-             top_domains keeps parent domains and subdomains separate — actions on example.com never include mail.example.com implicitly; registrableDomain and subdomain are grouping context only. \
-             Never use delete_by_sender for mailing list cleanup — it deletes ALL messages from a sender including non-bulk ones. \
-             top_mailing_lists groups by List-Id header (RFC 2919) — all messages from the same mailing list regardless of sender. Use delete_list_id to remove an entire list. \
-             top_senders groups by (email, display name) — same email with different display names are separate entries. \
-             A non-native MOVE can return reconciliationPending or needsAttention with an operationId; use list_pending_moves to inspect durable operations and reconcile_moves to safely retry one operation or all pending operations. \
-             Ranking rows include a nested sample {mailbox, uidValidity, uid, resourceUri}; map those fields to mailbox, expectedUidValidity, and uid for a later UID action. move_subscription live-validates that sample, then moves exact sender + list-action-header matches account-wide and also requires the sample's List-Id when present. \
-             top_subscriptions advertisedOneClick is syntactic only; unsubscribe_message re-fetches exact headers and verifies DKIM. \
-             unsubscribe_message requires explicit confirmOneClick=true. Optional matching-message cleanup is the nested cleanup {when, identity, deletion} object (omit it to only unsubscribe); it prefers the DKIM-authenticated List-Id, otherwise requires exact sender email + List-Unsubscribe-Post + the sample's List-Id when present, stops after a failed POST unless when=\"always\", and never silently escalates a Trash failure to permanent deletion unless deletion=\"trashThenPermanent\". \
-             list_flags resolves Apple Mail $MailFlagBit color flags to named colors (red, orange, yellow, green, blue, purple, gray). \
-             find_attachments returns mailbox-safe {mailbox, uidValidity, uid, date, resourceUri} hits; pass that identity to download_attachments. \
-             Use download_message_source when exact RFC822 bytes must be saved to disk without crossing model context; use download_thread for a caller-selected UID set plus a JSON integrity manifest. Both validate UIDVALIDITY, use BODY.PEEK[], refuse overwrite, return SHA-256 and local DKIM results, and confine writes to the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). \
-             For a self-contained thread record, call preview_thread_record on one live message, review the exact Message-ID/In-Reply-To/References graph and selectionDigest, then pass that digest and a purpose explanation to export_thread_record. Export re-discovers and refuses drift, writes private PDF/EML/manifest artifacts, and reports recorded/submittable only after reopening and integrity checks; those flags describe packet completeness, not legal admissibility. \
-             resources/list exposes one annotated email://{account} catalog root per account. Read an account root for annotated mailbox URIs, then read email://{account}/{mailbox}{?offset,limit} for paged message metadata and canonical message URIs. \
-             Message resources are email://{account}/{mailbox}/{uidValidity}/{uid} (markdown), plus /headers (exact headers), /source (bounded raw RFC822), /info (JSON metadata: subject, sender, date, flags, size, attachment inventory), and /attachments/{index} (one attachment as a blob with its own content type, 4 MiB limit). Resources carry audience and priority annotations; percent-encode account and mailbox, including '/' in mailbox names as %2F. \
-             An attachment's canonical filename in /info is {uid}_{index}_{name} — the same name download_attachments writes to disk. \
-             All reads use BODY.PEEK to avoid marking messages as read.",
-        )
+            // Without this the server announces itself as "rmcp" — rmcp's
+            // Implementation::from_build_env() bakes in its own crate name.
+            // Version carries the build SHA so `initialize` responses and logs
+            // identify the exact running build — deploy skew (an app compiled
+            // from a stale agentmail checkout) becomes visible instead of being
+            // inferred from behavioral fingerprints.
+            .with_server_info(Implementation::new(
+                "agentmail",
+                concat!(
+                    env!("CARGO_PKG_VERSION"),
+                    " (",
+                    env!("AGENTMAIL_BUILD_SHA"),
+                    ")"
+                ),
+            ))
+            .with_instructions(
+                "# AgentMail\n\
+             \n\
+             Read, organize, draft and archive IMAP mail. **This server never sends.**\n\
+             Drafts are saved to the server; nothing is transmitted to a recipient.\n\
+             \n\
+             ## Accounts\n\
+             \n\
+             The configured accounts are already listed in every `account` argument's\n\
+             schema — choose one from there. Call `list_accounts` only when you need to know\n\
+             which account is the DEFAULT.\n\
+             \n\
+             `list_mailboxes` takes one account and returns selectable mailboxes only, 100\n\
+             per page.\n\
+             \n\
+             ## Reading\n\
+             \n\
+             `get_messages` and `search_messages` return metadata only, newest first, with\n\
+             the mailbox UIDVALIDITY on every row.\n\
+             \n\
+             Each row rides the result as a `resource_link`: the message as markdown, next\n\
+             to its `/info` (headers, raw source and attachment URIs).\n\
+             \n\
+             **Links are the only place a result carries a URI.** Follow them. Never build a\n\
+             URI by hand, and never lift one out of JSON.\n\
+             \n\
+             All reads use `BODY.PEEK`, so nothing is marked as read.\n\
+             \n\
+             ## The UID rule\n\
+             \n\
+             Every action that takes a UID also needs the mailbox and the non-zero\n\
+             `expectedUidValidity` from the SAME discovery result. If the mailbox's UID epoch\n\
+             changed, the action fails before touching anything.\n\
+             \n\
+             `Message not found` on a ranking sample means it was deleted since the scan.\n\
+             Re-run the ranking for a fresh sample rather than retrying the UID.\n\
+             \n\
+             ## Drafts\n\
+             \n\
+             `create_draft` and `update_draft`. Both accept Reply-To, Bcc,\n\
+             attachments and RFC threading headers.\n\
+\n\
+             To reply, give `create_draft` a `replyToMessage` — the mailbox, uid,\n\
+             expectedUidValidity and mode of the live message. It derives the\n\
+             recipients, the Re: subject and the threading headers; omit `to`, `cc`,\n\
+             `inReplyTo` and `references`, which it refuses if you also send them.\n\
+             \n\
+             Bodies are Markdown. They ship as `multipart/alternative` — your text exactly as\n\
+             written, plus an HTML rendering of it. Pass `plainTextOnly: true` for a single\n\
+             unrendered text part.\n\
+             \n\
+             `update_draft` works on every server: RFC 8508 REPLACE where it exists, an\n\
+             equivalent emulation where it does not. Never hand-roll `create_draft` +\n\
+             `delete_messages` to edit a draft.\n\
+             \n\
+             A draft's UID is not durable. Every update mints a new one, and other mail\n\
+             clients re-save drafts the same way. Use the UID `update_draft` returns, and\n\
+             re-read links from a fresh `get_messages`.\n\
+             \n\
+             ## Organizing\n\
+             \n\
+             Move or delete with `move_message` and `delete_messages`, or the bulk forms\n\
+             `move_by_sender`, `move_by_domain`, `move_list_id`, `move_subscription`,\n\
+             `delete_by_sender`, `delete_by_domain` and `delete_list_id`.\n\
+             \n\
+             A bulk form handles every exact match in ONE call. Never loop `move_message`\n\
+             per UID for that.\n\
+             \n\
+             `update_flags` adds flags, removes flags and sets or clears the Apple Mail\n\
+             color in ONE call — doing those separately opens two UIDVALIDITY windows.\n\
+             Pass `color: \"none\"` to clear it.\n\
+\n\
+             Mailboxes: `create_mailbox`, `rename_mailbox`, `delete_mailbox`. Rename and\n\
+             delete are preview-then-confirm. INBOX and any mailbox referenced by a pending\n\
+             MOVE recovery are never eligible; non-empty, special-use and descendant-bearing\n\
+             mailboxes each need their own acknowledgement.\n\
+             \n\
+             A server without native MOVE may return `reconciliationPending` or\n\
+             `needsAttention` with an `operationId`. Inspect it with `list_pending_moves` and\n\
+             retry with `reconcile_moves`.\n\
+             \n\
+             ## Rankings\n\
+             \n\
+             `top_senders`, `top_domains`, `top_subscriptions`, `top_mailing_lists`,\n\
+             `list_flags` and `find_attachments` take an OPTIONAL mailbox — omit it to scan\n\
+             the whole account.\n\
+             \n\
+             Pages are live: 100 rows maximum, default 20 for `top_domains` and 10 for the\n\
+             others. Pages shift as mail changes.\n\
+             \n\
+             Each ranked row carries a sample `{mailbox, uidValidity, uid}` and its\n\
+             `resource_link`. Map those to `mailbox`, `expectedUidValidity` and `uid` for a\n\
+             later action.\n\
+             \n\
+             Pair a ranking with its action:\n\
+             \n\
+             - `top_senders` to `move_by_sender` or `delete_by_sender`\n\
+             - `top_domains` to `move_by_domain` or `delete_by_domain`\n\
+             - `top_mailing_lists` to `move_list_id` or `delete_list_id`\n\
+             - `top_subscriptions` to `move_subscription` to file, or `unsubscribe_message`\n\
+             \n\
+             Grouping is exact and never widens:\n\
+             \n\
+             - `top_senders` groups by (email, display name). One address under two display\n\
+               names is two rows.\n\
+             - `top_domains` keeps parents and subdomains apart. Acting on `example.com`\n\
+               never touches `mail.example.com`; `registrableDomain` and `subdomain` are\n\
+               context, not scope.\n\
+             - `top_mailing_lists` groups by List-Id (RFC 2919) across senders. Use\n\
+               `delete_list_id` to remove a whole list.\n\
+             \n\
+             **Never use `delete_by_sender` to clean up a mailing list.** It deletes every\n\
+             message from that sender, including their non-bulk mail.\n\
+             \n\
+             ## Unsubscribing\n\
+             \n\
+             `advertisedOneClick` on `top_subscriptions` is syntactic only —\n\
+             `unsubscribe_message` re-fetches the exact headers and verifies DKIM itself.\n\
+             \n\
+             It requires `confirmOneClick: true`. Matching-message cleanup is the optional\n\
+             nested `cleanup {when, identity, deletion}` object; omit it to unsubscribe and\n\
+             nothing else. Cleanup prefers the DKIM-authenticated List-Id, and otherwise\n\
+             requires an exact sender address, `List-Unsubscribe-Post`, and the sample's\n\
+             List-Id when present. It stops after a failed POST unless `when` is `always`,\n\
+             and never escalates a failed Trash move to permanent deletion unless `deletion`\n\
+             is `trashThenPermanent`.\n\
+             \n\
+             ## Account-wide scans\n\
+             \n\
+             Discovery uses one selectable All mailbox where the server has it. Otherwise it\n\
+             enumerates storage mailboxes and skips Trash, Junk, Spam, Drafts and virtual\n\
+             aggregate views. A destructive scan never writes through an aggregate view.\n\
+             \n\
+             On a provider with a visible-window limit (Yahoo, AOL), rankings and\n\
+             account-wide sweeps cover the ENTIRE mailbox through RFC 9586 UID Mode when a\n\
+             persistent cache is available. Without one, a sweep repeats passes as older mail\n\
+             backfills into view.\n\
+             \n\
+             ## Saving to disk\n\
+             \n\
+             `download_attachments`, `download_message_source` and `download_thread` write\n\
+             files. Omit `outputDir` to write into the session workspace — that is the\n\
+             default and usually what you want.\n\
+             \n\
+             `find_attachments` hits carry `{mailbox, uidValidity, uid, date}` and a link;\n\
+             pass that identity to `download_attachments`. An attachment's canonical filename\n\
+             in `/info` is `{uid}_{index}_{name}`, the same name `download_attachments`\n\
+             writes.\n\
+             \n\
+             Use `download_message_source` when exact RFC822 bytes must reach disk without\n\
+             crossing model context, and `download_thread` for a chosen UID set plus a JSON\n\
+             integrity manifest. Both validate UIDVALIDITY, use `BODY.PEEK`, refuse to\n\
+             overwrite, and return SHA-256 plus local DKIM results.\n\
+             \n\
+             For a self-contained thread record: call `preview_thread_record` on one live\n\
+             message, review the Message-ID / In-Reply-To / References graph and the\n\
+             `selectionDigest`, then pass that digest and a purpose to\n\
+             `export_thread_record`. Export re-discovers and refuses drift, writes private\n\
+             PDF, EML and manifest artifacts, and reports `recorded` / `submittable` only\n\
+             after reopening and integrity checks. Those flags describe packet completeness,\n\
+             not legal admissibility.\n\
+             \n\
+             ## Resources\n\
+             \n\
+             `resources/list` publishes one `email://{account}` catalog root per account.\n\
+             Read a root for its mailbox URIs, then `email://{account}/{mailbox}` for a page\n\
+             of message metadata.\n\
+             \n\
+             A message is `email://{account}/{mailbox}/{uidValidity}/{uid}` (markdown), plus:\n\
+             \n\
+             - `/headers` — exact headers\n\
+             - `/source` — bounded raw RFC822\n\
+             - `/info` — JSON metadata and the sibling URIs\n\
+             - `/attachments/{index}` — one attachment as a blob, 4 MiB limit\n\
+             \n\
+             Percent-encode the account and mailbox segments, including a `/` inside a\n\
+             mailbox name as `%2F`.\n\
+             \n\
+             `list_flags` resolves Apple Mail `$MailFlagBit` colors to names: red, orange,\n\
+             yellow, green, blue, purple, gray.",
+            )
     }
 
     async fn list_resource_templates(
@@ -658,6 +871,157 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
 mod tests {
     use super::*;
 
+    fn server_with_accounts(names: &[&str]) -> AgentMailServer {
+        let accounts = names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    crate::config::AccountConfig {
+                        host: "imap.example.com".to_string(),
+                        port: 993,
+                        username: format!("{name}@example.com"),
+                        email: None,
+                        aliases: Vec::new(),
+                        password: None,
+                        tls: true,
+                        max_connections: None,
+                        auth: crate::config::AuthMethod::Password,
+                    },
+                )
+            })
+            .collect();
+        AgentMailServer::new_embedded(crate::Agentmail::new(crate::Config::from_accounts(
+            accounts,
+        )))
+    }
+
+    fn account_enum(tool: &rmcp::model::Tool) -> Option<Vec<String>> {
+        Some(
+            tool.input_schema
+                .get("properties")?
+                .as_object()?
+                .get("account")?
+                .as_object()?
+                .get("enum")?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+
+    /// The configured accounts are the only part of this schema unknowable at
+    /// compile time, and the first thing every tool needs. Publishing them as
+    /// an `enum` is what stops an agent opening every session with a
+    /// `list_accounts` call it does not need — a resource it must read and
+    /// interpret is not the same affordance as a value in the schema of the
+    /// argument that wants it.
+    #[test]
+    fn every_account_argument_advertises_the_configured_accounts() {
+        let server = server_with_accounts(&["Gmail", "iCloud"]);
+        let accounts = server.agentmail.account_names();
+        let mut tools = AgentMailServer::tool_router().list_all();
+
+        let mut patched = Vec::new();
+        for tool in &mut tools {
+            assert!(
+                account_enum(tool).is_none(),
+                "`{}` must not carry a compile-time account enum",
+                tool.name
+            );
+            let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
+            patch_account_enum(schema, &accounts);
+            if let Some(values) = account_enum(tool) {
+                assert_eq!(
+                    values,
+                    vec!["Gmail".to_string(), "iCloud".to_string()],
+                    "`{}` offers the live accounts",
+                    tool.name
+                );
+                patched.push(tool.name.to_string());
+            }
+        }
+
+        assert!(
+            patched.contains(&"get_messages".to_string())
+                && patched.contains(&"create_draft".to_string()),
+            "the tools that take an account get the enum; patched: {patched:?}"
+        );
+        // `list_accounts` takes no account — the patch must not invent the
+        // property on a schema that never had it.
+        assert!(
+            !patched.contains(&"list_accounts".to_string()),
+            "a tool without an `account` argument is left alone"
+        );
+    }
+
+    /// An empty `enum` is a parameter nothing can satisfy, so `list_tools`
+    /// skips the patch entirely when no account is configured — the caller then
+    /// gets "no such account" from the server rather than a schema rejection
+    /// with no explanation. This pins the shape that guard exists to avoid.
+    #[test]
+    fn an_empty_account_list_would_be_unsatisfiable_hence_the_guard() {
+        let mut schema = serde_json::Map::new();
+        schema.insert(
+            "properties".to_string(),
+            serde_json::json!({ "account": { "type": "string" } }),
+        );
+        patch_account_enum(&mut schema, &[]);
+        assert_eq!(
+            schema["properties"]["account"]["enum"],
+            serde_json::json!([]),
+            "which is why `list_tools` never calls this with an empty list"
+        );
+    }
+
+    /// The handshake instructions are the first thing a model reads, and they
+    /// spent a long time as one unbroken 7 KB paragraph of semicolons. The
+    /// structure IS the contract: sections it can scan for, lines short enough
+    /// to hold, and no guidance that contradicts the schema it also receives.
+    #[test]
+    fn the_handshake_instructions_stay_scannable() {
+        use rmcp::ServerHandler as _;
+        let instructions = server_with_accounts(&["work"])
+            .get_info()
+            .instructions
+            .expect("instructions are advertised");
+
+        for section in [
+            "## Accounts",
+            "## Reading",
+            "## The UID rule",
+            "## Drafts",
+            "## Organizing",
+            "## Rankings",
+            "## Unsubscribing",
+            "## Account-wide scans",
+            "## Saving to disk",
+            "## Resources",
+        ] {
+            assert!(
+                instructions.contains(section),
+                "missing section `{section}`"
+            );
+        }
+
+        let unwrapped: Vec<&str> = instructions
+            .lines()
+            .filter(|line| line.chars().count() > 90)
+            .collect();
+        assert!(
+            unwrapped.is_empty(),
+            "long lines are how this collapses back into one paragraph: {unwrapped:#?}"
+        );
+
+        assert!(
+            !instructions.contains("Start with list_accounts"),
+            "the accounts are in every `account` enum — instructing a discovery \
+             call contradicts the schema and is what made agents open every \
+             session with one"
+        );
+    }
+
     #[test]
     fn pagination_applies_defaults_and_bounds_consistently() {
         assert_eq!(
@@ -786,7 +1150,7 @@ mod tests {
         let tools = AgentMailServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            37,
+            35,
             "tool count drifted — update docs and tests"
         );
         for tool in &tools {
@@ -835,8 +1199,7 @@ mod tests {
             "download_thread",
             "move_message",
             "unsubscribe_message",
-            "add_flags",
-            "remove_flags",
+            "update_flags",
         ] {
             let tool = tools
                 .iter()

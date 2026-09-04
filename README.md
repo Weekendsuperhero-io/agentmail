@@ -447,12 +447,10 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 | `move_subscription`    | Move the exact bulk-mail subscription represented by a `top_subscriptions` sample     |
 | `move_message`         | Move a message between mailboxes via IMAP MOVE                                        |
 | `reconcile_moves`      | Safely resume one or all pending COPY-fallback MOVE operations                        |
-| `create_draft`         | Save a draft with To/Cc/Bcc/Reply-To, threading headers, and attachments              |
-| `create_reply_draft`   | Derive reply or reply-all recipients and RFC threading headers from a live message     |
-| `update_draft`         | Atomically replace a draft using RFC 8508 REPLACE; never sends                        |
+| `create_draft`         | Save a draft — fresh, or a reply derived from a live message via `replyToMessage`     |
+| `update_draft`         | Replace a draft (RFC 8508 REPLACE, or emulated); never sends                          |
 | `unsubscribe_message`  | DKIM-verified RFC 8058 unsubscribe; optional List-Id cleanup is off by default          |
-| `add_flags`            | Add flags and/or set Apple Mail color on a message (union semantics)                  |
-| `remove_flags`         | Remove flags and/or clear Apple Mail color from a message                             |
+| `update_flags`         | Add flags, remove flags, and set or clear Apple Mail color in one call                |
 
 ### Key parameters
 
@@ -474,8 +472,9 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   remain useful internally for planning but are not exposed as actionable MCP
   mailboxes.
 - `get_messages` and `search_messages` default to 25 rows and accept at most 50.
-  Their MCP results contain compact metadata and a UIDVALIDITY-safe
-  `resourceUri`, never message bodies or complete header maps.
+  Their MCP results contain compact metadata, never message bodies or
+  complete header maps. Each row's message rides the result as a
+  `resource_link`; a tool result carries no URI in its JSON.
 - The `top_*` tools paginate ranked
   groups with `offset`/`limit` (default 10, maximum 100) and `nextOffset`. A
   ranking page size never limits messages examined or later matched for
@@ -494,9 +493,10 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - Delete tools take a `permanent` flag (default false): false moves to Trash when available, true expunges directly (bypassing Trash, irreversible; requires server UIDPLUS).
 - The `top_*` tools share a persistent, live-validated UID/header cache. Each invocation uses `EXAMINE` before reuse. An unchanged `UIDVALIDITY`/`UIDNEXT`/message-count tuple is a hit; a proven append fetches only new UIDs; deletions and mixed changes reconcile UID membership while reusing unchanged header rows. A changed or missing `UIDVALIDITY` prevents unsafe UID reuse. If discovery enumerates folders, results dedupe by Message-ID and exclude your own configured email and aliases.
 - Every discovery result that can lead to a UID action carries the complete
-  `(mailbox, uidValidity, uid)` identity and a canonical `resourceUri`.
+  `(mailbox, uidValidity, uid)` identity, plus a `resource_link` to the
+  message itself.
   `delete_messages`, `move_message`, `download_attachments`,
-  `download_message_source`, `download_thread`, `add_flags`, `remove_flags`,
+  `download_message_source`, `download_thread`, `update_flags`,
   `move_subscription`, and `unsubscribe_message` require
   `expectedUidValidity` and refuse the action if a live `EXAMINE` observes
   another UID epoch.
@@ -555,11 +555,17 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - Non-ASCII `search_messages` text is sent with `CHARSET UTF-8`. Drafts include
   `Date`, `Message-ID`, and Apple Mail draft markers. Bcc is retained in the
   saved draft, Reply-To is supported, and reply drafts use RFC
-  `In-Reply-To`/`References` headers. `update_draft` requires server-advertised
-  RFC 8508 REPLACE and deliberately refuses an APPEND+DELETE emulation. A lost
-  draft-APPEND completion is reconciled on a fresh connection with the
-  generated Message-ID; an unprovable outcome tells the caller to inspect
-  Drafts instead of inviting a duplicate-producing retry.
+  `In-Reply-To`/`References` headers. Draft bodies are Markdown and ship as
+  `multipart/alternative` — the source verbatim as `text/plain` plus an HTML
+  rendering — so formatting arrives rendered rather than as literal syntax;
+  raw HTML in a body is escaped, never rendered, and `plainTextOnly: true`
+  sends one unrendered text part instead. `update_draft` uses RFC 8508 REPLACE
+  where the server advertises it and otherwise emulates it as
+  APPEND-then-discard — new content durable first, so the worst failure is a
+  duplicate draft (reported in `warning`), never a lost one. Every update mints
+  a NEW UID. A lost draft-APPEND completion is reconciled on a fresh connection
+  with the generated Message-ID; an unprovable outcome tells the caller to
+  inspect Drafts instead of inviting a duplicate-producing retry.
 - Tool calls return one compact text summary for compatibility plus one
   authoritative `structuredContent` object. The full JSON value is not repeated
   in the text content block.

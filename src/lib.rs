@@ -2764,8 +2764,11 @@ impl Agentmail {
         })
     }
 
-    /// Add flags and/or set a color on a message.
-    /// Flags use union semantics (+FLAGS). Color replaces any existing color.
+    /// Add flags and/or set an Apple Mail color on one message.
+    ///
+    /// Thin wrapper over [`Self::update_flags`] — kept because it is public
+    /// API and the CLI uses it. New callers that both add and remove should
+    /// use `update_flags` directly and pay ONE UIDVALIDITY window.
     pub async fn add_flags(
         &self,
         mailbox: &str,
@@ -2775,61 +2778,24 @@ impl Agentmail {
         flags: &[String],
         color: Option<&str>,
     ) -> Result<UpdateFlagsResponse> {
-        Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
-        let _mutation_guard = self.lock_account_mutation(account).await;
-        let mut session = self.pool.acquire(account).await?;
-        imap_client::select_with_expected_uid_validity(
-            session.session(),
+        let color = color.map_or(FlagColorChange::Leave, |name| {
+            FlagColorChange::Set(name.to_string())
+        });
+        self.update_flags(
             mailbox,
-            expected_uid_validity,
-        )
-        .await?;
-
-        // Set color if requested (clear old bits, set new ones)
-        if let Some(color_name) = color {
-            let bits = color_to_bits(color_name).ok_or_else(|| {
-                AgentmailError::Other(format!(
-                    "Unknown flag color '{}'. Valid: red, orange, yellow, green, blue, purple, gray",
-                    color_name
-                ))
-            })?;
-            let color_bits = ["$MailFlagBit0", "$MailFlagBit1", "$MailFlagBit2"];
-            imap_client::remove_flags(
-                session.session(),
-                uid,
-                &color_bits.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            )
-            .await?;
-            let mut add = vec!["\\Flagged".to_string()];
-            for (i, &bit) in color_bits.iter().enumerate() {
-                if bits[i] {
-                    add.push(bit.to_string());
-                }
-            }
-            imap_client::add_flags(session.session(), uid, &add).await?;
-        }
-
-        // Add regular flags
-        if !flags.is_empty() {
-            imap_client::add_flags(session.session(), uid, flags).await?;
-        }
-
-        imap_client::sync(session.session()).await?;
-        let updated_flags = imap_client::get_flags(session.session(), uid).await?;
-        let resolved_color = bits_to_color(&updated_flags).map(|c| c.to_string());
-        session.release().await;
-
-        Ok(UpdateFlagsResponse {
-            mailbox: mailbox.to_string(),
-            account: account.to_string(),
+            account,
             uid,
-            flags: updated_flags,
-            color: resolved_color,
-        })
+            expected_uid_validity,
+            flags,
+            &[],
+            color,
+        )
+        .await
     }
 
-    /// Remove flags and/or clear color from a message.
-    /// Flags use difference semantics (-FLAGS). `remove_color` clears \Flagged + all color bits.
+    /// Remove flags and/or clear the Apple Mail color from one message.
+    ///
+    /// Thin wrapper over [`Self::update_flags`]; see the note there.
     pub async fn remove_flags(
         &self,
         mailbox: &str,
@@ -2839,7 +2805,58 @@ impl Agentmail {
         flags: &[String],
         remove_color: bool,
     ) -> Result<UpdateFlagsResponse> {
+        let color = if remove_color {
+            FlagColorChange::Clear
+        } else {
+            FlagColorChange::Leave
+        };
+        self.update_flags(
+            mailbox,
+            account,
+            uid,
+            expected_uid_validity,
+            &[],
+            flags,
+            color,
+        )
+        .await
+    }
+
+    /// Add and remove flags on one message in a SINGLE UIDVALIDITY window.
+    ///
+    /// Adding and removing used to be two tools and two library calls, so
+    /// "mark read and clear the colour" meant two SELECTs, two epoch checks and
+    /// a gap between them in which the mailbox could be renumbered — the second
+    /// call then failed having already applied the first. One call, one window,
+    /// one outcome.
+    ///
+    /// Order is REMOVE, then the colour change, then ADD. It is fixed and
+    /// documented rather than incidental: a flag named in both lists ends up
+    /// SET, and a colour survives a `remove` list that also names `\Flagged`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_flags(
+        &self,
+        mailbox: &str,
+        account: &str,
+        uid: u32,
+        expected_uid_validity: u32,
+        add: &[String],
+        remove: &[String],
+        color: FlagColorChange,
+    ) -> Result<UpdateFlagsResponse> {
         Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
+        // Reject before the connection: an unknown colour is the caller's
+        // mistake, and finding out after a partial STORE is worse than not
+        // starting.
+        let color_bits = match &color {
+            FlagColorChange::Set(name) => Some(color_to_bits(name).ok_or_else(|| {
+                AgentmailError::Other(format!(
+                    "Unknown flag color '{name}'. Valid: red, orange, yellow, green, blue, purple, gray"
+                ))
+            })?),
+            FlagColorChange::Leave | FlagColorChange::Clear => None,
+        };
+
         let _mutation_guard = self.lock_account_mutation(account).await;
         let mut session = self.pool.acquire(account).await?;
         imap_client::select_with_expected_uid_validity(
@@ -2849,20 +2866,44 @@ impl Agentmail {
         )
         .await?;
 
-        // Remove color if requested
-        if remove_color {
-            let mut remove = vec!["\\Flagged".to_string()];
-            remove.extend(
-                ["$MailFlagBit0", "$MailFlagBit1", "$MailFlagBit2"]
-                    .iter()
-                    .map(|s| s.to_string()),
-            );
-            imap_client::remove_flags(session.session(), uid, &remove).await?;
+        const COLOR_BIT_KEYWORDS: [&str; 3] = ["$MailFlagBit0", "$MailFlagBit1", "$MailFlagBit2"];
+
+        if !remove.is_empty() {
+            imap_client::remove_flags(session.session(), uid, remove).await?;
         }
 
-        // Remove regular flags
-        if !flags.is_empty() {
-            imap_client::remove_flags(session.session(), uid, flags).await?;
+        match (&color, color_bits) {
+            (FlagColorChange::Leave, _) => {}
+            (FlagColorChange::Clear, _) => {
+                let mut clear = vec!["\\Flagged".to_string()];
+                clear.extend(COLOR_BIT_KEYWORDS.iter().map(|bit| (*bit).to_string()));
+                imap_client::remove_flags(session.session(), uid, &clear).await?;
+            }
+            (FlagColorChange::Set(_), Some(bits)) => {
+                // Clear the old bits first: the keywords are a 3-bit code, so
+                // leaving a stale bit set would name a different colour.
+                imap_client::remove_flags(
+                    session.session(),
+                    uid,
+                    &COLOR_BIT_KEYWORDS
+                        .iter()
+                        .map(|bit| (*bit).to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .await?;
+                let mut set = vec!["\\Flagged".to_string()];
+                for (index, &bit) in COLOR_BIT_KEYWORDS.iter().enumerate() {
+                    if bits[index] {
+                        set.push(bit.to_string());
+                    }
+                }
+                imap_client::add_flags(session.session(), uid, &set).await?;
+            }
+            (FlagColorChange::Set(_), None) => unreachable!("bits resolved above"),
+        }
+
+        if !add.is_empty() {
+            imap_client::add_flags(session.session(), uid, add).await?;
         }
 
         imap_client::sync(session.session()).await?;
@@ -3755,6 +3796,7 @@ impl Agentmail {
             &[],
             attachments,
             None,
+            draft::BodyFormat::default(),
         )
         .await
     }
@@ -3774,6 +3816,7 @@ impl Agentmail {
         references: &[String],
         attachments: &[crate::types::DraftAttachment],
         warning: Option<String>,
+        body_format: draft::BodyFormat,
     ) -> Result<CreateDraftResponse> {
         validate_draft_payload(body, to, cc, bcc, reply_to, attachments)?;
 
@@ -3799,16 +3842,18 @@ impl Agentmail {
                 in_reply_to,
                 references,
                 apple_uuid: uuid::Uuid::new_v4(),
+                body_format,
             },
         )?;
-        if rfc822.len() > MAX_DRAFT_MIME_BYTES {
-            return Err(AgentmailError::Other(format!(
-                "composed draft is {} bytes; maximum is {MAX_DRAFT_MIME_BYTES}",
-                rfc822.len()
-            )));
-        }
-
         let mut session = self.pool.acquire(account).await?;
+        // AFTER the connection, because the bound is the SERVER's — see
+        // `check_draft_size`. `server_caps` is cached per account, so this is
+        // not an extra round trip on a warm pool.
+        let caps = self.pool.server_caps(account, session.session()).await?;
+        if let Err(error) = check_draft_size(rfc822.len(), &caps) {
+            session.release().await;
+            return Err(error);
+        }
 
         let (_, drafts) = self.special_mailboxes(account, session.session()).await?;
         let drafts_name = drafts.unwrap_or_else(|| "Drafts".to_string());
@@ -3866,6 +3911,7 @@ impl Agentmail {
         bcc: &[String],
         reply_to: &[String],
         attachments: &[DraftAttachment],
+        body_format: draft::BodyFormat,
     ) -> Result<CreateDraftResponse> {
         let response = self
             .get_messages_by_uid(
@@ -3946,11 +3992,28 @@ impl Agentmail {
             &references,
             attachments,
             warning,
+            body_format,
         )
         .await
     }
 
-    /// Atomically replace one live `\Draft` using RFC 8508 UID REPLACE.
+    /// Replace one live `\Draft`.
+    ///
+    /// Uses RFC 8508 UID REPLACE when the server advertises it — one atomic
+    /// command, no window in which both drafts exist. Most servers do NOT:
+    /// neither Iyahoo/iCloud nor Gmail offers REPLACE, so the atomic path is
+    /// the exception rather than the rule. There we emulate it as
+    /// APPEND-then-discard, in that order.
+    ///
+    /// The order is the whole safety argument. APPEND first means the new
+    /// content is durable before anything is destroyed, so the worst failure
+    /// is a DUPLICATE draft, never a lost one — and a duplicate is reported in
+    /// `warning`, not raised as an error, because the caller's draft was in
+    /// fact written and the new UID is the answer they asked for. Refusing the
+    /// emulation outright (the pre-2026-09-03 behavior) did not avoid that
+    /// risk; it exported it. Agents simply ran `create_draft` + `delete_messages`
+    /// by hand, which is the same two commands with none of the guards below —
+    /// no `\Draft` verification, no UIDVALIDITY fence, no policy-aware discard.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_draft(
         &self,
@@ -3967,6 +4030,7 @@ impl Agentmail {
         in_reply_to: Option<&str>,
         references: &[String],
         attachments: &[DraftAttachment],
+        body_format: draft::BodyFormat,
     ) -> Result<UpdateDraftResponse> {
         validate_draft_payload(body, to, cc, bcc, reply_to, attachments)?;
         let _mutation_guard = self.lock_account_mutation(account).await;
@@ -3979,14 +4043,6 @@ impl Agentmail {
             .unwrap_or_else(|| account_config.username.clone());
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
-        if !caps.has("REPLACE") {
-            session.release().await;
-            return Err(AgentmailError::Other(
-                "server does not advertise RFC 8508 REPLACE; refusing a non-atomic APPEND+DELETE fallback"
-                    .to_string(),
-            ));
-        }
-
         imap_client::examine_with_expected_uid_validity(
             session.session(),
             drafts_mailbox,
@@ -4037,47 +4093,58 @@ impl Agentmail {
                 in_reply_to,
                 references,
                 apple_uuid,
+                body_format,
             },
         )?;
-        if replacement.len() > MAX_DRAFT_MIME_BYTES {
-            return Err(AgentmailError::Other(format!(
-                "composed draft is {} bytes; maximum is {MAX_DRAFT_MIME_BYTES}",
-                replacement.len()
-            )));
-        }
+        check_draft_size(replacement.len(), &caps)?;
 
         self.fence_header_cache_mutation(account).await;
         self.invalidate_mailbox_catalog(account);
-        let identity = match imap_client::replace_draft(
-            session.session(),
-            drafts_mailbox,
-            uid,
-            expected_uid_validity,
-            &replacement,
-        )
-        .await
-        {
-            Ok(identity) => identity,
-            Err(error) if error.is_connection_error() => {
-                return Err(AgentmailError::Other(format!(
-                    "draft replacement outcome is ambiguous after the IMAP connection failed; inspect the Drafts mailbox before retrying: {error}"
-                )));
-            }
-            Err(error) => return Err(error),
+        let (identity, warning) = if caps.has("REPLACE") {
+            let identity = match imap_client::replace_draft(
+                session.session(),
+                drafts_mailbox,
+                uid,
+                expected_uid_validity,
+                &replacement,
+            )
+            .await
+            {
+                Ok(identity) => identity,
+                Err(error) if error.is_connection_error() => {
+                    return Err(AgentmailError::Other(format!(
+                        "draft replacement outcome is ambiguous after the IMAP connection failed; inspect the Drafts mailbox before retrying: {error}"
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
+            let identity = match (identity, draft::extract_message_id(&replacement)) {
+                (Some(identity), _) => Some(identity),
+                (None, Some(message_id)) => imap_client::find_uid_by_message_id(
+                    session.session(),
+                    drafts_mailbox,
+                    &message_id,
+                )
+                .await
+                .ok()
+                .flatten(),
+                (None, None) => None,
+            };
+            self.fence_header_cache_mutation(account).await;
+            self.invalidate_mailbox_catalog(account);
+            session.release().await;
+            (identity, None)
+        } else {
+            self.emulate_replace_draft(
+                account,
+                drafts_mailbox,
+                uid,
+                expected_uid_validity,
+                &replacement,
+                session,
+            )
+            .await?
         };
-        let identity = match (identity, draft::extract_message_id(&replacement)) {
-            (Some(identity), _) => Some(identity),
-            (None, Some(message_id)) => {
-                imap_client::find_uid_by_message_id(session.session(), drafts_mailbox, &message_id)
-                    .await
-                    .ok()
-                    .flatten()
-            }
-            (None, None) => None,
-        };
-        self.fence_header_cache_mutation(account).await;
-        self.invalidate_mailbox_catalog(account);
-        session.release().await;
         Ok(UpdateDraftResponse {
             updated: true,
             account: account.to_string(),
@@ -4086,7 +4153,149 @@ impl Agentmail {
             previous_uid: uid,
             uid_validity: identity.map(|(uid_validity, _)| uid_validity),
             uid: identity.map(|(_, uid)| uid),
+            warning,
         })
+    }
+
+    /// RFC 8508 UID REPLACE emulated as APPEND-then-discard, for the majority
+    /// of servers that do not implement it.
+    ///
+    /// Consumes `session`: `append_draft_with_recovery` owns the connection
+    /// through its ambiguous-APPEND recovery (which may have to acquire a
+    /// FRESH one), so the discard runs on a newly acquired session. Our
+    /// caller holds the account mutation lock across both halves, so no other
+    /// mutation can interleave between them.
+    ///
+    /// Returns the new draft's identity plus, only when the superseded draft
+    /// survived, the warning describing it. A failed discard is NOT an error:
+    /// the replacement is already written, and reporting failure would send
+    /// the caller back to rewrite a draft that already exists.
+    async fn emulate_replace_draft(
+        &self,
+        account: &str,
+        drafts_mailbox: &str,
+        superseded_uid: u32,
+        expected_uid_validity: u32,
+        replacement: &[u8],
+        session: connection::PooledSession,
+    ) -> Result<(Option<(u32, u32)>, Option<String>)> {
+        // APPEND first — until this returns Ok, nothing has been destroyed.
+        // A failure here leaves the original draft untouched and propagates.
+        let identity = self
+            .append_draft_with_recovery(account, drafts_mailbox, replacement, session)
+            .await?;
+        self.fence_header_cache_mutation(account).await;
+        self.invalidate_mailbox_catalog(account);
+
+        let warning = match self
+            .discard_superseded_draft(
+                account,
+                drafts_mailbox,
+                superseded_uid,
+                expected_uid_validity,
+            )
+            .await
+        {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "agentmail",
+                    account,
+                    mailbox = drafts_mailbox,
+                    uid = superseded_uid,
+                    error = %error,
+                    "replacement draft was saved, but the superseded draft could not be discarded"
+                );
+                Some(format!(
+                    "the replacement draft was saved, but the superseded draft (UID \
+                     {superseded_uid}) could not be discarded and is still in \
+                     '{drafts_mailbox}': {error}"
+                ))
+            }
+        };
+        self.fence_header_cache_mutation(account).await;
+        self.invalidate_mailbox_catalog(account);
+        Ok((identity, warning))
+    }
+
+    /// Delete exactly the superseded draft, through the SAME policy-aware path
+    /// `delete_messages` uses — so Gmail routes to `[Gmail]/Trash` (an in-place
+    /// EXPUNGE there only drops a label, leaving the draft alive in All Mail),
+    /// and a server without UIDPLUS never reaches a plain EXPUNGE that would
+    /// purge unrelated `\Deleted` messages.
+    ///
+    /// `Permanent` mirrors REPLACE, which expunges the message it supersedes —
+    /// chosen only where the policy can honor it. Everywhere else the account's
+    /// Trash is the disposal path, which is recoverable and needs only MOVE.
+    async fn discard_superseded_draft(
+        &self,
+        account: &str,
+        drafts_mailbox: &str,
+        uid: u32,
+        expected_uid_validity: u32,
+    ) -> Result<()> {
+        let mut session = self.pool.acquire(account).await?;
+        let caps = self.pool.server_caps(account, session.session()).await?;
+        let mode = discard_mode_for(&caps);
+        imap_client::select_with_expected_uid_validity(
+            session.session(),
+            drafts_mailbox,
+            expected_uid_validity,
+        )
+        .await?;
+        let trash = self
+            .trash_for_mode(mode, account, session.session(), &caps)
+            .await?;
+        if let Err(error) = Self::require_disposal_path(mode, trash.as_deref(), &caps) {
+            session.release().await;
+            return Err(error);
+        }
+        // `trash_for_mode` may LIST for the special-use catalog, which leaves
+        // no mailbox selected — re-select before the mutation, exactly as
+        // `delete_messages` does.
+        imap_client::select_with_expected_uid_validity(
+            session.session(),
+            drafts_mailbox,
+            expected_uid_validity,
+        )
+        .await?;
+        let account_key = if trash.is_some() && !caps.has_move() {
+            self.mutation_account_key(account)?
+        } else {
+            String::new()
+        };
+        let result = imap_client::bulk_delete_messages_with_policy(
+            session.session(),
+            &[uid],
+            trash.as_deref(),
+            &caps,
+            false,
+            imap_client::JournalMoveContext {
+                journal: &self.mutation_journal,
+                account_key: &account_key,
+                source_mailbox: drafts_mailbox,
+                source_uid_validity: expected_uid_validity,
+            },
+            None,
+            None,
+        )
+        .await?;
+        if result.session_usable {
+            imap_client::sync(session.session()).await?;
+            session.release().await;
+        } else {
+            drop(session);
+        }
+        if result.deleted.contains(&uid) {
+            Ok(())
+        } else {
+            Err(AgentmailError::Other(format!(
+                "the discard reported no deletion (failed: {}, pending: {}, needs attention: {})",
+                result.failed.len(),
+                result.pending.len(),
+                result.needs_attention.len()
+            )))
+        }
     }
 
     // -----------------------------------------------------------------
@@ -5089,6 +5298,55 @@ impl Agentmail {
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
+
+/// Reject a composed draft that this SERVER would reject at APPEND.
+///
+/// RFC 7889 `APPENDLIMIT=N` is the largest message a server accepts in one
+/// APPEND. Gmail advertises 34 MiB against our own 64 MiB ceiling, so a draft
+/// between the two passed our check and failed on the wire — after composing
+/// it, after reading every attachment off disk, and (for `update_draft`'s
+/// emulated replace) at the one step whose failure the ordering is designed to
+/// avoid. Honour whichever bound is lower and name which one it was, so the
+/// caller knows whether trimming helps or the server simply will not take it.
+///
+/// A bare `APPENDLIMIT` (per-mailbox, reported via `STATUS`) yields `None` and
+/// leaves our ceiling in force; the server still gets the last word.
+fn check_draft_size(len: usize, caps: &imap_client::ServerCaps) -> Result<()> {
+    let client_ceiling = MAX_DRAFT_MIME_BYTES as u64;
+    let advertised = caps.append_limit();
+    let limit = advertised.map_or(client_ceiling, |server| server.min(client_ceiling));
+    let len = len as u64;
+    if len > limit {
+        let source = if advertised.is_some_and(|server| server < client_ceiling) {
+            "the server's APPENDLIMIT"
+        } else {
+            "this client's ceiling"
+        };
+        return Err(AgentmailError::Other(format!(
+            "composed draft is {len} bytes; maximum is {limit} ({source})"
+        )));
+    }
+    Ok(())
+}
+
+/// How to dispose of the draft an `update_draft` supersedes, on a server with
+/// no RFC 8508 REPLACE.
+///
+/// `Permanent` is the faithful emulation — REPLACE expunges what it
+/// supersedes — but it is only safe where the policy can honor it. Without
+/// UIDPLUS a permanent delete degrades to a plain EXPUNGE that would purge
+/// every `\Deleted` message in the mailbox, including ones another client
+/// flagged, so those servers dispose through Trash instead (recoverable, and
+/// needs only MOVE). Gmail takes `Permanent` because `trash_for_mode` routes
+/// it to `[Gmail]/Trash` anyway: an in-place EXPUNGE there drops a label and
+/// leaves the draft alive in All Mail.
+fn discard_mode_for(caps: &imap_client::ServerCaps) -> DeleteMode {
+    if caps.is_gmail() || caps.has_uidplus() {
+        DeleteMode::Permanent
+    } else {
+        DeleteMode::TrashFirst
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum MailboxMutationKind {
@@ -6613,6 +6871,95 @@ mod tests {
             Agentmail::uid_page_size(&unbounded),
             imap_client::MAX_FETCH_CHUNK as u32,
             "no MESSAGELIMIT falls back to the default fetch chunk"
+        );
+    }
+
+    /// A draft the SERVER will refuse must be refused before the wire.
+    /// RFC 7889 `APPENDLIMIT=N` is a hard server bound — Gmail's 34 MiB sits
+    /// well under this client's own 64 MiB ceiling, so anything between the two
+    /// used to pass here and fail at APPEND.
+    #[test]
+    fn a_draft_is_bounded_by_whichever_of_client_and_server_is_smaller() {
+        const MIB: usize = 1024 * 1024;
+        // Gmail's real capability line value.
+        let gmail = imap_client::ServerCaps::from_strings([
+            "IMAP4REV1".to_string(),
+            "APPENDLIMIT=35651584".to_string(),
+        ]);
+        assert!(check_draft_size(30 * MIB, &gmail).is_ok(), "under 34 MiB");
+        let error = check_draft_size(40 * MIB, &gmail)
+            .expect_err("40 MiB exceeds Gmail's APPENDLIMIT and must not reach the wire");
+        let message = error.to_string();
+        assert!(
+            message.contains("35651584") && message.contains("APPENDLIMIT"),
+            "the refusal must name the server's bound, not ours: {message}"
+        );
+
+        // iCloud advertises none: our own ceiling is the only bound.
+        let icloud =
+            imap_client::ServerCaps::from_strings(["IMAP4REV1".to_string(), "UIDPLUS".to_string()]);
+        assert!(
+            check_draft_size(40 * MIB, &icloud).is_ok(),
+            "40 MiB is fine where the server declares no limit"
+        );
+        let error = check_draft_size(70 * MIB, &icloud).expect_err("70 MiB exceeds our ceiling");
+        assert!(
+            error.to_string().contains("this client's ceiling"),
+            "with no server bound the refusal is ours to own: {error}"
+        );
+
+        // A BARE `APPENDLIMIT` means per-mailbox limits reported via STATUS —
+        // unknown here, so it must not be read as "no limit" OR as zero.
+        let bare = imap_client::ServerCaps::from_strings([
+            "IMAP4REV1".to_string(),
+            "APPENDLIMIT".to_string(),
+        ]);
+        assert!(check_draft_size(40 * MIB, &bare).is_ok(), "unknown ≠ zero");
+
+        // A server MORE generous than we are does not raise our ceiling.
+        let generous = imap_client::ServerCaps::from_strings([
+            "IMAP4REV1".to_string(),
+            "APPENDLIMIT=999999999".to_string(),
+        ]);
+        assert!(check_draft_size(70 * MIB, &generous).is_err());
+    }
+
+    /// The safety half of the APPEND-then-discard emulation. `Permanent`
+    /// mirrors REPLACE, but on a server without UIDPLUS it degrades to a plain
+    /// EXPUNGE that would purge every `\Deleted` message in Drafts — including
+    /// ones another client flagged. Those servers must dispose through Trash.
+    #[test]
+    fn a_superseded_draft_is_only_expunged_where_uidplus_makes_it_targeted() {
+        let icloud = imap_client::ServerCaps::from_strings([
+            "IMAP4REV1".to_string(),
+            "UIDPLUS".to_string(),
+            "MOVE".to_string(),
+        ]);
+        assert_eq!(
+            discard_mode_for(&icloud),
+            DeleteMode::Permanent,
+            "UIDPLUS makes UID EXPUNGE targeted, so REPLACE's semantics are safe to mirror"
+        );
+
+        // No UIDPLUS: permanent mode would reach a plain EXPUNGE.
+        let plain =
+            imap_client::ServerCaps::from_strings(["IMAP4REV1".to_string(), "MOVE".to_string()]);
+        assert_eq!(
+            discard_mode_for(&plain),
+            DeleteMode::TrashFirst,
+            "without UIDPLUS the discard must go to Trash, never a blanket EXPUNGE"
+        );
+
+        // Gmail: `trash_for_mode` routes Permanent to [Gmail]/Trash, because an
+        // in-place EXPUNGE there only drops a label.
+        let gmail = imap_client::ServerCaps::from_strings([
+            "IMAP4REV1".to_string(),
+            "X-GM-EXT-1".to_string(),
+        ]);
+        assert_eq!(
+            discard_mode_for(&gmail),
+            DeleteMode::Permanent,
+            "Gmail is routed to its Trash by trash_for_mode even in permanent mode"
         );
     }
 

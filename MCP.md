@@ -23,7 +23,15 @@ MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11
 AgentMail reads, organizes, archives, and saves drafts. It does not expose a
 send operation.
 
-## Tools (37)
+**Account discovery costs no call.** The configured accounts are patched into
+every tool's `account` argument as a JSON Schema `enum` at `tools/list` time —
+the one part of the schema not knowable at compile time. They are also listed
+as `email://{account}` resources (a mailbox catalog, read it for mailbox URIs)
+and complete on every `email://` resource template and every prompt. Call
+`list_accounts` only when the DEFAULT account matters, not to discover a
+selector.
+
+## Tools (35)
 
 ### Discovery & Connection
 
@@ -112,13 +120,16 @@ Search filters are **AND-combined** (a message must match all provided filters) 
 
 **MessageMetadata** (shared by `get_messages` and `search_messages`)
 ```json
-{ "uid", "subject", "sender", "date?", "flags": [], "size?", "resourceUri" }
+{ "uid", "subject", "sender", "date?", "flags": [], "size?" }
 ```
 
 These two tools are metadata-only over MCP. They do not accept
 `includeContent` or `includeHeaders`, and they never return bodies, complete
-headers, recipient lists, or raw list-action values. Follow `resourceUri` when
-body, exact-header, or raw-source data is actually needed.
+headers, recipient lists, or raw list-action values. Every row rides the
+result as a `resource_link` (the markdown body, plus that message's `/info`);
+follow those links when body, exact-header, or raw-source data is actually
+needed. A tool result never carries a URI in its JSON — see
+[DECISIONS.md](DECISIONS.md) "Tool Results Carry URIs As Links Only".
 
 **list_flags**
 ```json
@@ -135,7 +146,7 @@ breakdowns are capped at 50 rows and include total/truncation metadata.
 ```json
 { "mailbox": "INBOX" | "*", "account", "total", "offset", "limit",
   "nextOffset?",
-  "messages": [{ "mailbox", "uidValidity", "uid", "date?", "resourceUri" }],
+  "messages": [{ "mailbox", "uidValidity", "uid", "date?" }],
   "perMailbox?": [{ "mailbox", "count" }],
   "perMailboxTotal", "perMailboxTruncated" }
 ```
@@ -233,7 +244,7 @@ persisted in the ranking cache. As with every ranking, `limit = N` returns up
 to N domain rows; it is not a fixed five-row preview.
 
 ```json
-MessageIdentity = { "mailbox", "uidValidity", "uid", "resourceUri" }
+MessageIdentity = { "mailbox", "uidValidity", "uid" }
 ```
 
 The `top_*` tools share a persistent ranking-header projection. Every reuse is validated with live `EXAMINE` metadata and the RFC identity tuple `(mailbox, UIDVALIDITY, UID)`. Cache hits avoid header fetches, proven appends fetch only new UIDs, and deletions reconcile UID membership without refetching unchanged headers. A busy-mailbox snapshot is returned but remains reconcile-required until a stable snapshot is observed.
@@ -294,11 +305,10 @@ shown by the preview to a later `export_thread_record` confirmation.
 | 25  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
 | 26  | `rename_mailbox`       | Preview, then confirm a guarded mailbox rename.                                       | `destructive`                            |
 | 27  | `delete_mailbox`       | Preview, then confirm guarded mailbox deletion.                                       | `destructive`, `idempotent`              |
-| 28  | `create_draft`         | Save an RFC822 draft with To/Cc/Bcc/Reply-To, optional threading headers, and attachments. |                                      |
-| 29  | `create_reply_draft`   | Derive reply or reply-all recipients and RFC threading headers from a live message.  |                                          |
-| 30  | `update_draft`         | Atomically replace a live draft with RFC 8508 REPLACE; refuses APPEND+DELETE.          | `destructive`                            |
-| 31  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
-| 32  | `download_message_source` | Save exact RFC822 bytes directly to disk with SHA-256, metadata, and local DNS-backed DKIM evidence. | `open_world`, `taskable`                 |
+| 28  | `create_draft`         | Save an RFC822 draft — fresh, or a reply derived from a live message via `replyToMessage`. |                                      |
+| 29  | `update_draft`         | Replace a live draft: RFC 8508 REPLACE where the server has it, APPEND-then-discard otherwise. | `destructive`                            |
+| 30  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
+| 31  | `download_message_source` | Save exact RFC822 bytes directly to disk with SHA-256, metadata, and local DNS-backed DKIM evidence. | `open_world`, `taskable`                 |
 | 33  | `download_thread`      | Save a caller-selected set of up to 100 UIDs plus a JSON evidence manifest. Does not discover thread membership. | `open_world`, `taskable`                 |
 | 34  | `export_thread_record` | Confirm a preview digest and write PDF, exact EML sources, and an integrity manifest. | `open_world`, `taskable`                 |
 | 35  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional matching-message cleanup via the nested `cleanup {when, identity, deletion}` object (omitted = unsubscribe only). | `destructive`, `open_world`, `taskable`  |
@@ -335,7 +345,7 @@ default). The following arguments are required together with
 
 - `delete_messages`: one or more UIDs discovered in one mailbox epoch.
 - `move_message`, `download_attachments`, `download_message_source`,
-  `download_thread`, `add_flags`, and `remove_flags`:
+  `download_thread`, and `update_flags`:
   the UID from a current discovery result.
 - `unsubscribe_message`: the `sample` from `top_subscriptions`.
 - `move_subscription`: the same nested `sample`, plus the destination mailbox.
@@ -517,12 +527,41 @@ The rename destination must not exist. A missing delete target is an idempotent
 success. After a transport error, AgentMail re-lists the mailbox catalog and
 reports success only when the resulting state is unambiguous.
 
-**create_draft** / **create_reply_draft**
+**create_draft**
 ```json
 { "created": true, "account", "draftsMailbox", "attachmentCount",
   "replyToCount", "threadingApplied", "warning?",
-  "uidValidity?", "uid?", "resourceUri?" }
+  "uidValidity?", "uid?" }
 ```
+
+Draft bodies are written in **Markdown** and sent as `multipart/alternative`
+(RFC 2046 §5.1.4): the text exactly as written as `text/plain`, then an HTML
+rendering of the same source, least-preferred part first so every client picks
+the richest form it can display. `**bold**`, lists, links, tables and
+strikethrough arrive formatted instead of as literal syntax.
+
+Raw HTML inside a body is **escaped, never rendered** — a draft body is
+author-supplied text, and treating `<...>` in it as markup would let a tool call
+decide what runs in a recipient's mail client. Nothing is dropped: a literal
+`<b>` reaches the reader as the characters that were typed.
+
+Link and image destinations are limited to `http`, `https`, `mailto`, `tel` and
+relative URLs. A `javascript:` or `data:` destination has its link **unwrapped**
+— the text still appears, it just is not clickable — and the plain half of the
+message carries the original Markdown either way, so nothing is lost.
+
+Pass `plainTextOnly: true` (`create_draft`, `update_draft`) for a single
+unrendered `text/plain` part — for a plain-text-only
+recipient, a mailing list, or a body that must not be reinterpreted. AgentMail
+never emits Outlook's TNEF "Rich Text" (`application/ms-tnef`), which reaches
+non-Outlook recipients as `winmail.dat`.
+
+A composed draft must fit the SMALLER of this client's 64 MiB ceiling and the
+server's advertised RFC 7889 `APPENDLIMIT` (Gmail publishes 35651584 — 34 MiB;
+iCloud publishes none, leaving only our ceiling). Oversize is refused before any
+upload, and the error names which bound was hit. A bare `APPENDLIMIT` token
+means per-mailbox limits reported via `STATUS` — treated as unknown, not as
+unlimited, so the server still gets the last word at APPEND.
 
 The compact result confirms placement without echoing the subject, recipients,
 local input paths, or filenames. `create_draft` composes a complete RFC822
@@ -535,26 +574,43 @@ tagged completion, AgentMail discards that connection and searches the same
 Message-ID on a fresh one. It reports success only when the draft is found;
 otherwise it directs the caller to inspect Drafts before retrying.
 
-`create_reply_draft` starts from a live UIDVALIDITY-safe message. It uses the
-source Reply-To before From; reply-all adds source To/Cc while excluding the
-configured account address and aliases; Bcc is never inferred. It applies one
-`Re:` prefix and extends exact RFC threading headers. A source without a
-Message-ID still produces a draft but returns `threadingApplied: false` with a
-warning. Neither tool sends mail.
+Give `create_draft` a `replyToMessage` `{mailbox, uid, expectedUidValidity,
+mode}` to reply instead of composing fresh. It starts from that live
+UIDVALIDITY-safe message and uses the source Reply-To before From; `replyAll`
+adds the source To/Cc while excluding the configured account address and
+aliases; Bcc is never inferred. It applies one `Re:` prefix — `subject`
+overrides it — and extends the exact RFC threading headers. A source without a
+Message-ID still produces a draft, with `threadingApplied: false` and a warning.
+
+`to`, `cc`, `inReplyTo` and `references` are DERIVED when `replyToMessage` is
+present and are refused if also supplied: two sources for one field is how a
+reply goes to the wrong people. This tool never sends mail.
 
 **update_draft**
 
 ```json
 { "updated": true, "account", "draftsMailbox",
   "previousUidValidity", "previousUid",
-  "uidValidity?", "uid?", "resourceUri?" }
+  "uidValidity?", "uid?", "warning?" }
 ```
 
 The input is a complete replacement specification, including attachments.
-AgentMail verifies the live UIDVALIDITY and `\Draft` flag, preserves the Apple
-draft UUID, and requires server-advertised RFC 8508 REPLACE. It never emulates
-replacement with APPEND+DELETE because a disconnect can leave duplicates; an
-ambiguous REPLACE error instructs the caller to inspect Drafts before retrying.
+AgentMail verifies the live UIDVALIDITY and `\Draft` flag and preserves the
+Apple draft UUID.
+
+Where the server advertises RFC 8508 REPLACE the swap is one atomic command.
+Where it does not — Gmail and iCloud among them — AgentMail emulates it as
+APPEND-then-discard, in that order: the replacement is durable before anything
+is destroyed, so the worst failure is a duplicate draft, never a lost one. The
+superseded draft is discarded through the same policy-aware path
+`delete_messages` uses (Gmail routes to `[Gmail]/Trash`; a server without
+UIDPLUS disposes through Trash rather than reaching a blanket EXPUNGE). If that
+discard fails, the call still SUCCEEDS with the new identity and sets
+`warning` — the draft was written, and reporting failure would send the caller
+back to rewrite one that already exists. An ambiguous REPLACE error instructs
+the caller to inspect Drafts before retrying.
+
+A replaced draft always has a NEW UID. Use the one this returns.
 
 **download_attachments**
 ```json
@@ -691,12 +747,16 @@ message ceiling and continues to mutate in 500-UID batches.
 
 | #   | Tool           | Description                                                                          | Annotations |
 | --- | -------------- | ------------------------------------------------------------------------------------ | ----------- |
-| 36  | `add_flags`    | Add flags and/or set Apple Mail `color` (a color-name string; union semantics). Colors: red, orange, yellow, green, blue, purple, gray. | `idempotent` |
-| 37  | `remove_flags` | Remove specific flags and/or clear the Apple Mail color with `clearColor: true`. Others preserved. | `idempotent` |
+| 35  | `update_flags` | Add flags, remove flags, and set or clear the Apple Mail `color` in ONE call. Colors: red, orange, yellow, green, blue, purple, gray, or `none` to clear. Unnamed flags are untouched. | `idempotent` |
+
+Adding and removing were two tools. Doing both then meant two calls across two
+UIDVALIDITY windows, so the second could be refused with the first already
+applied. One call, one window. Order is `remove`, then the color, then `add`, so
+a flag named in both lists ends up SET.
 
 #### Output Schemas
 
-**add_flags** / **remove_flags**
+**update_flags**
 ```json
 { "mailbox", "account", "uidValidity", "uid",
   "flags": ["\\Seen", "\\Flagged", ...], "color?" }

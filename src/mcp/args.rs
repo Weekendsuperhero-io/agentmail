@@ -249,10 +249,20 @@ pub(super) struct CreateDraftArgs {
     pub(super) references: Vec<String>,
     #[serde(default)]
     #[schemars(
+        description = "Reply to this live message instead of composing fresh. When present, `to`, `cc`, `inReplyTo` and `references` are DERIVED from it and must be omitted; `subject` becomes an optional override of the Re: form."
+    )]
+    pub(super) reply_to_message: Option<ReplyToMessageArg>,
+    #[serde(default)]
+    #[schemars(
         length(max = 20),
         description = "Attachments to include (maximum 20 files, 25 MiB each, 40 MiB aggregate). Each entry requires a local filesystem 'path'. 'filename' and 'contentType' are optional and will be inferred when omitted."
     )]
     pub(super) attachments: Vec<DraftAttachmentArg>,
+    #[serde(default)]
+    #[schemars(
+        description = "Send the body as plain text ONLY, with no rendered alternative. Default false: the body is read as Markdown and sent as multipart/alternative — the text exactly as written, plus an HTML rendering of it, so **bold**, lists, links and tables arrive formatted instead of as literal syntax. Set true when literal plain text is the point (a plain-text-only recipient, a mailing list, or a body that must not be reinterpreted)."
+    )]
+    pub(super) plain_text_only: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -281,31 +291,28 @@ pub(super) enum ReplyModeArg {
     ReplyAll,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-#[schemars(description = "Arguments for creating a reply or reply-all draft from a live message.")]
-pub(super) struct CreateReplyDraftArgs {
-    pub(super) account: String,
+#[schemars(inline)]
+#[schemars(
+    description = "The live message this draft replies to. Supplying it derives the recipients, the Re: subject and the RFC threading headers from that message."
+)]
+pub(super) struct ReplyToMessageArg {
+    #[schemars(
+        description = "Mailbox holding the message being replied to — the same mailbox that produced expectedUidValidity."
+    )]
     pub(super) mailbox: String,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1), description = "Non-zero IMAP UID of that message.")]
     pub(super) uid: u32,
-    #[schemars(range(min = 1))]
+    #[schemars(
+        range(min = 1),
+        description = "UIDVALIDITY paired with the UID. The draft is refused if the mailbox UID epoch changed."
+    )]
     pub(super) expected_uid_validity: u32,
+    #[schemars(
+        description = "reply (the sender only) or replyAll (sender plus the original To and Cc, minus this account's own addresses)."
+    )]
     pub(super) mode: ReplyModeArg,
-    #[serde(default)]
-    #[schemars(description = "Optional subject override. Defaults to a single Re: prefix.")]
-    pub(super) subject: Option<String>,
-    #[serde(default)]
-    pub(super) body: String,
-    #[serde(default)]
-    #[schemars(description = "Explicit Bcc recipients. Bcc is never inferred from the source.")]
-    pub(super) bcc: Vec<String>,
-    #[serde(default)]
-    #[schemars(description = "Reply-To header addresses for the new draft.")]
-    pub(super) reply_to: Vec<String>,
-    #[serde(default)]
-    #[schemars(length(max = 20))]
-    pub(super) attachments: Vec<DraftAttachmentArg>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -340,6 +347,11 @@ pub(super) struct UpdateDraftArgs {
         description = "Complete replacement attachment list. Omitted means no attachments; partial preservation is intentionally unsupported."
     )]
     pub(super) attachments: Vec<DraftAttachmentArg>,
+    #[serde(default)]
+    #[schemars(
+        description = "Send the body as plain text ONLY, with no rendered alternative. Default false: the body is read as Markdown and sent as multipart/alternative — the text exactly as written, plus an HTML rendering of it, so **bold**, lists, links and tables arrive formatted instead of as literal syntax. Set true when literal plain text is the point (a plain-text-only recipient, a mailing list, or a body that must not be reinterpreted)."
+    )]
+    pub(super) plain_text_only: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -808,7 +820,7 @@ pub(super) struct DownloadAttachmentsArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Directory inside the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). Defaults to that workspace root."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
 }
@@ -833,7 +845,7 @@ pub(super) struct DownloadMessageSourceArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Directory inside the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). Defaults to that workspace root."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -868,7 +880,7 @@ pub(super) struct DownloadThreadArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Directory inside the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). Defaults to that workspace root."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -914,7 +926,7 @@ pub(super) struct ExportThreadRecordArgs {
     )]
     pub(super) purpose: String,
     #[schemars(
-        description = "Directory inside the active session workspace. Defaults to the workspace root."
+        description = "Where to write, resolved against the active session workspace. OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -926,16 +938,14 @@ pub(super) struct ExportThreadRecordArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(
-    description = "Arguments for adding flags and/or setting an Apple Mail color on a message."
+    description = "Arguments for adding and/or removing flags and setting or clearing the Apple Mail color on one message."
 )]
-pub(super) struct AddFlagsArgs {
+pub(super) struct UpdateFlagsArgs {
     #[schemars(
         description = "Mailbox containing the message (required) — the same mailbox that produced expectedUidValidity."
     )]
     pub(super) mailbox: String,
-    #[schemars(
-        description = "Account name (required). Use list_accounts to discover valid names."
-    )]
+    #[schemars(description = "Account name (required).")]
     pub(super) account: String,
     #[schemars(range(min = 1), description = "Non-zero IMAP UID of the message.")]
     pub(super) uid: u32,
@@ -946,46 +956,18 @@ pub(super) struct AddFlagsArgs {
     pub(super) expected_uid_validity: u32,
     #[serde(default)]
     #[schemars(
-        description = "Flags to add. System flags use backslash prefix (e.g. \"\\\\Seen\", \"\\\\Flagged\"). Custom keywords are plain strings. Cannot include \\\\Deleted or \\\\Recent."
+        description = "Flags to add. System flags use a backslash prefix (e.g. \"\\\\Seen\", \"\\\\Flagged\"); custom keywords are plain strings. Existing flags are preserved. Cannot include \\\\Deleted or \\\\Recent."
     )]
-    pub(super) flags: Vec<String>,
+    pub(super) add: Vec<String>,
+    #[serde(default)]
     #[schemars(
-        description = "Apple Mail color to set (case-insensitive): red, orange, yellow, green, blue, purple, gray. Sets \\\\Flagged + $MailFlagBit keywords. Replaces any existing color."
+        description = "Flags to remove. Only these are removed; every other flag remains. Cannot include \\\\Deleted or \\\\Recent."
+    )]
+    pub(super) remove: Vec<String>,
+    #[schemars(
+        description = "Apple Mail color, case-insensitive: red, orange, yellow, green, blue, purple, gray — or \"none\" to clear it. Setting a color sets \\\\Flagged plus the $MailFlagBit keywords and replaces any existing color; omit the field to leave the color untouched."
     )]
     pub(super) color: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-#[schemars(
-    description = "Arguments for removing flags and/or clearing Apple Mail color from a message."
-)]
-pub(super) struct RemoveFlagsArgs {
-    #[schemars(
-        description = "Mailbox containing the message (required) — the same mailbox that produced expectedUidValidity."
-    )]
-    pub(super) mailbox: String,
-    #[schemars(
-        description = "Account name (required). Use list_accounts to discover valid names."
-    )]
-    pub(super) account: String,
-    #[schemars(range(min = 1), description = "Non-zero IMAP UID of the message.")]
-    pub(super) uid: u32,
-    #[schemars(
-        range(min = 1),
-        description = "UIDVALIDITY paired with the UID. The update fails if the mailbox UID epoch changed."
-    )]
-    pub(super) expected_uid_validity: u32,
-    #[serde(default)]
-    #[schemars(
-        description = "Flags to remove. System flags use backslash prefix (e.g. \"\\\\Seen\"). Cannot include \\\\Deleted or \\\\Recent."
-    )]
-    pub(super) flags: Vec<String>,
-    #[serde(default = "default_false")]
-    #[schemars(
-        description = "If true, removes the Apple Mail color flag (\\\\Flagged + all $MailFlagBit keywords). Defaults to false."
-    )]
-    pub(super) clear_color: bool,
 }
 
 // ---------------------------------------------------------------------------

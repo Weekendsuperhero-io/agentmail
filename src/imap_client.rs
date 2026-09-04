@@ -952,6 +952,21 @@ impl ServerCaps {
                 .and_then(|value| value.parse().ok())
         })
     }
+
+    /// RFC 7889 `APPENDLIMIT=N`: the largest single message this server accepts
+    /// in one APPEND, in octets (Gmail advertises 35651584 — 34 MiB).
+    ///
+    /// A BARE `APPENDLIMIT` token means the limit varies PER MAILBOX and is
+    /// reported by `STATUS (APPENDLIMIT)` instead of the capability line. We
+    /// return `None` there rather than guess a number: the caller keeps its own
+    /// ceiling, and the server still gets the last word at APPEND.
+    pub fn append_limit(&self) -> Option<u64> {
+        self.tokens.iter().find_map(|token| {
+            token
+                .strip_prefix("APPENDLIMIT=")
+                .and_then(|value| value.parse().ok())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

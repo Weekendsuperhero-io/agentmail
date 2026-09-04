@@ -908,7 +908,24 @@ pub enum ReplyMode {
     ReplyAll,
 }
 
-/// Response for an atomic RFC 8508 draft replacement.
+/// Which way an Apple Mail colour should move in one `update_flags` call.
+///
+/// A tri-state, not an `Option<String>`: "leave the colour alone" and "clear
+/// it" are different intentions, and collapsing them would make the absent
+/// case ambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FlagColorChange {
+    /// Leave whatever colour the message already has.
+    #[default]
+    Leave,
+    /// Set this colour, replacing any existing one.
+    Set(String),
+    /// Remove `\\Flagged` and every `$MailFlagBit` keyword.
+    Clear,
+}
+
+/// Response for a draft replacement — RFC 8508 UID REPLACE where the server
+/// has it, an APPEND-then-discard emulation where it does not.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateDraftResponse {
@@ -921,6 +938,11 @@ pub struct UpdateDraftResponse {
     pub uid_validity: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
+    /// Set ONLY when the new draft was written but the superseded one could
+    /// not be discarded, so two drafts are now in the mailbox. The update
+    /// still succeeded; this says the cleanup half did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// A downloaded attachment file.

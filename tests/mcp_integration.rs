@@ -307,13 +307,13 @@ async fn initialize_reports_capabilities_and_identity() {
 }
 
 #[tokio::test]
-async fn tools_list_has_37_annotated_tools() {
+async fn tools_list_has_35_annotated_tools() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        37,
+        35,
         "tool count drifted — update docs and tests"
     );
 
@@ -679,8 +679,7 @@ async fn uid_actions_require_a_nonzero_expected_uidvalidity() {
         "download_attachments",
         "download_message_source",
         "download_thread",
-        "add_flags",
-        "remove_flags",
+        "update_flags",
     ] {
         let schema = &find_tool(tools, name)["inputSchema"];
         let required = schema["required"].as_array().expect("required fields");
@@ -772,12 +771,18 @@ async fn discovery_outputs_have_safe_complete_message_identities() {
     let attachment_properties = attachment["properties"]
         .as_object()
         .expect("attachment message properties");
-    for field in ["mailbox", "uidValidity", "uid", "resourceUri"] {
+    for field in ["mailbox", "uidValidity", "uid"] {
         assert!(
             attachment_properties.contains_key(field),
             "attachment hit must expose `{field}`: {attachment:#}"
         );
     }
+    // A URI travels as a `resource_link` block, never as JSON an aggregator
+    // cannot rewrite — so the schema must not promise one either.
+    assert!(
+        !attachment_properties.contains_key("resourceUri"),
+        "attachment hit must carry its URI as a link, not a JSON field: {attachment:#}"
+    );
     for field in ["uidValidity", "uid"] {
         assert_eq!(
             schema_minimum(&attachment_properties[field]),
@@ -807,7 +812,7 @@ async fn discovery_outputs_have_safe_complete_message_identities() {
         let message_properties = message["properties"]
             .as_object()
             .expect("message metadata properties");
-        for field in ["uid", "subject", "sender", "date", "flags", "resourceUri"] {
+        for field in ["uid", "subject", "sender", "date", "flags"] {
             assert!(
                 message_properties.contains_key(field),
                 "`{name}` message metadata must expose `{field}`: {message:#}"
@@ -820,6 +825,8 @@ async fn discovery_outputs_have_safe_complete_message_identities() {
             "listUnsubscribe",
             "to",
             "cc",
+            // Links are the only URI channel — see `message_resource_links`.
+            "resourceUri",
         ] {
             assert!(
                 !message_properties.contains_key(removed),
@@ -1026,6 +1033,77 @@ async fn completion_for_resource_template_account() {
         json!(["dummy"]),
         "resource template account completion: {resp:#}"
     );
+}
+
+/// End to end: the configured accounts reach the model in the schema of the
+/// argument that needs them, so choosing one costs no tool call. Before this,
+/// `list_accounts` was the only way to learn a selector and its own description
+/// told agents to call it first — which they did, every session.
+#[tokio::test]
+async fn tools_list_carries_the_live_accounts_in_the_account_enum() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let account_of = |name: &str| -> Option<Value> {
+        find_tool(tools, name)["inputSchema"]["properties"]["account"]
+            .get("enum")
+            .cloned()
+    };
+    assert_eq!(
+        account_of("get_messages"),
+        Some(json!(["dummy"])),
+        "a tool that takes an account advertises the configured ones: {resp:#}"
+    );
+    assert_eq!(
+        account_of("create_draft"),
+        Some(json!(["dummy"])),
+        "write tools too"
+    );
+    assert_eq!(
+        account_of("list_accounts"),
+        None,
+        "a tool with no account argument is untouched"
+    );
+}
+
+/// EVERY advertised template completes, including the mailbox index — which is
+/// listed FIRST and is the one an agent reaches for before it knows any UID.
+/// It was omitted from the completion whitelist, so the most reachable template
+/// silently completed to nothing, which reads as "no accounts configured"
+/// rather than "wrong template".
+#[tokio::test]
+async fn completion_covers_every_advertised_resource_template() {
+    let mut client = McpClient::start().await;
+
+    let templates = client.request("resources/templates/list", json!({})).await;
+    let advertised: Vec<String> = templates["result"]["resourceTemplates"]
+        .as_array()
+        .expect("templates array")
+        .iter()
+        .filter_map(|t| t["uriTemplate"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        advertised.contains(&"email://{account}/{mailbox}{?offset,limit}".to_string()),
+        "the mailbox index is advertised: {advertised:?}"
+    );
+
+    for uri in &advertised {
+        let resp = client
+            .request(
+                "completion/complete",
+                json!({
+                    "ref": {"type": "ref/resource", "uri": uri},
+                    "argument": {"name": "account", "value": ""}
+                }),
+            )
+            .await;
+        assert_eq!(
+            resp["result"]["completion"]["values"],
+            json!(["dummy"]),
+            "`{uri}` must complete its account argument: {resp:#}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1473,12 +1551,16 @@ async fn rank_outputs_expose_nested_action_identities() {
         let sample_properties = sample["properties"]
             .as_object()
             .expect("sample identity properties");
-        for field in ["mailbox", "uidValidity", "uid", "resourceUri"] {
+        for field in ["mailbox", "uidValidity", "uid"] {
             assert!(
                 sample_properties.contains_key(field),
                 "`{name}` sample must expose `{field}`: {sample:#}"
             );
         }
+        assert!(
+            !sample_properties.contains_key("resourceUri"),
+            "`{name}` sample must carry its URI as a link, not a JSON field: {sample:#}"
+        );
         for field in ["uidValidity", "uid"] {
             assert_eq!(
                 schema_minimum(&sample_properties[field]),
@@ -1850,8 +1932,7 @@ async fn mailbox_argument_follows_one_idiom() {
         "download_thread",
         "unsubscribe_message",
         "move_subscription",
-        "add_flags",
-        "remove_flags",
+        "update_flags",
         "move_message",
         "create_mailbox",
     ] {
@@ -1914,32 +1995,52 @@ async fn mailbox_argument_follows_one_idiom() {
     }
 }
 
-/// `add_flags.color` is a color name; `remove_flags` uses `clearColor: bool`
-/// — the shared `color` key with two meanings is gone.
+/// One tool, three independent levers. `add_flags` and `remove_flags` were
+/// separate tools with one `color` key that meant a color name in one and a
+/// boolean in the other — and, worse, made "mark read AND clear the color" two
+/// calls across two UIDVALIDITY windows.
 #[tokio::test]
-async fn flag_color_arguments_are_typed_consistently() {
+async fn update_flags_exposes_add_remove_and_color_as_one_call() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
 
-    let add = &find_tool(tools, "add_flags")["inputSchema"];
+    for gone in ["add_flags", "remove_flags"] {
+        assert!(
+            !tools.iter().any(|t| t["name"] == json!(gone)),
+            "`{gone}` was merged into update_flags"
+        );
+    }
+
+    let schema = &find_tool(tools, "update_flags")["inputSchema"];
+    let properties = schema["properties"]
+        .as_object()
+        .expect("update_flags input properties");
+    for lever in ["add", "remove", "color"] {
+        assert!(
+            properties.contains_key(lever),
+            "update_flags must expose `{lever}`: {schema:#}"
+        );
+    }
     assert!(
-        schema_allows_type(&add["properties"]["color"], "string"),
-        "add_flags color is a color-name string: {add:#}"
+        schema_allows_type(&properties["color"], "string"),
+        "color stays a name (or \"none\" to clear), never a boolean: {schema:#}"
+    );
+    assert!(
+        !properties.contains_key("clearColor"),
+        "clearColor folded into color=\"none\": {schema:#}"
     );
 
-    let remove = &find_tool(tools, "remove_flags")["inputSchema"];
-    let properties = remove["properties"]
-        .as_object()
-        .expect("remove_flags input properties");
-    assert!(
-        !properties.contains_key("color"),
-        "remove_flags renamed `color` to `clearColor`"
-    );
-    assert!(
-        schema_allows_type(&properties["clearColor"], "boolean"),
-        "remove_flags clearColor is a boolean switch: {remove:#}"
-    );
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for optional in ["add", "remove", "color"] {
+        assert!(
+            !required.contains(&optional),
+            "each lever is independently optional; `{optional}` must not be required"
+        );
+    }
 }
 
 /// `create_mailbox` uses the same `mailbox` argument name as every other tool.
@@ -1959,8 +2060,127 @@ async fn create_mailbox_argument_is_named_mailbox() {
     );
 }
 
+/// `update_draft` no longer refuses servers without RFC 8508 REPLACE — it
+/// emulates it — so the contract must (a) return the NEW identity, (b) offer
+/// `warning` for the one case the emulation can leave behind (the superseded
+/// draft survived), and (c) stop telling agents it will refuse. Gmail and
+/// iCloud both lack REPLACE, so the refusal made the tool useless on the two
+/// accounts it was most often pointed at.
+#[tokio::test]
+async fn update_draft_advertises_emulation_not_refusal() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let tool = find_tool(tools, "update_draft");
+
+    let description = tool["description"].as_str().expect("description");
+    assert!(
+        !description.contains("Refuses to emulate"),
+        "the refusal is gone; the description must not still promise it: {description}"
+    );
+
+    let properties = tool["outputSchema"]["properties"]
+        .as_object()
+        .expect("update_draft output properties");
+    for field in ["uid", "uidValidity", "warning"] {
+        assert!(
+            properties.contains_key(field),
+            "update_draft output must expose `{field}`: {tool:#}"
+        );
+    }
+    let required: Vec<&str> = tool["outputSchema"]["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        !required.contains(&"warning"),
+        "`warning` appears only when the superseded draft survived; it must be optional"
+    );
+}
+
+/// `create_reply_draft` was `create_draft` plus a source identity — it even
+/// delegated to the same composer — so it duplicated the whole body, format and
+/// attachment surface in a second schema and a second description. It is now an
+/// optional `replyToMessage` shape on `create_draft`: additive, so nothing
+/// `create_draft` could already do stopped working.
+#[tokio::test]
+async fn create_draft_absorbs_the_reply_form() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    assert!(
+        !tools
+            .iter()
+            .any(|t| t["name"] == json!("create_reply_draft")),
+        "create_reply_draft was merged into create_draft"
+    );
+
+    let schema = &find_tool(tools, "create_draft")["inputSchema"];
+    let source = object_schema(&schema["properties"]["replyToMessage"])
+        .expect("replyToMessage is an inlined object");
+    let fields = source["properties"]
+        .as_object()
+        .expect("replyToMessage properties");
+    for field in ["mailbox", "uid", "expectedUidValidity", "mode"] {
+        assert!(
+            fields.contains_key(field),
+            "replyToMessage must carry `{field}`: {source:#}"
+        );
+    }
+    // Composing fresh must stay possible — the whole point of merging INTO
+    // create_draft rather than replacing it.
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        !required.contains(&"replyToMessage"),
+        "replyToMessage is optional; create_draft still composes fresh mail"
+    );
+}
+
+/// Two sources for one field is how a reply quietly goes to the wrong people.
+/// Recipients and threading headers come from the source message OR from the
+/// caller, never merged.
+#[tokio::test]
+async fn a_reply_draft_refuses_recipients_it_would_derive() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "create_draft",
+                "arguments": {
+                    "account": "dummy",
+                    "body": "hello",
+                    "to": ["someone@example.com"],
+                    "replyToMessage": {
+                        "mailbox": "INBOX",
+                        "uid": 1,
+                        "expectedUidValidity": 1,
+                        "mode": "reply"
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "supplying a derived field must fail before any IMAP work: {resp:#}"
+    );
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("`to`") && m.contains("replyToMessage")),
+        "the refusal names the offending field: {resp:#}"
+    );
+}
+
 /// `create_draft` output advertises the recovered draft identity as optional
-/// nonzero uid/uidValidity plus a resourceUri.
+/// nonzero uid/uidValidity. The draft's URI rides the result as a
+/// `resource_link`, not as JSON.
 #[tokio::test]
 async fn create_draft_output_exposes_optional_draft_identity() {
     let mut client = McpClient::start().await;
@@ -1971,17 +2191,21 @@ async fn create_draft_output_exposes_optional_draft_identity() {
     let properties = output["properties"]
         .as_object()
         .expect("create_draft output properties");
-    for field in ["uid", "uidValidity", "resourceUri"] {
+    for field in ["uid", "uidValidity"] {
         assert!(
             properties.contains_key(field),
             "create_draft output must expose `{field}`: {output:#}"
         );
     }
+    assert!(
+        !properties.contains_key("resourceUri"),
+        "the new draft's URI must arrive as a link, not a JSON field: {output:#}"
+    );
     let required: Vec<&str> = output["required"]
         .as_array()
         .map(|values| values.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    for field in ["uid", "uidValidity", "resourceUri"] {
+    for field in ["uid", "uidValidity"] {
         assert!(
             !required.contains(&field),
             "draft identity recovery is best-effort; `{field}` must be optional"

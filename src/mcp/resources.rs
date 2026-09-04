@@ -553,7 +553,7 @@ fn exact_header_block(source: &str) -> &str {
 fn resource_not_found(parsed: &EmailResourceUri, detail: &str) -> McpError {
     McpError::resource_not_found(
         format!(
-            "email resource for mailbox '{}' UIDVALIDITY {} UID {} is unavailable: {detail}. Refresh get_messages, search_messages, or a top_* discovery result and use its current resourceUri",
+            "email resource for mailbox '{}' UIDVALIDITY {} UID {} is unavailable: {detail}. Refresh get_messages, search_messages, or a top_* discovery result and follow its current resource_link (a draft's UID changes on every re-save, so a link from an earlier turn goes stale)",
             parsed.mailbox, parsed.uid_validity, parsed.uid
         ),
         None,
@@ -841,8 +841,14 @@ impl AgentMailServer {
         request: CompleteRequestParams,
     ) -> Result<CompleteResult, McpError> {
         let is_prompt = request.r#ref.as_prompt_name().is_some();
+        // EVERY advertised template, `EMAIL_MAILBOX_TEMPLATE` included. It was
+        // missing here while being listed FIRST by `email_resource_templates`
+        // — so the one template an agent reaches for before it knows any UID
+        // completed to nothing, which reads as "this server has no accounts"
+        // rather than "ask a different template".
         let is_email_template = request.r#ref.as_resource_uri().is_some_and(|u| {
-            u == EMAIL_BODY_TEMPLATE
+            u == EMAIL_MAILBOX_TEMPLATE
+                || u == EMAIL_BODY_TEMPLATE
                 || u == EMAIL_HEADERS_TEMPLATE
                 || u == EMAIL_SOURCE_TEMPLATE
                 || u == EMAIL_INFO_TEMPLATE

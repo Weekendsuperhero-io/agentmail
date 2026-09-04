@@ -21,10 +21,35 @@ const MAX_LIST_SENDER_PREVIEW: usize = 5;
 
 /// Marker for schema-stable MCP outputs that can be serialized on both result
 /// channels.
-pub(super) trait WireOutput: Serialize {}
+pub(super) trait WireOutput: Serialize {
+    /// The message URIs this result should LINK, in row order.
+    ///
+    /// A tool result carries a URI as a `ResourceLink` and nowhere else, so
+    /// these are built here and never serialized: the URI is not a field of any
+    /// output type, which is what makes leaking one impossible rather than
+    /// merely cleaned up afterwards. Types that mention no message — every
+    /// write tool, `list_accounts` — keep the empty default.
+    fn resource_uris(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
 
 impl WireOutput for crate::ThreadRecordPreviewResponse {}
 impl WireOutput for crate::ThreadRecordExportResponse {}
+
+/// Collect URIs in row order, dropping repeats.
+///
+/// The ranking tools can sample the same message under two rows; it should be
+/// linked once.
+fn dedup(uris: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for uri in uris {
+        if !seen.contains(&uri) {
+            seen.push(uri);
+        }
+    }
+    seen
+}
 
 /// Construct a structured value plus the same complete JSON in a text block.
 ///
@@ -36,6 +61,9 @@ pub(super) fn compact_result<T>(output: T) -> Result<CallToolResult, McpError>
 where
     T: WireOutput,
 {
+    // Links come from the TYPE, before serialization. `structured` is then the
+    // output verbatim — not a serialized value that was afterwards edited.
+    let links = message_resource_links(&output.resource_uris());
     let structured = serde_json::to_value(output).map_err(|error| {
         McpError::internal_error(format!("failed to serialize tool result: {error}"), None)
     })?;
@@ -48,43 +76,11 @@ where
     // Links come AFTER the JSON: hosts that render only the first content
     // block must still see the complete page (same reasoning as the fallback).
     let mut content = vec![ContentBlock::text(fallback)];
-    content.extend(message_resource_links(&structured));
+    content.extend(links);
 
     let mut result = CallToolResult::success(content);
     result.structured_content = Some(structured);
     Ok(result)
-}
-
-/// Every `resourceUri` in a tool result, in row order, deduplicated.
-///
-/// Walking our OWN output for a known field name is legitimate in a way that
-/// walking an arbitrary backend's output would not be: every `resource_uri`
-/// field in this module is built by [`message_resource_uri`], so the name and
-/// the meaning are ours to guarantee. That is what lets one chokepoint cover
-/// `get_messages`, `search_messages`, `find_attachments` and the nested
-/// `sample` rows of the ranking tools without per-tool plumbing.
-fn collect_resource_uris(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                if key == "resourceUri"
-                    && let Some(uri) = child.as_str()
-                {
-                    if !out.iter().any(|seen| seen == uri) {
-                        out.push(uri.to_string());
-                    }
-                    continue;
-                }
-                collect_resource_uris(child, out);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_resource_uris(item, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Turn each message URI in a result into TWO `ResourceLink` blocks: the
@@ -104,18 +100,21 @@ fn collect_resource_uris(value: &serde_json::Value, out: &mut Vec<String>) {
 ///   almost all never followed, which is exactly the context bloat these
 ///   metadata-only tools exist to avoid.
 ///
-/// STRICTLY ADDITIVE: the JSON `resourceUri` field stays — it is in the
-/// declared `outputSchema` and existing consumers read it.
-fn message_resource_links(structured: &serde_json::Value) -> Vec<ContentBlock> {
+/// These links are the ONLY navigation a tool result carries. No output type
+/// has a URI field, so none can be serialized: a URI buried in a JSON string is
+/// a URI no aggregator can rewrite — the bridge namespaces `ResourceLink`
+/// blocks but cannot reach inside our text, so an agent that lifted a
+/// `resourceUri` out of the JSON read under a spelling nobody advertised
+/// (2026-09-03). One channel, one spelling, no drift.
+fn message_resource_links(uris: &[String]) -> Vec<ContentBlock> {
     use super::resources::{
         EMAIL_BODY_MIME, EMAIL_BODY_NAME, EMAIL_BODY_TITLE, EMAIL_INFO_MIME, EMAIL_INFO_NAME,
         EMAIL_INFO_TITLE, assistant_annotations,
     };
     use rmcp::model::Resource;
 
-    let mut uris = Vec::new();
-    collect_resource_uris(structured, &mut uris);
-    uris.into_iter()
+    uris.iter()
+        .cloned()
         .flat_map(|uri| {
             let info = format!("{uri}/info");
             [
@@ -342,12 +341,10 @@ pub(super) struct MessageMetadataOutput {
     pub(super) flags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) size: Option<u32>,
-    pub(super) resource_uri: String,
 }
 
-impl MessageMetadataOutput {
-    fn new(value: crate::MessageInfo, account: &str, mailbox: &str, uid_validity: u32) -> Self {
-        let resource_uri = message_resource_uri(account, mailbox, uid_validity, value.uid);
+impl From<crate::MessageInfo> for MessageMetadataOutput {
+    fn from(value: crate::MessageInfo) -> Self {
         Self {
             uid: value.uid,
             subject: value.subject,
@@ -355,7 +352,6 @@ impl MessageMetadataOutput {
             date: value.date.map(|date| date.to_rfc3339()),
             flags: value.flags,
             size: value.size,
-            resource_uri,
         }
     }
 }
@@ -388,7 +384,7 @@ impl From<crate::GetMessagesResponse> for GetMessagesOutput {
         } = value;
         let messages: Vec<MessageMetadataOutput> = messages
             .into_iter()
-            .map(|message| MessageMetadataOutput::new(message, &account, &mailbox, uid_validity))
+            .map(MessageMetadataOutput::from)
             .collect();
         Self {
             account,
@@ -403,7 +399,13 @@ impl From<crate::GetMessagesResponse> for GetMessagesOutput {
     }
 }
 
-impl WireOutput for GetMessagesOutput {}
+impl WireOutput for GetMessagesOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        dedup(self.messages.iter().map(|row| {
+            message_resource_uri(&self.account, &self.mailbox, self.uid_validity, row.uid)
+        }))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -433,7 +435,7 @@ impl From<crate::SearchMessagesResponse> for SearchMessagesOutput {
         } = value;
         let messages: Vec<MessageMetadataOutput> = messages
             .into_iter()
-            .map(|message| MessageMetadataOutput::new(message, &account, &mailbox, uid_validity))
+            .map(MessageMetadataOutput::from)
             .collect();
         Self {
             account,
@@ -448,7 +450,13 @@ impl From<crate::SearchMessagesResponse> for SearchMessagesOutput {
     }
 }
 
-impl WireOutput for SearchMessagesOutput {}
+impl WireOutput for SearchMessagesOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        dedup(self.messages.iter().map(|row| {
+            message_resource_uri(&self.account, &self.mailbox, self.uid_validity, row.uid)
+        }))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -554,7 +562,6 @@ pub(super) struct AttachmentHitOutput {
     pub(super) uid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) date: Option<String>,
-    pub(super) resource_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -588,12 +595,6 @@ impl From<crate::FindAttachmentsResponse> for FindAttachmentsOutput {
             .messages
             .into_iter()
             .map(|message| AttachmentHitOutput {
-                resource_uri: message_resource_uri(
-                    &account,
-                    &message.mailbox,
-                    message.uid_validity,
-                    message.uid,
-                ),
                 mailbox: message.mailbox,
                 uid_validity: message.uid_validity,
                 uid: message.uid,
@@ -626,7 +627,14 @@ impl From<crate::FindAttachmentsResponse> for FindAttachmentsOutput {
     }
 }
 
-impl WireOutput for FindAttachmentsOutput {}
+impl WireOutput for FindAttachmentsOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        // Each hit carries its OWN mailbox: an account-wide scan spans several.
+        dedup(self.messages.iter().map(|hit| {
+            message_resource_uri(&self.account, &hit.mailbox, hit.uid_validity, hit.uid)
+        }))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -637,18 +645,18 @@ pub(super) struct MessageSampleOutput {
     pub(super) uid_validity: u32,
     #[schemars(range(min = 1))]
     pub(super) uid: u32,
-    pub(super) resource_uri: String,
 }
 
 impl MessageSampleOutput {
-    fn new(account: &str, value: crate::MailboxMessageIdentity) -> Self {
+    /// The sample's message URI. The account lives on the enclosing result, so
+    /// the row cannot build this alone — which is exactly why the URI is a
+    /// method on the OUTPUT rather than a field on the row.
+    fn uri(&self, account: &str) -> String {
+        message_resource_uri(account, &self.mailbox, self.uid_validity, self.uid)
+    }
+
+    fn new(value: crate::MailboxMessageIdentity) -> Self {
         Self {
-            resource_uri: message_resource_uri(
-                account,
-                &value.mailbox,
-                value.uid_validity,
-                value.uid,
-            ),
             mailbox: value.mailbox,
             uid_validity: value.uid_validity,
             uid: value.uid,
@@ -698,7 +706,7 @@ impl From<crate::TopSendersResponse> for TopSendersOutput {
                     count: sender.count,
                     oldest_date: sender.oldest_date.map(|date| date.to_rfc3339()),
                     newest_date: sender.newest_date.map(|date| date.to_rfc3339()),
-                    sample: MessageSampleOutput::new(&account, sender.sample),
+                    sample: MessageSampleOutput::new(sender.sample),
                 })
                 .collect(),
             account,
@@ -712,7 +720,11 @@ impl From<crate::TopSendersResponse> for TopSendersOutput {
     }
 }
 
-impl WireOutput for TopSendersOutput {}
+impl WireOutput for TopSendersOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        dedup(self.senders.iter().map(|row| row.sample.uri(&self.account)))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -765,7 +777,7 @@ impl From<crate::TopDomainsResponse> for TopDomainsOutput {
                     subject: domain.subject,
                     oldest_date: domain.oldest_date.map(|date| date.to_rfc3339()),
                     newest_date: domain.newest_date.map(|date| date.to_rfc3339()),
-                    sample: MessageSampleOutput::new(&account, domain.sample),
+                    sample: MessageSampleOutput::new(domain.sample),
                 })
                 .collect(),
             account,
@@ -779,7 +791,11 @@ impl From<crate::TopDomainsResponse> for TopDomainsOutput {
     }
 }
 
-impl WireOutput for TopDomainsOutput {}
+impl WireOutput for TopDomainsOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        dedup(self.domains.iter().map(|row| row.sample.uri(&self.account)))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -829,7 +845,7 @@ impl From<crate::TopSubscriptionsResponse> for TopSubscriptionsOutput {
                     subject: list.subject,
                     oldest_date: list.oldest_date.map(|date| date.to_rfc3339()),
                     newest_date: list.newest_date.map(|date| date.to_rfc3339()),
-                    sample: MessageSampleOutput::new(&account, list.sample),
+                    sample: MessageSampleOutput::new(list.sample),
                 })
                 .collect(),
             account,
@@ -843,7 +859,11 @@ impl From<crate::TopSubscriptionsResponse> for TopSubscriptionsOutput {
     }
 }
 
-impl WireOutput for TopSubscriptionsOutput {}
+impl WireOutput for TopSubscriptionsOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        dedup(self.lists.iter().map(|row| row.sample.uri(&self.account)))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -900,7 +920,7 @@ impl From<crate::TopMailingListsResponse> for TopMailingListsOutput {
                     subject: list.subject,
                     oldest_date: list.oldest_date.map(|date| date.to_rfc3339()),
                     newest_date: list.newest_date.map(|date| date.to_rfc3339()),
-                    sample: MessageSampleOutput::new(&account, list.sample),
+                    sample: MessageSampleOutput::new(list.sample),
                 })
                 .collect(),
             account,
@@ -914,7 +934,11 @@ impl From<crate::TopMailingListsResponse> for TopMailingListsOutput {
     }
 }
 
-impl WireOutput for TopMailingListsOutput {}
+impl WireOutput for TopMailingListsOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        dedup(self.lists.iter().map(|row| row.sample.uri(&self.account)))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1644,22 +1668,10 @@ pub(super) struct CreateDraftOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub(super) uid: Option<u32>,
-    /// UIDVALIDITY-safe resource URI of the created draft, when recoverable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) resource_uri: Option<String>,
 }
 
 impl From<crate::CreateDraftResponse> for CreateDraftOutput {
     fn from(value: crate::CreateDraftResponse) -> Self {
-        let resource_uri = match (value.uid_validity, value.uid) {
-            (Some(uid_validity), Some(uid)) => Some(message_resource_uri(
-                &value.account,
-                &value.drafts_mailbox,
-                uid_validity,
-                uid,
-            )),
-            _ => None,
-        };
         Self {
             created: value.created,
             account: value.account,
@@ -1670,12 +1682,38 @@ impl From<crate::CreateDraftResponse> for CreateDraftOutput {
             warning: value.warning,
             uid_validity: value.uid_validity,
             uid: value.uid,
-            resource_uri,
         }
     }
 }
 
-impl WireOutput for CreateDraftOutput {}
+impl WireOutput for CreateDraftOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        draft_uri(
+            &self.account,
+            &self.drafts_mailbox,
+            self.uid_validity,
+            self.uid,
+        )
+    }
+}
+
+/// A draft's URI, when APPEND gave back an identity to build one from.
+fn draft_uri(
+    account: &str,
+    drafts_mailbox: &str,
+    uid_validity: Option<u32>,
+    uid: Option<u32>,
+) -> Vec<String> {
+    match (uid_validity, uid) {
+        (Some(uid_validity), Some(uid)) => vec![message_resource_uri(
+            account,
+            drafts_mailbox,
+            uid_validity,
+            uid,
+        )],
+        _ => Vec::new(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1693,21 +1731,14 @@ pub(super) struct UpdateDraftOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub(super) uid: Option<u32>,
+    /// Present ONLY when the superseded draft survived the update, so the
+    /// mailbox now holds both. The update itself still succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) resource_uri: Option<String>,
+    pub(super) warning: Option<String>,
 }
 
 impl From<crate::UpdateDraftResponse> for UpdateDraftOutput {
     fn from(value: crate::UpdateDraftResponse) -> Self {
-        let resource_uri = match (value.uid_validity, value.uid) {
-            (Some(uid_validity), Some(uid)) => Some(message_resource_uri(
-                &value.account,
-                &value.drafts_mailbox,
-                uid_validity,
-                uid,
-            )),
-            _ => None,
-        };
         Self {
             updated: value.updated,
             account: value.account,
@@ -1716,12 +1747,22 @@ impl From<crate::UpdateDraftResponse> for UpdateDraftOutput {
             previous_uid: value.previous_uid,
             uid_validity: value.uid_validity,
             uid: value.uid,
-            resource_uri,
+            warning: value.warning,
         }
     }
 }
 
-impl WireOutput for UpdateDraftOutput {}
+impl WireOutput for UpdateDraftOutput {
+    fn resource_uris(&self) -> Vec<String> {
+        // The NEW draft, when the server let its identity be recovered.
+        draft_uri(
+            &self.account,
+            &self.drafts_mailbox,
+            self.uid_validity,
+            self.uid,
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1993,19 +2034,21 @@ impl WireOutput for UnsubscribeMessageOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct AddFlagsOutput {
+pub(super) struct UpdateFlagsOutput {
     pub(super) account: String,
     pub(super) mailbox: String,
     #[schemars(range(min = 1))]
     pub(super) uid_validity: u32,
     #[schemars(range(min = 1))]
     pub(super) uid: u32,
+    /// The message's COMPLETE resulting flag set, re-read after the store —
+    /// not an echo of what was requested.
     pub(super) flags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) color: Option<String>,
 }
 
-impl AddFlagsOutput {
+impl UpdateFlagsOutput {
     pub(super) fn new(value: crate::UpdateFlagsResponse, uid_validity: u32) -> Self {
         Self {
             account: value.account,
@@ -2018,36 +2061,7 @@ impl AddFlagsOutput {
     }
 }
 
-impl WireOutput for AddFlagsOutput {}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct RemoveFlagsOutput {
-    pub(super) account: String,
-    pub(super) mailbox: String,
-    #[schemars(range(min = 1))]
-    pub(super) uid_validity: u32,
-    #[schemars(range(min = 1))]
-    pub(super) uid: u32,
-    pub(super) flags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) color: Option<String>,
-}
-
-impl RemoveFlagsOutput {
-    pub(super) fn new(value: crate::UpdateFlagsResponse, uid_validity: u32) -> Self {
-        Self {
-            account: value.account,
-            mailbox: value.mailbox,
-            uid_validity,
-            uid: value.uid,
-            flags: value.flags,
-            color: value.color,
-        }
-    }
-}
-
-impl WireOutput for RemoveFlagsOutput {}
+impl WireOutput for UpdateFlagsOutput {}
 
 #[cfg(test)]
 mod tests {
@@ -2091,18 +2105,14 @@ mod tests {
         );
     }
 
-    /// AMXSF-333 A2. A row's `resourceUri` is a plain JSON string — nothing
-    /// structural says "this is a readable resource", so a client has to know
-    /// the field is spelled `resourceUri` to follow it. The `ResourceLink`
-    /// blocks make that edge part of the protocol.
+    /// AMXSF-333 A2. A URI is not a field a client can be expected to know the
+    /// name of; a `ResourceLink` makes the edge part of the protocol. Two per
+    /// message: the body, and the `/info` hub that reaches everything else.
     #[test]
-    fn a_row_with_a_resource_uri_emits_body_and_info_links() {
+    fn each_message_uri_emits_body_and_info_links() {
         let uri = message_resource_uri("work", "INBOX", 77, 42);
-        let structured = serde_json::json!({
-            "messages": [ { "uid": 42, "resourceUri": uri } ]
-        });
 
-        let links: Vec<_> = message_resource_links(&structured)
+        let links: Vec<_> = message_resource_links(std::slice::from_ref(&uri))
             .into_iter()
             .map(|block| match block {
                 ContentBlock::ResourceLink(resource) => resource,
@@ -2117,34 +2127,132 @@ mod tests {
         assert_eq!(links[1].mime_type.as_deref(), Some("application/json"));
     }
 
-    /// One chokepoint covers every tool: the walk finds URIs wherever they sit,
-    /// including the ranking tools' NESTED `sample` rows, and never links the
-    /// same message twice.
+    /// The ranking tools sample messages, and two rows can sample the SAME
+    /// message. It is linked once, in row order. The URI comes off the typed
+    /// output — the account lives on the result, the identity on the row — so
+    /// this is `TopSendersOutput`'s own accessor, not a walk over its JSON.
     #[test]
-    fn links_cover_nested_rows_and_deduplicate() {
+    fn ranked_samples_link_in_row_order_without_repeats() {
+        let sample = |uid: u32| MessageSampleOutput {
+            mailbox: "INBOX".to_string(),
+            uid_validity: 77,
+            uid,
+        };
+        let row = |address: &str, uid: u32| SenderRankOutput {
+            address: address.to_string(),
+            display_name: String::new(),
+            count: 1,
+            oldest_date: None,
+            newest_date: None,
+            sample: sample(uid),
+        };
+        let output = TopSendersOutput {
+            account: "work".to_string(),
+            mailbox: "INBOX".to_string(),
+            total_messages: 3,
+            total: 3,
+            offset: 0,
+            limit: 10,
+            next_offset: None,
+            senders: vec![
+                row("a@example.com", 1),
+                row("b@example.com", 2),
+                row("c@example.com", 1),
+            ],
+        };
+
         let first = message_resource_uri("work", "INBOX", 77, 1);
         let second = message_resource_uri("work", "INBOX", 77, 2);
-        let structured = serde_json::json!({
-            "senders": [
-                { "address": "a@example.com", "sample": { "resourceUri": first } },
-                { "address": "b@example.com", "sample": { "resourceUri": second } },
-                // Same message sampled twice — one pair of links, not two.
-                { "address": "c@example.com", "sample": { "resourceUri": first } },
-            ]
-        });
+        assert_eq!(
+            output.resource_uris(),
+            vec![first, second],
+            "row order, and the twice-sampled message appears once"
+        );
+        assert_eq!(message_resource_links(&output.resource_uris()).len(), 4);
+    }
 
-        let mut uris = Vec::new();
-        collect_resource_uris(&structured, &mut uris);
-        assert_eq!(uris, vec![first, second], "row order, deduplicated");
-        assert_eq!(message_resource_links(&structured).len(), 4);
+    /// THE acceptance criterion. A URI inside a JSON string is one no aggregator
+    /// can rewrite — the bridge namespaces `ResourceLink` blocks but cannot
+    /// reach into our text, so an agent that lifted `resourceUri` out of the
+    /// JSON read under a spelling nobody advertised (2026-09-03). Links are the
+    /// only navigation a tool result carries now: present in `content`, absent
+    /// from BOTH result channels, and absent from the declared `outputSchema` so
+    /// the contract does not promise a field the payload never has.
+    #[test]
+    fn a_tool_result_carries_uris_as_links_only_never_as_json() {
+        let uri = message_resource_uri("work", "INBOX", 77, 42);
+        let output = GetMessagesOutput {
+            account: "work".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 77,
+            offset: 0,
+            limit: 25,
+            total: 1,
+            next_offset: None,
+            messages: vec![MessageMetadataOutput {
+                uid: 42,
+                subject: "hi".into(),
+                sender: "a@example.com".into(),
+                date: None,
+                flags: vec![],
+                size: None,
+            }],
+        };
+
+        let result = compact_result(output).expect("builds");
+
+        // The links survive — this is the channel that replaced the field.
+        let linked: Vec<&str> = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ResourceLink(resource) => Some(resource.uri.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(linked, vec![uri.as_str(), &format!("{uri}/info")]);
+
+        // … and the JSON does not mention it, on either channel.
+        let text = match result.content.first().expect("a text block") {
+            ContentBlock::Text(text) => text.text.clone(),
+            other => panic!("expected the JSON fallback first, got {other:?}"),
+        };
+        let structured =
+            serde_json::to_string(&result.structured_content).expect("structured serializes");
+        for (channel, json) in [("text fallback", &text), ("structuredContent", &structured)] {
+            assert!(
+                !json.contains("resourceUri") && !json.contains("email://"),
+                "{channel} still leaks a raw URI: {json}"
+            );
+            assert!(
+                json.contains("\"uid\":42"),
+                "{channel} lost its rows: {json}"
+            );
+        }
+
+        // The schema must not promise the field either.
+        let schema = serde_json::to_string(&rmcp::schemars::schema_for!(GetMessagesOutput))
+            .expect("schema serializes");
+        assert!(
+            !schema.contains("resourceUri"),
+            "outputSchema still declares a field the payload never carries: {schema}"
+        );
     }
 
     /// A result with no message rows gets no links — write tools and
-    /// `list_accounts` must not grow content blocks.
+    /// `list_accounts` must not grow content blocks. They inherit the trait's
+    /// empty default, so this is true by construction rather than by a walk
+    /// finding nothing.
     #[test]
     fn a_result_without_message_rows_emits_no_links() {
-        let structured = serde_json::json!({ "accounts": [ { "name": "work" } ] });
-        assert!(message_resource_links(&structured).is_empty());
+        let output = ListAccountsOutput {
+            accounts: vec![AccountOutput {
+                name: "work".to_string(),
+                is_default: true,
+            }],
+        };
+        assert!(output.resource_uris().is_empty());
+        assert!(message_resource_links(&output.resource_uris()).is_empty());
     }
 
     /// The links are ADDITIVE: the JSON stays first and complete, because it
@@ -2231,7 +2339,6 @@ mod tests {
         assert_ref_free::<ReconcileMovesOutput>();
         assert_ref_free::<UnsubscribeMessageOutput>();
         assert_ref_free::<DeleteListIdOutput>();
-        assert_ref_free::<AddFlagsOutput>();
-        assert_ref_free::<RemoveFlagsOutput>();
+        assert_ref_free::<UpdateFlagsOutput>();
     }
 }
