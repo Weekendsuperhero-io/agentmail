@@ -820,7 +820,7 @@ pub(super) struct DownloadAttachmentsArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace or one of the Project's other bound folders; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
 }
@@ -845,7 +845,7 @@ pub(super) struct DownloadMessageSourceArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace or one of the Project's other bound folders; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -880,7 +880,7 @@ pub(super) struct DownloadThreadArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace or one of the Project's other bound folders; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -926,7 +926,7 @@ pub(super) struct ExportThreadRecordArgs {
     )]
     pub(super) purpose: String,
     #[schemars(
-        description = "Where to write, resolved against the active session workspace. OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
+        description = "Where to write, resolved against the active session workspace. OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace or one of the Project's other bound folders; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(

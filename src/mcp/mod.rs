@@ -30,7 +30,16 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 
 const PREWARM_CONCURRENCY: usize = 3;
 const PREWARM_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The session's PRIMARY workspace root, as a JSON string.
 pub const WORKSPACE_ROOT_META_KEY: &str = "io.agentmuse/workspaceRoot";
+/// The Project's OTHER bound directories, as a JSON array of strings.
+///
+/// A separate key rather than widening [`WORKSPACE_ROOT_META_KEY`] to
+/// string-or-array: the primary root is load-bearing on its own (relative
+/// paths join it, an omitted `outputDir` lands in it), so it keeps a field
+/// whose type says there is exactly one. Absent or empty means what it always
+/// meant — one root — so an older app, or the standalone server, is unchanged.
+pub const ADDITIONAL_ROOTS_META_KEY: &str = "io.agentmuse/additionalWorkspaceRoots";
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -301,7 +310,24 @@ impl AgentMailServer {
                 None,
             ));
         }
-        Ok(file_access::FileAccessPolicy::with_root(root))
+        // The Project's other bound directories, if the app sent any. Each is
+        // filtered to an absolute path by `with_roots`; a malformed entry is
+        // dropped rather than failing the call, because the primary root
+        // alone is still a working session.
+        let additional: Vec<std::path::PathBuf> = meta
+            .get(ADDITIONAL_ROOTS_META_KEY)
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(file_access::FileAccessPolicy::with_roots(root, additional))
     }
 
     /// Combined tool router — referenced by `#[tool_handler]`'s default
