@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::types::BodyStructure;
+use crate::rfc3501::body_structure::BodyStructure;
+
 /// An utility parser helping to find the appropriate
 /// section part from a FETCH response.
 pub struct BodyStructParser<'a> {
@@ -33,10 +34,7 @@ impl<'a> BodyStructParser<'a> {
     /// # Arguments
     ///
     /// * `func` - The filter used to search elements within the bodystructure.
-    pub fn search<F>(&self, func: F) -> Option<Vec<u32>>
-    where
-        F: Fn(&'a BodyStructure<'a>) -> bool,
-    {
+    pub fn search(&self, func: impl Fn(&'a BodyStructure<'a>) -> bool) -> Option<Vec<u32>> {
         let elem: Vec<_> = self
             .map
             .iter()

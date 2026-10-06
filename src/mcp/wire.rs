@@ -202,6 +202,12 @@ fn redact_urls(value: Option<String>) -> Option<String> {
 pub(super) struct AccountOutput {
     pub(super) name: String,
     pub(super) is_default: bool,
+    /// The sender name drafts carry, when one is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) display_name: Option<String>,
+    /// The addresses this account sends as, primary first. A draft's `from`
+    /// must be one of them.
+    pub(super) addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -219,6 +225,8 @@ impl From<crate::ListAccountsResponse> for ListAccountsOutput {
                 .map(|account| AccountOutput {
                     name: account.name,
                     is_default: account.is_default,
+                    display_name: account.display_name,
+                    addresses: account.addresses,
                 })
                 .collect(),
         }
@@ -226,6 +234,61 @@ impl From<crate::ListAccountsResponse> for ListAccountsOutput {
 }
 
 impl WireOutput for ListAccountsOutput {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct SenderIdentityOutput {
+    pub(super) address: String,
+    /// One of the account's own addresses — usable as a draft's `from`.
+    pub(super) configured: bool,
+    /// The account's primary address, a draft's default sender.
+    pub(super) primary: bool,
+    /// Names Sent mail went out under from this address, most used first.
+    pub(super) display_names: Vec<String>,
+    /// Scanned Sent messages from this address.
+    pub(super) messages: usize,
+    /// Date of the newest of them, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) last_used: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ListIdentitiesOutput {
+    pub(super) account: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) display_name: Option<String>,
+    /// The Sent mailbox that was read; null when the account has none.
+    pub(super) sent_mailbox: Option<String>,
+    pub(super) scanned_messages: usize,
+    pub(super) identities: Vec<SenderIdentityOutput>,
+}
+
+impl From<crate::ListIdentitiesResponse> for ListIdentitiesOutput {
+    fn from(value: crate::ListIdentitiesResponse) -> Self {
+        Self {
+            account: value.account,
+            display_name: value.display_name,
+            sent_mailbox: value.sent_mailbox,
+            scanned_messages: value.scanned_messages,
+            identities: value
+                .identities
+                .into_iter()
+                .map(|identity| SenderIdentityOutput {
+                    address: identity.address,
+                    configured: identity.configured,
+                    primary: identity.primary,
+                    display_names: identity.display_names,
+                    messages: identity.messages,
+                    last_used: identity.last_used.map(|date| date.to_rfc3339()),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl WireOutput for ListIdentitiesOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1654,6 +1717,9 @@ pub(super) struct CreateDraftOutput {
     pub(super) created: bool,
     pub(super) account: String,
     pub(super) drafts_mailbox: String,
+    /// The sender the draft was written with, `Name <address>` or `address` —
+    /// resolved from the account, not echoed from the request.
+    pub(super) from: String,
     pub(super) attachment_count: usize,
     pub(super) reply_to_count: usize,
     pub(super) threading_applied: bool,
@@ -1676,6 +1742,7 @@ impl From<crate::CreateDraftResponse> for CreateDraftOutput {
             created: value.created,
             account: value.account,
             drafts_mailbox: value.drafts_mailbox,
+            from: value.from,
             attachment_count: value.attachments.len(),
             reply_to_count: value.recipients.reply_to.len(),
             threading_applied: value.threading_applied,
@@ -1721,6 +1788,9 @@ pub(super) struct UpdateDraftOutput {
     pub(super) updated: bool,
     pub(super) account: String,
     pub(super) drafts_mailbox: String,
+    /// The sender the replacement was written with, `Name <address>` or
+    /// `address` — resolved from the account, not echoed from the request.
+    pub(super) from: String,
     #[schemars(range(min = 1))]
     pub(super) previous_uid_validity: u32,
     #[schemars(range(min = 1))]
@@ -1743,6 +1813,7 @@ impl From<crate::UpdateDraftResponse> for UpdateDraftOutput {
             updated: value.updated,
             account: value.account,
             drafts_mailbox: value.drafts_mailbox,
+            from: value.from,
             previous_uid_validity: value.previous_uid_validity,
             previous_uid: value.previous_uid,
             uid_validity: value.uid_validity,
@@ -2249,6 +2320,8 @@ mod tests {
             accounts: vec![AccountOutput {
                 name: "work".to_string(),
                 is_default: true,
+                display_name: None,
+                addresses: vec!["me@example.com".to_string()],
             }],
         };
         assert!(output.resource_uris().is_empty());
@@ -2263,6 +2336,8 @@ mod tests {
             accounts: vec![AccountOutput {
                 name: "work".to_string(),
                 is_default: true,
+                display_name: None,
+                addresses: vec!["me@example.com".to_string()],
             }],
         })
         .expect("result should serialize");
@@ -2279,6 +2354,8 @@ mod tests {
                 .map(|index| AccountOutput {
                     name: format!("account-{index}"),
                     is_default: index == 0,
+                    display_name: None,
+                    addresses: Vec::new(),
                 })
                 .collect(),
         })
@@ -2330,6 +2407,8 @@ mod tests {
         assert_ref_free::<DeleteByDomainOutput>();
         assert_ref_free::<DownloadAttachmentsOutput>();
         assert_ref_free::<CreateDraftOutput>();
+        assert_ref_free::<UpdateDraftOutput>();
+        assert_ref_free::<ListIdentitiesOutput>();
         assert_ref_free::<MoveMessageOutput>();
         assert_ref_free::<MoveListIdOutput>();
         assert_ref_free::<MoveBySenderOutput>();

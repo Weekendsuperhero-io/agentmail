@@ -491,13 +491,13 @@ where
             Response::Done {
                 tag: done,
                 status,
-                information,
-                ..
+                outcome,
             } if done == &tag => {
                 return match status {
                     Status::Ok => Ok(enabled),
                     other => Err(AgentmailError::Other(format!(
-                        "ENABLE {extensions} rejected: {other:?} {information:?}"
+                        "ENABLE {extensions} rejected: {other:?} {:?}",
+                        outcome.information
                     ))),
                 };
             }
@@ -862,10 +862,67 @@ async fn send_client_id(session: &mut ImapSession) {
 
 /// Validate a session is still alive with NOOP.
 pub async fn ping(session: &mut ImapSession) -> Result<()> {
-    match tokio::time::timeout(PING_TIMEOUT, session.noop()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(AgentmailError::Imap(e)),
+    match tokio::time::timeout(PING_TIMEOUT, noop_checked(session)).await {
+        Ok(result) => result,
         Err(_) => Err(AgentmailError::Other("IMAP ping timed out".into())),
+    }
+}
+
+/// `NOOP` that only a tagged `OK` can pass.
+///
+/// async-imap's `noop()` cannot be a liveness probe: its `parse_noop` drains
+/// with `take_while(filter)`, so a stream that simply ENDS returns `Ok`, and so
+/// does a tagged `NO`. On macOS, security-framework maps a reset connection to a
+/// zero-byte read — the same end-of-stream — so after sleep or a server `BYE`
+/// every pooled session "passed" its ping and the next mutation failed on the
+/// dead socket (an APPEND then reported an ambiguous outcome). Written on
+/// `run_command` / `read_response` like [`enable`]: end-of-stream and an
+/// untagged `BYE` are a lost connection, and unsolicited `EXISTS`/`EXPUNGE`/
+/// `FETCH` updates in between are skipped.
+async fn noop_checked<T>(session: &mut Session<T>) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    use async_imap::imap_proto::{Response, Status};
+
+    let tag = session.run_command("NOOP").await?;
+    loop {
+        let Some(response) = session.read_response().await? else {
+            return Err(AgentmailError::Imap(
+                async_imap::error::Error::ConnectionLost,
+            ));
+        };
+        match response.parsed() {
+            Response::Data {
+                status: Status::Bye,
+                outcome,
+            } => {
+                debug!(
+                    target: "agentmail",
+                    information = ?outcome.information,
+                    "server said BYE in reply to NOOP"
+                );
+                return Err(AgentmailError::Imap(
+                    async_imap::error::Error::ConnectionLost,
+                ));
+            }
+            Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } if done == &tag => {
+                let detail = format!("NOOP: {:?}", outcome.information);
+                return match status {
+                    Status::Ok => Ok(()),
+                    Status::No => Err(AgentmailError::Imap(async_imap::error::Error::No(detail))),
+                    Status::Bad => Err(AgentmailError::Imap(async_imap::error::Error::Bad(detail))),
+                    other => Err(AgentmailError::Other(format!(
+                        "NOOP completed with unexpected status {other:?}: {detail}"
+                    ))),
+                };
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1535,6 +1592,24 @@ pub async fn fetch_sender_dates_for_uids(
     }
 
     Ok(results)
+}
+
+/// FROM + DATE rows for the `newest` most recent messages of `mailbox`, by
+/// UID — which ascends in arrival order, so the highest UIDs are the newest
+/// mail. EXAMINE, never SELECT, and `BODY.PEEK`: nothing is marked read.
+pub(crate) async fn recent_sender_rows(
+    session: &mut ImapSession,
+    mailbox: &str,
+    newest: usize,
+) -> Result<Vec<crate::scan_cache::SenderRow>> {
+    let opened = examine(session, mailbox).await?;
+    require_uid_validity(mailbox, opened.uid_validity)?;
+    if opened.exists == 0 || newest == 0 {
+        return Ok(Vec::new());
+    }
+    let uids = search_all_uids_checked(session, opened.exists, opened.uid_next).await?;
+    let tail = &uids[uids.len().saturating_sub(newest)..];
+    fetch_sender_dates_for_uids(session, tail, None, None).await
 }
 
 /// Fetch only FROM and DATE headers for all messages in a mailbox.
@@ -2374,8 +2449,10 @@ pub(crate) struct CopyUidMapping {
     pub(crate) pairs: Vec<(u32, u32)>,
 }
 
-fn expand_uid_members(members: &[async_imap::imap_proto::UidSetMember]) -> Result<Vec<u32>> {
-    use async_imap::imap_proto::UidSetMember;
+fn expand_uid_members(
+    members: &[async_imap::imap_proto::rfc4315::UidSetMember],
+) -> Result<Vec<u32>> {
+    use async_imap::imap_proto::rfc4315::UidSetMember;
 
     let mut expanded = Vec::new();
     for member in members {
@@ -2409,8 +2486,8 @@ fn expand_uid_members(members: &[async_imap::imap_proto::UidSetMember]) -> Resul
 
 fn copy_uid_mapping(
     uid_validity: u32,
-    source: &[async_imap::imap_proto::UidSetMember],
-    destination: &[async_imap::imap_proto::UidSetMember],
+    source: &[async_imap::imap_proto::rfc4315::UidSetMember],
+    destination: &[async_imap::imap_proto::rfc4315::UidSetMember],
 ) -> Result<CopyUidMapping> {
     let source = expand_uid_members(source)?;
     let destination = expand_uid_members(destination)?;
@@ -2442,7 +2519,7 @@ async fn checked_mutation_command<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
-    use async_imap::imap_proto::{Response, ResponseCode, Status};
+    use async_imap::imap_proto::{Outcome, Response, ResponseCode, Status};
 
     imap_timeout(async {
         let request_id = session.run_command(command).await?;
@@ -2455,16 +2532,18 @@ where
             match response.parsed() {
                 Response::Data {
                     status: Status::Ok,
-                    code: Some(ResponseCode::CopyUid(validity, source, destination)),
-                    ..
+                    outcome:
+                        Outcome {
+                            code: Some(ResponseCode::CopyUid(validity, source, destination)),
+                            ..
+                        },
                 } => {
                     copy_uid = Some(copy_uid_mapping(*validity, source, destination)?);
                 }
                 Response::Done {
                     tag,
                     status,
-                    code,
-                    information,
+                    outcome: Outcome { code, information },
                 } if tag == &request_id => {
                     if let Some(ResponseCode::CopyUid(validity, source, destination)) = code {
                         copy_uid = Some(copy_uid_mapping(*validity, source, destination)?);
@@ -3102,7 +3181,7 @@ pub async fn append_draft(
 
 fn append_uid_identity(
     uid_validity: u32,
-    members: &[async_imap::imap_proto::UidSetMember],
+    members: &[async_imap::imap_proto::rfc4315::UidSetMember],
 ) -> Result<Option<(u32, u32)>> {
     let uids = expand_uid_members(members)?;
     match uids.as_slice() {
@@ -3138,7 +3217,7 @@ pub async fn replace_draft(
     expected_uid_validity: u32,
     rfc822_message: &[u8],
 ) -> Result<Option<(u32, u32)>> {
-    use async_imap::imap_proto::{Response, ResponseCode, Status};
+    use async_imap::imap_proto::{Outcome, Response, ResponseCode, Status};
 
     select_with_expected_uid_validity(session, drafts_mailbox, expected_uid_validity).await?;
     let mailbox = quote_imap_string(drafts_mailbox)?;
@@ -3153,12 +3232,11 @@ pub async fn replace_draft(
             .await?
             .ok_or(AgentmailError::NotConnected)?;
         match response.parsed() {
-            Response::Continue { .. } => break,
+            Response::Continue(_) => break,
             Response::Done {
                 tag: done,
                 status,
-                information,
-                ..
+                outcome: Outcome { information, .. },
             } if done == &tag => {
                 return Err(match status {
                     Status::No => AgentmailError::Imap(async_imap::error::Error::No(format!(
@@ -3188,14 +3266,16 @@ pub async fn replace_draft(
         match response.parsed() {
             Response::Data {
                 status: Status::Ok,
-                code: Some(ResponseCode::AppendUid(uid_validity, members)),
-                ..
+                outcome:
+                    Outcome {
+                        code: Some(ResponseCode::AppendUid(uid_validity, members)),
+                        ..
+                    },
             } => identity = append_uid_identity(*uid_validity, members)?,
             Response::Done {
                 tag: done,
                 status,
-                code,
-                information,
+                outcome: Outcome { code, information },
             } if done == &tag => {
                 if let Some(ResponseCode::AppendUid(uid_validity, members)) = code {
                     identity = append_uid_identity(*uid_validity, members)?;
@@ -4802,13 +4882,160 @@ mod tests {
         server.await.expect("scripted server should finish");
     }
 
+    /// `list_identities` reads only the newest Sent mail: EXAMINE (never
+    /// SELECT), one SEARCH, then a `BODY.PEEK` fetch of the highest UIDs.
+    #[tokio::test]
+    async fn recent_sender_rows_fetch_only_the_newest_uids_without_marking_them_read() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            if command.contains("EXAMINE") {
+                Some(test_support::examine_reply(tag, 9, 31, 4))
+            } else if command.contains("UID SEARCH") {
+                Some(format!("* SEARCH 3 10 20 30\r\n{tag} OK SEARCH completed\r\n"))
+            } else if command.contains("UID FETCH") {
+                let fetch = |seq: u32, uid: u32, from: &str| {
+                    let headers = format!(
+                        "From: {from}\r\nDate: Tue, 01 Sep 2026 12:00:00 +0000\r\n\r\n"
+                    );
+                    format!(
+                        "* {seq} FETCH (UID {uid} BODY[HEADER.FIELDS (FROM DATE MESSAGE-ID)] {{{}}}\r\n{headers})\r\n",
+                        headers.len()
+                    )
+                };
+                Some(format!(
+                    "{}{}{tag} OK FETCH completed\r\n",
+                    fetch(3, 20, "\"Blake, Mark\" <Mark@Example.com>"),
+                    fetch(4, 30, "sales@example.com"),
+                ))
+            } else {
+                None
+            }
+        })
+        .await;
+
+        let rows = recent_sender_rows(&mut session, "Sent", 2)
+            .await
+            .expect("rows for the newest two");
+
+        let summary: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.uid, row.email.as_str(), row.display_name.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (20, "mark@example.com", "Blake, Mark"),
+                (30, "sales@example.com", "")
+            ]
+        );
+        drop(session);
+        let commands = server.commands().await;
+        let fetch = commands
+            .iter()
+            .find(|command| command.contains("UID FETCH"))
+            .expect("a fetch was sent");
+        assert!(fetch.contains("UID FETCH 20,30 "), "{fetch}");
+        assert!(fetch.contains("BODY.PEEK["), "{fetch}");
+        assert!(
+            !commands.iter().any(|command| command.contains(" SELECT ")),
+            "{commands:?}"
+        );
+    }
+
+    /// The bug [`noop_checked`] exists for, pinned against the library: a NOOP
+    /// whose connection ends before any reply is reported as success. If this
+    /// starts failing, async-imap fixed `parse_noop` and the hand-written NOOP
+    /// could go back to `session.noop()`.
+    #[tokio::test]
+    async fn async_imaps_own_noop_reports_a_closed_stream_as_alive() {
+        let (mut session, server) = test_support::scripted_session(|_, _| None).await;
+
+        assert!(
+            session.noop().await.is_ok(),
+            "async-imap 0.12 still treats end-of-stream as a completed NOOP"
+        );
+        drop(session);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn ping_fails_when_the_connection_ends_before_the_tagged_reply() {
+        let (mut session, server) = test_support::scripted_session(|_, _| None).await;
+
+        let error = ping(&mut session)
+            .await
+            .expect_err("end-of-stream is a dead session, not a live one");
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(session);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn ping_fails_on_an_untagged_bye_without_waiting_for_the_tag() {
+        let (mut session, server) = test_support::scripted_session(|_, command| {
+            command
+                .contains(" NOOP")
+                .then(|| "* BYE Autologout; idle for too long\r\n".to_string())
+        })
+        .await;
+
+        let error = ping(&mut session)
+            .await
+            .expect_err("a server that said BYE is closing the session");
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(session);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn ping_passes_only_on_its_own_tagged_ok_skipping_unsolicited_updates() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command.contains(" NOOP").then(|| {
+                format!(
+                    "* 4 EXISTS\r\n* 2 EXPUNGE\r\n* 1 FETCH (FLAGS (\\Seen))\r\n\
+                     {tag} OK NOOP completed\r\n"
+                )
+            })
+        })
+        .await;
+
+        ping(&mut session)
+            .await
+            .expect("a tagged OK after unsolicited updates is a live session");
+        drop(session);
+        let commands = server.commands().await;
+        assert!(
+            commands.iter().any(|c| c.ends_with("NOOP\r\n")),
+            "{commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_fails_on_a_tagged_no() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command
+                .contains(" NOOP")
+                .then(|| format!("{tag} NO [UNAVAILABLE] backend down\r\n"))
+        })
+        .await;
+
+        let error = ping(&mut session)
+            .await
+            .expect_err("a refused NOOP is not a healthy session");
+        assert!(
+            matches!(error, AgentmailError::Imap(async_imap::error::Error::No(_))),
+            "{error:?}"
+        );
+        drop(session);
+        server.commands().await;
+    }
+
     /// The exact shape AOL returns for a UID-only walk page:
     /// `* <uid> UIDFETCH (UID <uid>)` with the UID present inside too.
     #[test]
     fn uidonly_uidfetch_line_parses_via_the_patched_imap_proto() {
         use async_imap::imap_proto::{self, Response};
         let line = b"* 434894 UIDFETCH (UID 434894)\r\n";
-        let (rest, response) = imap_proto::parser::parse_response(line)
+        let (rest, response) = imap_proto::Response::parse(line)
             .expect("patched imap-proto must parse a UID-only UIDFETCH line");
         assert!(rest.is_empty(), "the whole line is consumed: {rest:?}");
         match response {
@@ -4838,7 +5065,7 @@ mod tests {
             "* 434894 UIDFETCH (UID 434894 BODY[HEADER.FIELDS (List-Id From)] {{{}}}\r\n{headers})\r\n",
             headers.len()
         );
-        let (rest, response) = imap_proto::parser::parse_response(line.as_bytes())
+        let (rest, response) = imap_proto::Response::parse(line.as_bytes())
             .expect("patched imap-proto must parse a UIDFETCH with a body-section literal");
         assert!(rest.is_empty(), "the whole line is consumed: {rest:?}");
         match response {
@@ -5256,7 +5483,7 @@ mod tests {
 
     #[test]
     fn copyuid_ranges_expand_in_protocol_order_and_reject_mismatch() {
-        use async_imap::imap_proto::UidSetMember;
+        use async_imap::imap_proto::rfc4315::UidSetMember;
 
         let mapping = copy_uid_mapping(
             9,

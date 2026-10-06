@@ -4,11 +4,11 @@ use super::AgentMailServer;
 use super::args::*;
 use super::wire::{
     CheckConnectionOutput, FindAttachmentsOutput, GetMessagesOutput, ListAccountsOutput,
-    ListCapabilitiesOutput, ListFlagsOutput, ListMailboxesOutput, ListPendingMovesOutput,
-    SearchMessagesOutput, TopDomainsOutput, TopMailingListsOutput, TopSendersOutput,
-    TopSubscriptionsOutput, compact_result, tool_error_result,
+    ListCapabilitiesOutput, ListFlagsOutput, ListIdentitiesOutput, ListMailboxesOutput,
+    ListPendingMovesOutput, SearchMessagesOutput, TopDomainsOutput, TopMailingListsOutput,
+    TopSendersOutput, TopSubscriptionsOutput, compact_result, tool_error_result,
 };
-use super::{Pagination, make_cancel_fn, make_progress_fn};
+use super::{Pagination, bounded_usize, make_cancel_fn, make_progress_fn};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
     handler::server::wrapper::Parameters,
@@ -35,7 +35,7 @@ impl AgentMailServer {
     #[tool(
         name = "list_accounts",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ListAccountsOutput>().expect("valid list_accounts output schema"),
-        description = "Return configured IMAP account names, each with whether it is the default. The names themselves are already in every tool's `account` enum and are listed as email://{account} resources — call this only when the DEFAULT matters or to confirm what is configured, not to discover a selector.",
+        description = "Return configured IMAP account names, each with whether it is the default, its display name, and the addresses it sends as (primary first) — the addresses a draft's `from` may use. The names themselves are already in every tool's `account` enum and are listed as email://{account} resources — call this when the DEFAULT or the sending addresses matter, not to discover a selector.",
         annotations(
             title = "List Accounts",
             read_only_hint = true,
@@ -48,6 +48,40 @@ impl AgentMailServer {
     ) -> Result<CallToolResult, McpError> {
         match self.agentmail.list_accounts().await {
             Ok(data) => compact_result(ListAccountsOutput::from(data)),
+            Err(e) => Ok(tool_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "list_identities",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ListIdentitiesOutput>().expect("valid list_identities output schema"),
+        description = "List the addresses one account sends as: its configured addresses (configured=true — the only ones a draft's `from` may use, the primary first) and the From addresses its recent Sent mail actually used, each with a message count, the display names it went out under, and when it was last used. Reads the newest sentMessages (default 200, max 1000) messages of the Sent mailbox with BODY.PEEK, so nothing is marked read; sentMailbox is null when the account has none, and the configured addresses are still listed. An address seen in Sent but not configured cannot be used as `from` until it is added to the account as an alias.",
+        annotations(
+            title = "List Sender Identities",
+            read_only_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    async fn list_identities_tool(
+        &self,
+        Parameters(args): Parameters<ListIdentitiesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.account.trim().is_empty() {
+            return Err(McpError::invalid_params("account is required", None));
+        }
+        let sent_messages = bounded_usize(
+            args.sent_messages,
+            crate::DEFAULT_IDENTITY_SCAN,
+            1,
+            crate::MAX_IDENTITY_SCAN,
+            "sentMessages",
+        )?;
+        match self
+            .agentmail
+            .list_identities(&args.account, sent_messages)
+            .await
+        {
+            Ok(data) => compact_result(ListIdentitiesOutput::from(data)),
             Err(e) => Ok(tool_error_result(&e)),
         }
     }

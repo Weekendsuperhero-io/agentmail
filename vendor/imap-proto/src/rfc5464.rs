@@ -1,5 +1,5 @@
 //!
-//! https://tools.ietf.org/html/rfc5464
+//! <https://tools.ietf.org/html/rfc5464>
 //!
 //! IMAP METADATA extension
 //!
@@ -9,12 +9,15 @@ use nom::{
     bytes::streaming::{tag, tag_no_case},
     combinator::map,
     multi::separated_list0,
-    sequence::tuple,
-    IResult,
+    IResult, Parser,
 };
 use std::borrow::Cow;
 
-use crate::{parser::core::*, types::*};
+use crate::{
+    core::*,
+    rfc3501::{MailboxDatum, ResponseCode},
+    Response,
+};
 
 fn is_entry_component_char(c: u8) -> bool {
     c < 0x80 && c > 0x19 && c != b'*' && c != b'%' && c != b'/'
@@ -124,41 +127,49 @@ fn slice_to_str(i: &[u8]) -> &str {
 }
 
 fn nil_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
-    map(tag_no_case("NIL"), |_| None)(i)
+    map(tag_no_case("NIL"), |_| None).parse(i)
 }
 
 fn string_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
     map(alt((quoted, literal)), |s| {
         Some(slice_to_str(s).to_string())
-    })(i)
+    })
+    .parse(i)
+}
+
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub struct Metadata {
+    pub entry: String,
+    pub value: Option<String>,
 }
 
 fn keyval_list(i: &[u8]) -> IResult<&[u8], Vec<Metadata>> {
     parenthesized_nonempty_list(map(
-        tuple((
+        (
             map(entry_name, slice_to_str),
             tag(" "),
             alt((nil_value, string_value)),
-        )),
+        ),
         |(key, _, value)| Metadata {
             entry: key.to_string(),
             value,
         },
-    ))(i)
+    ))
+    .parse(i)
 }
 
 fn entry_list(i: &[u8]) -> IResult<&[u8], Vec<Cow<'_, str>>> {
-    separated_list0(tag(" "), map(map(entry_name, slice_to_str), Cow::Borrowed))(i)
+    separated_list0(tag(" "), map(map(entry_name, slice_to_str), Cow::Borrowed)).parse(i)
 }
 
 fn metadata_common(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    let (i, (_, mbox, _)) = tuple((tag_no_case("METADATA "), quoted, tag(" ")))(i)?;
+    let (i, (_, mbox, _)) = (tag_no_case("METADATA "), quoted, tag(" ")).parse(i)?;
     Ok((i, mbox))
 }
 
 // [RFC5464 - 4.4.1 METADATA Response with values]
 pub(crate) fn metadata_solicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-    let (i, (mailbox, values)) = tuple((metadata_common, keyval_list))(i)?;
+    let (i, (mailbox, values)) = (metadata_common, keyval_list).parse(i)?;
     Ok((
         i,
         Response::MailboxData(MailboxDatum::MetadataSolicited {
@@ -170,7 +181,7 @@ pub(crate) fn metadata_solicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
 
 // [RFC5464 - 4.4.2 Unsolicited METADATA Response without values]
 pub(crate) fn metadata_unsolicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-    let (i, (mailbox, values)) = tuple((metadata_common, entry_list))(i)?;
+    let (i, (mailbox, values)) = (metadata_common, entry_list).parse(i)?;
     Ok((
         i,
         Response::MailboxData(MailboxDatum::MetadataUnsolicited {
@@ -185,7 +196,7 @@ pub(crate) fn metadata_unsolicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
 // [RFC5464 - 4.2.1 MAXSIZE GETMETADATA Command Option](https://tools.ietf.org/html/rfc5464#section-4.2.1)
 // [RFC5464 - 5. Formal Syntax - resp-text-code](https://tools.ietf.org/html/rfc5464#section-5)
 pub(crate) fn resp_text_code_metadata_long_entries(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
-    let (i, (_, num)) = tuple((tag_no_case("METADATA LONGENTRIES "), number_64))(i)?;
+    let (i, (_, num)) = (tag_no_case("METADATA LONGENTRIES "), number_64).parse(i)?;
     Ok((i, ResponseCode::MetadataLongEntries(num)))
 }
 
@@ -194,7 +205,7 @@ pub(crate) fn resp_text_code_metadata_long_entries(i: &[u8]) -> IResult<&[u8], R
 // [RFC5464 - 4.3 SETMETADATA Command](https://tools.ietf.org/html/rfc5464#section-4.3)
 // [RFC5464 - 5. Formal Syntax - resp-text-code](https://tools.ietf.org/html/rfc5464#section-5)
 pub(crate) fn resp_text_code_metadata_max_size(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
-    let (i, (_, num)) = tuple((tag_no_case("METADATA MAXSIZE "), number_64))(i)?;
+    let (i, (_, num)) = (tag_no_case("METADATA MAXSIZE "), number_64).parse(i)?;
     Ok((i, ResponseCode::MetadataMaxSize(num)))
 }
 
@@ -218,8 +229,8 @@ pub(crate) fn resp_text_code_metadata_no_private(i: &[u8]) -> IResult<&[u8], Res
 
 #[cfg(test)]
 mod tests {
-    use super::{metadata_solicited, metadata_unsolicited};
-    use crate::types::*;
+    use super::{metadata_solicited, metadata_unsolicited, MailboxDatum, Response, ResponseCode};
+    use crate::rfc3501::{Outcome, Status};
     use std::borrow::Cow;
 
     #[test]
@@ -350,51 +361,61 @@ mod tests {
 
     #[test]
     fn test_response_codes() {
-        use crate::parser::parse_response;
-
-        match parse_response(b"* OK [METADATA LONGENTRIES 123] Some entries omitted.\r\n") {
+        match Response::parse(b"* OK [METADATA LONGENTRIES 123] Some entries omitted.\r\n") {
             Ok((
                 _,
                 Response::Data {
                     status: Status::Ok,
-                    code: Some(ResponseCode::MetadataLongEntries(123)),
-                    information: Some(Cow::Borrowed("Some entries omitted.")),
+                    outcome:
+                        Outcome {
+                            code: Some(ResponseCode::MetadataLongEntries(123)),
+                            information: Some(Cow::Borrowed("Some entries omitted.")),
+                        },
                 },
             )) => {}
             rsp => panic!("unexpected response {rsp:?}"),
         }
 
-        match parse_response(b"* NO [METADATA MAXSIZE 123] Annotation too large.\r\n") {
+        match Response::parse(b"* NO [METADATA MAXSIZE 123] Annotation too large.\r\n") {
             Ok((
                 _,
                 Response::Data {
                     status: Status::No,
-                    code: Some(ResponseCode::MetadataMaxSize(123)),
-                    information: Some(Cow::Borrowed("Annotation too large.")),
+                    outcome:
+                        Outcome {
+                            code: Some(ResponseCode::MetadataMaxSize(123)),
+                            information: Some(Cow::Borrowed("Annotation too large.")),
+                        },
                 },
             )) => {}
             rsp => panic!("unexpected response {rsp:?}"),
         }
 
-        match parse_response(b"* NO [METADATA TOOMANY] Too many annotations.\r\n") {
+        match Response::parse(b"* NO [METADATA TOOMANY] Too many annotations.\r\n") {
             Ok((
                 _,
                 Response::Data {
                     status: Status::No,
-                    code: Some(ResponseCode::MetadataTooMany),
-                    information: Some(Cow::Borrowed("Too many annotations.")),
+                    outcome:
+                        Outcome {
+                            code: Some(ResponseCode::MetadataTooMany),
+                            information: Some(Cow::Borrowed("Too many annotations.")),
+                        },
                 },
             )) => {}
             rsp => panic!("unexpected response {rsp:?}"),
         }
 
-        match parse_response(b"* NO [METADATA NOPRIVATE] Private annotations not supported.\r\n") {
+        match Response::parse(b"* NO [METADATA NOPRIVATE] Private annotations not supported.\r\n") {
             Ok((
                 _,
                 Response::Data {
                     status: Status::No,
-                    code: Some(ResponseCode::MetadataNoPrivate),
-                    information: Some(Cow::Borrowed("Private annotations not supported.")),
+                    outcome:
+                        Outcome {
+                            code: Some(ResponseCode::MetadataNoPrivate),
+                            information: Some(Cow::Borrowed("Private annotations not supported.")),
+                        },
                 },
             )) => {}
             rsp => panic!("unexpected response {rsp:?}"),

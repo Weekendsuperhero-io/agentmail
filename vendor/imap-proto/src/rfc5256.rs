@@ -1,5 +1,5 @@
 //!
-//! https://tools.ietf.org/html/rfc5256
+//! <https://tools.ietf.org/html/rfc5256>
 //!
 //! SORT extension
 //!
@@ -9,10 +9,10 @@ use nom::{
     combinator::{map, opt},
     multi::many0,
     sequence::{preceded, terminated},
-    IResult,
+    IResult, Parser,
 };
 
-use crate::{parser::core::number, types::MailboxDatum};
+use crate::{core::number, rfc3501::MailboxDatum};
 
 /// BASE.7.2.SORT. SORT Response
 ///
@@ -38,9 +38,10 @@ pub(crate) fn mailbox_data_sort(i: &[u8]) -> IResult<&[u8], MailboxDatum<'_>> {
         // Since the SORT command extends the SEARCH command, the trailing whitespace
         // is exceptionnaly allowed here (as for the SEARCH command).
         terminated(
-            preceded(tag_no_case(b"SORT"), many0(preceded(tag(" "), number))),
+            preceded(tag_no_case("SORT"), many0(preceded(tag(" "), number))),
             opt(tag(" ")),
         ),
         MailboxDatum::Sort,
-    )(i)
+    )
+    .parse(i)
 }

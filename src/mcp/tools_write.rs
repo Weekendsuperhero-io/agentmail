@@ -1101,7 +1101,7 @@ impl AgentMailServer {
     #[tool(
         name = "create_draft",
         output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>().expect("valid create_draft output schema"),
-        description = "Create and save a draft — a fresh message, or a reply to a live one. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Compose fresh by giving recipients: at least one of to, cc or bcc. Reply instead by giving replyToMessage {mailbox, uid, expectedUidValidity, mode} from a discovery result — that derives the recipients (Reply-To before From, excluding this account's own addresses and aliases), a Re: subject you may override, and the RFC In-Reply-To/References headers; to, cc, inReplyTo and references must then be omitted, and bcc is still never inferred. Subject and body are optional; attachments may reference local file paths. The body is read as Markdown and sent as multipart/alternative — the text exactly as written, plus an HTML rendering — so **bold**, lists, links and tables arrive formatted rather than as literal syntax. Raw HTML in the body is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part. Returns the new draft's uid and uidValidity when the server allows recovering them, and links the draft as a resource_link. A draft's UID is NOT durable — re-saving it (here, or in any other mail client) appends a new message and expunges the old one, and some servers discard an APPENDed draft outright. Re-read the link from a fresh get_messages rather than reusing one from an earlier turn. This tool never sends mail.",
+        description = "Create and save a draft — a fresh message, or a reply to a live one. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Compose fresh by giving recipients: at least one of to, cc or bcc. Reply instead by giving replyToMessage {mailbox, uid, expectedUidValidity, mode} from a discovery result — that derives the recipients (Reply-To before From, excluding this account's own addresses and aliases), a Re: subject you may override, and the RFC In-Reply-To/References headers; to, cc, inReplyTo and references must then be omitted, and bcc is still never inferred. Subject and body are optional; attachments may reference local file paths. The body is read as Markdown and sent as multipart/alternative — the text exactly as written, plus an HTML rendering — so **bold**, lists, links and tables arrive formatted rather than as literal syntax. Raw HTML in the body is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part. The draft is From the account's primary address under its display name; pass `from` (Name <address> or an address) to use another of the account's own addresses — list_accounts lists them, and any other address is refused. A reply is From the address the original was sent to unless `from` says otherwise. Returns the sender actually written as `from`, plus the new draft's uid and uidValidity when the server allows recovering them, and links the draft as a resource_link. A draft's UID is NOT durable — re-saving it (here, or in any other mail client) appends a new message and expunges the old one, and some servers discard an APPENDed draft outright. Re-read the link from a fresh get_messages rather than reusing one from an earlier turn. This tool never sends mail.",
         annotations(
             title = "Create Draft",
             read_only_hint = false,
@@ -1143,6 +1143,7 @@ impl AgentMailServer {
                 .agentmail
                 .create_reply_draft(
                     &args.account,
+                    args.from.as_deref(),
                     source.mailbox.trim(),
                     source.uid,
                     source.expected_uid_validity,
@@ -1172,6 +1173,7 @@ impl AgentMailServer {
             .agentmail
             .create_draft_with_headers(
                 &args.account,
+                args.from.as_deref(),
                 args.subject.trim(),
                 &args.body,
                 &args.to,
@@ -1194,7 +1196,7 @@ impl AgentMailServer {
     #[tool(
         name = "update_draft",
         output_schema = rmcp::handler::server::tool::schema_for_output::<UpdateDraftOutput>().expect("valid update_draft output schema"),
-        description = "Replace one live IMAP draft with a complete new draft specification. Requires mailbox, uid, and expectedUidValidity; verifies the target still has the \\Draft flag. Uses RFC 8508 REPLACE where the server has it and otherwise emulates it, so this succeeds on servers without REPLACE (Gmail and iCloud among them) — do not hand-roll create_draft + delete_messages. Returns the NEW uid and uidValidity: a replaced draft always has a new identity, so discard the old one. A `warning` field appears only if the superseded draft could not be removed. Attachments are a complete replacement list, and this tool never sends mail. The body is read as Markdown and sent as multipart/alternative (the text as written plus an HTML rendering); raw HTML in it is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part.",
+        description = "Replace one live IMAP draft with a complete new draft specification. Requires mailbox, uid, and expectedUidValidity; verifies the target still has the \\Draft flag. Uses RFC 8508 REPLACE where the server has it and otherwise emulates it, so this succeeds on servers without REPLACE (Gmail and iCloud among them) — do not hand-roll create_draft + delete_messages. Returns the NEW uid and uidValidity: a replaced draft always has a new identity, so discard the old one. A `warning` field appears only if the superseded draft could not be removed. Attachments are a complete replacement list, and this tool never sends mail. The draft keeps its current sender when that is one of the account's addresses (so one chosen in another mail client survives); `from` replaces it with another of the account's own addresses, and the result's `from` is the sender written. The body is read as Markdown and sent as multipart/alternative (the text as written plus an HTML rendering); raw HTML in it is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part.",
         annotations(
             title = "Update Draft Atomically",
             read_only_hint = false,
@@ -1221,6 +1223,7 @@ impl AgentMailServer {
             .agentmail
             .update_draft(
                 &args.account,
+                args.from.as_deref(),
                 args.mailbox.trim(),
                 args.uid,
                 args.expected_uid_validity,

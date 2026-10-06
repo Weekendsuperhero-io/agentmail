@@ -79,6 +79,16 @@ impl TaskCompletion {
         self.changed.notify_waiters();
     }
 
+    /// Publish the result of a task removed at its TTL while still running.
+    /// The worker is aborted, so it will never publish, and without this the
+    /// status watcher and any blocked `tasks/result` would wait forever. A
+    /// worker that finished before the prune still wins: this publishes once.
+    fn expire(&self, task_id: &str) {
+        self.complete(Ok(CallToolResult::error(vec![ContentBlock::text(
+            format!("Task {task_id} expired before completion and was cancelled."),
+        )])));
+    }
+
     fn snapshot(&self) -> Option<Result<CallToolResult, McpError>> {
         self.result.lock().clone()
     }
@@ -287,6 +297,7 @@ impl TaskManager {
                 && !is_terminal(&managed.meta.status)
             {
                 managed.cancel.cancel();
+                managed.completion.expire(&task_id);
                 managed.handle.abort();
             }
             self.task_records.remove(&task_id);
@@ -627,6 +638,37 @@ mod tests {
         assert!(
             cancellation.is_cancelled() && error.message.contains("expired"),
             "expired running task should be cancelled and reported unavailable"
+        );
+    }
+
+    /// The status watcher waits on the completion, and an expired task's
+    /// worker is aborted before it can publish — so expiry must publish, or
+    /// the watcher (and any blocked `tasks/result`) waits forever.
+    #[tokio::test]
+    async fn prune_expired_should_publish_a_result_for_running_work() {
+        let clock = TestClock::new();
+        let mut manager = manager(&clock);
+        commit_running(&mut manager, "abandoned");
+        let completion = manager
+            .task_completion("abandoned")
+            .expect("task should be present");
+        let watcher = tokio::spawn({
+            let completion = Arc::clone(&completion);
+            async move { completion.wait(&CancellationToken::new()).await }
+        });
+
+        clock.advance(TASK_TTL_MS);
+        manager.prune_expired();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+            .await
+            .expect("expiry must wake the watcher")
+            .expect("watcher should not panic")
+            .expect("an expired task ends with a result, not an error");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            format!("{:?}", result.content).contains("expired"),
+            "{result:?}"
         );
     }
 

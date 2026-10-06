@@ -4,6 +4,120 @@ Architectural decisions, deferred work, and rationale for future reference.
 
 ---
 
+## 0.7.0 — A Draft Is From One Of The Account's Own Identities
+
+### Decision
+
+A draft's `From` is RESOLVED, never echoed. `draft::resolve_from` returns one of
+`AccountConfig::identities()` — the primary (`email`, or an email-shaped login
+when no `email` is set), then the aliases — under the configured
+`display_name`, so `display_name = "Mark Blake"` makes drafts
+`From: Mark Blake <you@example.com>`. `create_draft` and `update_draft` take an
+optional `from` (`Name <address>` or an address), and both results report the
+`from` actually written. `list_accounts` lists each account's identities, and
+`list_identities` adds what its Sent mail actually used.
+
+Before this, `From` was always the bare, lowercased `canonical_email()` — or the
+LOGIN NAME when there was none, which failed inside lettre as "Invalid email
+address 'johnappleseed'". No tool could choose a sender, the config had no
+name, and `update_draft` overwrote whatever `From` another client had set.
+
+### Why `from` is refused outside `identities()`
+
+An agent can be asked — or prompt-injected — to write a draft "from" anything.
+A `From` the account does not own is at best rewritten or rejected by the
+provider at send time, and at worst accepted by a permissive server as a spoof
+the user never meant. The account's configuration is the only authority on
+what the user sends as, so `from` must match it. The refusal lists the
+identities and names the fix (add the address as an alias), which turns a dead
+end into one settings change.
+
+A distinct email-shaped login is NOT an identity. A login is a credential, not
+an address the user chose to publish (MCP.md has always kept logins out of
+`list_accounts`); it stays in `canonical_addresses()`, which only recognizes the
+account's own mail. Listing it in `aliases` makes it sendable, so normalization
+no longer drops an alias equal to the login.
+
+### Why a reply uses the identity the original was addressed to
+
+Mail sent to `sales@` and answered from `mark@` leaks the personal address and
+reads as a different correspondent; every mainstream client answers from the
+address the message reached. The order is the original's own `From` when it is
+ours (a follow-up to our own mail stays on the address it went out from), then
+the first identity in its `To`, then its `Cc`. Mail that reached us by Bcc names
+no identity, so it falls back to the primary.
+
+### Why `update_draft` preserves `From`
+
+`update_draft` replaced `From` with the primary on every edit, so a draft the
+user began in Mail.app from an alias silently changed sender when an agent
+fixed a typo. Without `from`, the replacement now keeps the current `From` —
+name included, the display name filling a blank one — when that address is
+one of ours. A foreign `From` is replaced by the default, since keeping it would
+let an old draft carry a sender the account no longer owns.
+
+### Why the Sent scan, not provider APIs
+
+IMAP has no identity listing. Gmail's `sendAs` settings and Fastmail's JMAP
+`Identity` both need OAuth or API tokens, and the app-password accounts Agent
+Muse configures hold neither. What an account has actually sent is readable on
+every IMAP server: `list_identities` reads the `From` of the newest N Sent
+messages with `BODY.PEEK`. That is EVIDENCE, not permission — it never feeds
+`from` validation, so a forged or one-off `From` sitting in Sent cannot widen
+what a draft may claim. A discovered address must be added as an alias first.
+
+### Why `from` is in the results, and derived
+
+A caller cannot predict the reply rule or a preserved sender, so the result says
+what was written. It is formatted from the resolved mailbox, never copied from
+the request, and with our own quoting rather than lettre's `Mailbox` `Display`
+(which fails on a CR or LF in the name): a name with a comma comes back quoted
+and parses as one mailbox.
+
+### Consequence
+
+`AccountConfig` gains `display_name` (validated: no control characters, at most
+256 characters; `validate_display_name` is exported so an embedder applies the
+same rule). The draft facade (`create_draft_with_headers`, `create_reply_draft`,
+`update_draft`) gains `from`, and `MessageInfo.reply_to` becomes `Vec<String>`
+so a reply goes to EVERY Reply-To address — a breaking release, 0.7.0. 35 tools
+→ 36. Pinned by `the_default_sender_is_the_display_name_on_the_primary_address`,
+`an_explicit_sender_must_be_one_of_the_accounts_identities`,
+`a_reply_is_from_the_identity_the_original_was_sent_to`,
+`an_updated_draft_keeps_a_sender_of_ours_and_replaces_a_foreign_one`,
+`identities_are_the_primary_then_aliases_never_a_distinct_login`, and
+`draft_tools_take_a_sender_and_refuse_one_the_account_does_not_own`.
+
+## 0.7.0 — Liveness Means A Tagged OK, And Pool Clocks Count Sleep
+
+### Decision
+
+`imap_client::ping` sends `NOOP` by hand and passes only on its own tagged
+`OK`; end-of-stream and an untagged `BYE` are a lost connection. The pool's idle
+stamps, the `[LIMIT]` login cooldown and the mailbox-catalog TTL are measured on
+the WALL clock (`SystemTime`), and a clock set back past a stamp counts as
+expired.
+
+### Rationale
+
+async-imap's `noop()` drains with `take_while(filter)`, so a stream that simply
+ends is a successful NOOP. On macOS, security-framework maps a reset connection
+to a zero-byte read — that same end — so after sleep or a server `BYE` every
+pooled session passed its ping, and the next mutation failed on the dead
+socket; a draft APPEND then reported an "ambiguous" outcome it did not have.
+`async_imaps_own_noop_reports_a_closed_stream_as_alive` pins the upstream
+behavior, so the day it changes is visible.
+
+`Instant` on macOS is `CLOCK_UPTIME_RAW`, which stops while the machine sleeps.
+A session idled overnight therefore looked seconds old and was handed out
+instead of evicted, a cooldown resumed where it paused, and the catalog served a
+layout loaded hours earlier. The server's clocks run through our sleep, so ours
+must too. A backwards wall clock cannot say how much time passed; treating it
+as expired costs at most one reconnect or one LIST, while trusting it could
+stretch a cooldown by however far the clock moved.
+
+---
+
 ## 0.5.0 — Two Tool Pairs Become One Tool Each
 
 ### `add_flags` + `remove_flags` → `update_flags`
@@ -62,7 +176,9 @@ drive permission prompts.
 
 37 tools → 35. The count is asserted in two places
 (`tool_schemas_are_ref_free`, `tools_list_has_35_annotated_tools`) precisely so
-a drift like this cannot land without the docs being updated with it. Pinned by
+a drift like this cannot land without the docs being updated with it. (0.7.0
+added `list_identities`: 36, and the second guard is now
+`tools_list_has_36_annotated_tools`.) Pinned by
 `update_flags_exposes_add_remove_and_color_as_one_call`,
 `create_draft_absorbs_the_reply_form`, and
 `a_reply_draft_refuses_recipients_it_would_derive`.

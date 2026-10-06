@@ -1,20 +1,22 @@
 //!
-//! https://tools.ietf.org/html/rfc4315
+//! <https://tools.ietf.org/html/rfc4315>
 //!
 //! The IMAP UIDPLUS Extension
 //!
+
+use std::ops::RangeInclusive;
 
 use nom::{
     branch::alt,
     bytes::streaming::{tag, tag_no_case},
     combinator::map,
     multi::separated_list1,
-    sequence::{preceded, tuple},
-    IResult,
+    sequence::preceded,
+    IResult, Parser,
 };
 
-use crate::parser::core::number;
-use crate::types::*;
+use crate::core::number;
+use crate::rfc3501::ResponseCode;
 
 /// Extends resp-text-code as follows:
 ///
@@ -29,12 +31,10 @@ use crate::types::*;
 /// [RFC4315 - 3 Additional Response Codes](https://tools.ietf.org/html/rfc4315#section-3)
 pub(crate) fn resp_text_code_append_uid(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
     map(
-        preceded(
-            tag_no_case(b"APPENDUID "),
-            tuple((number, tag(" "), uid_set)),
-        ),
+        preceded(tag_no_case("APPENDUID "), (number, tag(" "), uid_set)),
         |(fst, _, snd)| ResponseCode::AppendUid(fst, snd),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Extends resp-text-code as follows:
@@ -48,11 +48,12 @@ pub(crate) fn resp_text_code_append_uid(i: &[u8]) -> IResult<&[u8], ResponseCode
 pub(crate) fn resp_text_code_copy_uid(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
     map(
         preceded(
-            tag_no_case(b"COPYUID "),
-            tuple((number, tag(" "), uid_set, tag(" "), uid_set)),
+            tag_no_case("COPYUID "),
+            (number, tag(" "), uid_set, tag(" "), uid_set),
         ),
         |(fst, _, snd, _, trd)| ResponseCode::CopyUid(fst, snd, trd),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Extends resp-text-code as follows:
@@ -63,7 +64,7 @@ pub(crate) fn resp_text_code_copy_uid(i: &[u8]) -> IResult<&[u8], ResponseCode<'
 ///
 /// [RFC4315 - 3 Additional Response Codes](https://tools.ietf.org/html/rfc4315#section-3)
 pub(crate) fn resp_text_code_uid_not_sticky(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
-    map(tag_no_case(b"UIDNOTSTICKY"), |_| ResponseCode::UidNotSticky)(i)
+    map(tag_no_case("UIDNOTSTICKY"), |_| ResponseCode::UidNotSticky).parse(i)
 }
 
 /// Parses the uid-set nonterminal:
@@ -74,7 +75,32 @@ pub(crate) fn resp_text_code_uid_not_sticky(i: &[u8]) -> IResult<&[u8], Response
 ///
 /// [RFC4315 - 4 Formal Syntax](https://tools.ietf.org/html/rfc4315#section-4)
 fn uid_set(i: &[u8]) -> IResult<&[u8], Vec<UidSetMember>> {
-    separated_list1(tag(","), alt((uid_range, map(number, From::from))))(i)
+    separated_list1(tag(","), UidSetMember::parse).parse(i)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UidSetMember {
+    UidRange(RangeInclusive<u32>),
+    Uid(u32),
+}
+
+impl UidSetMember {
+    // uid-set member: uniqueid / uid-range
+    fn parse(i: &[u8]) -> IResult<&[u8], Self> {
+        alt((uid_range, map(number, From::from))).parse(i)
+    }
+}
+
+impl From<RangeInclusive<u32>> for UidSetMember {
+    fn from(x: RangeInclusive<u32>) -> Self {
+        UidSetMember::UidRange(x)
+    }
+}
+
+impl From<u32> for UidSetMember {
+    fn from(x: u32) -> Self {
+        UidSetMember::Uid(x)
+    }
 }
 
 /// Parses the uid-set nonterminal:
@@ -91,5 +117,6 @@ fn uid_range(i: &[u8]) -> IResult<&[u8], UidSetMember> {
     map(
         nom::sequence::separated_pair(number, tag(":"), number),
         |(fst, snd)| if fst <= snd { fst..=snd } else { snd..=fst }.into(),
-    )(i)
+    )
+    .parse(i)
 }

@@ -31,25 +31,55 @@ and complete on every `email://` resource template and every prompt. Call
 `list_accounts` only when the DEFAULT account matters, not to discover a
 selector.
 
-## Tools (35)
+## Tools (36)
 
 ### Discovery & Connection
 
 | #   | Tool                | Description                                      | Annotations |
 | --- | ------------------- | ------------------------------------------------ | ----------- |
-| 1   | `list_accounts`     | Return configured IMAP account names             | `read_only` |
-| 2   | `list_mailboxes`    | Paginate selectable folders with counts and registered special-use roles | `read_only` |
-| 3   | `check_connection`  | Test IMAP connectivity and auth for an account   | `read_only` |
-| 4   | `list_capabilities` | Query IMAP extensions (IDLE, MOVE, CONDSTORE)    | `read_only` |
+| 1   | `list_accounts`     | Return configured IMAP account names, the default, and each account's sending addresses | `read_only` |
+| 2   | `list_identities`   | An account's sending addresses: configured ones plus the From addresses its recent Sent mail used | `read_only`, `idempotent` |
+| 3   | `list_mailboxes`    | Paginate selectable folders with counts and registered special-use roles | `read_only` |
+| 4   | `check_connection`  | Test IMAP connectivity and auth for an account   | `read_only` |
+| 5   | `list_capabilities` | Query IMAP extensions (IDLE, MOVE, CONDSTORE)    | `read_only` |
 
 #### Output Schemas
 
 **list_accounts** → `ListAccountsResponse`
 ```json
-{ "accounts": [{ "name", "isDefault": bool }] }
+{ "accounts": [{ "name", "isDefault": bool, "displayName?",
+    "addresses": ["primary@example.com", "alias@example.com"] }] }
 ```
 
-The MCP projection intentionally omits IMAP hostnames and login usernames.
+`addresses` are the account's **identities** — the addresses a draft may be
+`From`: the primary (`email`, or an email-shaped login when no `email` is set)
+first, then the aliases. `displayName` is the sender name drafts carry. The MCP
+projection intentionally omits IMAP hostnames and login usernames; a login that
+differs from the configured `email` is never listed unless it is also an alias.
+
+**list_identities** → `ListIdentitiesResponse`
+```json
+{ "account", "displayName?", "sentMailbox": "Sent" | null, "scannedMessages",
+  "identities": [{ "address", "configured": bool, "primary": bool,
+    "displayNames": [], "messages", "lastUsed?" }] }
+```
+
+IMAP has no identity list (Gmail's send-as and JMAP `Identity` need API
+credentials an app-password account does not hold), so this reports the
+configured identities plus what the account has actually SENT: the From
+addresses among the newest `sentMessages` (default 200, `1..=1000`) messages of
+the selectable `\Sent` mailbox — exact names (`Sent`, `Sent Items`, `Sent
+Messages`, `Sent Mail`, `[Gmail]/Sent Mail`, `INBOX.Sent`) when the server
+declares no role. The read is `EXAMINE` plus `BODY.PEEK`, so nothing is marked
+read.
+
+Configured identities come first (primary, then aliases) and appear even with
+`messages: 0`; addresses seen only in Sent follow, most used first, at most 50
+rows and five display names each (most used first). With no Sent mailbox,
+`sentMailbox` is `null` and the configured identities are still returned — not
+an error. A discovered address (`configured: false`) is evidence, not
+permission: `from` accepts it only after it is added to the account as an
+alias.
 
 **list_mailboxes** → `ListMailboxesResponse`
 ```json
@@ -89,16 +119,16 @@ an unknown account raises `-32602`.
 
 | #   | Tool               | Description                                                                                         | Annotations            |
 | --- | ------------------ | --------------------------------------------------------------------------------------------------- | ---------------------- |
-| 5   | `get_messages`     | Paginated metadata discovery from one required mailbox, newest-first. Default: offset=0, limit=25 (max 50) | `read_only`            |
-| 6   | `search_messages`  | Paginated IMAP metadata search of one required mailbox with text, headers, status, date, and size filters. | `read_only`            |
-| 7   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only`, `taskable` |
-| 8   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only`, `taskable` |
-| 9   | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only`, `taskable` |
-| 10  | `top_subscriptions` | Top bulk-mail senders with advertised one-click syntax and UIDVALIDITY-guarded samples.             | `read_only`, `taskable` |
-| 11  | `top_mailing_lists`     | Top mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.           | `read_only`, `taskable` |
-| 12  | `top_domains`     | Exact canonical Header From domains and subdomains with counts, dates, and a live sample subject.   | `read_only`, `taskable` |
-| 13  | `list_pending_moves` | List durable COPY-fallback MOVE operations awaiting reconciliation or review.                       | `read_only`             |
-| 14  | `preview_thread_record` | Discover a bounded exact Message-ID graph and return a confirmation digest without writing files. | `read_only`, `taskable` |
+| 6   | `get_messages`     | Paginated metadata discovery from one required mailbox, newest-first. Default: offset=0, limit=25 (max 50) | `read_only`            |
+| 7   | `search_messages`  | Paginated IMAP metadata search of one required mailbox with text, headers, status, date, and size filters. | `read_only`            |
+| 8   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only`, `taskable` |
+| 9   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only`, `taskable` |
+| 10  | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only`, `taskable` |
+| 11  | `top_subscriptions` | Top bulk-mail senders with advertised one-click syntax and UIDVALIDITY-guarded samples.             | `read_only`, `taskable` |
+| 12  | `top_mailing_lists`     | Top mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.           | `read_only`, `taskable` |
+| 13  | `top_domains`     | Exact canonical Header From domains and subdomains with counts, dates, and a live sample subject.   | `read_only`, `taskable` |
+| 14  | `list_pending_moves` | List durable COPY-fallback MOVE operations awaiting reconciliation or review.                       | `read_only`             |
+| 15  | `preview_thread_record` | Discover a bounded exact Message-ID graph and return a confirmation digest without writing files. | `read_only`, `taskable` |
 
 #### Output Schemas
 
@@ -292,23 +322,23 @@ shown by the preview to a later `export_thread_record` confirmation.
 
 | #   | Tool                   | Description                                                                           | Annotations                              |
 | --- | ---------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------- |
-| 15  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`, `taskable`   |
-| 16  | `delete_by_sender`     | Delete all from an exact sender identity (`email` + `name` from a ranking row). Omit `mailbox` for account-wide. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
-| 17  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
-| 18  | `delete_by_domain`     | Delete all messages from one exact canonical domain from `top_domains`; subdomains are never implicit. | `destructive`, `taskable`                 |
-| 19  | `move_list_id`         | Move all messages with an **exact** List-Id to a destination mailbox in one operation (e.g. archive a statement list). Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
-| 20  | `move_by_sender`       | Move all messages from an exact sender identity (`email` + `name`) to a destination mailbox in one operation. Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
-| 21  | `move_by_domain`       | Move all messages from one exact canonical domain to a destination; subdomains are never implicit. | `taskable`                               |
-| 22  | `move_subscription`    | Move the exact bulk-mail subscription represented by a UIDVALIDITY-safe `top_subscriptions` sample; destination excluded. | `taskable`                               |
-| 23  | `move_message`         | IMAP MOVE between mailboxes (durable COPY+EXPUNGE fallback when MOVE is unavailable). |                                          |
-| 24  | `reconcile_moves`      | Safely resume one or all pending COPY-fallback MOVE operations.                       | `destructive`, `taskable`                |
-| 25  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
-| 26  | `rename_mailbox`       | Preview, then confirm a guarded mailbox rename.                                       | `destructive`                            |
-| 27  | `delete_mailbox`       | Preview, then confirm guarded mailbox deletion.                                       | `destructive`, `idempotent`              |
-| 28  | `create_draft`         | Save an RFC822 draft — fresh, or a reply derived from a live message via `replyToMessage`. |                                      |
-| 29  | `update_draft`         | Replace a live draft: RFC 8508 REPLACE where the server has it, APPEND-then-discard otherwise. | `destructive`                            |
-| 30  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
-| 31  | `download_message_source` | Save exact RFC822 bytes directly to disk with SHA-256, metadata, and local DNS-backed DKIM evidence. | `open_world`, `taskable`                 |
+| 16  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`, `taskable`   |
+| 17  | `delete_by_sender`     | Delete all from an exact sender identity (`email` + `name` from a ranking row). Omit `mailbox` for account-wide. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
+| 18  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
+| 19  | `delete_by_domain`     | Delete all messages from one exact canonical domain from `top_domains`; subdomains are never implicit. | `destructive`, `taskable`                 |
+| 20  | `move_list_id`         | Move all messages with an **exact** List-Id to a destination mailbox in one operation (e.g. archive a statement list). Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
+| 21  | `move_by_sender`       | Move all messages from an exact sender identity (`email` + `name`) to a destination mailbox in one operation. Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
+| 22  | `move_by_domain`       | Move all messages from one exact canonical domain to a destination; subdomains are never implicit. | `taskable`                               |
+| 23  | `move_subscription`    | Move the exact bulk-mail subscription represented by a UIDVALIDITY-safe `top_subscriptions` sample; destination excluded. | `taskable`                               |
+| 24  | `move_message`         | IMAP MOVE between mailboxes (durable COPY+EXPUNGE fallback when MOVE is unavailable). |                                          |
+| 25  | `reconcile_moves`      | Safely resume one or all pending COPY-fallback MOVE operations.                       | `destructive`, `taskable`                |
+| 26  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
+| 27  | `rename_mailbox`       | Preview, then confirm a guarded mailbox rename.                                       | `destructive`                            |
+| 28  | `delete_mailbox`       | Preview, then confirm guarded mailbox deletion.                                       | `destructive`, `idempotent`              |
+| 29  | `create_draft`         | Save an RFC822 draft — fresh, or a reply derived from a live message via `replyToMessage`. |                                      |
+| 30  | `update_draft`         | Replace a live draft: RFC 8508 REPLACE where the server has it, APPEND-then-discard otherwise. | `destructive`                            |
+| 31  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
+| 32  | `download_message_source` | Save exact RFC822 bytes directly to disk with SHA-256, metadata, and local DNS-backed DKIM evidence. | `open_world`, `taskable`                 |
 | 33  | `download_thread`      | Save a caller-selected set of up to 100 UIDs plus a JSON evidence manifest. Does not discover thread membership. | `open_world`, `taskable`                 |
 | 34  | `export_thread_record` | Confirm a preview digest and write PDF, exact EML sources, and an integrity manifest. | `open_world`, `taskable`                 |
 | 35  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional matching-message cleanup via the nested `cleanup {when, identity, deletion}` object (omitted = unsubscribe only). | `destructive`, `open_world`, `taskable`  |
@@ -529,10 +559,26 @@ reports success only when the resulting state is unambiguous.
 
 **create_draft**
 ```json
-{ "created": true, "account", "draftsMailbox", "attachmentCount",
+{ "created": true, "account", "draftsMailbox", "from", "attachmentCount",
   "replyToCount", "threadingApplied", "warning?",
   "uidValidity?", "uid?" }
 ```
+
+**The sender.** A draft is `From` one of the account's identities (the
+`addresses` `list_accounts` reports), under the configured display name:
+
+1. `from` — `Name <address>` or a bare address — must be one of the identities,
+   or the call is refused with the list of them. A name given with it replaces
+   the display name.
+2. A reply (`replyToMessage`) is From the identity the original involved: its
+   own `From` for a follow-up to this account's mail, else the first identity
+   in its `To`, then `Cc`.
+3. Otherwise the primary identity.
+
+An account with no identity at all (an opaque login and no `email`) is refused
+with what to configure. The result's `from` is the sender actually written —
+resolved, not echoed — formatted so it parses back as one mailbox (a name with a
+comma or other special is quoted).
 
 Draft bodies are written in **Markdown** and sent as `multipart/alternative`
 (RFC 2046 §5.1.4): the text exactly as written as `text/plain`, then an HTML
@@ -589,14 +635,18 @@ reply goes to the wrong people. This tool never sends mail.
 **update_draft**
 
 ```json
-{ "updated": true, "account", "draftsMailbox",
+{ "updated": true, "account", "draftsMailbox", "from",
   "previousUidValidity", "previousUid",
   "uidValidity?", "uid?", "warning?" }
 ```
 
 The input is a complete replacement specification, including attachments.
 AgentMail verifies the live UIDVALIDITY and `\Draft` flag and preserves the
-Apple draft UUID.
+Apple draft UUID. It also preserves the draft's sender: without `from`, the
+replacement keeps the current `From` — name included, the display name filling
+a blank one — when that address is one of the account's identities, so a sender
+chosen in another mail client survives an edit here; a foreign `From` is
+replaced by the primary identity. `from` follows the `create_draft` rules.
 
 Where the server advertises RFC 8508 REPLACE the swap is one atomic command.
 Where it does not — Gmail and iCloud among them — AgentMail emulates it as
@@ -747,7 +797,7 @@ message ceiling and continues to mutate in 500-UID batches.
 
 | #   | Tool           | Description                                                                          | Annotations |
 | --- | -------------- | ------------------------------------------------------------------------------------ | ----------- |
-| 35  | `update_flags` | Add flags, remove flags, and set or clear the Apple Mail `color` in ONE call. Colors: red, orange, yellow, green, blue, purple, gray, or `none` to clear. Unnamed flags are untouched. | `idempotent` |
+| 36  | `update_flags` | Add flags, remove flags, and set or clear the Apple Mail `color` in ONE call. Colors: red, orange, yellow, green, blue, purple, gray, or `none` to clear. Unnamed flags are untouched. | `idempotent` |
 
 Adding and removing were two tools. Doing both then meant two calls across two
 UIDVALIDITY windows, so the second could be refused with the first already

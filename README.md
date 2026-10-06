@@ -30,14 +30,18 @@ Output binary: `target/release/agentmail`
 
 ## Configuration
 
-agentmail reads its config from a single TOML file:
+agentmail reads its config from a single TOML file, at the platform's config
+directory unless `AGENTMAIL_CONFIG` names another path:
 
-| Location | Path                                                        |
+| Platform | Default path                                                |
 | -------- | ----------------------------------------------------------- |
-| Default  | `~/.config/agentmail/config.toml`                           |
-| Override | Set the `AGENTMAIL_CONFIG` environment variable to any path |
+| macOS    | `~/Library/Application Support/agentmail/config.toml`       |
+| Linux    | `$XDG_CONFIG_HOME/agentmail/config.toml` (`~/.config/…`)    |
+| Windows  | `%APPDATA%\agentmail\config.toml`                           |
+| Any      | Set the `AGENTMAIL_CONFIG` environment variable to any path |
 
-On macOS the default expands to `~/Library/Application Support/agentmail/config.toml` if `dirs::config_dir()` returns `Library/Application Support`, but `~/.config/agentmail/config.toml` is more conventional and works fine — just pick one.
+On macOS, `~/.config/agentmail/config.toml` is NOT read. To keep the file there,
+point `AGENTMAIL_CONFIG` at it.
 
 ### Quick start
 
@@ -79,6 +83,7 @@ host = "imap.mail.me.com"
 username = "johnappleseed"
 email = "john@example.com"
 aliases = ["john@icloud.com", "john@me.com"]
+display_name = "John Appleseed"
 password.cmd = "security find-internet-password -s imap.mail.me.com -a johnappleseed -w"
 
 [accounts.work]
@@ -96,8 +101,9 @@ All accounts are available simultaneously — the MCP tools and CLI commands acc
 | `host`            | string | **required** | Non-empty IMAP hostname or IP address               |
 | `port`            | u16    | `993`        | IMAP port; must be non-zero                         |
 | `username`        | string | **required** | Non-empty login username / email                    |
-| `email`           | string | —            | Primary mailbox address when it differs from the login |
-| `aliases`         | string[] | `[]`       | Additional own addresses, canonicalized and deduplicated |
+| `email`           | string | —            | Primary mailbox address when it differs from the login; a draft's default `From` |
+| `aliases`         | string[] | `[]`       | Other addresses this account sends as, canonicalized and deduplicated |
+| `display_name`    | string | —            | Sender name on drafts: `Mark Blake <you@example.com>`. No control characters, at most 256 characters |
 | `password`        | Secret | —            | Password source (see [Passwords](#passwords) below) |
 | `tls`             | bool   | `true`       | TLS is mandatory; `false` is rejected               |
 | `max_connections` | usize  | provider-specific | `1..=32`; defaults to 1 for Yahoo/AOL and 3 otherwise |
@@ -109,6 +115,30 @@ and unsafe transport or connection-pool values fail fast. `email`, aliases, and
 email-shaped login usernames are canonicalized for own-address comparisons;
 opaque IMAP login names remain valid. Set `email` for providers such as iCloud
 when the login name is not an address, and list any delivery aliases separately.
+
+### Sender identity
+
+A draft is `From` one of the account's **identities**: the primary address
+(`email`, or an email-shaped `username` when `email` is unset), then each alias.
+`display_name` is the name shown with it, so `display_name = "Mark Blake"` makes
+drafts `From: Mark Blake <you@example.com>`.
+
+- **Default:** the primary address, under `display_name`.
+- **`from`:** `create_draft` and `update_draft` (and the CLI's `create-draft
+  --from`) take `Name <address>` or a bare address. The address must be one of
+  the identities; anything else is refused with the list of them. Add an
+  address as an alias to send as it.
+- **Replies** are `From` the identity the original involved: its own `From` for
+  a follow-up to your own mail, else the first identity in its `To`, then `Cc`.
+- **`update_draft`** keeps the draft's current `From` — name included — when it
+  is one of the identities, so a sender chosen in another mail client survives.
+- An account with no identity at all (an opaque login and no `email`) cannot
+  create drafts until `email` is set.
+
+A distinct email-shaped login is used to recognize your own mail but is never a
+sending identity unless you list it in `aliases`. `list_accounts` reports each
+account's identities; `list_identities` adds the addresses its recent Sent mail
+actually went out from.
 
 Trash and drafts mailboxes are auto-detected at runtime via RFC 6154 special-use attributes (`\Trash`, `\Drafts`), with string-matching fallback for servers that don't support RFC 6154.
 
@@ -362,6 +392,7 @@ agentmail download-attachments --account gmail --mailbox INBOX --uid 123 --expec
 agentmail list-flags --account gmail
 agentmail add-flags --account gmail --mailbox INBOX --uid 123 --expected-uid-validity 3857529045 --flags "\\Seen" --color red
 agentmail create-draft --account gmail --subject "Hello" --body "Hi there" --to user@example.com
+agentmail create-draft --account gmail --from "Mark Blake <sales@example.com>" --subject "Hello" --body "Hi" --to user@example.com
 agentmail list-pending-moves --account gmail
 agentmail reconcile-moves --account gmail --operation-id <operation-id>
 ```
@@ -409,14 +440,15 @@ Opens a web UI to exercise all advertised tools, 6 prompts, and task calls inter
 
 ## MCP Tools
 
-37 tools cover account discovery, mailbox management, message reading, search,
+36 tools cover account discovery, mailbox management, message reading, search,
 bulk operations, recovery, evidence archiving, flag management, and composition. AgentMail saves drafts but never sends mail. 22 long-running tools support
 optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/tasks)
 (SEP-1686) for asynchronous execution.
 
 | Tool                   | Description                                                                           |
 | ---------------------- | ------------------------------------------------------------------------------------- |
-| `list_accounts`        | Return configured account names (use this first)                                      |
+| `list_accounts`        | Return configured account names, the default, and each account's sending addresses    |
+| `list_identities`      | An account's sending addresses: configured ones plus those its recent Sent mail used  |
 | `list_mailboxes`       | Paginate selectable mailboxes with counts and registered special-use roles             |
 | `create_mailbox`       | Create a new mailbox (folder) on the server                                           |
 | `rename_mailbox`       | Preview, then confirm a guarded mailbox rename                                        |
@@ -454,9 +486,10 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 
 ### Key parameters
 
-- `account` is **required** for most tools, including `list_mailboxes`. Use
-  `list_accounts` to discover valid names. MCP account discovery returns names
-  and default status, not IMAP hosts or usernames.
+- `account` is **required** for most tools, including `list_mailboxes`. The
+  configured names are in every `account` argument's schema. `list_accounts`
+  returns names, default status, the display name and the addresses each
+  account sends as — never IMAP hosts or login usernames.
 - `mailbox` is required for single-mailbox readers and every UID consumer. It
   may be omitted only on account-wide tools such as `top_*`, `list_flags`, and
   `find_attachments`. Discovery uses one selectable server-declared `\All`
@@ -555,7 +588,9 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - Non-ASCII `search_messages` text is sent with `CHARSET UTF-8`. Drafts include
   `Date`, `Message-ID`, and Apple Mail draft markers. Bcc is retained in the
   saved draft, Reply-To is supported, and reply drafts use RFC
-  `In-Reply-To`/`References` headers. Draft bodies are Markdown and ship as
+  `In-Reply-To`/`References` headers. A draft is `From` one of the account's
+  identities (see [Sender identity](#sender-identity)); `from` picks another,
+  and the result reports the sender written. Draft bodies are Markdown and ship as
   `multipart/alternative` — the source verbatim as `text/plain` plus an HTML
   rendering — so formatting arrives rendered rather than as literal syntax;
   raw HTML in a body is escaped, never rendered, and `plainTextOnly: true`
@@ -724,7 +759,7 @@ Argument autocompletion (`completion/complete`) is supported for the prompts and
 ```
 agentmail (binary crate: agentmail-mcp)
   ├── serve                → MCP stdio server (tokio + rmcp)
-  │                          37 tools + 6 prompts, tasks, progress notifications
+  │                          36 tools + 6 prompts, tasks, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
   ├── create-mailbox       → CLI
@@ -748,7 +783,7 @@ agentmail (binary crate: agentmail-mcp)
 src/ (library + binary)
   ├── lib.rs          → Public API facade (25+ async methods)
   ├── main.rs         → CLI dispatch (clap), account configuration
-  ├── mcp/            → MCP server: 37 tools, 6 prompts, tasks, resources, completions
+  ├── mcp/            → MCP server: 36 tools, 6 prompts, tasks, resources, completions
   ├── config.rs       → TOML config loading, default account resolution
   ├── credentials.rs  → Password resolution (env → config secret → default keyring)
   ├── connection.rs   → IMAP connection pool (provider-aware per-account cap)

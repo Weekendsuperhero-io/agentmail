@@ -96,7 +96,9 @@ impl AgentMailServer {
         instructions.push_str(
             " Ask me what I want to say, help me write the body, then use create_draft \
              (with optional attachments) to save it. Show me a preview before saving; create_draft resolves \
-             the proper Drafts mailbox and applies the Draft flag itself.",
+             the proper Drafts mailbox and applies the Draft flag itself. It is From the account's primary \
+             address under its display name; if I want another of the account's addresses (list_accounts \
+             shows them), pass it as `from`.",
         );
         vec![PromptMessage::new_text(Role::User, instructions)]
     }

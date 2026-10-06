@@ -31,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         username: user,
         email: None,
         aliases: Vec::new(),
+        display_name: None,
         password: Some(Secret::new_raw(&pass)),
         tls: true,
         max_connections: None,

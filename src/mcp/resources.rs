@@ -1206,7 +1206,7 @@ mod tests {
             "uid": 42,
             "subject": "Quarterly report",
             "sender": "Alice <alice@example.com>",
-            "replyTo": "",
+            "replyTo": [],
             "to": ["me@example.com"],
             "cc": [],
             "mailbox": "INBOX",

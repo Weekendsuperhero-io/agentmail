@@ -24,7 +24,6 @@ struct McpClient {
 
 impl McpClient {
     async fn start() -> Self {
-        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let config = Config::from_accounts(vec![(
             "dummy".to_string(),
             AccountConfig {
@@ -33,12 +32,18 @@ impl McpClient {
                 username: "dummy@example.invalid".to_string(),
                 email: None,
                 aliases: Vec::new(),
+                display_name: None,
                 password: Some(Secret::new_raw("unused")),
                 tls: true,
                 max_connections: None,
                 auth: agentmail::AuthMethod::Password,
             },
         )]);
+        Self::start_with(config).await
+    }
+
+    async fn start_with(config: Config) -> Self {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         tokio::spawn(async move {
             let _ = agentmail::mcp::serve_on(server_io, Agentmail::new(config)).await;
         });
@@ -307,13 +312,13 @@ async fn initialize_reports_capabilities_and_identity() {
 }
 
 #[tokio::test]
-async fn tools_list_has_35_annotated_tools() {
+async fn tools_list_has_36_annotated_tools() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        35,
+        36,
         "tool count drifted — update docs and tests"
     );
 
@@ -472,6 +477,169 @@ async fn list_accounts_schema_omits_connection_credentials() {
             "list_accounts schema must omit `{credential}`: {output:#}"
         );
     }
+}
+
+/// An account whose IMAP login is NOT one of its addresses, so a test can tell
+/// "the addresses it sends as" from "everything it authenticates with".
+async fn client_with_sender_identity() -> McpClient {
+    let account = AccountConfig::new("imap.invalid", "login-name")
+        .with_email("Mark@Example.com")
+        .with_aliases(["sales@example.com"])
+        .with_display_name("Mark Blake");
+    McpClient::start_with(Config::from_accounts(vec![("work".to_string(), account)])).await
+}
+
+/// `list_accounts` answers "what can I send as": the display name and the
+/// addresses, primary first — and still never a login or a host.
+#[tokio::test]
+async fn list_accounts_reports_the_addresses_an_account_sends_as() {
+    let mut client = client_with_sender_identity().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({"name": "list_accounts", "arguments": {}}),
+        )
+        .await;
+    let account = &resp["result"]["structuredContent"]["accounts"][0];
+
+    assert_eq!(account["displayName"], json!("Mark Blake"));
+    assert_eq!(
+        account["addresses"],
+        json!(["mark@example.com", "sales@example.com"])
+    );
+    let serialized = resp["result"].to_string();
+    assert!(
+        !serialized.contains("login-name") && !serialized.contains("imap.invalid"),
+        "no login or host in the result: {serialized}"
+    );
+
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let output = &find_tool(tools, "list_accounts")["outputSchema"];
+    let account = object_schema(&output["properties"]["accounts"]["items"])
+        .expect("account item object schema");
+    let required: Vec<&str> = account["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        required.contains(&"addresses"),
+        "addresses is always present: {account:#}"
+    );
+}
+
+/// Both draft tools take a `from` and report the sender they resolved; the
+/// address is checked against the account before any IMAP work.
+#[tokio::test]
+async fn draft_tools_take_a_sender_and_refuse_one_the_account_does_not_own() {
+    let mut client = client_with_sender_identity().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in ["create_draft", "update_draft"] {
+        let tool = find_tool(tools, name);
+        assert!(
+            tool["inputSchema"]["properties"]["from"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("list_accounts")),
+            "`{name}` takes a documented `from`: {tool:#}"
+        );
+        let required: Vec<&str> = tool["outputSchema"]["required"]
+            .as_array()
+            .map(|values| values.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            required.contains(&"from"),
+            "`{name}` always reports its sender"
+        );
+    }
+
+    for (name, arguments) in [
+        (
+            "create_draft",
+            json!({"account": "work", "to": ["you@example.net"], "from": "Mark <mark@elsewhere.example>"}),
+        ),
+        (
+            "update_draft",
+            json!({
+                "account": "work",
+                "mailbox": "Drafts",
+                "uid": 7,
+                "expectedUidValidity": 9,
+                "to": ["you@example.net"],
+                "from": "mark@elsewhere.example"
+            }),
+        ),
+    ] {
+        let resp = client
+            .request("tools/call", json!({"name": name, "arguments": arguments}))
+            .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp:#}");
+        let message = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            message.contains("mark@example.com, sales@example.com") && message.contains("alias"),
+            "`{name}` names the usable addresses: {message}"
+        );
+    }
+}
+
+/// Adding `from` did not loosen the schema: a near-miss name is still refused
+/// with the field named, rather than silently ignored.
+#[tokio::test]
+async fn draft_tools_still_refuse_unknown_parameters() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "create_draft",
+                "arguments": {"account": "dummy", "to": ["a@example.com"], "sender": "x@example.com"}
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], json!(true), "{resp:#}");
+    assert!(
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|message| message.contains("sender")),
+        "the error names the unknown field: {resp:#}"
+    );
+}
+
+#[tokio::test]
+async fn list_identities_is_a_bounded_read_only_tool() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let tool = find_tool(tools, "list_identities");
+
+    assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
+    assert_eq!(tool["annotations"]["idempotentHint"], json!(true));
+    assert!(
+        tool.get("execution")
+            .is_none_or(|execution| execution["taskSupport"].is_null()),
+        "a bounded read is not a task tool: {tool:#}"
+    );
+    let sent = &tool["inputSchema"]["properties"]["sentMessages"];
+    assert_eq!(schema_minimum(sent), Some(1.0));
+    assert_eq!(schema_maximum(sent), Some(1000.0));
+    let output = &tool["outputSchema"]["properties"];
+    for field in ["sentMailbox", "scannedMessages", "identities"] {
+        assert!(output.get(field).is_some(), "output carries `{field}`");
+    }
+
+    let resp = client
+        .request(
+            "tools/call",
+            json!({"name": "list_identities", "arguments": {"account": "dummy", "sentMessages": 0}}),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "an out-of-range window fails before any IMAP work: {resp:#}"
+    );
 }
 
 #[tokio::test]

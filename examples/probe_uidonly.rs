@@ -59,10 +59,9 @@ async fn raw_uid_fetch(
             Response::Done {
                 tag: done,
                 status,
-                information,
-                ..
+                outcome,
             } if done == &tag => {
-                let text = format!("{status:?} {information:?}");
+                let text = format!("{status:?} {:?}", outcome.information);
                 if !matches!(status, Status::Ok) {
                     return Ok((rows, text)); // report NO/BAD without erroring
                 }
@@ -158,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         username: user,
         email: None,
         aliases: Vec::new(),
+        display_name: None,
         password: Some(Secret::new_raw(&pass)),
         tls: true,
         max_connections: None,

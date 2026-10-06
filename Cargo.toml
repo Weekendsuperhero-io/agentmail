@@ -1,15 +1,15 @@
 [workspace]
 
-# Local imap-proto fork adding RFC 9586 UIDFETCH response parsing (the enabler
-# for Yahoo/AOL UID Mode / ENABLE UIDONLY, which lifts the visible-window
-# limit). Applies to async-imap's transitive imap-proto too. See
+# Local imap-proto 0.17 fork adding RFC 9586 UIDFETCH response parsing (the
+# enabler for Yahoo/AOL UID Mode / ENABLE UIDONLY, which lifts the
+# visible-window limit). Applies to async-imap's transitive imap-proto too. See
 # docs/patches/imap-proto-uidfetch.md; upstream when possible to drop the fork.
 [patch.crates-io]
 imap-proto = { path = "vendor/imap-proto" }
 
 [package]
 name = "agentmail"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.94"
 description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
@@ -33,27 +33,30 @@ path = "src/main.rs"
 # IMAP protocol (tokio runtime). `compress` enables optional RFC 4978
 # COMPRESS=DEFLATE, negotiated after login only when the server advertises it.
 # It materially reduces transfer size for large full-header scans.
-async-imap = { version = "0.11", default-features = false, features = [
+async-imap = { version = "0.12", default-features = false, features = [
   "runtime-tokio",
   "compress",
 ] }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 fast_html2md = "0.0"
 futures = "0.3"
 hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 idna = "1"
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 mail-parser = "0.11"
-mail-auth = { version = "0.12.1", default-features = false, features = ["ring"] }
+mail-auth = { version = "0.13.3", default-features = false, features = ["ring"] }
 native-tls = "0.2"
 parking_lot = "0.12"
 percent-encoding = "2"
 printpdf = { version = "0.12", default-features = false }
 psl = "2"
 reqwest = { version = "0.13", features = ["json"] }
+# Pinned to the bridge's rmcp. 3.x removes the task API this server's background
+# tools are built on; the move is one decision across the Agent Muse bridge,
+# agentmail and eventkit-rs, deferred to its own ADR in the embedding workspace.
 rmcp = { version = "=2.2.0", features = ["server", "macros", "transport-io"] }
 # Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native

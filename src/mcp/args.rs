@@ -18,6 +18,19 @@ pub(super) struct ListAccountsArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for listing the addresses an account sends as.")]
+pub(super) struct ListIdentitiesArgs {
+    #[schemars(description = "Account name (required).")]
+    pub(super) account: String,
+    #[schemars(
+        range(min = 1, max = 1000),
+        description = "How many of the newest Sent messages to read. Defaults to 200; maximum 1000."
+    )]
+    pub(super) sent_messages: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for listing mailboxes.")]
 pub(super) struct ListMailboxesArgs {
     #[schemars(description = "Account name (required).")]
@@ -224,6 +237,11 @@ pub(super) struct CreateDraftArgs {
     )]
     pub(super) account: String,
     #[serde(default)]
+    #[schemars(
+        description = "Sender, as `Name <address>` or a bare address. The address must be one of this account's own — list_accounts lists them — or the draft is refused; the name defaults to the account's display name. Omit it to send as the account's primary address, or, for a reply, as the address the original was sent to."
+    )]
+    pub(super) from: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Draft subject line.")]
     pub(super) subject: String,
     #[serde(default)]
@@ -325,6 +343,11 @@ pub(super) struct UpdateDraftArgs {
     pub(super) uid: u32,
     #[schemars(range(min = 1))]
     pub(super) expected_uid_validity: u32,
+    #[serde(default)]
+    #[schemars(
+        description = "Sender, as `Name <address>` or a bare address. The address must be one of this account's own — list_accounts lists them — or the update is refused; the name defaults to the account's display name. Omit it to keep the draft's current sender when that is one of the account's addresses, otherwise the primary address."
+    )]
+    pub(super) from: Option<String>,
     #[serde(default)]
     pub(super) subject: String,
     #[serde(default)]
@@ -1002,7 +1025,9 @@ pub(super) struct FindAttachmentsPromptArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ComposeEmailArgs {
-    #[schemars(description = "Account name to send from.")]
+    #[schemars(
+        description = "Account name. The draft is saved to this account's Drafts, From one of its addresses."
+    )]
     pub(super) account: String,
     #[schemars(description = "Recipient email address.")]
     pub(super) to: Option<String>,

@@ -6,7 +6,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use hashbrown::HashMap;
 use parking_lot::Mutex;
@@ -27,7 +27,9 @@ struct AccountState {
 
 struct CatalogSnapshot {
     entries: Arc<[MailboxLayout]>,
-    loaded_at: Instant,
+    /// Wall-clock, so the TTL runs through sleep — see
+    /// [`crate::connection::wall_elapsed`].
+    loaded_at: SystemTime,
 }
 
 /// Layout snapshots and per-account refresh locks.
@@ -43,7 +45,7 @@ pub(crate) struct MailboxCatalog {
 impl MailboxCatalog {
     pub(crate) fn get(&self, account: &str) -> Option<Arc<[MailboxLayout]>> {
         let started = Instant::now();
-        let entries = self.get_at(account, started);
+        let entries = self.get_at(account, SystemTime::now());
         if let Some(ref entries) = entries {
             trace_catalog("hit", started, 0, entries.len(), true);
         }
@@ -65,7 +67,7 @@ impl MailboxCatalog {
         Fut: Future<Output = Result<Vec<MailboxLayout>>>,
     {
         let started = Instant::now();
-        if let Some(entries) = self.get_at(account, started) {
+        if let Some(entries) = self.get_at(account, SystemTime::now()) {
             trace_catalog("hit", started, 0, entries.len(), true);
             return Ok(entries);
         }
@@ -73,7 +75,7 @@ impl MailboxCatalog {
         let refresh_lock = self.refresh_lock(account);
         let _refresh_guard = refresh_lock.lock().await;
 
-        if let Some(entries) = self.get_at(account, Instant::now()) {
+        if let Some(entries) = self.get_at(account, SystemTime::now()) {
             trace_catalog("shared_hit", started, 0, entries.len(), true);
             return Ok(entries);
         }
@@ -87,7 +89,7 @@ impl MailboxCatalog {
             }
         };
         let (entries, retained) =
-            self.store_if_generation(account, generation, entries, Instant::now());
+            self.store_if_generation(account, generation, entries, SystemTime::now());
         let cache_status = if retained { "miss" } else { "not_retained" };
         trace_catalog(cache_status, started, 1, entries.len(), retained);
         Ok(entries)
@@ -100,11 +102,12 @@ impl MailboxCatalog {
         state.snapshot = None;
     }
 
-    fn get_at(&self, account: &str, now: Instant) -> Option<Arc<[MailboxLayout]>> {
+    fn get_at(&self, account: &str, now: SystemTime) -> Option<Arc<[MailboxLayout]>> {
         let mut states = self.states.lock();
         let state = states.get_mut(account)?;
         let is_fresh = state.snapshot.as_ref().is_some_and(|snapshot| {
-            now.saturating_duration_since(snapshot.loaded_at) < MAILBOX_CATALOG_TTL
+            crate::connection::wall_elapsed(snapshot.loaded_at, now)
+                .is_some_and(|age| age < MAILBOX_CATALOG_TTL)
         });
         if !is_fresh {
             state.snapshot = None;
@@ -138,7 +141,7 @@ impl MailboxCatalog {
         account: &str,
         generation: u64,
         entries: Vec<MailboxLayout>,
-        loaded_at: Instant,
+        loaded_at: SystemTime,
     ) -> (Arc<[MailboxLayout]>, bool) {
         let cacheable = is_cacheable(&entries);
         let entries: Arc<[MailboxLayout]> = entries.into();
@@ -199,6 +202,25 @@ pub(crate) fn resolve_drafts(entries: &[MailboxLayout]) -> Option<String> {
         "drafts",
         &["Drafts", "[Gmail]/Drafts", "INBOX.Drafts"],
         &["draft"],
+    )
+}
+
+/// Resolve a selectable RFC 6154 Sent mailbox, with fallbacks for servers that
+/// omit the special-use attribute. EXACT names only: the substring fallback the
+/// other roles use would match "sent" inside "Consent" or "Presentations".
+pub(crate) fn resolve_sent(entries: &[MailboxLayout]) -> Option<String> {
+    resolve_selectable_special_mailbox(
+        entries,
+        "sent",
+        &[
+            "Sent",
+            "Sent Items",
+            "Sent Messages",
+            "Sent Mail",
+            "[Gmail]/Sent Mail",
+            "INBOX.Sent",
+        ],
+        &[],
     )
 }
 
@@ -304,6 +326,27 @@ mod tests {
     }
 
     #[test]
+    fn sent_resolver_prefers_the_role_then_exact_names_never_a_substring() {
+        let entries = [
+            entry("Sent Messages"),
+            special_entry("Gesendet", "sent", false),
+        ];
+        assert_eq!(resolve_sent(&entries).as_deref(), Some("Gesendet"));
+
+        let entries = [entry("Consent Forms"), entry("INBOX.Sent")];
+        assert_eq!(resolve_sent(&entries).as_deref(), Some("INBOX.Sent"));
+
+        let entries = [entry("Consent Forms"), entry("Presentations")];
+        assert!(resolve_sent(&entries).is_none());
+
+        let entries = [special_entry("Sent", "sent", true)];
+        assert!(
+            resolve_sent(&entries).is_none(),
+            "an unselectable Sent cannot be read"
+        );
+    }
+
+    #[test]
     fn trash_resolver_returns_none_for_only_unselectable_candidates() {
         let entries = [special_entry("Trash", "trash", true)];
 
@@ -320,7 +363,7 @@ mod tests {
     #[test]
     fn fresh_snapshot_is_returned() {
         let catalog = MailboxCatalog::default();
-        let now = Instant::now();
+        let now = SystemTime::now();
         let generation = catalog.generation("work");
         catalog.store_if_generation("work", generation, vec![entry("INBOX")], now);
 
@@ -332,7 +375,7 @@ mod tests {
     #[test]
     fn snapshot_expires_at_ttl_boundary() {
         let catalog = MailboxCatalog::default();
-        let now = Instant::now();
+        let now = SystemTime::now();
         let generation = catalog.generation("work");
         catalog.store_if_generation("work", generation, vec![entry("INBOX")], now);
 
@@ -341,10 +384,24 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// A snapshot whose load time is in the future — the clock was set back
+    /// since — has no knowable age, so it is refreshed rather than trusted.
+    #[test]
+    fn snapshot_loaded_after_now_is_expired() {
+        let catalog = MailboxCatalog::default();
+        let now = SystemTime::now();
+        let generation = catalog.generation("work");
+        catalog.store_if_generation("work", generation, vec![entry("INBOX")], now);
+
+        let result = catalog.get_at("work", now - Duration::from_secs(1));
+
+        assert!(result.is_none());
+    }
+
     #[test]
     fn invalidation_is_scoped_to_one_account() {
         let catalog = MailboxCatalog::default();
-        let now = Instant::now();
+        let now = SystemTime::now();
         for account in ["work", "personal"] {
             let generation = catalog.generation(account);
             catalog.store_if_generation(account, generation, vec![entry("INBOX")], now);
@@ -397,7 +454,7 @@ mod tests {
         let oversized = vec![entry("x".repeat(MAX_LAYOUT_BYTES_PER_ACCOUNT + 1))];
 
         let (entries, retained) =
-            catalog.store_if_generation("work", generation, oversized, Instant::now());
+            catalog.store_if_generation("work", generation, oversized, SystemTime::now());
 
         assert_eq!(entries.len(), 1);
         assert!(!retained);
@@ -431,7 +488,7 @@ mod tests {
     async fn failed_refresh_does_not_serve_expired_snapshot() {
         let catalog = MailboxCatalog::default();
         let generation = catalog.generation("work");
-        let expired_at = Instant::now() - MAILBOX_CATALOG_TTL;
+        let expired_at = SystemTime::now() - MAILBOX_CATALOG_TTL;
         catalog.store_if_generation("work", generation, vec![entry("stale")], expired_at);
 
         let result = catalog
@@ -493,8 +550,12 @@ mod tests {
         let generation = catalog.generation("work");
         catalog.invalidate("work");
 
-        let (entries, retained) =
-            catalog.store_if_generation("work", generation, vec![entry("stale")], Instant::now());
+        let (entries, retained) = catalog.store_if_generation(
+            "work",
+            generation,
+            vec![entry("stale")],
+            SystemTime::now(),
+        );
 
         assert_eq!(entries.len(), 1);
         assert!(!retained);

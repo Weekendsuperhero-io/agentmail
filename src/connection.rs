@@ -1,7 +1,7 @@
 use hashbrown::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::AgentmailError;
@@ -12,7 +12,30 @@ use crate::imap_client::{self, ImapSession};
 /// evict ones the IMAP server has very likely already dropped.
 struct IdleSession {
     session: ImapSession,
-    idle_since: Instant,
+    /// Wall-clock, not `Instant` — see [`wall_elapsed`].
+    idle_since: SystemTime,
+}
+
+impl IdleSession {
+    /// Whether this session has been idle for less than `max_idle` as of `now`.
+    fn is_fresh(&self, max_idle: Duration, now: SystemTime) -> bool {
+        idle_is_fresh(wall_elapsed(self.idle_since, now), max_idle)
+    }
+}
+
+/// Wall-clock time from `since` to `now`, or `None` when the clock reads
+/// earlier than `since` — it was set back — which every caller treats as
+/// expired.
+///
+/// The pool's timers measure wall time on purpose. `Instant` is
+/// `CLOCK_UPTIME_RAW` on macOS and stops while the machine sleeps, so after a
+/// night asleep an idle session looked seconds old and was handed out, a
+/// `[LIMIT]` cooldown resumed where it paused, and the mailbox catalog served a
+/// layout loaded hours earlier. The server's clocks run through our sleep — it
+/// drops idle connections and lifts its penalties on its own time — so these
+/// must too.
+pub(crate) fn wall_elapsed(since: SystemTime, now: SystemTime) -> Option<Duration> {
+    now.duration_since(since).ok()
 }
 
 /// Connection pool managing IMAP sessions across accounts.
@@ -163,9 +186,10 @@ const MAX_IDLE_UID_MODE: usize = 1;
 const MIN_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// Whether a session idle for `idle_for` is fresh enough to attempt reuse
-/// against the pool's configured threshold.
-fn idle_is_fresh(idle_for: Duration, max_idle: Duration) -> bool {
-    idle_for < max_idle
+/// against the pool's configured threshold. An unknown idle time (the clock was
+/// set back) is not fresh.
+fn idle_is_fresh(idle_for: Option<Duration>, max_idle: Duration) -> bool {
+    idle_for.is_some_and(|idle_for| idle_for < max_idle)
 }
 
 /// Ceiling for the escalating login cooldown. One hour outlasts observed
@@ -179,15 +203,25 @@ const LOGIN_RATE_LIMIT_COOLDOWN_CAP: Duration = Duration::from_secs(3600);
 /// is the memory that decides whether the next LIMIT counts as consecutive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LoginCooldown {
-    /// New LOGINs are refused until this instant.
-    until: Instant,
+    /// When this cooldown was armed. Wall-clock, like `until` — see
+    /// [`wall_elapsed`].
+    armed_at: SystemTime,
+    /// New LOGINs are refused until this time.
+    until: SystemTime,
     /// Consecutive LIMIT strikes; 1 = first (or lapsed-episode) LIMIT.
     strikes: u32,
 }
 
-/// Time left on a login cooldown that ends at `until`, `None` once it lifted.
-fn cooldown_remaining(until: Instant, now: Instant) -> Option<Duration> {
-    (until > now).then(|| until - now)
+/// Time left on a login cooldown, `None` once it lifted — or once the clock has
+/// been set back past the moment it was armed, which would otherwise stretch
+/// the gate by however far the clock moved.
+fn cooldown_remaining(cooldown: LoginCooldown, now: SystemTime) -> Option<Duration> {
+    wall_elapsed(cooldown.armed_at, now)?;
+    cooldown
+        .until
+        .duration_since(now)
+        .ok()
+        .filter(|remaining| !remaining.is_zero())
 }
 
 /// Cooldown applied at the given strike count: the base doubled per extra
@@ -205,17 +239,21 @@ fn cooldown_after_strikes(base: Duration, strikes: u32) -> Duration {
 /// length — covering both a LIMIT while still armed and one shortly after
 /// expiry (the "server penalty outlasts our cooldown" case, where each
 /// expiry's single probing LOGIN gets re-LIMITed). At or past the window
-/// boundary the episode has lapsed and the account starts over at strike 1.
-fn next_cooldown(prev: Option<LoginCooldown>, base: Duration, now: Instant) -> LoginCooldown {
+/// boundary the episode has lapsed and the account starts over at strike 1, as
+/// it does when the clock was set back past the previous arming.
+fn next_cooldown(prev: Option<LoginCooldown>, base: Duration, now: SystemTime) -> LoginCooldown {
     let strikes = match prev {
         Some(prev)
-            if now < prev.until + cooldown_after_strikes(base, prev.strikes).saturating_mul(2) =>
+            if wall_elapsed(prev.armed_at, now).is_some()
+                && now
+                    < prev.until + cooldown_after_strikes(base, prev.strikes).saturating_mul(2) =>
         {
             prev.strikes.saturating_add(1)
         }
         _ => 1,
     };
     LoginCooldown {
+        armed_at: now,
         until: now + cooldown_after_strikes(base, strikes),
         strikes,
     }
@@ -414,7 +452,7 @@ impl ConnectionPool {
                         let mut alive = Vec::with_capacity(idle_set.len());
                         for mut idle in idle_set {
                             if imap_client::ping(&mut idle.session).await.is_ok() {
-                                idle.idle_since = Instant::now();
+                                idle.idle_since = SystemTime::now();
                                 alive.push(idle);
                                 stats.keepalive_pings.fetch_add(1, Ordering::Relaxed);
                             } else {
@@ -452,7 +490,7 @@ impl ConnectionPool {
     pub(crate) fn note_login_rate_limit(&self, account_name: &str) {
         let mut cooldowns = self.login_cooldowns.lock();
         let prev = cooldowns.get(account_name).copied();
-        let next = next_cooldown(prev, self.login_cooldown, Instant::now());
+        let next = next_cooldown(prev, self.login_cooldown, SystemTime::now());
         cooldowns.insert(account_name.to_string(), next);
         drop(cooldowns);
         tracing::warn!(
@@ -484,7 +522,7 @@ impl ConnectionPool {
     /// strike-aware fast-fail message. `None` once the gate has lifted.
     pub(crate) fn login_cooldown_status(&self, account_name: &str) -> Option<(Duration, u32)> {
         let state = *self.login_cooldowns.lock().get(account_name)?;
-        cooldown_remaining(state.until, Instant::now()).map(|remaining| (remaining, state.strikes))
+        cooldown_remaining(state, SystemTime::now()).map(|remaining| (remaining, state.strikes))
     }
 
     /// Get the server capabilities for an account, fetching once and caching.
@@ -554,10 +592,9 @@ impl ConnectionPool {
                 pools.get_mut(account_name).and_then(|pool| pool.pop())
             }; // lock released here — before any network I/O
             if let Some(idle) = maybe_idle {
+                let fresh = idle.is_fresh(self.max_idle, SystemTime::now());
                 let mut session = idle.session;
-                if idle_is_fresh(idle.idle_since.elapsed(), self.max_idle)
-                    && imap_client::ping(&mut session).await.is_ok()
-                {
+                if fresh && imap_client::ping(&mut session).await.is_ok() {
                     return Some((session, uid_mode));
                 }
                 // too old or stale → `session` drops here (connection closes);
@@ -767,10 +804,9 @@ impl ConnectionPool {
             pools.get_mut(account_name).and_then(|pool| pool.pop())
         };
         if let Some(idle) = maybe_idle {
+            let fresh = idle.is_fresh(self.max_idle, SystemTime::now());
             let mut session = idle.session;
-            if idle_is_fresh(idle.idle_since.elapsed(), self.max_idle)
-                && imap_client::ping(&mut session).await.is_ok()
-            {
+            if fresh && imap_client::ping(&mut session).await.is_ok() {
                 return Ok(Some(PooledSession {
                     session: Some(session),
                     account_name: account_name.to_string(),
@@ -881,7 +917,7 @@ impl PooledSession {
             if pool.len() < cap {
                 pool.push(IdleSession {
                     session,
-                    idle_since: Instant::now(),
+                    idle_since: SystemTime::now(),
                 });
             }
             // else: drop the session (connection closes)
@@ -989,28 +1025,54 @@ mod tests {
     #[test]
     fn idle_freshness_threshold() {
         assert!(
-            idle_is_fresh(Duration::from_secs(0), MAX_IDLE),
+            idle_is_fresh(Some(Duration::from_secs(0)), MAX_IDLE),
             "fresh session reusable"
         );
         assert!(
-            idle_is_fresh(MAX_IDLE - Duration::from_secs(1), MAX_IDLE),
+            idle_is_fresh(Some(MAX_IDLE - Duration::from_secs(1)), MAX_IDLE),
             "just under the threshold is still reusable",
         );
         assert!(
-            !idle_is_fresh(MAX_IDLE, MAX_IDLE),
+            !idle_is_fresh(Some(MAX_IDLE), MAX_IDLE),
             "exactly at the threshold is evicted"
         );
         assert!(
-            !idle_is_fresh(MAX_IDLE + Duration::from_secs(30 * 60), MAX_IDLE),
+            !idle_is_fresh(Some(MAX_IDLE + Duration::from_secs(30 * 60)), MAX_IDLE),
             "long-idle (likely server-dropped) session is evicted",
         );
         // A raised threshold (builder .max_idle) keeps older sessions eligible.
         assert!(
             idle_is_fresh(
-                MAX_IDLE + Duration::from_secs(60),
+                Some(MAX_IDLE + Duration::from_secs(60)),
                 Duration::from_secs(20 * 60)
             ),
             "a raised max_idle admits sessions the default would evict",
+        );
+        assert!(
+            !idle_is_fresh(None, Duration::from_secs(20 * 60)),
+            "an idle time the clock cannot vouch for is not fresh",
+        );
+    }
+
+    /// A fixed wall-clock origin, so the timer tests are deterministic.
+    fn wall(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)
+    }
+
+    /// The bug the wall clock fixes: idle time is measured from the stamps, so
+    /// a night asleep (which `Instant` on macOS does not count) still ages the
+    /// session past `max_idle`.
+    #[test]
+    fn wall_elapsed_measures_forward_time_and_refuses_a_clock_set_back() {
+        assert_eq!(
+            wall_elapsed(wall(0), wall(8 * 3600)),
+            Some(Duration::from_secs(8 * 3600))
+        );
+        assert_eq!(wall_elapsed(wall(60), wall(60)), Some(Duration::ZERO));
+        assert_eq!(wall_elapsed(wall(60), wall(0)), None);
+        assert!(
+            !idle_is_fresh(wall_elapsed(wall(0), wall(8 * 3600)), MAX_IDLE),
+            "a session idled overnight is evicted, not pinged and reused"
         );
     }
 
@@ -1044,24 +1106,51 @@ mod tests {
 
     #[test]
     fn cooldown_remaining_counts_down_and_lifts() {
-        let now = Instant::now();
+        let now = wall(0);
         let until = now + Duration::from_secs(120);
+        let cooldown = LoginCooldown {
+            armed_at: now,
+            until,
+            strikes: 1,
+        };
         assert_eq!(
-            cooldown_remaining(until, now),
+            cooldown_remaining(cooldown, now),
             Some(Duration::from_secs(120))
         );
         assert_eq!(
-            cooldown_remaining(until, now + Duration::from_secs(60)),
+            cooldown_remaining(cooldown, now + Duration::from_secs(60)),
             Some(Duration::from_secs(60))
         );
         assert_eq!(
-            cooldown_remaining(until, until),
+            cooldown_remaining(cooldown, until),
             None,
             "the gate lifts exactly at the deadline"
         );
         assert_eq!(
-            cooldown_remaining(until, until + Duration::from_secs(1)),
+            cooldown_remaining(cooldown, until + Duration::from_secs(1)),
             None
+        );
+    }
+
+    /// A cooldown armed before a sleep keeps counting through it, and a clock
+    /// set back past the arming lifts the gate rather than stretching it.
+    #[test]
+    fn cooldown_runs_on_the_wall_clock_and_a_clock_set_back_lifts_it() {
+        let cooldown = next_cooldown(None, Duration::from_secs(300), wall(1000));
+        assert_eq!(
+            cooldown_remaining(cooldown, wall(1000 + 3600)),
+            None,
+            "an hour asleep outlasts a five-minute cooldown"
+        );
+        assert_eq!(
+            cooldown_remaining(cooldown, wall(999)),
+            None,
+            "a clock set back past the arming cannot extend the gate"
+        );
+        assert_eq!(
+            next_cooldown(Some(cooldown), Duration::from_secs(300), wall(999)).strikes,
+            1,
+            "nor count as a consecutive LIMIT"
         );
     }
 
@@ -1126,7 +1215,7 @@ mod tests {
     #[test]
     fn next_cooldown_first_limit_is_strike_one() {
         let base = Duration::from_secs(300);
-        let now = Instant::now();
+        let now = wall(0);
         let state = next_cooldown(None, base, now);
         assert_eq!(state.strikes, 1);
         assert_eq!(state.until, now + base);
@@ -1135,7 +1224,7 @@ mod tests {
     #[test]
     fn next_cooldown_relimit_within_window_escalates() {
         let base = Duration::from_secs(300);
-        let t0 = Instant::now();
+        let t0 = wall(0);
         let first = next_cooldown(None, base, t0);
         // Re-LIMIT while still armed → strike 2.
         let while_armed = next_cooldown(Some(first), base, t0 + Duration::from_secs(100));
@@ -1151,8 +1240,9 @@ mod tests {
     #[test]
     fn next_cooldown_relimit_at_or_after_window_starts_over() {
         let base = Duration::from_secs(300);
-        let t0 = Instant::now();
+        let t0 = wall(0);
         let third = LoginCooldown {
+            armed_at: t0,
             until: t0 + Duration::from_secs(1200),
             strikes: 3,
         };
@@ -1169,12 +1259,12 @@ mod tests {
     #[test]
     fn next_cooldown_walks_the_escalation_ladder() {
         let base = Duration::from_secs(300);
-        let mut now = Instant::now();
+        let mut now = wall(0);
         let mut state: Option<LoginCooldown> = None;
         let mut applied = Vec::new();
         for _ in 0..6 {
             let next = next_cooldown(state, base, now);
-            applied.push((next.until - now).as_secs());
+            applied.push(next.until.duration_since(now).unwrap().as_secs());
             // The next probe fires just after this cooldown expires — the
             // exact leak pattern observed live.
             now = next.until + Duration::from_secs(1);
@@ -1261,6 +1351,7 @@ mod tests {
                 username: "user@example.com".to_string(),
                 email: None,
                 aliases: Vec::new(),
+                display_name: None,
                 password: Some(crate::secret::Secret::new_raw("unused")),
                 tls: true,
                 max_connections: None,

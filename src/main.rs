@@ -165,6 +165,10 @@ enum CliCommand {
     CreateDraft {
         #[arg(long)]
         account: String,
+        /// Sender, "Name <address>" or "address"; must be one of the account's
+        /// own addresses. Defaults to its primary address and display name.
+        #[arg(long)]
+        from: Option<String>,
         #[arg(long)]
         subject: String,
         #[arg(long)]
@@ -410,6 +414,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliCommand::CreateDraft {
             account,
+            from,
             subject,
             body,
             to,
@@ -418,7 +423,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
             let value = mk
-                .create_draft(&account, &subject, &body, &to, &cc, &bcc, &[])
+                .create_draft_with_headers(
+                    &account,
+                    from.as_deref(),
+                    &subject,
+                    &body,
+                    &to,
+                    &cc,
+                    &bcc,
+                    &[],
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    agentmail::draft::BodyFormat::default(),
+                )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -650,6 +669,48 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// A TOML string literal for `value`, written by the TOML serializer.
+///
+/// Never `{:?}`: Rust's debug escapes are not TOML's (`\u{301}` versus
+/// `\u0301`), so a name typed with a decomposed accent produced a config file
+/// that failed to parse.
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+/// The `[accounts.<name>]` table for one validated account.
+fn account_section(
+    account_name: &str,
+    account: &agentmail::AccountConfig,
+    password_toml: &str,
+) -> String {
+    let mut section = format!("[accounts.{}]\n", toml_string(account_name));
+    section.push_str(&format!("host = {}\n", toml_string(&account.host)));
+    if account.port != 993 {
+        section.push_str(&format!("port = {}\n", account.port));
+    }
+    section.push_str(&format!("username = {}\n", toml_string(&account.username)));
+    if let Some(email) = &account.email {
+        section.push_str(&format!("email = {}\n", toml_string(email)));
+    }
+    if !account.aliases.is_empty() {
+        let aliases = toml::Value::Array(
+            account
+                .aliases
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        );
+        section.push_str(&format!("aliases = {aliases}\n"));
+    }
+    if let Some(display_name) = &account.display_name {
+        section.push_str(&format!("display_name = {}\n", toml_string(display_name)));
+    }
+    section.push_str(&format!("{password_toml}\n"));
+    section
+}
+
 struct TemporaryConfigFile {
     path: std::path::PathBuf,
     armed: bool,
@@ -808,18 +869,22 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
     } else {
         prompt_default("Primary email", &suggested_email)?
     };
-    let aliases = prompt("Aliases (comma-separated, optional): ")?
+    let aliases = prompt("Other addresses you send as (comma-separated, optional): ")?
         .split(',')
         .map(str::trim)
         .filter(|alias| !alias.is_empty())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
+    let display_name = prompt("Your name (shown on drafts, optional): ")?;
 
     let mut account_config = agentmail::AccountConfig::new(&host, &username)
         .with_port(port)
         .with_aliases(aliases);
     if !email.is_empty() {
         account_config = account_config.with_email(email);
+    }
+    if !display_name.trim().is_empty() {
+        account_config = account_config.with_display_name(display_name);
     }
     let validated =
         agentmail::Config::try_from_accounts(vec![(account_name.clone(), account_config)])?;
@@ -829,8 +894,6 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         .expect("validated account is present");
     let host = account_config.host.clone();
     let username = account_config.username.clone();
-    let email = account_config.email.clone();
-    let aliases = account_config.aliases.clone();
 
     // 4. Password method
     eprintln!("\nPassword storage:");
@@ -848,16 +911,19 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
             );
             eprintln!("  (hint: use the default to read Apple Mail's stored password)");
             let cmd = prompt_default("Command", &default_cmd)?;
-            (format!("password.cmd = {:?}", cmd), false)
+            (format!("password.cmd = {}", toml_string(&cmd)), false)
         }
         "raw" | "3" => {
             let pw = prompt_secret("Password: ")?;
-            (format!("password.raw = {:?}", pw), false)
+            (format!("password.raw = {}", toml_string(&pw)), false)
         }
         "keyring" | "1" => {
             // keyring (default)
             (
-                format!("password.keyring = {:?}", format!("mail.{username}")),
+                format!(
+                    "password.keyring = {}",
+                    toml_string(&format!("mail.{username}"))
+                ),
                 true,
             )
         }
@@ -881,19 +947,7 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         String::new()
     };
 
-    let mut section = format!("[accounts.{account_name:?}]\n");
-    section.push_str(&format!("host = {:?}\n", host));
-    if port != 993 {
-        section.push_str(&format!("port = {}\n", port));
-    }
-    section.push_str(&format!("username = {:?}\n", username));
-    if let Some(email) = email {
-        section.push_str(&format!("email = {email:?}\n"));
-    }
-    if !aliases.is_empty() {
-        section.push_str(&format!("aliases = {aliases:?}\n"));
-    }
-    section.push_str(&format!("{}\n", password_toml));
+    let section = account_section(&account_name, account_config, &password_toml);
 
     let separator = if existing.is_empty() || existing.ends_with('\n') {
         ""
@@ -949,6 +1003,56 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wizard's output must parse back to what was typed — including a
+    /// name with a combining accent, quotes and a backslash, which `{:?}`
+    /// turned into Rust escapes TOML refuses.
+    #[test]
+    fn a_generated_account_section_round_trips_through_toml() {
+        let display_name = "Jose\u{301} \"Pepe\" Bla\\ke";
+        let account = agentmail::AccountConfig::new("imap.example.com", "me@example.com")
+            .with_port(1993)
+            .with_aliases(["sales@example.com"])
+            .with_display_name(display_name);
+        let section = account_section(
+            "work",
+            &account,
+            &format!("password.keyring = {}", toml_string("mail.me@example.com")),
+        );
+
+        let mut parsed: agentmail::Config = toml::from_str(&section).expect("valid TOML");
+        parsed.normalize_and_validate().expect("valid config");
+        let work = &parsed.accounts["work"];
+        assert_eq!(work.display_name.as_deref(), Some(display_name));
+        assert_eq!(work.aliases, ["sales@example.com"]);
+        assert_eq!(work.port, 1993);
+    }
+
+    #[test]
+    fn create_draft_cli_accepts_a_sender() {
+        let cli = Cli::try_parse_from([
+            "agentmail",
+            "create-draft",
+            "--account",
+            "work",
+            "--from",
+            "Mark Blake <mark@example.com>",
+            "--subject",
+            "Hi",
+            "--body",
+            "Hello",
+            "--to",
+            "you@example.com",
+        ])
+        .expect("valid command");
+
+        match cli.command.expect("subcommand") {
+            CliCommand::CreateDraft { from, .. } => {
+                assert_eq!(from.as_deref(), Some("Mark Blake <mark@example.com>"));
+            }
+            _ => panic!("expected create-draft"),
+        }
+    }
 
     #[test]
     fn account_names_reject_toml_structure_characters() {

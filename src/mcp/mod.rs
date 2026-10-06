@@ -439,7 +439,8 @@ impl ServerHandler for AgentMailServer {
              \n\
              The configured accounts are already listed in every `account` argument's\n\
              schema — choose one from there. Call `list_accounts` only when you need to know\n\
-             which account is the DEFAULT.\n\
+             which account is the DEFAULT, or which addresses an account sends as.\n\
+             `list_identities` adds the From addresses its recent Sent mail used.\n\
              \n\
              `list_mailboxes` takes one account and returns selectable mailboxes only, 100\n\
              per page.\n\
@@ -470,6 +471,12 @@ impl ServerHandler for AgentMailServer {
              \n\
              `create_draft` and `update_draft`. Both accept Reply-To, Bcc,\n\
              attachments and RFC threading headers.\n\
+             \n\
+             A draft is From the account's primary address under its display name. Pass\n\
+             `from` (`Name <address>` or an address) to use another of the account's own\n\
+             addresses — any other address is refused. A reply is From the address the\n\
+             original was sent to; `update_draft` keeps the draft's current sender. The\n\
+             result's `from` is the sender actually written.\n\
 \n\
              To reply, give `create_draft` a `replyToMessage` — the mailbox, uid,\n\
              expectedUidValidity and mode of the live message. It derives the\n\
@@ -909,6 +916,7 @@ mod tests {
                         username: format!("{name}@example.com"),
                         email: None,
                         aliases: Vec::new(),
+                        display_name: None,
                         password: None,
                         tls: true,
                         max_connections: None,
@@ -1176,7 +1184,7 @@ mod tests {
         let tools = AgentMailServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            35,
+            36,
             "tool count drifted — update docs and tests"
         );
         for tool in &tools {

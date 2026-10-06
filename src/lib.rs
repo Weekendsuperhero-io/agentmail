@@ -21,7 +21,7 @@ mod mutation_journal;
 mod scan_plan;
 mod unsubscribe;
 
-pub use config::{AccountConfig, AuthMethod, Config};
+pub use config::{AccountConfig, AuthMethod, Config, canonicalize_email, validate_display_name};
 pub use connection::{
     ConnectionPool, ConnectionStats, is_login_rate_limited_host, recommended_max_connections,
 };
@@ -454,11 +454,62 @@ impl Agentmail {
                 host: cfg.host.clone(),
                 username: cfg.username.clone(),
                 is_default: default == Some(name.as_str()),
+                display_name: cfg.display_name.clone(),
+                addresses: cfg.identities(),
             })
             .collect();
         accounts.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(ListAccountsResponse { accounts })
+    }
+
+    /// The addresses an account sends as: every configured identity, and
+    /// every From address among its newest `sent_messages` Sent messages.
+    ///
+    /// IMAP has no identity list — Gmail's send-as and JMAP `Identity` need
+    /// API credentials an app-password account does not hold — so what the
+    /// account has actually sent is the evidence. Reading it never widens what
+    /// a draft may be `from`: an address seen only in Sent is reported with
+    /// `configured: false` and must be added as an alias first. Without a Sent
+    /// mailbox the configured addresses are still returned.
+    pub async fn list_identities(
+        &self,
+        account: &str,
+        sent_messages: usize,
+    ) -> Result<ListIdentitiesResponse> {
+        if !(1..=MAX_IDENTITY_SCAN).contains(&sent_messages) {
+            return Err(AgentmailError::Other(format!(
+                "sentMessages must be between 1 and {MAX_IDENTITY_SCAN}"
+            )));
+        }
+        let config = self
+            .pool
+            .account_config(account)
+            .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
+        let configured = config.identities();
+        let display_name = config.display_name.clone();
+
+        let layout = self.cached_mailbox_layout(account).await?;
+        let sent_mailbox = mailbox_catalog::resolve_sent(&layout);
+        let rows = match &sent_mailbox {
+            None => Vec::new(),
+            Some(mailbox) => {
+                let mailbox = mailbox.clone();
+                self.pool
+                    .with_session_retry(account, async move |session| {
+                        imap_client::recent_sender_rows(session, &mailbox, sent_messages).await
+                    })
+                    .await?
+            }
+        };
+
+        Ok(ListIdentitiesResponse {
+            account: account.to_string(),
+            display_name,
+            sent_mailbox,
+            scanned_messages: rows.len(),
+            identities: aggregate_identities(&configured, &rows),
+        })
     }
 
     /// Check IMAP connectivity for an account.
@@ -3786,6 +3837,7 @@ impl Agentmail {
     ) -> Result<CreateDraftResponse> {
         self.create_draft_with_headers(
             account,
+            None,
             subject,
             body,
             to,
@@ -3802,10 +3854,16 @@ impl Agentmail {
     }
 
     /// Create a draft with Reply-To and RFC threading headers.
+    ///
+    /// `from` picks the sender, as `Name <addr>` or `addr`. The address must be
+    /// one of the account's [`config::AccountConfig::identities`] or the draft
+    /// is refused; the name defaults to the configured `display_name`. `None`
+    /// sends as the primary identity.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_draft_with_headers(
         &self,
         account: &str,
+        from: Option<&str>,
         subject: &str,
         body: &str,
         to: &[String],
@@ -3819,23 +3877,57 @@ impl Agentmail {
         body_format: draft::BodyFormat,
     ) -> Result<CreateDraftResponse> {
         validate_draft_payload(body, to, cc, bcc, reply_to, attachments)?;
-
-        let _mutation_guard = self.lock_account_mutation(account).await;
-
         let account_config = self
             .pool
             .account_config(account)
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
-        let from = account_config
-            .canonical_email()
-            .unwrap_or_else(|| account_config.username.clone());
+        let from = draft::resolve_from(account, account_config, from, None, None)?;
+        self.save_new_draft(
+            account,
+            &from,
+            subject,
+            body,
+            to,
+            cc,
+            bcc,
+            reply_to,
+            in_reply_to,
+            references,
+            attachments,
+            warning,
+            body_format,
+        )
+        .await
+    }
+
+    /// Compose a new draft From an already-resolved sender and APPEND it to
+    /// the account's Drafts mailbox.
+    #[allow(clippy::too_many_arguments)]
+    async fn save_new_draft(
+        &self,
+        account: &str,
+        from: &lettre::message::Mailbox,
+        subject: &str,
+        body: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        reply_to: &[String],
+        in_reply_to: Option<&str>,
+        references: &[String],
+        attachments: &[crate::types::DraftAttachment],
+        warning: Option<String>,
+        body_format: draft::BodyFormat,
+    ) -> Result<CreateDraftResponse> {
+        let _mutation_guard = self.lock_account_mutation(account).await;
+
         let rfc822 = draft::compose_draft_with_headers(
             subject,
             body,
             to,
             cc,
             bcc,
-            Some(&from),
+            Some(from),
             attachments,
             draft::DraftHeaderOptions {
                 reply_to,
@@ -3880,6 +3972,7 @@ impl Agentmail {
             created: true,
             account: account.to_string(),
             drafts_mailbox: drafts_name,
+            from: draft::format_mailbox(from),
             subject: subject.to_string(),
             recipients: DraftRecipients {
                 to: to.to_vec(),
@@ -3898,10 +3991,16 @@ impl Agentmail {
     }
 
     /// Create a reply or reply-all draft from one live message identity.
+    ///
+    /// The draft is From the account identity the original involved — its own
+    /// `From` for a follow-up to this account's mail, else the first identity
+    /// it was addressed to — unless `from` names another of the account's
+    /// addresses (see [`Self::create_draft_with_headers`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_reply_draft(
         &self,
         account: &str,
+        from: Option<&str>,
         mailbox: &str,
         uid: u32,
         expected_uid_validity: u32,
@@ -3913,6 +4012,10 @@ impl Agentmail {
         attachments: &[DraftAttachment],
         body_format: draft::BodyFormat,
     ) -> Result<CreateDraftResponse> {
+        let account_config = self
+            .pool
+            .account_config(account)
+            .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
         let response = self
             .get_messages_by_uid(
                 mailbox,
@@ -3928,70 +4031,31 @@ impl Agentmail {
             .into_iter()
             .next()
             .ok_or(AgentmailError::MessageNotFound(uid))?;
-        let own = self.own_addresses(account);
-        let reply_target = if source.reply_to.trim().is_empty() {
-            source.sender.clone()
-        } else {
-            source.reply_to.clone()
-        };
-        let mut seen = hashbrown::HashSet::new();
-        let mut to = Vec::new();
-        push_reply_recipient(&mut to, &mut seen, &own, &reply_target);
-        let mut cc = Vec::new();
-        if mode == ReplyMode::ReplyAll {
-            for recipient in &source.to {
-                push_reply_recipient(&mut to, &mut seen, &own, recipient);
-            }
-            for recipient in &source.cc {
-                push_reply_recipient(&mut cc, &mut seen, &own, recipient);
-            }
-        }
-        if to.is_empty() && mode == ReplyMode::Reply {
-            for recipient in source.to.iter().chain(&source.cc) {
-                push_reply_recipient(&mut to, &mut seen, &own, recipient);
-                if !to.is_empty() {
-                    break;
-                }
-            }
-        }
-        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        let reply = derive_reply(&source, &self.own_addresses(account), mode);
+        if reply.to.is_empty() && reply.cc.is_empty() && bcc.is_empty() {
             return Err(AgentmailError::Other(
                 "the source message has no reply recipient outside this account".to_string(),
             ));
         }
-
+        validate_draft_payload(body, &reply.to, &reply.cc, bcc, reply_to, attachments)?;
+        let from = draft::resolve_from(account, account_config, from, Some(&source), None)?;
         let subject = subject
             .map(str::trim)
             .filter(|subject| !subject.is_empty())
-            .map_or_else(|| reply_subject(&source.subject), str::to_string);
-        let mut references = source.references;
-        let (in_reply_to, warning) = match source.message_id {
-            Some(message_id) => {
-                if !references.iter().any(|reference| reference == &message_id) {
-                    references.push(message_id.clone());
-                }
-                (Some(message_id), None)
-            }
-            None => (
-                None,
-                Some(
-                    "source message has no Message-ID; recipients and subject were prepared, but RFC thread headers could not be applied"
-                        .to_string(),
-                ),
-            ),
-        };
-        self.create_draft_with_headers(
+            .map_or(reply.subject, str::to_string);
+        self.save_new_draft(
             account,
+            &from,
             &subject,
             body,
-            &to,
-            &cc,
+            &reply.to,
+            &reply.cc,
             bcc,
             reply_to,
-            in_reply_to.as_deref(),
-            &references,
+            reply.in_reply_to.as_deref(),
+            &reply.references,
             attachments,
-            warning,
+            reply.warning,
             body_format,
         )
         .await
@@ -4014,10 +4078,15 @@ impl Agentmail {
     /// risk; it exported it. Agents simply ran `create_draft` + `delete_messages`
     /// by hand, which is the same two commands with none of the guards below —
     /// no `\Draft` verification, no UIDVALIDITY fence, no policy-aware discard.
+    ///
+    /// `from` follows [`Self::create_draft_with_headers`]. Without it the draft
+    /// keeps its current `From` when that is one of the account's identities,
+    /// so a sender chosen in another mail client survives the edit.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_draft(
         &self,
         account: &str,
+        from: Option<&str>,
         drafts_mailbox: &str,
         uid: u32,
         expected_uid_validity: u32,
@@ -4038,9 +4107,10 @@ impl Agentmail {
             .pool
             .account_config(account)
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
-        let from = account_config
-            .canonical_email()
-            .unwrap_or_else(|| account_config.username.clone());
+        let explicit_from = from.map(str::trim).filter(|from| !from.is_empty());
+        // Refuse a sender that is not the account's before touching the server.
+        // Without one, the draft's current From is read further down.
+        let mut from = draft::resolve_from(account, account_config, explicit_from, None, None)?;
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         imap_client::examine_with_expected_uid_validity(
@@ -4080,6 +4150,10 @@ impl Agentmail {
         .await?;
         let apple_uuid =
             draft::extract_apple_uuid(&current_source).unwrap_or_else(uuid::Uuid::new_v4);
+        if explicit_from.is_none() {
+            let existing = draft::extract_from_mailbox(&current_source);
+            from = draft::resolve_from(account, account_config, None, None, existing.as_ref())?;
+        }
         let replacement = draft::compose_draft_with_headers(
             subject,
             body,
@@ -4149,6 +4223,7 @@ impl Agentmail {
             updated: true,
             account: account.to_string(),
             drafts_mailbox: drafts_mailbox.to_string(),
+            from: draft::format_mailbox(&from),
             previous_uid_validity: expected_uid_validity,
             previous_uid: uid,
             uid_validity: identity.map(|(uid_validity, _)| uid_validity),
@@ -4776,67 +4851,7 @@ impl Agentmail {
             });
         }
 
-        // Write files using async I/O
-        let output_dir = output_dir.to_path_buf();
-        #[cfg(unix)]
-        let output_dir_existed = output_dir.exists();
-        tokio::fs::create_dir_all(&output_dir).await.map_err(|e| {
-            AgentmailError::Other(format!(
-                "Failed to create directory '{}': {}",
-                output_dir.display(),
-                e
-            ))
-        })?;
-        #[cfg(unix)]
-        if !output_dir_existed {
-            tokio::fs::set_permissions(
-                &output_dir,
-                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-            )
-            .await
-            .map_err(|error| {
-                AgentmailError::Other(format!(
-                    "Failed to make download directory '{}' private: {error}",
-                    output_dir.display()
-                ))
-            })?;
-        }
-
-        let mut downloaded = Vec::new();
-        for (index, (name, content_type, bytes)) in attachments.iter().enumerate() {
-            let filename = format!("{}_{}_{}", uid, index, sanitize_filename(name));
-            let path = output_dir.join(&filename);
-            let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                options.mode(0o600);
-            }
-            let mut file = options.open(&path).await.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AgentmailError::Other(format!(
-                        "refusing to overwrite existing attachment '{}'",
-                        path.display()
-                    ))
-                } else {
-                    AgentmailError::Other(format!("Failed to create '{}': {error}", path.display()))
-                }
-            })?;
-            file.write_all(bytes).await.map_err(|error| {
-                AgentmailError::Other(format!("Failed to write '{}': {error}", path.display()))
-            })?;
-            file.flush().await.map_err(|error| {
-                AgentmailError::Other(format!("Failed to flush '{}': {error}", path.display()))
-            })?;
-
-            downloaded.push(DownloadedFile {
-                index,
-                path: filename.clone(),
-                filename,
-                content_type: content_type.clone(),
-                size: bytes.len(),
-            });
-        }
+        let downloaded = write_attachment_files(output_dir, uid, &attachments).await?;
 
         Ok(DownloadAttachmentsResponse {
             mailbox: mailbox.to_string(),
@@ -5571,15 +5586,87 @@ fn require_expected_message_count(expected: Option<u32>, actual: u32) -> Result<
     }
 }
 
-fn canonical_recipient_address(value: &str) -> Option<String> {
-    let value = value.trim();
-    let candidate = value
-        .rfind('<')
-        .and_then(|start| value.get(start + 1..))
-        .and_then(|tail| tail.strip_suffix('>'))
-        .unwrap_or(value)
-        .trim();
-    crate::config::canonicalize_email(candidate)
+/// What a reply takes from the message it answers: recipients, the `Re:`
+/// subject and the RFC threading headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplyDerivation {
+    to: Vec<String>,
+    cc: Vec<String>,
+    subject: String,
+    in_reply_to: Option<String>,
+    references: Vec<String>,
+    warning: Option<String>,
+}
+
+/// Derive a reply to `source`, leaving out the account's `own` addresses.
+///
+/// The reply goes to EVERY `Reply-To` address — a message that asks for
+/// answers at two addresses means both — and to `From` only when there is no
+/// `Reply-To`. `ReplyAll` adds the original `To` and `Cc`. A plain reply whose
+/// only target is this account (a follow-up to our own message) falls back to
+/// the first outside recipient of the original.
+fn derive_reply(
+    source: &MessageInfo,
+    own: &hashbrown::HashSet<String>,
+    mode: ReplyMode,
+) -> ReplyDerivation {
+    let mut seen = hashbrown::HashSet::new();
+    let mut to = Vec::new();
+    let reply_targets: Vec<&str> = source
+        .reply_to
+        .iter()
+        .map(|target| target.trim())
+        .filter(|target| !target.is_empty())
+        .collect();
+    if reply_targets.is_empty() {
+        push_reply_recipient(&mut to, &mut seen, own, &source.sender);
+    } else {
+        for target in reply_targets {
+            push_reply_recipient(&mut to, &mut seen, own, target);
+        }
+    }
+    let mut cc = Vec::new();
+    if mode == ReplyMode::ReplyAll {
+        for recipient in &source.to {
+            push_reply_recipient(&mut to, &mut seen, own, recipient);
+        }
+        for recipient in &source.cc {
+            push_reply_recipient(&mut cc, &mut seen, own, recipient);
+        }
+    }
+    if to.is_empty() && mode == ReplyMode::Reply {
+        for recipient in source.to.iter().chain(&source.cc) {
+            push_reply_recipient(&mut to, &mut seen, own, recipient);
+            if !to.is_empty() {
+                break;
+            }
+        }
+    }
+
+    let mut references = source.references.clone();
+    let (in_reply_to, warning) = match &source.message_id {
+        Some(message_id) => {
+            if !references.iter().any(|reference| reference == message_id) {
+                references.push(message_id.clone());
+            }
+            (Some(message_id.clone()), None)
+        }
+        None => (
+            None,
+            Some(
+                "source message has no Message-ID; recipients and subject were prepared, but RFC thread headers could not be applied"
+                    .to_string(),
+            ),
+        ),
+    };
+    ReplyDerivation {
+        to,
+        cc,
+        subject: reply_subject(&source.subject),
+        in_reply_to,
+        references,
+        warning,
+    }
 }
 
 fn push_reply_recipient(
@@ -5592,8 +5679,8 @@ fn push_reply_recipient(
     if recipient.is_empty() {
         return;
     }
-    let identity =
-        canonical_recipient_address(recipient).unwrap_or_else(|| recipient.to_ascii_lowercase());
+    let identity = draft::canonical_recipient_address(recipient)
+        .unwrap_or_else(|| recipient.to_ascii_lowercase());
     if own.contains(&identity) || !seen.insert(identity) {
         return;
     }
@@ -5612,6 +5699,111 @@ fn reply_subject(subject: &str) -> String {
     } else {
         format!("Re: {subject}")
     }
+}
+
+/// Default number of newest Sent messages `list_identities` reads.
+pub const DEFAULT_IDENTITY_SCAN: usize = 200;
+/// Most Sent messages one `list_identities` call reads.
+pub const MAX_IDENTITY_SCAN: usize = 1_000;
+/// Most addresses one `list_identities` call reports.
+const MAX_IDENTITY_ROWS: usize = 50;
+/// Most display names reported per address.
+const MAX_IDENTITY_NAMES: usize = 5;
+
+/// Fold Sent-mail From rows into one [`SenderIdentity`] per address.
+///
+/// Configured addresses come first, in configuration order (primary, then
+/// aliases), each reported even when no scanned message used it. Addresses
+/// seen only in Sent follow, most used first, then most recently used. Display
+/// names are counted per address and the most used kept first.
+fn aggregate_identities(
+    configured: &[String],
+    sent: &[scan_cache::SenderRow],
+) -> Vec<SenderIdentity> {
+    /// How often, and how recently, something was used.
+    #[derive(Default)]
+    struct Usage {
+        count: usize,
+        newest: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    impl Usage {
+        fn record(&mut self, date: Option<chrono::DateTime<chrono::Utc>>) {
+            self.count += 1;
+            self.newest = self.newest.max(date);
+        }
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        messages: Usage,
+        names: hashbrown::HashMap<String, Usage>,
+    }
+
+    let mut tallies: hashbrown::HashMap<&str, Tally> = hashbrown::HashMap::new();
+    for row in sent.iter().filter(|row| !row.email.is_empty()) {
+        let tally = tallies.entry(row.email.as_str()).or_default();
+        tally.messages.record(row.date);
+        let name = row.display_name.trim();
+        if !name.is_empty() {
+            tally
+                .names
+                .entry(name.to_string())
+                .or_default()
+                .record(row.date);
+        }
+    }
+
+    let identity = |address: &str, tally: Option<&Tally>, configured: bool, primary: bool| {
+        let mut names: Vec<(&String, &Usage)> = tally
+            .map(|tally| tally.names.iter().collect())
+            .unwrap_or_default();
+        names.sort_by(|(left_name, left), (right_name, right)| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| right.newest.cmp(&left.newest))
+                .then_with(|| left_name.cmp(right_name))
+        });
+        SenderIdentity {
+            address: address.to_string(),
+            configured,
+            primary,
+            display_names: names
+                .into_iter()
+                .take(MAX_IDENTITY_NAMES)
+                .map(|(name, _)| name.clone())
+                .collect(),
+            messages: tally.map_or(0, |tally| tally.messages.count),
+            last_used: tally.and_then(|tally| tally.messages.newest),
+        }
+    };
+
+    let mut identities: Vec<SenderIdentity> = configured
+        .iter()
+        .enumerate()
+        .map(|(index, address)| identity(address, tallies.get(address.as_str()), true, index == 0))
+        .collect();
+    let mut discovered: Vec<(&str, &Tally)> = tallies
+        .iter()
+        .filter(|(address, _)| !configured.iter().any(|configured| configured == *address))
+        .map(|(address, tally)| (*address, tally))
+        .collect();
+    discovered.sort_by(|(left, left_tally), (right, right_tally)| {
+        right_tally
+            .messages
+            .count
+            .cmp(&left_tally.messages.count)
+            .then_with(|| right_tally.messages.newest.cmp(&left_tally.messages.newest))
+            .then_with(|| left.cmp(right))
+    });
+    identities.extend(
+        discovered
+            .into_iter()
+            .map(|(address, tally)| identity(address, Some(tally), false, false)),
+    );
+    identities.truncate(MAX_IDENTITY_ROWS);
+    identities
 }
 
 fn validate_draft_payload(
@@ -6273,6 +6465,85 @@ pub(crate) fn validate_plain_filename(filename: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write one message's attachments into `output_dir` as `{uid}_{index}_{name}`,
+/// creating the directory private (0700) when it is new. Each file is
+/// create-new and 0600, so an existing file is refused, never overwritten.
+async fn write_attachment_files(
+    output_dir: &std::path::Path,
+    uid: u32,
+    attachments: &[(String, String, Vec<u8>)],
+) -> Result<Vec<DownloadedFile>> {
+    #[cfg(unix)]
+    let output_dir_existed = output_dir.exists();
+    tokio::fs::create_dir_all(output_dir).await.map_err(|e| {
+        AgentmailError::Other(format!(
+            "Failed to create directory '{}': {}",
+            output_dir.display(),
+            e
+        ))
+    })?;
+    #[cfg(unix)]
+    if !output_dir_existed {
+        tokio::fs::set_permissions(
+            output_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .await
+        .map_err(|error| {
+            AgentmailError::Other(format!(
+                "Failed to make download directory '{}' private: {error}",
+                output_dir.display()
+            ))
+        })?;
+    }
+
+    let mut downloaded = Vec::new();
+    for (index, (name, content_type, bytes)) in attachments.iter().enumerate() {
+        let filename = format!("{}_{}_{}", uid, index, sanitize_filename(name));
+        let path = output_dir.join(&filename);
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AgentmailError::Other(format!(
+                    "refusing to overwrite existing attachment '{}'",
+                    path.display()
+                ))
+            } else {
+                AgentmailError::Other(format!("Failed to create '{}': {error}", path.display()))
+            }
+        })?;
+        file.write_all(bytes).await.map_err(|error| {
+            AgentmailError::Other(format!("Failed to write '{}': {error}", path.display()))
+        })?;
+        file.flush().await.map_err(|error| {
+            AgentmailError::Other(format!("Failed to flush '{}': {error}", path.display()))
+        })?;
+        // The absolute path, as `download_message_source` returns: a bare
+        // filename names nothing once the caller's working directory is not
+        // `output_dir`, which for the MCP server is always the case.
+        let path = tokio::fs::canonicalize(&path).await.map_err(|error| {
+            AgentmailError::Other(format!(
+                "saved attachment but could not resolve '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+        downloaded.push(DownloadedFile {
+            index,
+            path: path.display().to_string(),
+            filename,
+            content_type: content_type.clone(),
+            size: bytes.len(),
+        });
+    }
+    Ok(downloaded)
+}
+
 /// Create, durably write, and close one private file. Any ordinary write error
 /// removes the incomplete file; `create_new` is the no-overwrite boundary.
 pub(crate) async fn write_new_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
@@ -6362,6 +6633,175 @@ mod tests {
         assert!(!mailbox_names_equal("Archive", "archive"));
     }
 
+    /// A reply goes to EVERY Reply-To address, and a sender whose display
+    /// name holds a comma or an `@` goes back into a draft as ONE mailbox.
+    #[test]
+    fn a_reply_goes_to_every_reply_to_and_keeps_quoted_names_whole() {
+        let raw = b"From: \"Blake, Mark\" <mark@example.com>\r\n\
+                    Reply-To: \"Blake, Mark\" <mark@example.com>, Desk <desk@example.com>\r\n\
+                    To: Me <ME@example.com>, colleague@example.com\r\n\
+                    Cc: \"x@y.example\" <x@y.example>\r\n\
+                    Subject: Plans\r\n\
+                    Message-ID: <plans@example.com>\r\n\r\nbody";
+        let source = parser::parse_rfc822(raw, 1, Vec::new(), None, "INBOX", "work", false, false)
+            .expect("parse source");
+        let own: hashbrown::HashSet<String> = ["me@example.com".to_string()].into_iter().collect();
+
+        let reply = derive_reply(&source, &own, ReplyMode::Reply);
+        assert_eq!(
+            reply.to,
+            [
+                "\"Blake, Mark\" <mark@example.com>",
+                "Desk <desk@example.com>"
+            ]
+        );
+        assert!(reply.cc.is_empty());
+        assert_eq!(reply.subject, "Re: Plans");
+        assert_eq!(reply.in_reply_to.as_deref(), Some("plans@example.com"));
+        assert_eq!(reply.references, ["plans@example.com"]);
+        assert_eq!(reply.warning, None);
+
+        let all = derive_reply(&source, &own, ReplyMode::ReplyAll);
+        assert_eq!(
+            all.to,
+            [
+                "\"Blake, Mark\" <mark@example.com>",
+                "Desk <desk@example.com>",
+                "colleague@example.com"
+            ],
+            "the account's own address is never a recipient"
+        );
+        assert_eq!(all.cc, ["\"x@y.example\" <x@y.example>"]);
+
+        let raw =
+            draft::compose_draft("s", "b", &all.to, &all.cc, &[], Some("me@example.com"), &[])
+                .expect("every derived recipient composes");
+        let parsed = mail_parser::MessageParser::default()
+            .parse(&raw)
+            .expect("parse draft");
+        let to: Vec<_> = parsed.to().expect("To").iter().collect();
+        assert_eq!(to.len(), 3, "no recipient split at a comma");
+        assert_eq!(to[0].name.as_deref(), Some("Blake, Mark"));
+        assert_eq!(parsed.cc().expect("Cc").iter().count(), 1);
+    }
+
+    #[test]
+    fn a_reply_without_reply_to_goes_to_the_sender_and_a_follow_up_to_the_original_recipient() {
+        let own: hashbrown::HashSet<String> = ["me@example.com".to_string()].into_iter().collect();
+        let incoming = parser::parse_rfc822(
+            b"From: Ann <ann@example.com>\r\nTo: me@example.com\r\nSubject: Hi\r\n\r\nx",
+            1,
+            Vec::new(),
+            None,
+            "INBOX",
+            "work",
+            false,
+            false,
+        )
+        .expect("parse");
+        let reply = derive_reply(&incoming, &own, ReplyMode::Reply);
+        assert_eq!(reply.to, ["Ann <ann@example.com>"]);
+        assert!(reply.warning.is_some(), "no Message-ID means no threading");
+
+        let our_own = parser::parse_rfc822(
+            b"From: me@example.com\r\nTo: Ann <ann@example.com>\r\nSubject: Hi\r\n\r\nx",
+            2,
+            Vec::new(),
+            None,
+            "Sent",
+            "work",
+            false,
+            false,
+        )
+        .expect("parse");
+        assert_eq!(
+            derive_reply(&our_own, &own, ReplyMode::Reply).to,
+            ["Ann <ann@example.com>"]
+        );
+    }
+
+    fn sent_row(email: &str, name: &str, day: u32) -> scan_cache::SenderRow {
+        scan_cache::SenderRow {
+            uid: day,
+            email: email.to_string(),
+            display_name: name.to_string(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 9, day)
+                .and_then(|date| date.and_hms_opt(12, 0, 0))
+                .map(|time| time.and_utc()),
+            message_id: None,
+        }
+    }
+
+    #[test]
+    fn identities_list_configured_addresses_first_then_what_sent_mail_used() {
+        let configured = [
+            "mark@example.com".to_string(),
+            "sales@example.com".to_string(),
+        ];
+        let sent = [
+            sent_row("mark@example.com", "Mark Blake", 1),
+            sent_row("mark@example.com", "Mark", 2),
+            sent_row("mark@example.com", "Mark Blake", 3),
+            sent_row("once@example.org", "M", 4),
+            sent_row("old@example.net", "Mark Blake", 5),
+            sent_row("old@example.net", " ", 6),
+            sent_row("", "No Address", 7),
+        ];
+
+        let identities = aggregate_identities(&configured, &sent);
+
+        let summary: Vec<(&str, bool, bool, usize)> = identities
+            .iter()
+            .map(|row| {
+                (
+                    row.address.as_str(),
+                    row.configured,
+                    row.primary,
+                    row.messages,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("mark@example.com", true, true, 3),
+                ("sales@example.com", true, false, 0),
+                ("old@example.net", false, false, 2),
+                ("once@example.org", false, false, 1),
+            ],
+            "configured first even when unused, then the rest by use"
+        );
+        assert_eq!(identities[0].display_names, ["Mark Blake", "Mark"]);
+        assert_eq!(identities[0].last_used, sent[2].date);
+        assert!(identities[1].display_names.is_empty() && identities[1].last_used.is_none());
+        assert_eq!(
+            identities[2].display_names,
+            ["Mark Blake"],
+            "a blank name is no name"
+        );
+    }
+
+    #[test]
+    fn identities_are_bounded_in_rows_and_names() {
+        let configured = ["mark@example.com".to_string()];
+        let mut sent: Vec<_> = (1..=60)
+            .map(|index| sent_row(&format!("a{index}@example.net"), "", 1))
+            .collect();
+        for (day, name) in ["A", "B", "C", "D", "E", "F"].into_iter().enumerate() {
+            sent.push(sent_row("mark@example.com", name, day as u32 + 1));
+        }
+
+        let identities = aggregate_identities(&configured, &sent);
+
+        assert_eq!(identities.len(), MAX_IDENTITY_ROWS);
+        assert!(identities[0].primary, "the configured rows survive the cap");
+        assert_eq!(
+            identities[0].display_names,
+            ["F", "E", "D", "C", "B"],
+            "equal use breaks to the newest, five at most"
+        );
+    }
+
     #[test]
     fn reply_subject_adds_exactly_one_prefix() {
         assert_eq!(reply_subject("Status"), "Re: Status");
@@ -6409,6 +6849,51 @@ mod tests {
         }
     }
 
+    /// `path` is where the file IS — absolute and canonical — not the bare
+    /// filename, which resolved against the server's working directory rather
+    /// than the output directory.
+    #[tokio::test]
+    async fn downloaded_attachments_report_their_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("agentmail-att-{}", uuid::Uuid::new_v4()));
+        let attachments = vec![
+            (
+                "report.pdf".to_string(),
+                "application/pdf".to_string(),
+                b"%PDF".to_vec(),
+            ),
+            (
+                "a/b.txt".to_string(),
+                "text/plain".to_string(),
+                b"hi".to_vec(),
+            ),
+        ];
+
+        let written = write_attachment_files(&dir, 7, &attachments)
+            .await
+            .expect("write into a fresh directory");
+
+        let canonical_dir = tokio::fs::canonicalize(&dir).await.expect("dir exists");
+        assert_eq!(written.len(), 2);
+        for file in &written {
+            let path = std::path::Path::new(&file.path);
+            assert!(path.is_absolute(), "{path:?}");
+            assert_eq!(path, canonical_dir.join(&file.filename));
+            assert_eq!(
+                tokio::fs::read(path).await.expect("written").len(),
+                file.size
+            );
+        }
+        assert_eq!(written[0].filename, "7_0_report.pdf");
+        let again = write_attachment_files(&dir, 7, &attachments[..1])
+            .await
+            .expect_err("an existing attachment is never overwritten");
+        assert!(
+            again.to_string().contains("refusing to overwrite"),
+            "{again}"
+        );
+        tokio::fs::remove_dir_all(dir).await.expect("cleanup");
+    }
+
     #[tokio::test]
     async fn archive_write_is_private_and_never_overwrites() {
         let dir = std::env::temp_dir().join(format!("agentmail-eml-{}", uuid::Uuid::new_v4()));
@@ -6452,6 +6937,7 @@ mod tests {
                 username: "Me@Example.COM".to_string(),
                 email: None,
                 aliases: Vec::new(),
+                display_name: None,
                 password: None,
                 tls: true,
                 max_connections: None,
@@ -7145,6 +7631,7 @@ mod tests {
                 username: "login".to_string(),
                 email: Some("me@example.com".to_string()),
                 aliases: Vec::new(),
+                display_name: None,
                 password: None,
                 tls: true,
                 max_connections: None,

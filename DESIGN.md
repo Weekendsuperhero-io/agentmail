@@ -2,7 +2,7 @@
 
 ## Overview
 
-Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 31 tools and 6 prompts for reading, searching, composing, organizing, archiving, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
+Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 36 tools and 6 prompts for reading, searching, composing, organizing, archiving, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
 
 MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | rmcp 2.2
 
@@ -20,7 +20,7 @@ graph TB
     end
 
     subgraph "agentmail-mcp (in-process)"
-        MCP[AgentMailServer<br/>31 tools, 6 prompts, tasks]
+        MCP[AgentMailServer<br/>36 tools, 6 prompts, tasks]
         MK[Agentmail Facade]
         POOL[ConnectionPool<br/>provider-aware cap/account]
         CRED[Credential Resolver]
@@ -54,7 +54,7 @@ graph LR
     subgraph "Standalone"
         CLI[agentmail serve] -->|stdio| MCP1[AgentMailServer]
         MCP1 --> MK1[Agentmail]
-        MK1 -->|config.toml| FS[~/.config/agentmail/]
+        MK1 -->|config.toml| FS[platform config dir/agentmail/]
     end
 
     subgraph "In-Process (Agent App)"
@@ -68,9 +68,12 @@ graph LR
 | --------------- | --------------------------------- | ----------------------------------------------- |
 | Binary          | `agentmail serve`                 | None (library)                                  |
 | Transport       | stdio                             | DuplexStream                                    |
-| Account config  | `~/.config/agentmail/config.toml` | Passed at spawn via `serve_on()`                |
+| Account config  | `<config dir>/agentmail/config.toml`¹ | Passed at spawn via `serve_on()`            |
 | Password source | keyring (agentmail service)       | keyring (agent service)                         |
 | Entry point     | `main.rs`                         | `agentmail_mcp::serve_on(transport, agentmail)` |
+
+¹ `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` (`~/.config`) on
+Linux, `%APPDATA%` on Windows; `AGENTMAIL_CONFIG` overrides it everywhere.
 
 ## Crate Structure
 
@@ -134,7 +137,11 @@ sequenceDiagram
 ```
 
 - Default 1 concurrent IMAP operation for Yahoo/AOL and 3 otherwise; configurable from 1 through 32
-- Sessions validated with NOOP before reuse
+- Sessions validated with NOOP before reuse — and only the NOOP's own tagged
+  `OK` counts; end-of-stream or `BYE` means dead (async-imap's `noop()` reports a
+  closed stream as success)
+- Idle age, the `[LIMIT]` login cooldown and the mailbox-catalog TTL run on the
+  wall clock: `Instant` stops while a Mac sleeps, the server's clocks do not
 - Stale sessions dropped, fresh ones created on demand
 - `PooledSession` auto-releases semaphore permit on drop
 
@@ -160,45 +167,53 @@ timeout/drop, and every `Secret` debug representation is redacted.
 
 ## MCP Tools
 
+[MCP.md](MCP.md) is the authoritative catalog; this is the shape.
+
 ### Read Operations (read_only_hint = true)
 
-| Tool                  | Description                                                      |
-| --------------------- | ---------------------------------------------------------------- |
-| `list_accounts`       | List configured IMAP accounts                                    |
-| `list_mailboxes`      | List mailboxes with counts, attributes (noSelect, noInferiors), and RFC 6154 roles |
-| `list_capabilities`   | Query IMAP server capabilities                                   |
-| `check_connection`    | Test IMAP connectivity                                           |
-| `get_messages`        | Paginated fetch, newest-first by UID                             |
-| `search_messages`     | IMAP SEARCH with text/header/flag filters                        |
-| `list_flags`          | List all flags in use with counts; resolves Apple Mail colors    |
-| `find_attachments`    | Scan for messages with attachments                               |
-| `top_senders`         | Rank senders by message count                                    |
-| `top_domains`         | Rank exact sender domains/subdomains with a live sample subject  |
-| `top_subscriptions`   | Rank bulk-mail senders by List-Unsubscribe, sorted by one-click  |
-| `top_mailing_lists`   | Rank mailing lists by List-Id (RFC 2919), groups across senders  |
-| `list_pending_moves`  | Inspect durable COPY-fallback operations needing recovery/review |
+| Tool                    | Description                                                      |
+| ----------------------- | ---------------------------------------------------------------- |
+| `list_accounts`         | Configured accounts, the default, and each one's sending addresses |
+| `list_identities`       | Sending addresses: configured identities plus what Sent mail used |
+| `list_mailboxes`        | Selectable mailboxes with counts and special-use roles, paginated |
+| `list_capabilities`     | Query IMAP server capabilities                                   |
+| `check_connection`      | Test IMAP connectivity                                           |
+| `get_messages`          | Paginated fetch, newest-first by UID                             |
+| `search_messages`       | IMAP SEARCH with text/header/flag/date/size filters              |
+| `list_flags`            | List all flags in use with counts; resolves Apple Mail colors    |
+| `find_attachments`      | Scan for messages with attachments                               |
+| `top_senders`           | Rank senders by message count                                    |
+| `top_domains`           | Rank exact sender domains/subdomains with a live sample subject  |
+| `top_subscriptions`     | Rank bulk-mail senders by List-Unsubscribe, sorted by one-click  |
+| `top_mailing_lists`     | Rank mailing lists by List-Id (RFC 2919), groups across senders  |
+| `list_pending_moves`    | Inspect durable COPY-fallback operations needing recovery/review |
+| `preview_thread_record` | Discover an exact Message-ID graph and return its digest         |
 
 ### Write Operations
 
-| Tool                   | Description                                                       |
-| ---------------------- | ----------------------------------------------------------------- |
-| `delete_messages`      | Delete by UID (up to 500)                                         |
-| `delete_by_sender`     | Delete all from a sender, optionally across all mailboxes         |
-| `delete_by_domain`     | Delete all from one exact canonical sender domain                 |
-| `delete_list_id`       | Delete all messages with a specific List-Id across all mailboxes  |
-| `move_by_sender`       | Move messages from an exact sender identity                       |
-| `move_by_domain`       | Move messages from one exact canonical sender domain              |
-| `move_list_id`         | Move messages with an exact List-Id                               |
-| `move_message`         | IMAP MOVE between mailboxes                                       |
-| `reconcile_moves`      | Safely resume durable COPY-fallback operations                    |
-| `create_mailbox`       | Create new folder                                                 |
-| `create_draft`         | Compose RFC822 → Drafts folder                                    |
-| `add_flags`            | Add flags and/or Apple Mail color (union semantics)               |
-| `remove_flags`         | Remove flags and/or clear Apple Mail color                        |
-| `unsubscribe_message`  | RFC 8058 one-click unsubscribe + bulk delete matching bulk mail   |
-| `download_attachments` | Extract attachments to disk                                       |
+| Tool                      | Description                                                     |
+| ------------------------- | --------------------------------------------------------------- |
+| `delete_messages`         | Delete by UID (up to 500)                                       |
+| `delete_by_sender`        | Delete all from a sender, optionally across all mailboxes       |
+| `delete_by_domain`        | Delete all from one exact canonical sender domain               |
+| `delete_list_id`          | Delete all messages with a specific List-Id                     |
+| `move_by_sender`          | Move messages from an exact sender identity                     |
+| `move_by_domain`          | Move messages from one exact canonical sender domain            |
+| `move_list_id`            | Move messages with an exact List-Id                             |
+| `move_subscription`       | Move the bulk-mail subscription behind a `top_subscriptions` row |
+| `move_message`            | IMAP MOVE between mailboxes                                     |
+| `reconcile_moves`         | Safely resume durable COPY-fallback operations                  |
+| `create_mailbox`          | Create new folder                                               |
+| `rename_mailbox`          | Preview, then confirm a guarded rename                          |
+| `delete_mailbox`          | Preview, then confirm a guarded delete                          |
+| `create_draft`            | Compose RFC822 → Drafts, fresh or as a reply, From an identity  |
+| `update_draft`            | Replace a draft (REPLACE or emulated), keeping its sender       |
+| `update_flags`            | Add/remove flags and set or clear the Apple Mail color, one call |
+| `unsubscribe_message`     | RFC 8058 one-click unsubscribe, optional matching cleanup       |
+| `download_attachments`    | Extract attachments to disk                                     |
 | `download_message_source` | Save exact RFC822 bytes with integrity and DKIM evidence        |
-| `download_thread`      | Save a caller-selected UID set plus a JSON evidence manifest      |
+| `download_thread`         | Save a caller-selected UID set plus a JSON evidence manifest    |
+| `export_thread_record`    | Confirm a preview digest; write PDF, EML and a manifest         |
 
 ## MCP Prompts (6)
 
@@ -265,7 +280,11 @@ within `1..=32`, an explicit default account must exist, and plaintext IMAP
 TOML before replacing it atomically, uses `0600` files on Unix, and disables
 terminal echo for password entry. A primary mailbox `email` is modelled
 separately from the login username, and `aliases` are canonicalized and
-deduplicated for own-address comparisons; opaque IMAP usernames remain valid.
+deduplicated; opaque IMAP usernames remain valid. The primary and the aliases
+are the account's sending identities — the only addresses a draft may be
+`From` — and `display_name` is the name drafts carry. A distinct login is a
+credential, used to recognize the account's own mail but never sent as unless
+it is also listed as an alias.
 
 ## Verification
 

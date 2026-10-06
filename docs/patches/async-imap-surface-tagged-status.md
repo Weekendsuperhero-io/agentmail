@@ -1,4 +1,11 @@
-# Patch: surface tagged NO/BAD on SEARCH and FETCH (async-imap 0.11.3)
+# Patch: surface tagged NO/BAD on SEARCH and FETCH (async-imap 0.11.3, 0.12.0)
+
+Status: NOT applied. Re-checked against async-imap 0.12.0 (2026-10-06): the
+release moved to imap-proto 0.17 and fixed LOGIN, but `parse_ids` and
+`parse_fetches` still drain with `take_while(filter)`, so the gap below is
+unchanged and agentmail's guards stay load-bearing. In 0.12 the tagged
+response's code and text moved into `Response::Done { outcome, .. }`
+(`outcome.code`, `outcome.information`); the sketch below is written for 0.12.
 
 ## The bug
 
@@ -46,8 +53,9 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
 
     while let Some(resp) = stream.try_next().await? {
         match resp.parsed() {
-            Response::Done { tag, status, code, information, .. } if tag == &command_tag => {
+            Response::Done { tag, status, outcome } if tag == &command_tag => {
                 use imap_proto::Status;
+                let (code, information) = (&outcome.code, &outcome.information);
                 match status {
                     Status::Ok => break,
                     Status::Bad => return Err(Error::Bad(format!("code: {code:?}, info: {information:?}"))),

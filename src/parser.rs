@@ -30,7 +30,7 @@ pub fn parse_rfc822(
 
     let subject = parsed.subject().unwrap_or("").to_string();
     let sender = format_address(parsed.from());
-    let reply_to = format_address(parsed.reply_to());
+    let reply_to = format_address_list(parsed.reply_to());
     let to = format_address_list(parsed.to());
     let cc = format_address_list(parsed.cc());
     let bcc = format_address_list(parsed.bcc());
@@ -363,13 +363,51 @@ fn format_address_list(addr: Option<&mail_parser::Address<'_>>) -> Vec<String> {
 }
 
 fn format_single_addr(a: &mail_parser::Addr<'_>) -> String {
-    let name = a.name.as_deref().unwrap_or("");
-    let email = a.address.as_deref().unwrap_or("");
+    format_name_addr(
+        a.name.as_deref().unwrap_or(""),
+        a.address.as_deref().unwrap_or(""),
+    )
+}
+
+/// `Name <email>`, or the bare `email` when there is no name — written so it
+/// parses back as exactly ONE mailbox.
+///
+/// A display name holding an RFC 5322 special (`,` `.` `@` `"` `<` …) is
+/// emitted as a quoted-string with `\` and `"` escaped. Unquoted, the sender
+/// `"Blake, Mark" <m@x>` came out as `Blake, Mark <m@x>` — two mailboxes to
+/// any parser, and a refused address when a reply fed it back into a draft.
+/// Control characters, CR and LF included, cannot appear in a header phrase
+/// and are dropped. Our own quoting rather than lettre's `Mailbox` `Display`,
+/// which fails outright on a CR or LF in the name.
+pub(crate) fn format_name_addr(name: &str, email: &str) -> String {
+    let name: String = name
+        .chars()
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    let name = name.trim();
     if name.is_empty() {
-        email.to_string()
-    } else {
-        format!("{} <{}>", name, email)
+        return email.to_string();
     }
+    if name.chars().all(|c| c == ' ' || is_atext(c)) {
+        return format!("{name} <{email}>");
+    }
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for c in name.chars() {
+        if matches!(c, '\\' | '"') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    format!("{quoted} <{email}>")
+}
+
+/// RFC 5322 `atext`, plus the non-ASCII letters RFC 6532 admits: everything
+/// that may stand in an unquoted display name between spaces.
+fn is_atext(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c) || !c.is_ascii()
 }
 
 #[cfg(test)]
@@ -408,6 +446,72 @@ mod tests {
             map.get("Subject").map(Vec::as_slice),
             Some(["Hi there".to_string()].as_slice())
         );
+    }
+
+    /// Every formatted address parses back as exactly ONE mailbox with the
+    /// same name — the property a reply depends on when it feeds a sender
+    /// back into a draft.
+    #[test]
+    fn format_name_addr_quotes_names_that_hold_specials() {
+        for (name, expected) in [
+            ("", "m@x.example"),
+            ("Mark Blake", "Mark Blake <m@x.example>"),
+            ("José Ñúñez", "José Ñúñez <m@x.example>"),
+            ("Blake, Mark", "\"Blake, Mark\" <m@x.example>"),
+            ("m@x.example", "\"m@x.example\" <m@x.example>"),
+            ("J. Smith", "\"J. Smith\" <m@x.example>"),
+            (
+                "Mark \"Shark\" Blake",
+                "\"Mark \\\"Shark\\\" Blake\" <m@x.example>",
+            ),
+            ("back\\slash", "\"back\\\\slash\" <m@x.example>"),
+            (
+                "Mark\r\nBcc: evil@x.example",
+                "\"MarkBcc: evil@x.example\" <m@x.example>",
+            ),
+        ] {
+            let formatted = format_name_addr(name, "m@x.example");
+            assert_eq!(formatted, expected, "name {name:?}");
+            let mailbox: lettre::message::Mailbox = formatted
+                .parse()
+                .unwrap_or_else(|error| panic!("{formatted:?} must parse: {error}"));
+            let expected_name: String = name.chars().filter(|c| !c.is_control()).collect();
+            assert_eq!(
+                mailbox.name.as_deref().unwrap_or(""),
+                expected_name,
+                "name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reply_to_address_is_kept() {
+        let raw = b"From: \"Blake, Mark\" <mark@example.com>\r\n\
+                    Reply-To: Desk <desk@example.com>, \"Blake, Mark\" <mark@example.com>\r\n\
+                    Subject: s\r\n\r\nbody";
+        let message =
+            parse_rfc822(raw, 1, Vec::new(), None, "INBOX", "work", false, false).expect("parse");
+
+        assert_eq!(message.sender, "\"Blake, Mark\" <mark@example.com>");
+        assert_eq!(
+            message.reply_to,
+            [
+                "Desk <desk@example.com>",
+                "\"Blake, Mark\" <mark@example.com>"
+            ]
+        );
+        let without = parse_rfc822(
+            b"From: a@b.example\r\n\r\nx",
+            2,
+            Vec::new(),
+            None,
+            "INBOX",
+            "work",
+            false,
+            false,
+        )
+        .expect("parse");
+        assert!(without.reply_to.is_empty());
     }
 
     /// Empty (whitespace-only) header values are skipped — no key is created,

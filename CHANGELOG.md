@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-08-04T00:00
+updated: 2026-10-06T00:00
 ---
 # Changelog
 
@@ -13,11 +13,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sender identity** — `display_name` in an account's config makes drafts
+  `From: Mark Blake <you@example.com>`. `create_draft` and `update_draft` take an
+  optional `from` (`Name <address>` or an address) that must be one of the
+  account's identities — the primary address, then its aliases — and refuse any
+  other address with the list of usable ones. Both results report the `from`
+  actually written. The CLI gains `create-draft --from`, and `configure` asks
+  for "Your name (shown on drafts)". `AccountConfig::identities()`,
+  `with_display_name` and `validate_display_name` are public.
+- **`list_identities` tool** (36 tools) — an account's configured identities
+  plus the From addresses among its newest Sent messages (default 200, max
+  1000; `EXAMINE` + `BODY.PEEK`), each with a count, the display names used and
+  when it was last used. Evidence only: a discovered address is not sendable
+  until it is added as an alias. `list_accounts` now carries each account's
+  `displayName` and `addresses`.
 - **Evidence-grade RFC822 archive tools** — `download_message_source` writes one
   exact `BODY.PEEK[]` result directly to a create-new private file, returning
   its SHA-256, parsed message metadata, and a contemporaneous DNS-backed local
   DKIM result. `download_thread` applies the same contract to a caller-selected
   set of up to 100 UIDs and creates a JSON manifest.
+
+### Changed
+
+- **Replies are From the address the original reached** — the original's own
+  `From` for a follow-up to this account's mail, else the first identity in its
+  `To`, then `Cc`. `update_draft` keeps the draft's current `From` (name
+  included) when it is one of the account's identities instead of overwriting
+  it with the primary address.
+- **Replies go to every Reply-To address.** `MessageInfo.reply_to` is now
+  `Vec<String>` (JSON `replyTo` is an array), where only the first address was
+  kept before.
+- **Breaking library API (0.7.0)** — `create_draft_with_headers`,
+  `create_reply_draft` and `update_draft` take `from: Option<&str>`;
+  `CreateDraftResponse`/`UpdateDraftResponse` gain `from`; `AccountConfig`
+  gains `display_name`; `AccountInfo` gains `display_name` and `addresses`.
+- **A distinct login is never a sending identity** unless listed in `aliases`;
+  an alias equal to the login is now kept rather than normalized away.
+- **Dependencies** — async-imap 0.11.3 → 0.12.0 (LOGIN no longer fails on a
+  `NO` for another tag; unicode banners parse) with the vendored imap-proto
+  rebased onto 0.17.0 (nom 8) and its UIDFETCH patch re-applied; mail-auth
+  0.12.1 → 0.13.3; dirs 6 → 7; semver-compatible updates across the lockfile.
+  rusqlite stays at 0.39 (the embedding app's sqlx-sqlite caps libsqlite3-sys
+  below 0.38) and rmcp at 2.2.0 (3.x removes the task API; its own decision in
+  the embedding workspace).
+
+### Fixed
+
+- **Dead pooled sessions passed their liveness check.** async-imap's `NOOP`
+  treats end-of-stream as success, and on macOS a reset connection reads as
+  end-of-stream, so after sleep or a server `BYE` the pool handed out dead
+  sessions and drafts reported a false "APPEND outcome is ambiguous". `NOOP` now
+  passes only on its own tagged `OK`.
+- **Pool and catalog timers stopped while the Mac slept.** Idle eviction, the
+  `[LIMIT]` login cooldown and the mailbox-catalog TTL now run on the wall
+  clock; a clock set back counts as expired.
+- **Replying to a sender with a comma or `@` in their name failed.** Display
+  names holding RFC 5322 specials are quoted (`"Blake, Mark" <m@x>`), and an
+  agent-written `Blake, Mark <m@x>` is accepted as one mailbox — while
+  `Bob <b@y>, Alice <a@x>` is still refused rather than losing Bob.
+- **A draft for an account with no email address** failed as "Invalid email
+  address 'johnappleseed'"; it now says to set `email`.
+- **`download_attachments` returned the bare filename as `path`**; it is now the
+  absolute, canonical path, as `download_message_source` returns.
+- **An expired task's status watcher waited forever** — the TTL prune aborted
+  the worker without publishing a result. Expiry now publishes a cancelled one.
+- **`configure` wrote Rust escapes into TOML** (`\u{301}` for a decomposed
+  accent), producing a config file that failed to parse; every string is now
+  written by the TOML serializer.
+- **README claimed `~/.config/agentmail/config.toml` works on macOS**; only
+  `~/Library/Application Support/agentmail/config.toml` (or
+  `AGENTMAIL_CONFIG`) is read.
 
 ### Security
 
