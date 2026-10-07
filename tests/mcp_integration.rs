@@ -584,6 +584,28 @@ async fn draft_tools_take_a_sender_and_refuse_one_the_account_does_not_own() {
     }
 }
 
+/// Recipients take `Name <address>` exactly as `from` does, and every
+/// recipient field of both draft tools says so — an agent that only sees
+/// "email addresses" strips the names the user typed.
+#[tokio::test]
+async fn every_recipient_field_documents_the_named_form() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in ["create_draft", "update_draft"] {
+        let properties = &find_tool(tools, name)["inputSchema"]["properties"];
+        for field in ["to", "cc", "bcc", "replyTo"] {
+            let description = properties[field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                description.contains("Name <address>"),
+                "`{name}.{field}` must document the named form: {description:?}"
+            );
+        }
+    }
+}
+
 /// Adding `from` did not loosen the schema: a near-miss name is still refused
 /// with the field named, rather than silently ignored.
 #[tokio::test]
@@ -1233,6 +1255,37 @@ async fn tools_list_carries_the_live_accounts_in_the_account_enum() {
         None,
         "a tool with no account argument is untouched"
     );
+}
+
+/// Every server in a process dispatches through ONE shared tool router, and
+/// `tools/list` patches each server's accounts into copies of its schemas. A
+/// patch written into the shared definitions would leak one server's accounts
+/// into the next server's list.
+#[tokio::test]
+async fn servers_sharing_the_tool_router_each_advertise_only_their_own_accounts() {
+    let server = |name: &str| {
+        Config::from_accounts(vec![(
+            name.to_string(),
+            AccountConfig::new("imap.invalid", format!("{name}@example.invalid")),
+        )])
+    };
+    let mut clients = [
+        (McpClient::start_with(server("work")).await, "work"),
+        (McpClient::start_with(server("home")).await, "home"),
+    ];
+
+    // work, home, then work again: the second list of a server must not carry
+    // what the other server patched in between.
+    for index in [0, 1, 0] {
+        let (client, expected) = &mut clients[index];
+        let resp = client.request("tools/list", json!({})).await;
+        let tools = resp["result"]["tools"].as_array().expect("tools array");
+        assert_eq!(
+            find_tool(tools, "get_messages")["inputSchema"]["properties"]["account"]["enum"],
+            json!([*expected]),
+            "each server lists only its own accounts"
+        );
+    }
 }
 
 /// EVERY advertised template completes, including the mailbox index — which is

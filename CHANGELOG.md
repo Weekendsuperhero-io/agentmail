@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when it was last used. Evidence only: a discovered address is not sendable
   until it is added as an alias. `list_accounts` now carries each account's
   `displayName` and `addresses`.
+- **`ListIdentitiesResponse` and `SenderIdentity` implement `Deserialize`**, so
+  an embedder can read the `list_identities` tool's structured result back into
+  the library type (the wire output is asserted to round-trip). Agent Muse's
+  Mail Accounts settings use it to offer the Sent addresses as aliases.
+- **Every recipient field documents `Name <address>`** — `to`, `cc`, `bcc` and
+  `replyTo` on both draft tools, and the handshake instructions — so agents keep
+  the names users write instead of stripping them to bare addresses.
 - **Evidence-grade RFC822 archive tools** — `download_message_source` writes one
   exact `BODY.PEEK[]` result directly to a create-new private file, returning
   its SHA-256, parsed message metadata, and a contemporaneous DNS-backed local
@@ -49,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gains `display_name`; `AccountInfo` gains `display_name` and `addresses`.
 - **A distinct login is never a sending identity** unless listed in `aliases`;
   an alias equal to the login is now kept rather than normalized away.
+- **`AGENTMAIL_CACHE_DIR` holds both caches directly** —
+  `<dir>/header-cache-v1.sqlite3` beside `<dir>/mutation-journal.sqlite3`, the
+  layout the builder's `cache_dir(dir)` already used. The header cache used to
+  sit one level deeper (`<dir>/agentmail/`); that copy is no longer read and
+  rebuilds on its own.
+- **`SecretError` gains `NoEntry` and `KeyringTimedOut`** (breaking for
+  exhaustive matches): a missing keychain entry was `Backend(..)`.
+- **The tool router is built once per process**, not on every `call_tool`,
+  `list_tools` and `get_tool`.
 - **Dependencies** — async-imap 0.11.3 → 0.12.0 (LOGIN no longer fails on a
   `NO` for another tag; unicode banners parse) with the vendored imap-proto
   rebased onto 0.17.0 (nom 8) and its UIDFETCH patch re-applied; mail-auth
@@ -77,6 +93,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absolute, canonical path, as `download_message_source` returns.
 - **An expired task's status watcher waited forever** — the TTL prune aborted
   the worker without publishing a result. Expiry now publishes a cancelled one.
+- **The UID Mode walk could loop forever** on a server that ignores the UID
+  range, re-fetching the same page until cancelled. A page that does not move
+  the range down is now refused.
+- **Unsolicited FETCH responses** — another client changing flags while a
+  fetch runs — failed `get_messages` ("message UID 0") and could add empty or
+  duplicate rows to the ranking projection. Only the requested UIDs, each with
+  its fetched section, are kept.
+- **The keepalive could open a second connection** on one-connection
+  providers (Yahoo/AOL): it took idle sessions out of the pool without a
+  connection permit, so an acquire during the ping LOGINed anew. It now pings
+  under a permit and skips accounts whose connections are all busy.
+- **A locked keychain** could stall every connect for the account (the read
+  had no deadline and runs under the connect lock), and without a configured
+  `password` it was reported as "No password found". Keychain calls now give
+  up after 30 s with a reason, and only a genuinely absent entry reads as
+  missing.
+- **Attachments named past a filesystem's 255-byte limit could not be
+  downloaded** ("File name too long"). The canonical `{uid}_{index}_{name}` is
+  now shortened to 240 bytes, its extension kept and never split mid-character,
+  and `/info` advertises exactly that name.
+- **A `download_attachments` failure partway left files behind**, unreported.
+  The download is now all or nothing: every name is checked before writing,
+  and a failure removes what was already written.
 - **`configure` wrote Rust escapes into TOML** (`\u{301}` for a decomposed
   accent), producing a config file that failed to parse; every string is now
   written by the TOML serializer.

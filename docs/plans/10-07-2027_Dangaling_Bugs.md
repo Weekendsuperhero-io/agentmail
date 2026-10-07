@@ -1,0 +1,35 @@
+# 10-07-2027_Dangaling_Bugs
+
+Here are the 16 Part 5 findings, each re-checked against today's code, with an effort level. All 16 still hold, and two came out different on the re-check (see below the table).
+
+**Effort scale:** XS = up to 2 hours · S = about half a day · M = 1–2 days · L = 3+ days. Each includes tests.
+
+| # | Sev | Finding | Where | Effort | What drives it | Status |
+|---|---|---|---|---|---|---|
+| 1 | Med | Account-wide scans keep using a session after a connection error, waiting the app's 120 s timeout per remaining folder, and still return `Ok` | `lib.rs:2489`, `:2504`, `:2757`, `:3026`, `:4646` | M | Four sites. Two scan outputs need a new skipped-mailboxes field to report the gap. |
+| 2 | **High** | Any SELECT failure during move reconciliation becomes a permanent `NeedsAttention`, and nothing can clear it. A BYE right after SELECT can mark a move Complete while the source copy survives. | `imap_client.rs:2892`, `:2918` | L | Error classification (S) and a search that must see its own tagged OK (S–M), plus a new tool or argument to clear stuck moves (M). |
+| 3 | Med | Login retries `AUTHENTICATIONFAILED` 3 times, even on Yahoo/AOL | `imap_client.rs:444`, `:612` | XS | The code change is tiny. Whether Yahoo sends transient auth failures needs a decision or a real-account check. |
+| 4 | Med | Cancelling a task aborts it mid-mutation and loses the partial counts | `mcp/tasks.rs:353` | L | Cooperative stop with a grace period, sweeps returning partial totals instead of an error, and a `cancelled` field in outputs. |
+| 5 | Low-Med | An unsolicited `FETCH (FLAGS…)` becomes a UID-0 row, which fails the page or adds a bogus one | `imap_client.rs:2021`, `:2219` | S | Keep only requested UIDs, and audit the 4 other fetch loops. | Done |
+| 6 | Low-Med | `ENABLE UIDONLY` is re-sent on a session already in UID mode or after SELECT; a strict server's BAD fails the whole sweep | `lib.rs:1073`, `:2416` | S | Skip ENABLE on UID-mode sessions and enable only on fresh ones. A Yahoo/AOL probe should confirm. |
+| 7 | Low | Keepalive pings outside the pool permit, so a concurrent acquire can open a second Yahoo login | `connection.rs:426` | S | Take the account permit before pinging; the concurrency test is the fiddly part. | Done |
+| 8 | Low | The keyring read has no deadline and runs under the connect lock; a locked keychain can stall every connect or read as "no password" | `credentials.rs:22-35`, `secret.rs:265`, `connection.rs:711-743` | S | Timeout plus a distinct "keychain locked" error. | Done|
+| 9 | Low | The UID-mode walk has no progress guard; a server that ignores the range loops until cancelled | `imap_client.rs:519-563` | XS | Require the upper bound to fall each page, plus an iteration cap. | Done A server that ignores the range used to loop until the 5 s timeout; now it errors after one repeat. |
+| 10 | Low | File sandbox: (a) recreates a missing (unmounted) workspace; (b) checks a path, then uses it later (race); (c) errors name stale roots | `mcp/file_access.rs:94`, `:177-233`, `:161` | S for (a)+(c), L for (b) | The race fix means directory-handle-relative I/O (cap-std or `openat`) across every download, archive and attachment path. |
+| 11 | Low | Resources: (a) library size refusals surface as `internal_error`; (b) one attachment fetches and decodes the whole message; (c) each `uidValidity` completion costs a STATUS and can starve a 1-connection pool | `mcp/resources.rs:563`, `:791`, `:921` | S + M + S | (b) is the risky one: fetching a single part must keep `/info`'s attachment numbering. |
+| 12 | Low | The tool router is rebuilt on every `list_tools` **and every `call_tool`** (wider than first reported) | `mcp/mod.rs:335`, `:366`, `:389` | XS | Build once, then patch the account enum per call. | Done The same tool fetched on two threads came back with different schema copies. A second test runs two servers with different accounts to check neither sees the other's accounts. |
+| 13 | Low | A failed `download_attachments` doesn't report files already written | `lib.rs:6471` | S | Pre-check every target name first, and clean up or report on a mid-write failure. | Done |
+| 14 | Low | `AGENTMAIL_CACHE_DIR` means `<dir>/agentmail/` for the header cache but `<dir>/` for the move journal | `header_cache.rs:1394` vs `mutation_journal.rs:117` | XS | Move the header cache (a one-time rebuild), never the journal: pending moves live there. | Done A layout test covering both files, with and without the variable. |
+| 15 | Upstream | async-imap 0.12 still swallows a tagged NO/BAD after SEARCH/FETCH | async-imap `parse.rs` | M | Carry a fork like the imap-proto one, plus an upstream PR. Filing the issue alone is XS. |
+| 16 | Docs | CHANGELOG has no 0.5/0.6 sections; ARCHITECTURE.md points at a nonexistent path | `CHANGELOG.md`, parent `ARCHITECTURE.md:266` | XS + S | There are no v0.5.0/v0.6.0 git tags, so the release boundaries have to be reconstructed from history. | Done
+
+**Changed on re-check:**
+- **#2 is worse than reported, so I've raised it to High.** A stuck move also blocks renaming or deleting both its source and destination mailboxes. The only remedy offered is "reconcile that operation", and reconcile returns `NeedsAttention` immediately. So one transient connection drop can lock two mailboxes for good.
+- **#3 is narrower.** A `[LIMIT]` reply itself is already exempt from retry; only the auth-failure retries remain.
+
+**Suggested order:**
+1. The quick wins: #9, #12, #14, the ARCHITECTURE.md path, #5, #7, #8, #13.
+2. #2, for data integrity and the permanent block.
+3. #1.
+4. #6 and #3 once you've checked Yahoo/AOL behaviour.
+5. The larger items: #4, #10b, #11b, #15.

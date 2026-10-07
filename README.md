@@ -609,10 +609,14 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 ### Ranking cache privacy and configuration
 
 The ranking cache defaults to
-`dirs::cache_dir()/agentmail/header-cache-v1.sqlite3`. Set
-`AGENTMAIL_CACHE_DIR` to override the cache root, or set
-`AGENTMAIL_DISABLE_HEADER_CACHE=1` (`true` and `yes` also work) to use live scans
-only. SQLite failures automatically fall back to live IMAP behavior.
+`dirs::cache_dir()/agentmail/header-cache-v1.sqlite3`. Set `AGENTMAIL_CACHE_DIR`
+to keep it and the recovery journal directly in another directory —
+`<dir>/header-cache-v1.sqlite3` and `<dir>/mutation-journal.sqlite3`, the same
+layout as the builder's `cache_dir(dir)` (before 0.7 the header cache went one
+level deeper, in `<dir>/agentmail/`; that copy is no longer read, rebuilds on its
+own, and can be deleted). Set `AGENTMAIL_DISABLE_HEADER_CACHE=1` (`true` and
+`yes` also work) to use live scans only. SQLite failures automatically fall back
+to live IMAP behavior.
 
 Embedding applications configure the same knobs programmatically — explicit
 builder settings override the environment variables:
@@ -685,8 +689,8 @@ agentmail reconcile-moves --account gmail --operation-id <operation-id>
 # Omit --operation-id to reconcile every pending operation for the account.
 ```
 
-The recovery database lives beside the ranking cache (or under
-`AGENTMAIL_CACHE_DIR`), uses `synchronous=FULL`, and has owner-only permissions
+The recovery database lives beside the ranking cache (both directly in
+`AGENTMAIL_CACHE_DIR` when it is set), uses `synchronous=FULL`, and has owner-only permissions
 on Unix. It remains enabled when header-cache persistence is disabled because
 mutation intent is not disposable. Reconciliation repeats COPY only when
 unchanged destination `UIDNEXT` proves the ambiguous attempt created nothing.

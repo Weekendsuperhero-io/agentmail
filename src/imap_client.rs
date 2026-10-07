@@ -288,6 +288,48 @@ where
     .await
 }
 
+/// The items of a `UID FETCH` that answer it: one per requested UID, in the
+/// order the server sent them.
+///
+/// Unsolicited FETCH responses — another client changing a message's flags
+/// while this command runs — share the command's response stream, and
+/// async-imap yields them as ordinary items. Taken at face value, one without
+/// a UID became "UID 0" and failed the whole page, one for a UID nobody asked
+/// for became a row of its own, and a FLAGS-only repeat of a requested message
+/// became a second, empty row for it. Kept: for each requested UID, its first
+/// item that carries a fetched section, else its first item. An item is never
+/// dropped for lacking a section alone — a requested message whose section came
+/// back `NIL` still answers, and callers that prune unanswered UIDs rely on it.
+fn answering_fetches(
+    fetched: Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>,
+    requested: &[u32],
+) -> Result<Vec<(u32, async_imap::types::Fetch)>> {
+    let carries_section = |fetch: &async_imap::types::Fetch| {
+        fetch.header().is_some() || fetch.body().is_some() || fetch.text().is_some()
+    };
+    let requested: hashbrown::HashSet<u32> = requested.iter().copied().collect();
+    let mut answers: Vec<(u32, async_imap::types::Fetch)> = Vec::with_capacity(requested.len());
+    let mut position: hashbrown::HashMap<u32, usize> = hashbrown::HashMap::new();
+    for item in fetched {
+        let fetch = item.map_err(AgentmailError::Imap)?;
+        let Some(uid) = fetch.uid.filter(|uid| requested.contains(uid)) else {
+            continue;
+        };
+        match position.get(&uid) {
+            Some(&index) => {
+                if !carries_section(&answers[index].1) && carries_section(&fetch) {
+                    answers[index].1 = fetch;
+                }
+            }
+            None => {
+                position.insert(uid, answers.len());
+                answers.push((uid, fetch));
+            }
+        }
+    }
+    Ok(answers)
+}
+
 /// Select a mailbox with timeout. Use this instead of calling `session.select()` directly.
 /// Yahoo/AOL intermittently answer SELECT/EXAMINE with
 /// `NO [SERVERBUG] ... Please try again later`. It is genuinely transient;
@@ -556,9 +598,24 @@ where
         if page < window {
             break;
         }
-        // Next page covers UIDs strictly below the lowest one just seen.
+        // Next page covers UIDs strictly below the lowest one just seen. The
+        // bound must SHRINK every page: a server that ignores the range answers
+        // each request with the same newest window, and without this check the
+        // walk would re-fetch it until someone cancelled.
         match lowest {
-            Some(low) if low > 1 => upper = Some(low - 1),
+            Some(low) if low > 1 => {
+                let next = low - 1;
+                if let Some(previous) = upper
+                    && next >= previous
+                {
+                    return Err(AgentmailError::Parse(format!(
+                        "UID Mode walk made no progress: the server answered UIDs 1:{previous} \
+                         with a page reaching down only to UID {low}; it may be ignoring the \
+                         requested range"
+                    )));
+                }
+                upper = Some(next);
+            }
             _ => break,
         }
     }
@@ -1886,12 +1943,7 @@ async fn fetch_rank_header_rows(
 
         let fetched = timed_uid_fetch_collect(session, &uid_set, items).await?;
 
-        for item in fetched {
-            let fetch = item.map_err(AgentmailError::Imap)?;
-            let uid = match fetch.uid {
-                Some(u) => u,
-                None => continue,
-            };
+        for (uid, fetch) in answering_fetches(fetched, chunk)? {
             let header_bytes = fetch.header().unwrap_or(&[]);
             let header_str = String::from_utf8_lossy(header_bytes);
 
@@ -1965,9 +2017,7 @@ where
             "(UID BODY.PEEK[HEADER.FIELDS (List-Id)])",
         )
         .await?;
-        for item in fetched {
-            let fetch = item.map_err(AgentmailError::Imap)?;
-            let Some(uid) = fetch.uid else { continue };
+        for (uid, fetch) in answering_fetches(fetched, chunk)? {
             let header_str = String::from_utf8_lossy(fetch.header().unwrap_or(&[]));
             results.push((uid, extract_header_value(&header_str, "List-Id")));
         }
@@ -2013,12 +2063,7 @@ pub async fn fetch_by_uids(
 
     // Extract owned data from the IMAP fetch results so we can parse off-thread
     let mut raw_items: RawFetchItems = Vec::with_capacity(fetched.len());
-    for item in fetched {
-        if item.is_err() {
-            debug!("FETCH item error");
-        }
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        let uid = fetch.uid.unwrap_or(0);
+    for (uid, fetch) in answering_fetches(fetched, uids)? {
         let size = fetch.size;
         if include_content && size.is_none_or(|value| value as usize > MAX_TRANSIENT_MESSAGE_BYTES)
         {
@@ -4858,6 +4903,78 @@ mod tests {
                 && fetches[1].contains("UID FETCH 1:97 ")
                 && fetches[2].contains("UID FETCH 1:94 "),
             "the UID range shrinks below the lowest UID of the prior page: {fetches:?}"
+        );
+    }
+
+    /// Another client changing flags mid-fetch makes the server interleave
+    /// unsolicited FETCH responses into our UID FETCH: one without a UID, one
+    /// for a UID nobody asked for, and a FLAGS-only repeat of the requested
+    /// message. Only the requested message, with its fetched header, may come
+    /// back.
+    #[tokio::test]
+    async fn unsolicited_fetch_responses_do_not_become_messages() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command.contains("UID FETCH").then(|| {
+                let header = "From: Ann <ann@example.com>\r\nSubject: Hello\r\n\r\n";
+                // A FLAGS-only repeat on BOTH sides of the real answer: the
+                // fetched section must win whichever arrives first.
+                format!(
+                    "* 3 FETCH (FLAGS (\\Seen))\r\n\
+                     * 1 FETCH (UID 7 FLAGS (\\Answered))\r\n\
+                     * 1 FETCH (UID 7 FLAGS () INTERNALDATE \"06-Oct-2026 10:00:00 +0000\" \
+                     RFC822.SIZE 120 BODY[HEADER] {{{}}}\r\n{header})\r\n\
+                     * 4 FETCH (UID 99 FLAGS (\\Flagged))\r\n\
+                     * 1 FETCH (UID 7 FLAGS (\\Seen))\r\n\
+                     {tag} OK UID FETCH completed\r\n",
+                    header.len()
+                )
+            })
+        })
+        .await;
+
+        let messages = fetch_by_uids(&mut session, &[7], "INBOX", "work", false, false)
+            .await
+            .expect("unsolicited updates must not fail the page");
+
+        let rows: Vec<(u32, &str)> = messages
+            .iter()
+            .map(|message| (message.uid, message.subject.as_str()))
+            .collect();
+        assert_eq!(rows, [(7, "Hello")]);
+        drop(session);
+        server.commands().await;
+    }
+
+    /// A server that ignores the UID range answers every page with the same
+    /// newest window. The walk must refuse that instead of re-fetching it until
+    /// someone cancels — the scan would otherwise never finish.
+    #[tokio::test]
+    async fn walk_all_uids_uidmode_refuses_a_server_that_ignores_the_range() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command.contains("UID FETCH").then(|| {
+                format!(
+                    "* 10 UIDFETCH (UID 10)\r\n* 9 UIDFETCH (UID 9)\r\n\
+                     {tag} OK UID FETCH completed\r\n"
+                )
+            })
+        })
+        .await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            walk_all_uids_uidmode(&mut session, 2, None, None),
+        )
+        .await
+        .expect("the walk must end, not loop on a repeated page");
+
+        let error = outcome.expect_err("a page that does not shrink is refused");
+        assert!(error.to_string().contains("no progress"), "{error}");
+        drop(session);
+        let commands = server.commands().await;
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("UID FETCH")).count(),
+            2,
+            "one repeat is enough to know: {commands:?}"
         );
     }
 

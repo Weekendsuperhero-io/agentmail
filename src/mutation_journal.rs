@@ -114,11 +114,7 @@ impl MutationJournal {
     }
 
     pub(crate) fn default_path() -> Option<PathBuf> {
-        if let Some(path) = std::env::var_os("AGENTMAIL_CACHE_DIR") {
-            return Some(PathBuf::from(path).join(Self::FILE_NAME));
-        }
-        let root = dirs::cache_dir()?;
-        Some(root.join("agentmail").join(Self::FILE_NAME))
+        crate::default_cache_file(Self::FILE_NAME)
     }
 
     pub(crate) fn default_persistent() -> Self {

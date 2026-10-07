@@ -1015,6 +1015,67 @@ mod tests {
         );
     }
 
+    /// Every recipient field takes the same forms `from` does — a bare
+    /// address, `Name <address>`, a quoted name, a non-ASCII name, and an
+    /// unquoted `Last, First <address>` — and each name survives to the header.
+    #[test]
+    fn recipients_take_a_name_in_every_address_field() {
+        let raw = compose_draft_with_headers(
+            "s",
+            "b",
+            &[
+                "Ann Example <ann@example.com>".to_string(),
+                "plain@example.com".to_string(),
+            ],
+            &["\"Blake, Mark\" <mark@example.com>".to_string()],
+            &["Blake, Jo <jo@example.com>".to_string()],
+            Some(&me()),
+            &[],
+            DraftHeaderOptions {
+                reply_to: &["José Núñez <jose@example.com>".to_string()],
+                in_reply_to: None,
+                references: &[],
+                apple_uuid: uuid::Uuid::nil(),
+                body_format: BodyFormat::PlainOnly,
+            },
+        )
+        .expect("named recipients compose");
+        let parsed = parse(&raw);
+        let mailboxes = |header: Option<&mail_parser::Address<'_>>| -> Vec<(String, String)> {
+            header
+                .expect("header present")
+                .iter()
+                .map(|addr| {
+                    (
+                        addr.name.as_deref().unwrap_or("").to_string(),
+                        addr.address.as_deref().unwrap_or("").to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            mailboxes(parsed.to()),
+            [
+                ("Ann Example".to_string(), "ann@example.com".to_string()),
+                (String::new(), "plain@example.com".to_string()),
+            ]
+        );
+        assert_eq!(
+            mailboxes(parsed.cc()),
+            [("Blake, Mark".to_string(), "mark@example.com".to_string())]
+        );
+        assert_eq!(
+            mailboxes(parsed.bcc()),
+            [("Blake, Jo".to_string(), "jo@example.com".to_string())],
+            "the unquoted Last, First form arrives as one named mailbox"
+        );
+        assert_eq!(
+            mailboxes(parsed.reply_to()),
+            [("José Núñez".to_string(), "jose@example.com".to_string())]
+        );
+    }
+
     #[test]
     fn an_unquoted_last_first_name_parses_as_one_mailbox_and_two_mailboxes_do_not() {
         let mailbox = parse_mailbox("Blake, Mark <mark@example.com>").expect("tolerated");

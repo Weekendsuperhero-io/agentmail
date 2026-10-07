@@ -228,7 +228,7 @@ pub struct ListAccountsResponse {
 }
 
 /// One address an account sends as, configured or seen in its Sent mail.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
 pub struct SenderIdentity {
@@ -250,8 +250,10 @@ pub struct SenderIdentity {
     pub last_used: Option<DateTime<Utc>>,
 }
 
-/// Response for list_identities.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+/// Response for list_identities. Also `Deserialize`, so an embedder reading
+/// the `list_identities` tool's structured result gets this type back — the
+/// wire output is asserted to round-trip into it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ListIdentitiesResponse {
     pub account: String,

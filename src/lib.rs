@@ -65,6 +65,31 @@ pub struct Agentmail {
     >,
 }
 
+/// Where a persistent cache file lives when no [`AgentmailBuilder::cache_dir`]
+/// was given: directly inside `$AGENTMAIL_CACHE_DIR` when it is set — the same
+/// layout as `cache_dir(dir)` — else in `agentmail/` under the OS cache
+/// directory. The header cache and the mutation journal both resolve through
+/// here: they used to disagree, the header cache adding an `agentmail/` level
+/// under the variable that the journal did not.
+pub(crate) fn default_cache_file(file_name: &str) -> Option<std::path::PathBuf> {
+    cache_file_in(
+        std::env::var_os("AGENTMAIL_CACHE_DIR").map(std::path::PathBuf::from),
+        dirs::cache_dir(),
+        file_name,
+    )
+}
+
+fn cache_file_in(
+    override_dir: Option<std::path::PathBuf>,
+    os_cache_dir: Option<std::path::PathBuf>,
+    file_name: &str,
+) -> Option<std::path::PathBuf> {
+    match override_dir {
+        Some(dir) => Some(dir.join(file_name)),
+        None => Some(os_cache_dir?.join("agentmail").join(file_name)),
+    }
+}
+
 /// Where the header cache lives — the builder's programmatic answer to the
 /// `AGENTMAIL_CACHE_DIR` / `AGENTMAIL_DISABLE_HEADER_CACHE` environment
 /// variables. An explicit choice overrides both variables.
@@ -4829,7 +4854,8 @@ impl Agentmail {
     }
 
     /// Download attachments from a message to a directory.
-    /// Files are named `{uid}_{index}_{original_name}`.
+    /// Files are named `{uid}_{index}_{original_name}`, the name sanitized and
+    /// shortened past 240 bytes (extension kept); all or nothing on failure.
     pub async fn download_attachments(
         &self,
         mailbox: &str,
@@ -6443,6 +6469,51 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+/// Longest filename AgentMail writes, in bytes. Most filesystems allow 255;
+/// the margin covers a name that grows on disk (HFS+ stores names decomposed),
+/// and it is the archive-name limit too.
+const MAX_FILENAME_BYTES: usize = 240;
+
+/// The canonical on-disk name of one attachment part: `{uid}_{index}_{name}`,
+/// the name sanitized and — past [`MAX_FILENAME_BYTES`] — its stem cut short
+/// so the extension survives. The download writes it and the `/info` resource
+/// advertises it, so both come from here. Unique within a message by its
+/// index, so shortening two long names can never collide.
+pub(crate) fn attachment_filename(uid: u32, index: usize, name: &str) -> String {
+    let prefix = format!("{uid}_{index}_");
+    let name = sanitize_filename(name);
+    let budget = MAX_FILENAME_BYTES.saturating_sub(prefix.len());
+    if name.len() <= budget {
+        return format!("{prefix}{name}");
+    }
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= 16
+                && !extension.contains(' ') =>
+        {
+            (stem, Some(extension))
+        }
+        _ => (name.as_str(), None),
+    };
+    let mut cut = budget
+        .saturating_sub(extension.map_or(0, |extension| extension.len() + 1))
+        .min(stem.len());
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // A trailing space or dot is not a usable filename ending on Windows.
+    let stem = match stem[..cut].trim_end_matches([' ', '.']) {
+        "" => "unnamed",
+        stem => stem,
+    };
+    match extension {
+        Some(extension) => format!("{prefix}{stem}.{extension}"),
+        None => format!("{prefix}{stem}"),
+    }
+}
+
 /// Require a caller-supplied filename to be one portable path component.
 pub(crate) fn validate_plain_filename(filename: &str) -> Result<()> {
     use std::path::{Component, Path};
@@ -6468,11 +6539,36 @@ pub(crate) fn validate_plain_filename(filename: &str) -> Result<()> {
 /// Write one message's attachments into `output_dir` as `{uid}_{index}_{name}`,
 /// creating the directory private (0700) when it is new. Each file is
 /// create-new and 0600, so an existing file is refused, never overwritten.
+///
+/// All or nothing: every target name is checked before the first byte is
+/// written, and a failure partway removes the files this call already wrote,
+/// so the caller never has to work out which attachments arrived — and a retry
+/// does not trip over the survivors of the failed attempt.
 async fn write_attachment_files(
     output_dir: &std::path::Path,
     uid: u32,
     attachments: &[(String, String, Vec<u8>)],
 ) -> Result<Vec<DownloadedFile>> {
+    write_attachment_files_with(output_dir, uid, attachments, |path, bytes| {
+        Box::pin(write_new_attachment(path, bytes))
+    })
+    .await
+}
+
+/// [`write_attachment_files`] with the per-file writer passed in, so a test
+/// can make one file fail partway through a download.
+async fn write_attachment_files_with<W>(
+    output_dir: &std::path::Path,
+    uid: u32,
+    attachments: &[(String, String, Vec<u8>)],
+    write: W,
+) -> Result<Vec<DownloadedFile>>
+where
+    W: for<'a> Fn(
+        &'a std::path::Path,
+        &'a [u8],
+    ) -> futures::future::BoxFuture<'a, Result<std::path::PathBuf>>,
+{
     #[cfg(unix)]
     let output_dir_existed = output_dir.exists();
     tokio::fs::create_dir_all(output_dir).await.map_err(|e| {
@@ -6497,51 +6593,112 @@ async fn write_attachment_files(
         })?;
     }
 
-    let mut downloaded = Vec::new();
-    for (index, (name, content_type, bytes)) in attachments.iter().enumerate() {
-        let filename = format!("{}_{}_{}", uid, index, sanitize_filename(name));
-        let path = output_dir.join(&filename);
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
+    let targets: Vec<(String, std::path::PathBuf)> = attachments
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _, _))| {
+            let filename = attachment_filename(uid, index, name);
+            let path = output_dir.join(&filename);
+            (filename, path)
+        })
+        .collect();
+    for (_, path) in &targets {
+        // `symlink_metadata`, not `exists`: a dangling symlink is a taken name.
+        if tokio::fs::symlink_metadata(path).await.is_ok() {
+            return Err(AgentmailError::Other(format!(
+                "refusing to overwrite existing attachment '{}'; no attachment was written",
+                path.display()
+            )));
         }
-        let mut file = options.open(&path).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                AgentmailError::Other(format!(
-                    "refusing to overwrite existing attachment '{}'",
-                    path.display()
-                ))
-            } else {
-                AgentmailError::Other(format!("Failed to create '{}': {error}", path.display()))
+    }
+
+    let mut downloaded: Vec<DownloadedFile> = Vec::with_capacity(targets.len());
+    let mut written: Vec<std::path::PathBuf> = Vec::with_capacity(targets.len());
+    for (index, ((filename, path), (_, content_type, bytes))) in
+        targets.into_iter().zip(attachments).enumerate()
+    {
+        match write(&path, bytes).await {
+            Ok(canonical) => {
+                downloaded.push(DownloadedFile {
+                    index,
+                    // The absolute path, as `download_message_source` returns:
+                    // a bare filename names nothing once the caller's working
+                    // directory is not `output_dir`, which for the MCP server
+                    // is always the case.
+                    path: canonical.display().to_string(),
+                    filename,
+                    content_type: content_type.clone(),
+                    size: bytes.len(),
+                });
+                written.push(path);
             }
-        })?;
+            Err(error) => {
+                let mut left_behind = Vec::new();
+                for path in &written {
+                    if tokio::fs::remove_file(path).await.is_err() {
+                        left_behind.push(path.display().to_string());
+                    }
+                }
+                let outcome = if written.is_empty() {
+                    "no attachment was written".to_string()
+                } else if left_behind.is_empty() {
+                    format!(
+                        "the {} attachment(s) already written were removed",
+                        written.len()
+                    )
+                } else {
+                    format!(
+                        "these could not be removed and must be deleted before retrying: {}",
+                        left_behind.join(", ")
+                    )
+                };
+                return Err(AgentmailError::Other(format!("{error}; {outcome}")));
+            }
+        }
+    }
+    Ok(downloaded)
+}
+
+/// Create `path` (create-new, 0600), write `bytes`, and return its canonical
+/// path. A file this created is removed again if anything after creating it
+/// fails, so an error never leaves a partial attachment behind.
+async fn write_new_attachment(path: &std::path::Path, bytes: &[u8]) -> Result<std::path::PathBuf> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AgentmailError::Other(format!(
+                "refusing to overwrite existing attachment '{}'",
+                path.display()
+            ))
+        } else {
+            AgentmailError::Other(format!("Failed to create '{}': {error}", path.display()))
+        }
+    })?;
+    let written = async {
         file.write_all(bytes).await.map_err(|error| {
             AgentmailError::Other(format!("Failed to write '{}': {error}", path.display()))
         })?;
         file.flush().await.map_err(|error| {
             AgentmailError::Other(format!("Failed to flush '{}': {error}", path.display()))
         })?;
-        // The absolute path, as `download_message_source` returns: a bare
-        // filename names nothing once the caller's working directory is not
-        // `output_dir`, which for the MCP server is always the case.
-        let path = tokio::fs::canonicalize(&path).await.map_err(|error| {
+        tokio::fs::canonicalize(path).await.map_err(|error| {
             AgentmailError::Other(format!(
                 "saved attachment but could not resolve '{}': {error}",
                 path.display()
             ))
-        })?;
-
-        downloaded.push(DownloadedFile {
-            index,
-            path: path.display().to_string(),
-            filename,
-            content_type: content_type.clone(),
-            size: bytes.len(),
-        });
+        })
     }
-    Ok(downloaded)
+    .await;
+    if written.is_err() {
+        drop(file);
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    written
 }
 
 /// Create, durably write, and close one private file. Any ordinary write error
@@ -6802,6 +6959,29 @@ mod tests {
         );
     }
 
+    /// `AGENTMAIL_CACHE_DIR=dir` means what `cache_dir(dir)` means: both
+    /// files directly in `dir`. Without it, both sit in `agentmail/` under the
+    /// OS cache directory.
+    #[test]
+    fn both_caches_resolve_into_the_same_directory() {
+        let dir = std::path::PathBuf::from("/tmp/agentmail-cache-root");
+        let os = std::path::PathBuf::from("/Users/me/Library/Caches");
+        for file in [
+            header_cache::HeaderCache::FILE_NAME,
+            mutation_journal::MutationJournal::FILE_NAME,
+        ] {
+            assert_eq!(
+                cache_file_in(Some(dir.clone()), Some(os.clone()), file),
+                Some(dir.join(file))
+            );
+            assert_eq!(
+                cache_file_in(None, Some(os.clone()), file),
+                Some(os.join("agentmail").join(file))
+            );
+        }
+        assert_eq!(cache_file_in(None, None, "x.sqlite3"), None);
+    }
+
     #[test]
     fn reply_subject_adds_exactly_one_prefix() {
         assert_eq!(reply_subject("Status"), "Re: Status");
@@ -6890,6 +7070,120 @@ mod tests {
         assert!(
             again.to_string().contains("refusing to overwrite"),
             "{again}"
+        );
+        tokio::fs::remove_dir_all(dir).await.expect("cleanup");
+    }
+
+    fn attachment(name: &str) -> (String, String, Vec<u8>) {
+        (name.to_string(), "text/plain".to_string(), b"data".to_vec())
+    }
+
+    async fn files_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir).await.expect("dir exists");
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        names
+    }
+
+    /// An attachment named past the filesystem's 255-byte limit is still
+    /// saved — under a shortened name that keeps its extension.
+    #[tokio::test]
+    async fn an_attachment_with_a_very_long_name_is_saved_under_a_shortened_one() {
+        let dir = std::env::temp_dir().join(format!("agentmail-att-{}", uuid::Uuid::new_v4()));
+        let long = format!("{}.pdf", "quarterly report ".repeat(25));
+        assert!(long.len() > 255);
+
+        let written = write_attachment_files(&dir, 7, &[attachment(&long)])
+            .await
+            .expect("a long name is shortened, not refused");
+
+        let filename = &written[0].filename;
+        assert!(
+            filename.len() <= 240,
+            "{} bytes: {filename}",
+            filename.len()
+        );
+        assert!(filename.starts_with("7_0_quarterly report"), "{filename}");
+        assert!(filename.ends_with(".pdf"), "{filename}");
+        assert_eq!(files_in(&dir).await, std::slice::from_ref(filename));
+        tokio::fs::remove_dir_all(dir).await.expect("cleanup");
+    }
+
+    /// A download that fails partway leaves nothing behind: the files it had
+    /// already written are removed, so a retry neither collides with them nor
+    /// leaves the caller guessing which attachments arrived.
+    #[tokio::test]
+    async fn a_download_that_fails_partway_removes_what_it_wrote() {
+        let dir = std::env::temp_dir().join(format!("agentmail-att-{}", uuid::Uuid::new_v4()));
+        let attachments = [attachment("first.txt"), attachment("second.txt")];
+        let writes = std::sync::atomic::AtomicUsize::new(0);
+
+        // The first file is written for real; the second fails — a full disk,
+        // say — after the first is already on disk.
+        let error = write_attachment_files_with(&dir, 7, &attachments, |path, bytes| {
+            let nth = writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if nth == 0 {
+                    write_new_attachment(path, bytes).await
+                } else {
+                    Err(AgentmailError::Other("No space left on device".to_string()))
+                }
+            })
+        })
+        .await
+        .expect_err("the second file cannot be written");
+
+        assert!(error.to_string().contains("removed"), "{error}");
+        assert!(files_in(&dir).await.is_empty(), "nothing is left behind");
+        tokio::fs::remove_dir_all(dir).await.expect("cleanup");
+    }
+
+    /// A shortened name stays valid UTF-8 — the cut never splits a character
+    /// — and keeps its extension; a short one is untouched.
+    #[test]
+    fn attachment_filenames_are_capped_on_a_character_boundary() {
+        let name = format!("{}.docx", "\u{e9}".repeat(200));
+        let filename = attachment_filename(123, 4, &name);
+        assert!(filename.len() <= MAX_FILENAME_BYTES, "{}", filename.len());
+        assert!(filename.starts_with("123_4_\u{e9}"), "{filename}");
+        assert!(filename.ends_with(".docx"), "{filename}");
+
+        let no_extension = "x".repeat(400);
+        assert_eq!(
+            attachment_filename(1, 0, &no_extension).len(),
+            MAX_FILENAME_BYTES
+        );
+        assert_eq!(attachment_filename(1, 0, "a/b.txt"), "1_0_a_b.txt");
+    }
+
+    /// A name already taken is refused before ANY file is written, not after
+    /// the attachments ahead of it.
+    #[tokio::test]
+    async fn an_existing_target_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!("agentmail-att-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.expect("dir");
+        tokio::fs::write(dir.join("7_1_second.txt"), b"mine")
+            .await
+            .expect("existing file");
+        let attachments = [attachment("first.txt"), attachment("second.txt")];
+
+        let error = write_attachment_files(&dir, 7, &attachments)
+            .await
+            .expect_err("a taken name is refused");
+
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "{error}"
+        );
+        assert_eq!(files_in(&dir).await, ["7_1_second.txt"]);
+        assert_eq!(
+            tokio::fs::read(dir.join("7_1_second.txt"))
+                .await
+                .expect("read"),
+            b"mine"
         );
         tokio::fs::remove_dir_all(dir).await.expect("cleanup");
     }

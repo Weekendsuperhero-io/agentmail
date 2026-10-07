@@ -834,7 +834,7 @@ impl AgentMailServer {
     #[tool(
         name = "download_attachments",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadAttachmentsOutput>().expect("valid download_attachments output schema"),
-        description = "Download all attachments from one message to disk. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Each file is saved as {uid}_{index}_{name} with the name sanitized — the same canonical filename /info reports for that part. Omit outputDir to write into the session workspace. Returns paths, content types, and sizes.",
+        description = "Download all attachments from one message to disk. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Each file is saved as {uid}_{index}_{name} with the name sanitized (and shortened, extension kept, when it is too long for a filesystem) — the same canonical filename /info reports for that part. Omit outputDir to write into the session workspace. Returns absolute paths, content types, and sizes. All or nothing: a name that already exists is refused before anything is written, and a failure partway removes the files already written.",
         annotations(
             title = "Download Attachments",
             read_only_hint = false,

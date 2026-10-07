@@ -291,7 +291,7 @@ server identities from colliding, but deliberately excludes the local account
 display name so renaming an account reuses the same projection. SQLite uses WAL mode with
 `synchronous=NORMAL`. Set
 `AGENTMAIL_DISABLE_HEADER_CACHE=1` to disable it or `AGENTMAIL_CACHE_DIR` to
-override its root; cache errors fall back to live IMAP.
+keep it directly in another directory; cache errors fall back to live IMAP.
 
 `list_flags` and `find_attachments` use the same discovery plan. Discovery uses one selectable `\All` mailbox exclusively when available. Enumerated fallback and account-wide destructive tools skip `\All`, `\Drafts`, `\Flagged`, `\Important`, `\Junk`, and `\Trash`, while retaining storage roles including `\Archive`, `\Sent`, `\Memos`, `\Scheduled`, and `\Snoozed`. A caller-provided mailbox bypasses planning and is honored directly. IMAP defines `\NoSelect`, not a separate `\NoScan` attribute; `\NoSelect` is always excluded automatically.
 
@@ -575,6 +575,12 @@ reports success only when the resulting state is unambiguous.
    in its `To`, then `Cc`.
 3. Otherwise the primary identity.
 
+**Recipients.** `to`, `cc`, `bcc` and `replyTo` take the same forms as `from`:
+a bare address or `Name <address>`, one recipient per entry. A name with a
+comma or other punctuation can be quoted (`"Blake, Mark" <mark@example.com>`)
+or written plainly (`Blake, Mark <mark@example.com>`); two recipients in one
+entry are refused rather than guessed apart.
+
 An account with no identity at all (an opaque login and no `email`) is refused
 with what to configure. The result's `from` is the sender actually written —
 resolved, not echoed — formatted so it parses back as one mailbox (a name with a
@@ -667,6 +673,11 @@ A replaced draft always has a NEW UID. Use the one this returns.
 { "mailbox", "account", "uidValidity", "uid",
   "downloaded": [{ "index", "filename", "path", "contentType", "size" }] }
 ```
+
+`path` is absolute. The download is all or nothing: every target name is
+checked before the first byte is written (an existing file is refused, never
+overwritten), and a failure partway removes the files already written, so a
+retry starts clean.
 
 **download_message_source**
 
@@ -890,8 +901,9 @@ Each inventory entry carries `index`, the original `name` (omitted for
 nameless parts), the canonical `filename`, `contentType`, `size`, an optional
 `contentId`, and the part's `resourceUri`. Attachments follow one naming
 nomenclature everywhere: the canonical filename is
-`{uid}_{index}_{sanitized-name}` (`unnamed` for nameless parts) — exactly what
-`download_attachments` writes to disk. `/attachments/{index}` (zero-based part
+`{uid}_{index}_{sanitized-name}` (`unnamed` for nameless parts), shortened to
+240 bytes with its extension kept when the original name is longer than a
+filesystem allows — exactly what `download_attachments` writes to disk. `/attachments/{index}` (zero-based part
 index, stable within a UIDVALIDITY epoch) returns the part as an MCP resource
 `blob` served with the part's own content type; parts above 4 MiB fail with
 guidance to use the `download_attachments` tool instead.

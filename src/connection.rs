@@ -192,6 +192,78 @@ fn idle_is_fresh(idle_for: Option<Duration>, max_idle: Duration) -> bool {
     idle_for.is_some_and(|idle_for| idle_for < max_idle)
 }
 
+/// One store of idle sessions, keyed by account.
+type IdleStore = Arc<Mutex<HashMap<String, Vec<IdleSession>>>>;
+
+/// One keepalive pass over the idle stores: NOOP every idle session OUTSIDE
+/// the store lock (an acquiring caller must never wait behind a slow
+/// dead-socket ping) and return the survivors with refreshed idle stamps. A
+/// failed ping drops that session; the next acquire reconnects fresh.
+///
+/// A session leaves the store only with one of its account's connection
+/// permits, held until the ping ends. Without it an acquire during the ping
+/// took a permit, found the store empty and LOGINed a second connection — on a
+/// one-connection provider (Yahoo/AOL) the very login that trips `[LIMIT]`. With
+/// the permit held that acquire waits, and gets the pinged session back. No
+/// permit free means every connection is busy with real work; there is nothing
+/// idle worth pinging, so the account is skipped until the next tick.
+async fn keepalive_tick(
+    stores: &[IdleStore],
+    semaphores: &Mutex<HashMap<String, Arc<Semaphore>>>,
+    stats: &PoolStats,
+) {
+    for store in stores {
+        let accounts: Vec<String> = store.lock().await.keys().cloned().collect();
+        for account in accounts {
+            // Every pooled session was released after an acquire, which
+            // created the account's semaphore — none means nothing to ping.
+            let Some(semaphore) = semaphores.lock().await.get(&account).cloned() else {
+                continue;
+            };
+            let mut permits = Vec::new();
+            let mut idle_set = Vec::new();
+            loop {
+                let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+                    break;
+                };
+                let Some(idle) = store.lock().await.get_mut(&account).and_then(Vec::pop) else {
+                    break;
+                };
+                permits.push(permit);
+                idle_set.push(idle);
+            }
+            if idle_set.is_empty() {
+                continue;
+            }
+            let mut alive = Vec::with_capacity(idle_set.len());
+            for mut idle in idle_set {
+                if imap_client::ping(&mut idle.session).await.is_ok() {
+                    idle.idle_since = SystemTime::now();
+                    alive.push(idle);
+                    stats.keepalive_pings.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // dead — dropped; the next acquire reconnects.
+                    stats.keepalive_drops.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        account = %account,
+                        "keepalive: dropped a dead idle session; next acquire reconnects",
+                    );
+                }
+            }
+            if !alive.is_empty() {
+                tracing::debug!(
+                    account = %account,
+                    held = alive.len(),
+                    "keepalive: kept idle session(s) alive",
+                );
+                store.lock().await.entry(account).or_default().extend(alive);
+            }
+            // Released only now that the sessions are back in the store.
+            drop(permits);
+        }
+    }
+}
+
 /// Ceiling for the escalating login cooldown. One hour outlasts observed
 /// AOL/Yahoo LOGIN penalty windows; doubling past it would only strand a
 /// recovered account.
@@ -414,15 +486,15 @@ impl ConnectionPool {
     }
 
     /// Spawn the keepalive task once, if configured. Called from the async
-    /// acquire paths so a Tokio runtime is guaranteed. Each tick drains every
-    /// idle session — Limited pool and UID-Mode pool alike — NOOPs each
-    /// OUTSIDE the pool lock (an acquiring caller must never wait behind a
-    /// slow dead-socket ping), and returns survivors with refreshed idle
-    /// stamps, so they never cross the `max_idle` threshold and the server
-    /// never sees them as idle. This is what makes the process behave like a
-    /// mainstream mail client: a few long-lived connections, each LOGINed
-    /// once, instead of a login per gap in traffic. A failed ping drops that
-    /// session; the next acquire reconnects fresh.
+    /// acquire paths so a Tokio runtime is guaranteed. Each tick
+    /// ([`keepalive_tick`]) NOOPs every idle session — Limited pool and
+    /// UID-Mode pool alike — under a connection permit and outside the pool
+    /// lock, and returns survivors with refreshed idle stamps, so they never
+    /// cross the `max_idle` threshold and the server never sees them as idle.
+    /// This is what makes the process behave like a mainstream mail client: a
+    /// few long-lived connections, each LOGINed once, instead of a login per
+    /// gap in traffic. A failed ping drops that session; the next acquire
+    /// reconnects fresh.
     fn ensure_keepalive(&self) {
         let Some(interval) = self.keepalive else {
             return;
@@ -432,48 +504,14 @@ impl ConnectionPool {
             return;
         }
         let stores = [Arc::clone(&self.pools), Arc::clone(&self.uid_pools)];
+        let semaphores = Arc::clone(&self.semaphores);
         let stats = Arc::clone(&self.stats);
         *slot = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                for store in &stores {
-                    let accounts: Vec<String> = store.lock().await.keys().cloned().collect();
-                    for account in accounts {
-                        // Take the whole idle set while locked; ping outside
-                        // the lock; return survivors.
-                        let idle_set = store
-                            .lock()
-                            .await
-                            .get_mut(&account)
-                            .map(std::mem::take)
-                            .unwrap_or_default();
-                        let mut alive = Vec::with_capacity(idle_set.len());
-                        for mut idle in idle_set {
-                            if imap_client::ping(&mut idle.session).await.is_ok() {
-                                idle.idle_since = SystemTime::now();
-                                alive.push(idle);
-                                stats.keepalive_pings.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                // dead — dropped; the next acquire reconnects.
-                                stats.keepalive_drops.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(
-                                    account = %account,
-                                    "keepalive: dropped a dead idle session; next acquire reconnects",
-                                );
-                            }
-                        }
-                        if !alive.is_empty() {
-                            tracing::debug!(
-                                account = %account,
-                                held = alive.len(),
-                                "keepalive: kept idle session(s) alive",
-                            );
-                            store.lock().await.entry(account).or_default().extend(alive);
-                        }
-                    }
-                }
+                keepalive_tick(&stores, &semaphores, &stats).await;
             }
         }));
     }
@@ -1074,6 +1112,98 @@ mod tests {
             !idle_is_fresh(wall_elapsed(wall(0), wall(8 * 3600)), MAX_IDLE),
             "a session idled overnight is evicted, not pinged and reused"
         );
+    }
+
+    /// One account's idle store holding `session`, and a one-permit
+    /// semaphore for it — a Yahoo/AOL account's shape.
+    async fn one_idle_session(
+        session: ImapSession,
+    ) -> (
+        IdleStore,
+        Arc<Semaphore>,
+        Mutex<HashMap<String, Arc<Semaphore>>>,
+    ) {
+        let store: IdleStore = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert(
+            "aol".to_string(),
+            vec![IdleSession {
+                session,
+                idle_since: SystemTime::now(),
+            }],
+        );
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut semaphores = HashMap::new();
+        semaphores.insert("aol".to_string(), Arc::clone(&semaphore));
+        (store, semaphore, Mutex::new(semaphores))
+    }
+
+    /// With every permit held by in-flight work there is nothing idle to keep
+    /// alive: taking the session out anyway is what let a concurrent acquire
+    /// find the store empty and LOGIN a second connection.
+    #[tokio::test]
+    async fn keepalive_takes_no_session_while_every_permit_is_in_use() {
+        let (session, server) = imap_client::test_support::scripted_session(|_, _| None).await;
+        let (store, semaphore, semaphores) = one_idle_session(session).await;
+        let stats = PoolStats::default();
+        let _in_flight = Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .expect("the only permit");
+
+        keepalive_tick(&[Arc::clone(&store)], &semaphores, &stats).await;
+
+        assert_eq!(
+            store.lock().await.get("aol").map(Vec::len),
+            Some(1),
+            "the idle session stays in the store"
+        );
+        assert_eq!(stats.keepalive_pings.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.keepalive_drops.load(Ordering::Relaxed), 0);
+        drop(store);
+        let commands = server.commands().await;
+        assert!(!commands.iter().any(|c| c.contains("NOOP")), "{commands:?}");
+    }
+
+    /// A session out of the store for its ping is covered by a permit for the
+    /// whole ping, so an acquire in that window waits for the session to come
+    /// back instead of opening another connection; both return afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_holds_a_permit_for_the_session_it_is_pinging() {
+        let (noop_seen, noop_arrived) = std::sync::mpsc::channel::<()>();
+        let (release_reply, reply_released) = std::sync::mpsc::channel::<()>();
+        let (session, server) = imap_client::test_support::scripted_session(move |tag, command| {
+            command.contains(" NOOP").then(|| {
+                // Hold the reply until the test has looked at the permit.
+                noop_seen.send(()).expect("test listening");
+                reply_released.recv().expect("test releases the reply");
+                format!("{tag} OK NOOP completed\r\n")
+            })
+        })
+        .await;
+        let (store, semaphore, semaphores) = one_idle_session(session).await;
+        let stats = Arc::new(PoolStats::default());
+
+        let tick = tokio::spawn({
+            let store = Arc::clone(&store);
+            let stats = Arc::clone(&stats);
+            async move { keepalive_tick(&[store], &semaphores, &stats).await }
+        });
+        tokio::task::spawn_blocking(move || noop_arrived.recv())
+            .await
+            .expect("join")
+            .expect("the NOOP reached the server");
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "the session being pinged holds the account's permit"
+        );
+        release_reply.send(()).expect("server waiting");
+        tick.await.expect("tick");
+
+        assert_eq!(semaphore.available_permits(), 1, "and gives it back");
+        assert_eq!(store.lock().await.get("aol").map(Vec::len), Some(1));
+        assert_eq!(stats.keepalive_pings.load(Ordering::Relaxed), 1);
+        drop(store);
+        server.commands().await;
     }
 
     /// The keepalive task spawns once on first pool use when configured, and

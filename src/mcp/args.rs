@@ -248,16 +248,24 @@ pub(super) struct CreateDraftArgs {
     #[schemars(description = "Draft body content.")]
     pub(super) body: String,
     #[serde(default)]
-    #[schemars(description = "To recipient email addresses.")]
+    #[schemars(
+        description = "To recipients, one per entry: a bare address or `Name <address>`. A name with a comma or other punctuation can be quoted (`\"Blake, Mark\" <mark@example.com>`) or written as is (`Blake, Mark <mark@example.com>`). Never put two recipients in one entry."
+    )]
     pub(super) to: Vec<String>,
     #[serde(default)]
-    #[schemars(description = "Cc recipient email addresses.")]
+    #[schemars(
+        description = "Cc recipients, in the same forms as `to`: a bare address or `Name <address>`, one per entry."
+    )]
     pub(super) cc: Vec<String>,
     #[serde(default)]
-    #[schemars(description = "Bcc recipient email addresses.")]
+    #[schemars(
+        description = "Bcc recipients, in the same forms as `to`: a bare address or `Name <address>`, one per entry. Kept in the saved draft."
+    )]
     pub(super) bcc: Vec<String>,
     #[serde(default)]
-    #[schemars(description = "Reply-To header addresses for responses to this draft.")]
+    #[schemars(
+        description = "Reply-To addresses for responses to this draft, in the same forms as `to`: a bare address or `Name <address>`, one per entry."
+    )]
     pub(super) reply_to: Vec<String>,
     #[serde(default)]
     #[schemars(description = "Message-ID this draft replies to. Angle brackets are optional.")]
@@ -353,12 +361,24 @@ pub(super) struct UpdateDraftArgs {
     #[serde(default)]
     pub(super) body: String,
     #[serde(default)]
+    #[schemars(
+        description = "To recipients, one per entry: a bare address or `Name <address>`. A name with a comma or other punctuation can be quoted (`\"Blake, Mark\" <mark@example.com>`) or written as is (`Blake, Mark <mark@example.com>`). Never put two recipients in one entry."
+    )]
     pub(super) to: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Cc recipients, in the same forms as `to`: a bare address or `Name <address>`, one per entry."
+    )]
     pub(super) cc: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Bcc recipients, in the same forms as `to`: a bare address or `Name <address>`, one per entry. Kept in the saved draft."
+    )]
     pub(super) bcc: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Reply-To addresses for responses to this draft, in the same forms as `to`: a bare address or `Name <address>`, one per entry."
+    )]
     pub(super) reply_to: Vec<String>,
     #[serde(default)]
     pub(super) in_reply_to: Option<String>,

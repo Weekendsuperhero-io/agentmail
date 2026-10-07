@@ -2387,6 +2387,44 @@ mod tests {
         );
     }
 
+    /// An embedder (the Agent Muse settings screen) reads `list_identities`'
+    /// structured result back into the library's `ListIdentitiesResponse`.
+    /// The wire output is a separate struct, so pin that the two agree.
+    #[test]
+    fn list_identities_wire_output_reads_back_into_the_library_type() {
+        let response = crate::ListIdentitiesResponse {
+            account: "work".to_string(),
+            display_name: Some("Mark Blake".to_string()),
+            sent_mailbox: Some("Sent".to_string()),
+            scanned_messages: 2,
+            identities: vec![
+                crate::SenderIdentity {
+                    address: "mark@example.com".to_string(),
+                    configured: true,
+                    primary: true,
+                    display_names: vec!["Mark Blake".to_string()],
+                    messages: 1,
+                    last_used: chrono::DateTime::from_timestamp(1_790_000_000, 0),
+                },
+                crate::SenderIdentity {
+                    address: "old@example.net".to_string(),
+                    configured: false,
+                    primary: false,
+                    display_names: Vec::new(),
+                    messages: 1,
+                    last_used: None,
+                },
+            ],
+        };
+
+        let wire =
+            serde_json::to_value(ListIdentitiesOutput::from(response.clone())).expect("serializes");
+        let read_back: crate::ListIdentitiesResponse =
+            serde_json::from_value(wire).expect("the wire output reads back");
+
+        assert_eq!(read_back, response);
+    }
+
     #[test]
     fn all_tool_output_schemas_are_ref_free_root_objects() {
         assert_ref_free::<ListAccountsOutput>();

@@ -14,7 +14,8 @@
 //!
 //! Attachment parts follow one naming nomenclature everywhere: the canonical
 //! filename is `{uid}_{index}_{sanitized-original-name}` ("unnamed" when the
-//! part has no name), identical to what `download_attachments` writes to disk.
+//! part has no name, shortened past 240 bytes with its extension kept),
+//! identical to what `download_attachments` writes to disk.
 //!
 //! Account and mailbox are percent-encoded URI segments; a `/` inside a
 //! mailbox name (hierarchy delimiter) must be encoded as `%2F` so it cannot
@@ -433,13 +434,10 @@ fn render_message_markdown(msg: &crate::MessageInfo) -> String {
     cap_chars(&out, MAX_BODY_CHARS)
 }
 
-/// Canonical exposed filename for an attachment part — the same nomenclature
-/// `download_attachments` uses on disk: `{uid}_{index}_{sanitized-name}`.
+/// Canonical exposed filename for an attachment part — exactly the name
+/// `download_attachments` writes, shortening included.
 fn attachment_filename(uid: u32, index: usize, name: Option<&str>) -> String {
-    format!(
-        "{uid}_{index}_{}",
-        crate::sanitize_filename(name.unwrap_or("unnamed"))
-    )
+    crate::attachment_filename(uid, index, name.unwrap_or("unnamed"))
 }
 
 /// Drop `null` members recursively so the info document stays compact,
@@ -1199,6 +1197,14 @@ mod tests {
             "path separators are sanitized like download_attachments does"
         );
         assert_eq!(attachment_filename(42, 2, None), "42_2_unnamed");
+        // A name too long for a filesystem is shortened — and /info advertises
+        // exactly the name the download writes.
+        let long = format!("{}.pdf", "minutes ".repeat(40));
+        assert_eq!(
+            attachment_filename(42, 3, Some(&long)),
+            crate::attachment_filename(42, 3, &long)
+        );
+        assert!(attachment_filename(42, 3, Some(&long)).len() <= 240);
     }
 
     fn message_with_attachments() -> crate::MessageInfo {

@@ -1391,10 +1391,7 @@ fn default_cache_path() -> Option<PathBuf> {
     {
         return None;
     }
-    let root = std::env::var_os("AGENTMAIL_CACHE_DIR")
-        .map(PathBuf::from)
-        .or_else(dirs::cache_dir)?;
-    Some(root.join("agentmail").join(HeaderCache::FILE_NAME))
+    crate::default_cache_file(HeaderCache::FILE_NAME)
 }
 
 fn open_connection(path: &Path) -> CacheResult<Connection> {

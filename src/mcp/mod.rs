@@ -330,12 +330,22 @@ impl AgentMailServer {
         Ok(file_access::FileAccessPolicy::with_roots(root, additional))
     }
 
-    /// Combined tool router — referenced by `#[tool_handler]`'s default
-    /// `Self::tool_router()` expression and by the regression tests.
+    /// Combined tool router. Built ONCE, into [`TOOL_ROUTER`]: `#[tool_handler]`
+    /// evaluates its router expression on every `call_tool`, `list_tools` and
+    /// `get_tool`, so calling this there rebuilt all 36 routes per request (and,
+    /// on each runtime thread's first request, every schema — rmcp caches them
+    /// per thread). The regression tests call it directly.
     fn tool_router() -> ToolRouter<Self> {
         Self::read_tools_router() + Self::write_tools_router()
     }
 }
+
+/// The one router every request dispatches through — see
+/// [`AgentMailServer::tool_router`]. `list_tools` clones its tools and patches
+/// the live accounts into the copies (`Arc::make_mut` copies a shared schema on
+/// write), so the shared definitions are never edited.
+static TOOL_ROUTER: std::sync::LazyLock<ToolRouter<AgentMailServer>> =
+    std::sync::LazyLock::new(AgentMailServer::tool_router);
 
 /// Constrain every `account` argument in a tool's input schema to the accounts
 /// this server actually has.
@@ -363,7 +373,7 @@ fn patch_account_enum(schema: &mut serde_json::Map<String, serde_json::Value>, a
     );
 }
 
-#[tool_handler]
+#[tool_handler(router = TOOL_ROUTER)]
 #[prompt_handler]
 impl ServerHandler for AgentMailServer {
     /// The tool list, with the LIVE account names patched into every `account`
@@ -386,7 +396,7 @@ impl ServerHandler for AgentMailServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, McpError> {
-        let mut tools = Self::tool_router().list_all();
+        let mut tools = TOOL_ROUTER.list_all();
         let accounts = self.agentmail.account_names();
         if !accounts.is_empty() {
             for tool in &mut tools {
@@ -470,7 +480,8 @@ impl ServerHandler for AgentMailServer {
              ## Drafts\n\
              \n\
              `create_draft` and `update_draft`. Both accept Reply-To, Bcc,\n\
-             attachments and RFC threading headers.\n\
+             attachments and RFC threading headers. Every recipient field takes\n\
+             `Name <address>` or a bare address, one recipient per entry.\n\
              \n\
              A draft is From the account's primary address under its display name. Pass\n\
              `from` (`Name <address>` or an address) to use another of the account's own\n\
@@ -1056,6 +1067,28 @@ mod tests {
         );
     }
 
+    /// `#[tool_handler]` evaluates its router expression on EVERY call_tool,
+    /// list_tools and get_tool. Rebuilt per call, the router re-creates all 36
+    /// routes each time, and on each runtime worker thread its first request
+    /// regenerates every schema (rmcp caches them per thread). Shared, a request
+    /// on any thread gets the same schema allocation back.
+    #[test]
+    fn the_tool_router_is_built_once_not_per_request() {
+        use rmcp::ServerHandler as _;
+        let server = server_with_accounts(&["work"]);
+        let here = server.get_tool("create_draft").expect("create_draft");
+        let elsewhere = std::thread::scope(|scope| {
+            scope
+                .spawn(|| server.get_tool("create_draft"))
+                .join()
+                .expect("thread")
+        })
+        .expect("create_draft");
+        assert!(
+            std::sync::Arc::ptr_eq(&here.input_schema, &elsewhere.input_schema),
+            "the router was rebuilt for a request on another thread"
+        );
+    }
     #[test]
     fn pagination_applies_defaults_and_bounds_consistently() {
         assert_eq!(
