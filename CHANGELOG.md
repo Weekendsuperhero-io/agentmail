@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Every recipient field documents `Name <address>`** — `to`, `cc`, `bcc` and
   `replyTo` on both draft tools, and the handshake instructions — so agents keep
   the names users write instead of stripping them to bare addresses.
+- **A stuck move can be dismissed** — `reconcile_moves` with `dismiss: true`
+  and an `operationId` (CLI `reconcile-moves --dismiss`, library
+  `Agentmail::dismiss_move`) closes a move reconciliation can't finish, once
+  both mailboxes have been checked. It moves, copies and deletes nothing; it
+  releases the source message and frees both mailboxes for rename and delete.
+  Results gain `dismissed` and `errors`.
 - **Evidence-grade RFC822 archive tools** — `download_message_source` writes one
   exact `BODY.PEEK[]` result directly to a create-new private file, returning
   its SHA-256, parsed message metadata, and a contemporaneous DNS-backed local
@@ -63,6 +69,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebuilds on its own.
 - **`SecretError` gains `NoEntry` and `KeyringTimedOut`** (breaking for
   exhaustive matches): a missing keychain entry was `Backend(..)`.
+- **`list_flags` and `find_attachments` report `skipped`** (with
+  `skippedTotal`/`skippedTruncated`, as the sweeps do): the mailboxes an
+  account-wide scan did not cover. A mailbox it could not open used to vanish
+  from the result without a trace.
+- **`reconcile_moves` examines `needsAttention` moves again** and deletes a
+  source only right after seeing its copy (the `COPYUID`) in the destination; a
+  copy deleted in the meantime keeps the source and asks for review. An attempt
+  that learns nothing counts as `pending` and is listed in `errors`, so `failed`
+  now means only a COPY the server rejected.
 - **The tool router is built once per process**, not on every `call_tool`,
   `list_tools` and `get_tool`.
 - **Dependencies** — async-imap 0.11.3 → 0.12.0 (LOGIN no longer fails on a
@@ -80,6 +95,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-of-stream, so after sleep or a server `BYE` the pool handed out dead
   sessions and drafts reported a false "APPEND outcome is ambiguous". `NOOP` now
   passes only on its own tagged `OK`.
+- **One dropped connection could strand a COPY-fallback move for good.** Any
+  failure opening the source mailbox during reconciliation — a lost connection
+  included — parked the move as `needsAttention`, which reconciliation then
+  returned unexamined, and a pending move blocks rename and delete of both its
+  mailboxes. Now only a live server's answer (a new `UIDVALIDITY`,
+  `NO [NONEXISTENT]`) parks a move; anything else leaves it as it was.
+- **A connection lost right after SELECT could mark a move complete** while
+  the source survived, releasing its claim: async-imap reads end-of-stream as
+  an empty SEARCH. The check now needs the search's own tagged `OK`, and on a
+  Yahoo/AOL Limited Mode session "not found" proves nothing.
+- **A dropped connection made account-wide scans and sweeps report mailboxes
+  they never read.** On a closed stream SELECT, EXAMINE, SEARCH and FETCH come
+  back empty instead of failing, so every remaining mailbox "drained" or
+  counted as empty, the dead session went back to the pool, and a hung one
+  waited out the timeout (120 s in the app) once per remaining mailbox. A
+  mailbox now counts only once the connection answers a checked `NOOP` after
+  it; a lost connection ends the scan or sweep at once and lists that mailbox
+  and every later one in `skipped`. A single-mailbox `list_flags` or
+  `find_attachments`, and `preview_thread_record`, fail instead of returning a
+  partial answer.
 - **Pool and catalog timers stopped while the Mac slept.** Idle eviction, the
   `[LIMIT]` login cooldown and the mailbox-catalog TTL now run on the wall
   clock; a clock set back counts as expired.

@@ -6,8 +6,8 @@ Here are the 16 Part 5 findings, each re-checked against today's code, with an e
 
 | # | Sev | Finding | Where | Effort | What drives it | Status |
 |---|---|---|---|---|---|---|
-| 1 | Med | Account-wide scans keep using a session after a connection error, waiting the app's 120 s timeout per remaining folder, and still return `Ok` | `lib.rs:2489`, `:2504`, `:2757`, `:3026`, `:4646` | M | Four sites. Two scan outputs need a new skipped-mailboxes field to report the gap. |
-| 2 | **High** | Any SELECT failure during move reconciliation becomes a permanent `NeedsAttention`, and nothing can clear it. A BYE right after SELECT can mark a move Complete while the source copy survives. | `imap_client.rs:2892`, `:2918` | L | Error classification (S) and a search that must see its own tagged OK (S–M), plus a new tool or argument to clear stuck moves (M). |
+| 1 | Med | Account-wide scans keep using a session after a connection error, waiting the app's 120 s timeout per remaining folder, and still return `Ok` | `lib.rs:2489`, `:2504`, `:2757`, `:3026`, `:4646` | M | Four sites. Two scan outputs need a new skipped-mailboxes field to report the gap. | Done. Wider than reported: on a closed stream SELECT/SEARCH/FETCH return empty `Ok`s, so the remaining folders mostly "drained" as empty rather than timing out, and the dead session was pooled. A mailbox now counts only after a checked NOOP passes; a lost connection stops the scan and lists the rest in `skipped` (new on `list_flags`/`find_attachments`); thread preview fails instead. |
+| 2 | **High** | Any SELECT failure during move reconciliation becomes a permanent `NeedsAttention`, and nothing can clear it. A BYE right after SELECT can mark a move Complete while the source copy survives. | `imap_client.rs:2892`, `:2918` | L | Error classification (S) and a search that must see its own tagged OK (S–M), plus a new tool or argument to clear stuck moves (M). | Done. Only a live server's answer moves the journal; `needsAttention` moves are re-examined; `reconcile_moves` gains `dismiss` (+ CLI `--dismiss`), `dismissed` and `errors`. Added: a source is deleted only right after its copy is seen in the destination, so re-examining can't lose a message whose copy was removed meanwhile. |
 | 3 | Med | Login retries `AUTHENTICATIONFAILED` 3 times, even on Yahoo/AOL | `imap_client.rs:444`, `:612` | XS | The code change is tiny. Whether Yahoo sends transient auth failures needs a decision or a real-account check. |
 | 4 | Med | Cancelling a task aborts it mid-mutation and loses the partial counts | `mcp/tasks.rs:353` | L | Cooperative stop with a grace period, sweeps returning partial totals instead of an error, and a `cancelled` field in outputs. |
 | 5 | Low-Med | An unsolicited `FETCH (FLAGS…)` becomes a UID-0 row, which fails the page or adds a bogus one | `imap_client.rs:2021`, `:2219` | S | Keep only requested UIDs, and audit the 4 other fetch loops. | Done |
@@ -21,7 +21,19 @@ Here are the 16 Part 5 findings, each re-checked against today's code, with an e
 | 13 | Low | A failed `download_attachments` doesn't report files already written | `lib.rs:6471` | S | Pre-check every target name first, and clean up or report on a mid-write failure. | Done |
 | 14 | Low | `AGENTMAIL_CACHE_DIR` means `<dir>/agentmail/` for the header cache but `<dir>/` for the move journal | `header_cache.rs:1394` vs `mutation_journal.rs:117` | XS | Move the header cache (a one-time rebuild), never the journal: pending moves live there. | Done A layout test covering both files, with and without the variable. |
 | 15 | Upstream | async-imap 0.12 still swallows a tagged NO/BAD after SEARCH/FETCH | async-imap `parse.rs` | M | Carry a fork like the imap-proto one, plus an upstream PR. Filing the issue alone is XS. |
-| 16 | Docs | CHANGELOG has no 0.5/0.6 sections; ARCHITECTURE.md points at a nonexistent path | `CHANGELOG.md`, parent `ARCHITECTURE.md:266` | XS + S | There are no v0.5.0/v0.6.0 git tags, so the release boundaries have to be reconstructed from history. | Done
+| 16 | Docs | CHANGELOG has no 0.5/0.6 sections; ARCHITECTURE.md points at a nonexistent path | `CHANGELOG.md`, parent `ARCHITECTURE.md:266` | XS + S | There are no v0.5.0/v0.6.0 git tags, so the release boundaries have to be reconstructed from history. | Half done: the ARCHITECTURE.md path is fixed; the CHANGELOG 0.5/0.6 sections are still missing. |
+
+**Fixed alongside (not in the 16):**
+- Attachment names past a filesystem's 255-byte limit could not be downloaded; the canonical name is now capped at 240 bytes for both the download and `/info`.
+- `to`/`cc`/`bcc`/`replyTo` document `Name <address>`; Mail Accounts settings offer the account's Sent From addresses as aliases.
+
+**New findings while fixing #1 and #2 (reported, not fixed):**
+
+| # | Sev | Finding | Where | Effort |
+|---|---|---|---|---|
+| 17 | Med | `sync` (the post-mutation NOOP) is async-imap's unchecked one, and five call sites `?` it after the mutation landed: a timeout there reports a completed CREATE, flag change, delete, move or superseded-draft cleanup as failed. On a closed stream it passes, so the dead session is pooled (the next acquire's ping catches it). | `imap_client.rs` `sync`; `lib.rs` `create_mailbox`, `update_flags`, `delete_messages`, `move_message`, `discard_superseded_draft` | S |
+| 18 | Med | `list_mailbox_layout` reads LIST to end-of-stream, so a connection lost mid-LIST caches a partial mailbox catalog for its TTL, and account-wide scans silently skip the missing mailboxes. | `imap_client.rs` `list_mailbox_layout`, `mailbox_catalog.rs` | S |
+| 19 | Low | Single-mailbox reads (`search_messages`, `get_messages`, `list_identities`) still take an empty or short SEARCH/FETCH from a closed stream as the answer. Same root as #15; `confirm_alive` after the read would close it per call. | `lib.rs` | S |
 
 **Changed on re-check:**
 - **#2 is worse than reported, so I've raised it to High.** A stuck move also blocks renaming or deleting both its source and destination mailboxes. The only remedy offered is "reconcile that operation", and reconcile returns `NeedsAttention` immediately. So one transient connection drop can lock two mailboxes for good.

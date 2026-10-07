@@ -395,6 +395,7 @@ agentmail create-draft --account gmail --subject "Hello" --body "Hi there" --to 
 agentmail create-draft --account gmail --from "Mark Blake <sales@example.com>" --subject "Hello" --body "Hi" --to user@example.com
 agentmail list-pending-moves --account gmail
 agentmail reconcile-moves --account gmail --operation-id <operation-id>
+agentmail reconcile-moves --account gmail --operation-id <operation-id> --dismiss
 ```
 
 Full subcommand list: `agentmail --help`
@@ -687,13 +688,20 @@ with:
 agentmail list-pending-moves --account gmail
 agentmail reconcile-moves --account gmail --operation-id <operation-id>
 # Omit --operation-id to reconcile every pending operation for the account.
+agentmail reconcile-moves --account gmail --operation-id <operation-id> --dismiss
+# Closes one move reconciliation can't finish. Check both mailboxes first:
+# dismissing moves, copies and deletes nothing.
 ```
 
 The recovery database lives beside the ranking cache (both directly in
 `AGENTMAIL_CACHE_DIR` when it is set), uses `synchronous=FULL`, and has owner-only permissions
 on Unix. It remains enabled when header-cache persistence is disabled because
 mutation intent is not disposable. Reconciliation repeats COPY only when
-unchanged destination `UIDNEXT` proves the ambiguous attempt created nothing.
+unchanged destination `UIDNEXT` proves the ambiguous attempt created nothing,
+deletes a source only right after seeing its copy in the destination, and
+changes nothing on an attempt that loses its connection. `needsAttention`
+moves are examined again each time. A pending move holds its source and
+destination against rename and delete until it finishes or is dismissed.
 
 ## MCP Prompts
 

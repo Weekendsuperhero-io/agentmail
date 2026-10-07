@@ -26,7 +26,19 @@ pub(crate) enum MoveJournalState {
     Complete,
     CopyFailed,
     NeedsAttention,
+    /// Closed by a person who checked both mailboxes. Nothing was moved or
+    /// deleted to get here; the journal just stops tracking the operation.
+    Dismissed,
 }
+
+/// Every state that still holds its source UID claim.
+const ACTIVE_STATES: [MoveJournalState; 5] = [
+    MoveJournalState::Prepared,
+    MoveJournalState::CopyInFlight,
+    MoveJournalState::Copied,
+    MoveJournalState::DeleteInFlight,
+    MoveJournalState::NeedsAttention,
+];
 
 impl MoveJournalState {
     pub(crate) fn as_str(self) -> &'static str {
@@ -38,6 +50,7 @@ impl MoveJournalState {
             Self::Complete => "complete",
             Self::CopyFailed => "copy_failed",
             Self::NeedsAttention => "needs_attention",
+            Self::Dismissed => "dismissed",
         }
     }
 
@@ -50,6 +63,7 @@ impl MoveJournalState {
             "complete" => Ok(Self::Complete),
             "copy_failed" => Ok(Self::CopyFailed),
             "needs_attention" => Ok(Self::NeedsAttention),
+            "dismissed" => Ok(Self::Dismissed),
             other => Err(rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Text,
@@ -59,14 +73,7 @@ impl MoveJournalState {
     }
 
     fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::Prepared
-                | Self::CopyInFlight
-                | Self::Copied
-                | Self::DeleteInFlight
-                | Self::NeedsAttention
-        )
+        ACTIVE_STATES.contains(&self)
     }
 }
 
@@ -276,6 +283,26 @@ impl MutationJournal {
             transaction.commit()?;
             Ok(operation)
         })
+        .await
+    }
+
+    /// Close an active operation without touching either mailbox: it releases
+    /// its source UID claim and stops holding its two mailboxes against rename
+    /// and delete. Dismissing a dismissed operation changes nothing; one that
+    /// already finished (complete, or its COPY rejected) is refused, because
+    /// there is nothing left to dismiss.
+    pub(crate) async fn dismiss(&self, operation_id: &str) -> Result<MoveOperation> {
+        if let Some(operation) = self.get(operation_id).await?
+            && operation.state == MoveJournalState::Dismissed
+        {
+            return Ok(operation);
+        }
+        self.transition(
+            operation_id,
+            &ACTIVE_STATES,
+            MoveJournalState::Dismissed,
+            Some("dismissed after checking both mailboxes; nothing was moved or deleted"),
+        )
         .await
     }
 
@@ -525,14 +552,14 @@ fn prune_terminal_history(connection: &Connection) -> Result<()> {
         .to_rfc3339();
     connection.execute(
         "DELETE FROM move_operations
-          WHERE state IN ('complete', 'copy_failed') AND updated_at < ?1",
+          WHERE state IN ('complete', 'copy_failed', 'dismissed') AND updated_at < ?1",
         params![cutoff],
     )?;
     connection.execute(
         "DELETE FROM move_operations
           WHERE operation_id IN (
               SELECT operation_id FROM move_operations
-               WHERE state IN ('complete', 'copy_failed')
+               WHERE state IN ('complete', 'copy_failed', 'dismissed')
                ORDER BY updated_at DESC, operation_id DESC
                LIMIT -1 OFFSET ?1
           )",
@@ -697,6 +724,67 @@ mod tests {
         assert_ne!(first.operation_id, replacement.operation_id);
     }
 
+    fn inbox_42_to(destination: &str) -> PrepareMove<'_> {
+        PrepareMove {
+            account_key: "account",
+            source_mailbox: "INBOX",
+            source_uid_validity: 7,
+            source_uid: 42,
+            destination,
+            destination_uid_validity: 9,
+            destination_uid_next: 100,
+        }
+    }
+
+    /// A stuck move used to hold its source UID — and both its mailboxes —
+    /// forever. Dismissing it releases the claim, drops it from the pending
+    /// list, and touches nothing else.
+    #[tokio::test]
+    async fn dismissing_a_stuck_move_releases_its_claim() {
+        let journal = test_journal("dismiss");
+        let stuck = journal.prepare(inbox_42_to("Archive")).await.unwrap();
+        journal
+            .transition(
+                &stuck.operation_id,
+                &[MoveJournalState::Prepared],
+                MoveJournalState::NeedsAttention,
+                Some("source disappeared before COPY"),
+            )
+            .await
+            .unwrap();
+
+        let dismissed = journal.dismiss(&stuck.operation_id).await.unwrap();
+
+        assert_eq!(dismissed.state, MoveJournalState::Dismissed);
+        assert!(journal.list_pending("account").await.unwrap().is_empty());
+        let replacement = journal.prepare(inbox_42_to("Other")).await.unwrap();
+        assert_ne!(replacement.operation_id, stuck.operation_id);
+    }
+
+    #[tokio::test]
+    async fn dismissing_twice_is_harmless_but_a_finished_move_is_refused() {
+        let journal = test_journal("dismiss-twice");
+        let pending = journal.prepare(inbox_42_to("Archive")).await.unwrap();
+        journal.dismiss(&pending.operation_id).await.unwrap();
+        assert_eq!(
+            journal.dismiss(&pending.operation_id).await.unwrap().state,
+            MoveJournalState::Dismissed
+        );
+
+        let finished = journal.prepare(inbox_42_to("Archive")).await.unwrap();
+        journal
+            .transition(
+                &finished.operation_id,
+                &[MoveJournalState::Prepared],
+                MoveJournalState::Complete,
+                None,
+            )
+            .await
+            .unwrap();
+        let refusal = journal.dismiss(&finished.operation_id).await.unwrap_err();
+        assert!(refusal.to_string().contains("is complete"), "{refusal}");
+    }
+
     #[tokio::test]
     async fn only_inbox_is_case_insensitive_in_journal_identities() {
         let journal = test_journal("mailbox-case");
@@ -765,15 +853,33 @@ mod tests {
             )
             .await
             .unwrap();
+        let dismissed = journal
+            .prepare(PrepareMove {
+                account_key: "account",
+                source_mailbox: "INBOX",
+                source_uid_validity: 7,
+                source_uid: 44,
+                destination: "Archive",
+                destination_uid_validity: 9,
+                destination_uid_next: 100,
+            })
+            .await
+            .unwrap();
+        journal.dismiss(&dismissed.operation_id).await.unwrap();
 
         let path = journal.required_path().unwrap();
-        let operation_id = finished.operation_id.clone();
+        let aged = [
+            finished.operation_id.clone(),
+            dismissed.operation_id.clone(),
+        ];
         run_db(path, move |connection| {
             let old = (Utc::now() - chrono::Duration::days(TERMINAL_HISTORY_DAYS + 1)).to_rfc3339();
-            connection.execute(
-                "UPDATE move_operations SET updated_at = ?2 WHERE operation_id = ?1",
-                params![operation_id, old],
-            )?;
+            for operation_id in aged {
+                connection.execute(
+                    "UPDATE move_operations SET updated_at = ?2 WHERE operation_id = ?1",
+                    params![operation_id, old],
+                )?;
+            }
             Ok(())
         })
         .await
@@ -792,5 +898,12 @@ mod tests {
             .await
             .unwrap();
         assert!(journal.get(&finished.operation_id).await.unwrap().is_none());
+        assert!(
+            journal
+                .get(&dismissed.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

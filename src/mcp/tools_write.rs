@@ -1541,7 +1541,7 @@ impl AgentMailServer {
     #[tool(
         name = "reconcile_moves",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ReconcileMovesOutput>().expect("valid reconcile_moves output schema"),
-        description = "Safely reconcile durable non-native IMAP MOVE operations after a connection loss or ambiguous COPY/delete boundary. Pass one operationId from list_pending_moves, or omit it to process all pending operations for the account. The reconciler only removes a source message after it can prove the destination copy; ambiguous cases remain needsAttention instead of risking loss or duplicate deletion.",
+        description = "Safely reconcile durable non-native IMAP MOVE operations after a connection loss or ambiguous COPY/delete boundary. Pass one operationId from list_pending_moves, or omit it to process all pending operations for the account. A source message is removed only right after its destination copy has been seen, and COPY is retried only when the destination's UIDNEXT proves the first attempt created nothing; cases it can't prove stay needsAttention instead of risking loss or a duplicate. needsAttention operations are examined again on every call. An attempt that learns nothing (a dropped connection, a timeout) leaves its operation as it was and is listed in errors. To close a move that still can't finish, check both mailboxes, then pass its operationId with dismiss: true — that moves and deletes nothing.",
         annotations(
             title = "Reconcile Pending Moves",
             destructive_hint = true,
@@ -1565,6 +1565,22 @@ impl AgentMailServer {
                 "operationId cannot be empty",
                 None,
             ));
+        }
+        if args.dismiss {
+            let Some(operation_id) = args.operation_id.as_deref() else {
+                return Err(McpError::invalid_params(
+                    "dismiss requires operationId: name the one move to close",
+                    None,
+                ));
+            };
+            return match self
+                .agentmail
+                .dismiss_move(&args.account, operation_id)
+                .await
+            {
+                Ok(data) => compact_result(ReconcileMovesOutput::from(data)),
+                Err(e) => Ok(tool_error_result(&e)),
+            };
         }
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);

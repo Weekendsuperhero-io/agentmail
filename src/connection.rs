@@ -623,6 +623,23 @@ impl ConnectionPool {
     /// right store. Stale/dead candidates are dropped (connection closes) and
     /// the next store is tried. The pool lock is held only for each pop — never
     /// across the liveness ping.
+    /// Park `session` as an idle Limited-Mode connection for `account_name`, so
+    /// a test can drive the library's own `acquire` against a scripted server.
+    /// `acquire` pings it before handing it out, so the script must answer
+    /// `NOOP`.
+    #[cfg(test)]
+    pub(crate) async fn hold_idle_for_test(&self, account_name: &str, session: ImapSession) {
+        self.pools
+            .lock()
+            .await
+            .entry(account_name.to_string())
+            .or_default()
+            .push(IdleSession {
+                session,
+                idle_since: SystemTime::now(),
+            });
+    }
+
     async fn pop_idle_any(&self, account_name: &str) -> Option<(ImapSession, bool)> {
         for (store, uid_mode) in [(&self.uid_pools, true), (&self.pools, false)] {
             let maybe_idle = {

@@ -2507,12 +2507,13 @@ impl Agentmail {
                 imap_client::check_cancel(cancel)?;
                 // Re-select each pass so a windowed server's freshly backfilled
                 // messages become visible (a no-op once in UID Mode, where the
-                // whole mailbox is already visible).
+                // whole mailbox is already visible). A failure leaves the
+                // mailbox undrained, so it is reported skipped; a lost
+                // connection also ends the sweep (below).
                 let mb = match imap_client::select(session, mbox).await {
                     Ok(mb) => mb,
-                    Err(_) => {
-                        totals.skipped.push(mbox.clone());
-                        drained = true;
+                    Err(error) => {
+                        totals.session_usable &= !error.is_connection_error();
                         break;
                     }
                 };
@@ -2524,10 +2525,9 @@ impl Agentmail {
                     // A discovery failure marks the mailbox skipped (coverage
                     // incomplete) rather than aborting the account-wide sweep —
                     // but a pending cancellation must still propagate.
-                    Err(_) => {
+                    Err(error) => {
                         imap_client::check_cancel(cancel)?;
-                        totals.skipped.push(mbox.clone());
-                        drained = true;
+                        totals.session_usable &= !error.is_connection_error();
                         break;
                     }
                 };
@@ -2620,8 +2620,18 @@ impl Agentmail {
                         }
                     };
                 totals.session_usable &= session_usable;
-                if session_usable {
-                    imap_client::sync(session).await?;
+                if totals.session_usable
+                    && let Err(error) = imap_client::confirm_alive(session).await
+                {
+                    // The batch's outcome stands (its commands completed);
+                    // only further passes are off.
+                    tracing::warn!(
+                        target: "agentmail",
+                        mailbox = mbox,
+                        error = %error,
+                        "connection lost after a sweep batch; stopping"
+                    );
+                    totals.session_usable = false;
                 }
                 mailbox_found += uids.len();
                 mailbox_affected += affected;
@@ -2629,10 +2639,32 @@ impl Agentmail {
                 mailbox_pending += pending;
                 mailbox_needs_attention += needs_attention;
                 mailbox_operation_ids.extend(operation_ids);
-                if affected == 0 || !session_usable {
+                // Without a usable connection there is no next pass, so the
+                // mailbox may still hold matches: it stays undrained.
+                if !totals.session_usable {
+                    break;
+                }
+                if affected == 0 {
                     drained = true;
                     break;
                 }
+            }
+            // A mailbox counts as covered only if the connection answers after
+            // its last command: on a closed stream SELECT and SEARCH come back
+            // empty, and every remaining mailbox would "drain" with nothing
+            // found. The same probe tells a mailbox that failed on its own
+            // from a connection that ended.
+            if totals.session_usable
+                && let Err(error) = imap_client::confirm_alive(session).await
+            {
+                tracing::warn!(
+                    target: "agentmail",
+                    mailbox = mbox,
+                    error = %error,
+                    "connection lost during an account-wide sweep; stopping"
+                );
+                drained = false;
+                totals.session_usable = false;
             }
             if !drained {
                 totals.skipped.push(mbox.clone());
@@ -2657,10 +2689,10 @@ impl Agentmail {
                 });
             }
             if !totals.session_usable {
-                // No later mailbox was attempted after an ambiguous mutation
-                // invalidated this connection. Report that coverage gap
-                // explicitly instead of returning an apparently complete
-                // account-wide result.
+                // No later mailbox was attempted after an ambiguous mutation or
+                // a lost connection invalidated this session. Report that
+                // coverage gap explicitly instead of returning an apparently
+                // complete account-wide result.
                 totals
                     .skipped
                     .extend(mailboxes.iter().skip(mailbox_index + 1).cloned());
@@ -2767,24 +2799,28 @@ impl Agentmail {
         let mut total_flags: HashMap<String, u32> = HashMap::new();
         let mut total_colors: HashMap<String, u32> = HashMap::new();
         let mut per_mailbox = Vec::new();
+        let mut skipped = Vec::new();
+        let mut connection_alive = true;
 
-        for mbox in &mailboxes {
+        for (index, mbox) in mailboxes.iter().enumerate() {
             imap_client::check_cancel(cancel)?;
-            let scan = match imap_client::fetch_flags(session.session(), mbox, on_progress, cancel)
-                .await
-            {
-                Ok(s) => s,
-                Err(error) if mailbox.is_none() => {
-                    tracing::warn!(
-                        target: "agentmail",
-                        mailbox = mbox,
-                        error = %error,
-                        "account-wide flag scan skipped a mailbox"
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let scanned =
+                imap_client::fetch_flags(session.session(), mbox, on_progress, cancel).await;
+            let scan =
+                match settle_mailbox_scan(session.session(), mbox, scanned, mailbox.is_none())
+                    .await?
+                {
+                    MailboxScan::Counted(scan) => scan,
+                    MailboxScan::Skipped => {
+                        skipped.push(mbox.clone());
+                        continue;
+                    }
+                    MailboxScan::ConnectionLost => {
+                        skipped.extend(mailboxes[index..].iter().cloned());
+                        connection_alive = false;
+                        break;
+                    }
+                };
 
             if !scan.flags.is_empty() {
                 let mbox_flags: Vec<FlagCount> = scan
@@ -2814,7 +2850,9 @@ impl Agentmail {
         }
 
         imap_client::check_cancel(cancel)?;
-        session.release().await;
+        if connection_alive {
+            session.release().await;
+        }
 
         let mut flag_list: Vec<(String, u32)> = total_flags.into_iter().collect();
         flag_list.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -2837,6 +2875,7 @@ impl Agentmail {
             flags,
             colors,
             per_mailbox,
+            skipped,
         })
     }
 
@@ -3031,29 +3070,29 @@ impl Agentmail {
 
         let mut all_messages = Vec::new();
         let mut per_mailbox = Vec::new();
+        let mut skipped = Vec::new();
+        let mut connection_alive = true;
 
-        for mbox in &mailboxes {
+        for (index, mbox) in mailboxes.iter().enumerate() {
             imap_client::check_cancel(cancel)?;
-            let (hits, uid_validity) = match imap_client::fetch_attachment_uids(
-                session.session(),
-                mbox,
-                on_progress,
-                cancel,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) if mailbox.is_none() => {
-                    tracing::warn!(
-                        target: "agentmail",
-                        mailbox = mbox,
-                        error = %error,
-                        "account-wide attachment scan skipped a mailbox"
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let scanned =
+                imap_client::fetch_attachment_uids(session.session(), mbox, on_progress, cancel)
+                    .await;
+            let (hits, uid_validity) =
+                match settle_mailbox_scan(session.session(), mbox, scanned, mailbox.is_none())
+                    .await?
+                {
+                    MailboxScan::Counted(result) => result,
+                    MailboxScan::Skipped => {
+                        skipped.push(mbox.clone());
+                        continue;
+                    }
+                    MailboxScan::ConnectionLost => {
+                        skipped.extend(mailboxes[index..].iter().cloned());
+                        connection_alive = false;
+                        break;
+                    }
+                };
 
             if !hits.is_empty() {
                 per_mailbox.push(MailboxAttachmentCount {
@@ -3070,7 +3109,9 @@ impl Agentmail {
         }
 
         imap_client::check_cancel(cancel)?;
-        session.release().await;
+        if connection_alive {
+            session.release().await;
+        }
 
         all_messages.sort_unstable_by(|a, b| {
             b.date
@@ -3090,6 +3131,7 @@ impl Agentmail {
             limit,
             messages,
             per_mailbox,
+            skipped,
         })
     }
 
@@ -3662,22 +3704,20 @@ impl Agentmail {
     /// explicit review. Native UID MOVE never needs journal entries.
     pub async fn list_pending_moves(&self, account: &str) -> Result<ListPendingMovesResponse> {
         let account_key = self.mutation_account_key(account)?;
-        let operations = self
-            .mutation_journal
-            .list_pending(&account_key)
-            .await?
-            .into_iter()
-            .map(pending_move_from_operation)
-            .collect();
         Ok(ListPendingMovesResponse {
             account: account.to_string(),
-            operations,
+            operations: self.pending_moves(&account_key).await?,
         })
     }
 
     /// Reconcile all pending COPY-based moves for an account, or one durable
     /// operation ID. COPY is retried only when unchanged destination UIDNEXT
-    /// proves the ambiguous command did not create a message.
+    /// proves the ambiguous command did not create a message, and a source is
+    /// deleted only right after its copy has been seen.
+    ///
+    /// Operations that `NeedsAttention` are examined again. An attempt that
+    /// learns nothing (a dropped connection, a timeout) leaves its operation
+    /// as it was, counts it as `pending`, and says why in `errors`.
     pub async fn reconcile_moves(
         &self,
         account: &str,
@@ -3688,19 +3728,10 @@ impl Agentmail {
         let _mutation_guard = self.lock_account_mutation(account).await;
         let account_key = self.mutation_account_key(account)?;
         let operations = if let Some(operation_id) = operation_id {
-            let operation = self
-                .mutation_journal
-                .get(operation_id)
-                .await?
-                .ok_or_else(|| {
-                    AgentmailError::Other(format!("unknown move operation '{operation_id}'"))
-                })?;
-            if operation.account_key != account_key {
-                return Err(AgentmailError::Other(format!(
-                    "move operation '{operation_id}' does not belong to account '{account}'"
-                )));
-            }
-            vec![operation]
+            vec![
+                self.account_move_operation(account, &account_key, operation_id)
+                    .await?,
+            ]
         } else {
             self.mutation_journal.list_pending(&account_key).await?
         };
@@ -3710,20 +3741,38 @@ impl Agentmail {
         let mut pending = 0usize;
         let mut needs_attention = 0usize;
         let mut failed = 0usize;
-        for (index, operation) in operations.iter().cloned().enumerate() {
+        let mut dismissed = 0usize;
+        let mut errors = Vec::new();
+        for (index, operation) in operations.into_iter().enumerate() {
             imap_client::check_cancel(cancel)?;
-            let mut session = self.pool.acquire(account).await?;
+            if operation.state == mutation_journal::MoveJournalState::Dismissed {
+                dismissed += 1;
+                if let Some(progress) = on_progress {
+                    progress((index + 1) as u64, total);
+                }
+                continue;
+            }
+            let operation_id = operation.operation_id.clone();
             let source_mailbox = operation.source_mailbox.clone();
-            let outcome = imap_client::reconcile_journaled_move(
-                session.session(),
-                imap_client::JournalMoveContext {
-                    journal: &self.mutation_journal,
-                    account_key: &account_key,
-                    source_mailbox: &source_mailbox,
-                    source_uid_validity: operation.source_uid_validity,
-                },
-                operation,
-            )
+            let mut session = self.pool.acquire(account).await?;
+            let outcome = async {
+                let caps = self.pool.server_caps(account, session.session()).await?;
+                // Limited Mode (Yahoo/AOL outside UID Mode) hides messages
+                // below a window, so there "not found" proves nothing.
+                let whole_mailbox_visible = session.is_uid_mode() || !caps.has("UIDONLY");
+                imap_client::reconcile_journaled_move(
+                    session.session(),
+                    imap_client::JournalMoveContext {
+                        journal: &self.mutation_journal,
+                        account_key: &account_key,
+                        source_mailbox: &source_mailbox,
+                        source_uid_validity: operation.source_uid_validity,
+                    },
+                    operation,
+                    whole_mailbox_visible,
+                )
+                .await
+            }
             .await;
             match outcome {
                 Ok(outcome) => {
@@ -3747,25 +3796,22 @@ impl Agentmail {
                 Err(error) => {
                     tracing::warn!(
                         target: "agentmail",
-                        operation_id = operations[index].operation_id,
+                        operation_id,
                         error = %error,
-                        "move reconciliation attempt failed"
+                        "move reconciliation attempt learned nothing; operation left as it was"
                     );
                     drop(session);
-                    failed += 1;
+                    pending += 1;
+                    errors.push(ReconcileMoveError {
+                        operation_id,
+                        error: error.to_string(),
+                    });
                 }
             }
             if let Some(progress) = on_progress {
                 progress((index + 1) as u64, total);
             }
         }
-        let operations = self
-            .mutation_journal
-            .list_pending(&account_key)
-            .await?
-            .into_iter()
-            .map(pending_move_from_operation)
-            .collect();
         Ok(ReconcileMovesResponse {
             account: account.to_string(),
             examined: usize::try_from(total).unwrap_or(usize::MAX),
@@ -3773,8 +3819,78 @@ impl Agentmail {
             pending,
             needs_attention,
             failed,
-            operations,
+            dismissed,
+            errors,
+            operations: self.pending_moves(&account_key).await?,
         })
+    }
+
+    /// Close one pending move for good without touching either mailbox.
+    ///
+    /// For a move reconciliation can't finish — its source mailbox was
+    /// recreated, its copy deleted, a server answer was ambiguous — once a
+    /// person has checked both mailboxes and set things right by hand. Nothing
+    /// is moved, copied or deleted: the journal stops tracking the operation,
+    /// releases its claim on the source UID, and stops holding its two
+    /// mailboxes against rename and delete. Dismissing twice is harmless; an
+    /// operation that already finished can't be dismissed.
+    pub async fn dismiss_move(
+        &self,
+        account: &str,
+        operation_id: &str,
+    ) -> Result<ReconcileMovesResponse> {
+        let _mutation_guard = self.lock_account_mutation(account).await;
+        let account_key = self.mutation_account_key(account)?;
+        let operation = self
+            .account_move_operation(account, &account_key, operation_id)
+            .await?;
+        self.mutation_journal
+            .dismiss(&operation.operation_id)
+            .await?;
+        Ok(ReconcileMovesResponse {
+            account: account.to_string(),
+            examined: 1,
+            completed: 0,
+            pending: 0,
+            needs_attention: 0,
+            failed: 0,
+            dismissed: 1,
+            errors: Vec::new(),
+            operations: self.pending_moves(&account_key).await?,
+        })
+    }
+
+    /// One journal operation, refused unless it belongs to `account`.
+    async fn account_move_operation(
+        &self,
+        account: &str,
+        account_key: &str,
+        operation_id: &str,
+    ) -> Result<mutation_journal::MoveOperation> {
+        let operation = self
+            .mutation_journal
+            .get(operation_id)
+            .await?
+            .ok_or_else(|| {
+                AgentmailError::Other(format!("unknown move operation '{operation_id}'"))
+            })?;
+        if operation.account_key != account_key {
+            return Err(AgentmailError::Other(format!(
+                "move operation '{operation_id}' does not belong to account '{account}'"
+            )));
+        }
+        Ok(operation)
+    }
+
+    /// The account's moves still waiting on reconciliation or a person.
+    async fn pending_moves(&self, account_key: &str) -> Result<Vec<PendingMove>> {
+        Ok(self
+            .mutation_journal
+            .list_pending(account_key)
+            .await?
+            .into_iter()
+            .filter_map(pending_move_from_operation)
+            .collect())
     }
 
     /// Move a message to another mailbox.
@@ -4665,10 +4781,14 @@ impl Agentmail {
             imap_client::check_cancel(cancel)?;
             for candidate_mailbox in &mailboxes {
                 imap_client::check_cancel(cancel)?;
+                // A lost connection fails discovery outright: a graph missing
+                // what it could no longer search is not a preview. Other
+                // failures skip the mailbox with a warning.
                 let selected = match imap_client::examine(session.session(), candidate_mailbox)
                     .await
                 {
                     Ok(selected) => selected,
+                    Err(error) if error.is_connection_error() => return Err(error),
                     Err(error) => {
                         push_record_warning(
                             &mut warnings,
@@ -4685,6 +4805,8 @@ impl Agentmail {
                 ) {
                     Ok(uid_validity) => uid_validity,
                     Err(error) => {
+                        // A closed stream opens every mailbox without one.
+                        imap_client::confirm_alive(session.session()).await?;
                         push_record_warning(
                             &mut warnings,
                             format!(
@@ -4705,6 +4827,7 @@ impl Agentmail {
                     .await
                     {
                         Ok(uids) => candidate_uids.extend(uids),
+                        Err(error) if error.is_connection_error() => return Err(error),
                         Err(error) => {
                             push_record_warning(
                                 &mut warnings,
@@ -4742,6 +4865,7 @@ impl Agentmail {
                     .await
                     {
                         Ok(headers) => headers,
+                        Err(error) if error.is_connection_error() => return Err(error),
                         Err(error) => {
                             push_record_warning(
                                 &mut warnings,
@@ -4791,6 +4915,9 @@ impl Agentmail {
                 }
             }
         }
+        // Every empty search above is only "no match" if the connection was
+        // alive when it answered; one that ended reads as empty.
+        imap_client::confirm_alive(session.session()).await?;
         session.release().await;
 
         messages.sort_by(|left, right| {
@@ -5155,7 +5282,7 @@ impl Agentmail {
                 || mailbox_is_same_or_descendant(&operation.destination, &mailbox.path, delimiter)
         }) {
             return Err(AgentmailError::Other(format!(
-                "mailbox '{}' is referenced by pending move {}; reconcile that operation before renaming or deleting the mailbox",
+                "mailbox '{}' is referenced by pending move {}; reconcile that operation, or dismiss it once you have checked both mailboxes, before renaming or deleting the mailbox",
                 mailbox.path, operation.operation_id
             )));
         }
@@ -5493,6 +5620,67 @@ fn thread_match_basis(message: &MessageInfo, query_id: &str) -> Vec<String> {
         basis.push(format!("References contains {query_id}"));
     }
     basis
+}
+
+/// What one mailbox of a scan is worth.
+enum MailboxScan<R> {
+    /// Scanned, and the connection proven alive afterwards.
+    Counted(R),
+    /// Failed on its own; an account-wide scan goes on without it.
+    Skipped,
+    /// The connection is gone: this mailbox and every later one go uncovered.
+    ConnectionLost,
+}
+
+/// Settle one mailbox of a scan. A result counts only once the connection is
+/// proven alive after it ([`imap_client::confirm_alive`]): on a closed stream
+/// EXAMINE, SEARCH and FETCH come back empty or short rather than failing. A
+/// single-mailbox scan (`account_wide` false) fails instead of skipping, and a
+/// cancellation always propagates.
+async fn settle_mailbox_scan<T, R>(
+    session: &mut async_imap::Session<T>,
+    mailbox: &str,
+    scanned: Result<R>,
+    account_wide: bool,
+) -> Result<MailboxScan<R>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let error = match scanned {
+        Ok(result) => match imap_client::confirm_alive(session).await {
+            Ok(()) => return Ok(MailboxScan::Counted(result)),
+            Err(error) => error,
+        },
+        Err(error) => {
+            if matches!(error, AgentmailError::Cancelled) || !account_wide {
+                return Err(error);
+            }
+            // A mailbox that failed on a live connection is skipped on its
+            // own. The probe tells that apart from a connection that ended,
+            // whose EXAMINE "succeeds" without a UIDVALIDITY and then fails
+            // the scan for lack of one.
+            if !error.is_connection_error() && imap_client::confirm_alive(session).await.is_ok() {
+                tracing::warn!(
+                    target: "agentmail",
+                    mailbox,
+                    error = %error,
+                    "account-wide scan skipped a mailbox"
+                );
+                return Ok(MailboxScan::Skipped);
+            }
+            error
+        }
+    };
+    if !account_wide {
+        return Err(error);
+    }
+    tracing::warn!(
+        target: "agentmail",
+        mailbox,
+        error = %error,
+        "connection lost during an account-wide scan; the rest of the account is reported skipped"
+    );
+    Ok(MailboxScan::ConnectionLost)
 }
 
 fn push_record_warning(warnings: &mut Vec<String>, warning: String) {
@@ -6010,18 +6198,21 @@ fn move_tallies(tallies: Vec<SweepMailboxTally>) -> Vec<PerMailboxMoveResult> {
         .collect()
 }
 
-fn pending_move_from_operation(operation: mutation_journal::MoveOperation) -> PendingMove {
+/// The pending move an active journal operation is, or `None` for one that is
+/// over — complete, its COPY rejected, or dismissed — which is history.
+fn pending_move_from_operation(operation: mutation_journal::MoveOperation) -> Option<PendingMove> {
     use mutation_journal::MoveJournalState;
     let status = match operation.state {
-        MoveJournalState::Complete => MoveStatus::Moved,
-        MoveJournalState::CopyFailed => MoveStatus::Failed,
         MoveJournalState::NeedsAttention => MoveStatus::NeedsAttention,
         MoveJournalState::Prepared
         | MoveJournalState::CopyInFlight
         | MoveJournalState::Copied
         | MoveJournalState::DeleteInFlight => MoveStatus::ReconciliationPending,
+        MoveJournalState::Complete | MoveJournalState::CopyFailed | MoveJournalState::Dismissed => {
+            return None;
+        }
     };
-    PendingMove {
+    Some(PendingMove {
         operation_id: operation.operation_id,
         source_mailbox: operation.source_mailbox,
         source_uid_validity: operation.source_uid_validity,
@@ -6031,7 +6222,7 @@ fn pending_move_from_operation(operation: mutation_journal::MoveOperation) -> Pe
         detail: operation.detail,
         created_at: operation.created_at,
         updated_at: operation.updated_at,
-    }
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -8444,5 +8635,424 @@ mod tests {
             !joined.contains("UID MOVE 11,12") && !joined.contains("UID MOVE 11,12,13"),
             "sibling-list and ordinary mail must stay put: {commands:?}"
         );
+    }
+
+    /// An Agentmail with one account ("work") and its journal in a fresh
+    /// temp directory. Nothing here connects to a server.
+    fn journaled_agentmail() -> Agentmail {
+        let config = Config::from_accounts(vec![(
+            "work".to_string(),
+            AccountConfig {
+                host: "imap.example.com".to_string(),
+                port: 993,
+                username: "me@example.com".to_string(),
+                email: None,
+                aliases: Vec::new(),
+                display_name: None,
+                password: None,
+                tls: true,
+                max_connections: None,
+                auth: AuthMethod::Password,
+            },
+        )]);
+        Agentmail::builder(config)
+            .cache_dir(
+                std::env::temp_dir().join(format!("agentmail-dismiss-{}", uuid::Uuid::new_v4())),
+            )
+            .build()
+    }
+
+    async fn pending_move_to_archive(mk: &Agentmail) -> mutation_journal::MoveOperation {
+        let account_key = mk.mutation_account_key("work").expect("configured account");
+        mk.mutation_journal
+            .prepare(mutation_journal::PrepareMove {
+                account_key: &account_key,
+                source_mailbox: "INBOX",
+                source_uid_validity: 7,
+                source_uid: 42,
+                destination: "Archive",
+                destination_uid_validity: 9,
+                destination_uid_next: 100,
+            })
+            .await
+            .expect("journaled")
+    }
+
+    /// A move reconciliation can't finish held both its mailboxes against
+    /// rename and delete, and the only remedy offered was to reconcile it.
+    /// Dismissing it releases them, and touches no server.
+    #[tokio::test]
+    async fn a_dismissed_move_no_longer_blocks_its_mailboxes() {
+        let mk = journaled_agentmail();
+        let operation = pending_move_to_archive(&mk).await;
+        let archive = imap_client::MailboxLayout {
+            path: "Archive".to_string(),
+            delimiter: Some("/".to_string()),
+            no_select: false,
+            no_inferiors: false,
+            roles: Vec::new(),
+        };
+        let blocked = mk
+            .ensure_mailbox_not_in_pending_move("work", &archive)
+            .await
+            .expect_err("a pending move holds its destination");
+        assert!(
+            blocked
+                .to_string()
+                .contains("or dismiss it once you have checked both mailboxes"),
+            "{blocked}"
+        );
+
+        let response = mk
+            .dismiss_move("work", &operation.operation_id)
+            .await
+            .expect("dismissed");
+
+        assert_eq!((response.examined, response.dismissed), (1, 1));
+        assert!(response.operations.is_empty());
+        mk.ensure_mailbox_not_in_pending_move("work", &archive)
+            .await
+            .expect("the destination is free again");
+        let again = mk
+            .reconcile_moves("work", Some(&operation.operation_id), None, None)
+            .await
+            .expect("a dismissed move needs no connection");
+        assert_eq!(
+            (
+                again.examined,
+                again.dismissed,
+                again.pending,
+                again.errors.len()
+            ),
+            (1, 1, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_move_is_dismissed_only_through_its_own_account() {
+        let mk = journaled_agentmail();
+        let operation = pending_move_to_archive(&mk).await;
+        let other_key = "imap.example.net:993|1|3:you";
+        let foreign = mk
+            .mutation_journal
+            .prepare(mutation_journal::PrepareMove {
+                account_key: other_key,
+                source_mailbox: "INBOX",
+                source_uid_validity: 7,
+                source_uid: 42,
+                destination: "Archive",
+                destination_uid_validity: 9,
+                destination_uid_next: 100,
+            })
+            .await
+            .expect("journaled");
+
+        let refusal = mk
+            .dismiss_move("work", &foreign.operation_id)
+            .await
+            .expect_err("another account's move");
+        assert!(refusal.to_string().contains("does not belong"), "{refusal}");
+        assert_eq!(
+            mk.list_pending_moves("work")
+                .await
+                .expect("listed")
+                .operations[0]
+                .operation_id,
+            operation.operation_id
+        );
+    }
+
+    /// A connection that drops mid-sweep reads as an empty SELECT and SEARCH
+    /// from then on, so every later mailbox "drained" with nothing found and
+    /// the dead session went back to the pool. The sweep stops at the loss and
+    /// reports every mailbox it did not cover.
+    #[tokio::test]
+    async fn a_sweep_stops_at_a_lost_connection_and_reports_what_it_did_not_cover() {
+        let selected = std::sync::Mutex::new(String::new());
+        let (mut session, server) =
+            imap_client::test_support::scripted_session(move |tag, command| {
+                let words: Vec<&str> = command.split_whitespace().collect();
+                match (words.get(1).copied(), words.get(2).copied()) {
+                    (Some("SELECT"), Some(mailbox)) => {
+                        *selected.lock().expect("lock") = mailbox.trim_matches('"').to_string();
+                        Some(imap_client::test_support::examine_reply(tag, 9, 100, 3))
+                    }
+                    // INBOX holds no match; the connection drops during
+                    // Projects' search.
+                    (Some("UID"), Some("SEARCH")) => (selected.lock().expect("lock").as_str()
+                        == "INBOX")
+                        .then(|| format!("* SEARCH\r\n{tag} OK SEARCH completed\r\n")),
+                    (Some("NOOP"), _) => Some(format!("{tag} OK NOOP completed\r\n")),
+                    _ => None,
+                }
+            })
+            .await;
+        let mk = Agentmail::new(Config::empty());
+        let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
+
+        let totals = mk
+            .matching_sweep_loop(
+                &mut session,
+                "test-account",
+                &DeleteSelector::ListId("news.example.com".to_string()),
+                &[
+                    "INBOX".to_string(),
+                    "Projects".to_string(),
+                    "Clients".to_string(),
+                ],
+                SweepAction::Delete {
+                    trash: None,
+                    allow_permanent_fallback: false,
+                },
+                &caps,
+                None,
+                None,
+            )
+            .await
+            .expect("a lost connection ends the sweep, not its report");
+
+        assert_eq!(
+            totals.skipped,
+            vec!["Projects".to_string(), "Clients".to_string()]
+        );
+        assert!(!totals.session_usable, "a dead session must not be pooled");
+        drop(session);
+        server.commands().await;
+    }
+
+    /// A scripted account for thread discovery: the seed is INBOX UID 1
+    /// (`Message-ID: <seed@example.com>`), LIST shows Clients, INBOX and
+    /// Projects, and searches find nothing more. The connection drops at
+    /// the EXAMINE of `drop_at`.
+    fn thread_account(
+        drop_at: Option<&'static str>,
+    ) -> impl Fn(&str, &str) -> Option<String> + Send + 'static {
+        move |tag, command| {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            match (words.get(1).copied(), words.get(2).copied()) {
+                (Some("NOOP"), _) => Some(format!("{tag} OK NOOP completed\r\n")),
+                (Some("LIST"), _) => Some(format!(
+                    "* LIST (\\HasNoChildren) \"/\" \"Clients\"\r\n\
+                     * LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n\
+                     * LIST (\\HasNoChildren) \"/\" \"Projects\"\r\n\
+                     {tag} OK LIST completed\r\n"
+                )),
+                (Some("EXAMINE"), Some(mailbox)) => (drop_at != Some(mailbox.trim_matches('"')))
+                    .then(|| imap_client::test_support::examine_reply(tag, 9, 100, 3)),
+                (Some("UID"), Some("FETCH")) => {
+                    let headers = "Message-ID: <seed@example.com>\r\nSubject: Hi\r\n\r\n";
+                    Some(format!(
+                        "* 1 FETCH (UID 1 BODY[HEADER] {{{}}}\r\n{headers})\r\n{tag} OK FETCH completed\r\n",
+                        headers.len()
+                    ))
+                }
+                (Some("UID"), Some("SEARCH")) => {
+                    Some(format!("* SEARCH\r\n{tag} OK SEARCH completed\r\n"))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Discovery that loses its connection must fail rather than return a
+    /// graph missing what it could no longer search: the preview's digest
+    /// would bless an incomplete selection.
+    #[tokio::test]
+    async fn thread_discovery_fails_when_the_connection_is_lost() {
+        let (mk, server) = agentmail_on(thread_account(Some("Projects"))).await;
+
+        let preview = mk
+            .preview_thread_record("INBOX", "work", 1, 9, None, None)
+            .await;
+
+        let error = preview.expect_err("an incomplete graph is not a preview");
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(mk);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn thread_discovery_on_a_live_connection_searches_every_mailbox() {
+        let (mk, server) = agentmail_on(thread_account(None)).await;
+
+        let preview = mk
+            .preview_thread_record("INBOX", "work", 1, 9, None, None)
+            .await
+            .expect("previewed");
+
+        assert_eq!(preview.messages.len(), 1, "only the seed matches");
+        assert!(preview.warnings.is_empty(), "{:?}", preview.warnings);
+        drop(mk);
+        let commands = server.commands().await;
+        for mailbox in ["Clients", "INBOX", "Projects"] {
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.contains(&format!("EXAMINE \"{mailbox}\""))),
+                "{mailbox} was searched: {commands:?}"
+            );
+        }
+    }
+
+    /// A scripted account for scan tests. LIST shows Clients, INBOX and
+    /// Projects; each holds UID 1 (`\Seen`) and UID 2 (`\Seen \Flagged`), both
+    /// `multipart/mixed`. The connection drops at the first command whose
+    /// verb (`SEARCH`, `FETCH`) is `drop_at.1` while mailbox `drop_at.0` is
+    /// open, and `refuse` names a mailbox whose EXAMINE is refused.
+    fn scan_account(
+        drop_at: Option<(&'static str, &'static str)>,
+        refuse: Option<&'static str>,
+    ) -> impl Fn(&str, &str) -> Option<String> + Send + 'static {
+        let opened = std::sync::Mutex::new(String::new());
+        move |tag, command| {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            let (verb, argument) = (words.get(1).copied(), words.get(2).copied());
+            if let (Some((mailbox, dropped_verb)), Some("UID")) = (drop_at, verb)
+                && argument == Some(dropped_verb)
+                && opened.lock().expect("lock").as_str() == mailbox
+            {
+                return None;
+            }
+            match (verb, argument) {
+                (Some("NOOP"), _) => Some(format!("{tag} OK NOOP completed\r\n")),
+                (Some("LIST"), _) => Some(format!(
+                    "* LIST (\\HasNoChildren) \"/\" \"Clients\"\r\n\
+                     * LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n\
+                     * LIST (\\HasNoChildren) \"/\" \"Projects\"\r\n\
+                     {tag} OK LIST completed\r\n"
+                )),
+                (Some("EXAMINE"), Some(mailbox)) => {
+                    let mailbox = mailbox.trim_matches('"');
+                    if refuse == Some(mailbox) {
+                        return Some(format!("{tag} NO [NOPERM] Permission denied\r\n"));
+                    }
+                    *opened.lock().expect("lock") = mailbox.to_string();
+                    Some(imap_client::test_support::examine_reply(tag, 9, 100, 2))
+                }
+                (Some("UID"), Some("SEARCH")) => {
+                    Some(format!("* SEARCH 1 2\r\n{tag} OK SEARCH completed\r\n"))
+                }
+                (Some("UID"), Some("FETCH")) if command.contains("INTERNALDATE") => {
+                    let header = "Content-Type: multipart/mixed; boundary=b\r\n\r\n";
+                    let row = |uid: u32, day: u32| {
+                        format!(
+                            "* {uid} FETCH (UID {uid} INTERNALDATE \"0{day}-Jan-2026 10:00:00 +0000\" BODY[HEADER.FIELDS (CONTENT-TYPE)] {{{}}}\r\n{header})\r\n",
+                            header.len()
+                        )
+                    };
+                    Some(format!(
+                        "{}{}{tag} OK FETCH completed\r\n",
+                        row(1, 1),
+                        row(2, 2)
+                    ))
+                }
+                (Some("UID"), Some("FETCH")) => Some(format!(
+                    "* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n\
+                     * 2 FETCH (UID 2 FLAGS (\\Seen \\Flagged))\r\n\
+                     {tag} OK FETCH completed\r\n"
+                )),
+                _ => None,
+            }
+        }
+    }
+
+    /// An Agentmail whose "work" account's pool holds one scripted session.
+    async fn agentmail_on(
+        server: impl Fn(&str, &str) -> Option<String> + Send + 'static,
+    ) -> (Agentmail, imap_client::test_support::ScriptedServer) {
+        let (session, server) = imap_client::test_support::scripted_session(server).await;
+        let mk = journaled_agentmail();
+        mk.pool.hold_idle_for_test("work", session).await;
+        (mk, server)
+    }
+
+    fn flag_count(response: &ListFlagsResponse, flag: &str) -> Option<u32> {
+        response
+            .flags
+            .iter()
+            .find(|count| count.flag == flag)
+            .map(|count| count.count)
+    }
+
+    /// The connection drops while INBOX's flags are being fetched. Its empty
+    /// answer and every mailbox after it used to vanish from the result
+    /// without a trace; now they are reported as not covered.
+    #[tokio::test]
+    async fn a_flag_scan_reports_the_mailboxes_a_lost_connection_left_unscanned() {
+        let (mk, server) = agentmail_on(scan_account(Some(("INBOX", "FETCH")), None)).await;
+
+        let flags = mk
+            .list_flags(None, "work", None, None)
+            .await
+            .expect("a lost connection ends the scan, not its report");
+
+        assert_eq!(
+            flags.skipped,
+            vec!["INBOX".to_string(), "Projects".to_string()]
+        );
+        assert_eq!(
+            flags
+                .per_mailbox
+                .iter()
+                .map(|row| row.mailbox.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Clients"]
+        );
+        assert_eq!(flag_count(&flags, "\\Seen"), Some(2));
+        assert_eq!(flag_count(&flags, "\\Flagged"), Some(1));
+        drop(mk);
+        server.commands().await;
+    }
+
+    /// One mailbox refused on a live connection is skipped on its own; the
+    /// scan goes on.
+    #[tokio::test]
+    async fn a_flag_scan_skips_a_refused_mailbox_and_scans_the_rest() {
+        let (mk, server) = agentmail_on(scan_account(None, Some("Clients"))).await;
+
+        let flags = mk
+            .list_flags(None, "work", None, None)
+            .await
+            .expect("scanned");
+
+        assert_eq!(flags.skipped, vec!["Clients".to_string()]);
+        assert_eq!(flag_count(&flags, "\\Seen"), Some(4));
+        drop(mk);
+        server.commands().await;
+    }
+
+    /// Asked for one mailbox, a scan that lost its connection fails: an empty
+    /// answer from a dead connection is not "no flags".
+    #[tokio::test]
+    async fn a_single_mailbox_flag_scan_fails_on_a_lost_connection() {
+        let (mk, server) = agentmail_on(scan_account(Some(("INBOX", "FETCH")), None)).await;
+
+        let error = mk
+            .list_flags(Some("INBOX"), "work", None, None)
+            .await
+            .expect_err("an empty answer from a dead connection is not a result");
+
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(mk);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn an_attachment_scan_reports_the_mailboxes_a_lost_connection_left_unscanned() {
+        let (mk, server) = agentmail_on(scan_account(Some(("INBOX", "SEARCH")), None)).await;
+
+        let found = mk
+            .find_attachments(None, "work", 0, 50, None, None)
+            .await
+            .expect("a lost connection ends the scan, not its report");
+
+        assert_eq!(
+            found.skipped,
+            vec!["INBOX".to_string(), "Projects".to_string()]
+        );
+        assert_eq!(found.total, 2);
+        assert!(found.messages.iter().all(|hit| hit.mailbox == "Clients"));
+        drop(mk);
+        server.commands().await;
     }
 }

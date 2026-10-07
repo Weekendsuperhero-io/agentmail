@@ -338,6 +338,9 @@ pub struct ListFlagsResponse {
     pub flags: Vec<FlagCount>,
     pub colors: Vec<ColorCount>,
     pub per_mailbox: Vec<MailboxFlagBreakdown>,
+    /// Mailboxes an account-wide scan did not cover — each failed, or came
+    /// after the connection was lost. Their messages are in none of the counts.
+    pub skipped: Vec<String>,
 }
 
 /// A flag name with its count.
@@ -379,6 +382,9 @@ pub struct FindAttachmentsResponse {
     pub limit: usize,
     pub messages: Vec<AttachmentMessage>,
     pub per_mailbox: Vec<MailboxAttachmentCount>,
+    /// Mailboxes an account-wide scan did not cover — each failed, or came
+    /// after the connection was lost. Their messages are not in `total`.
+    pub skipped: Vec<String>,
 }
 
 /// A mailbox-safe attachment search hit.
@@ -847,17 +853,34 @@ pub struct ListPendingMovesResponse {
     pub operations: Vec<PendingMove>,
 }
 
-/// Response for reconcile_moves.
+/// Response for reconcile_moves (and for dismissing one move).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconcileMovesResponse {
     pub account: String,
     pub examined: usize,
     pub completed: usize,
+    /// Still waiting on reconciliation, including every attempt in `errors`.
     pub pending: usize,
     pub needs_attention: usize,
+    /// Moves whose COPY the server rejected; the source was never touched.
     pub failed: usize,
+    /// Moves closed without touching either mailbox.
+    pub dismissed: usize,
+    /// Attempts that learned nothing (a dropped connection, a timeout). Each
+    /// operation was left exactly as it was, for the next reconcile.
+    pub errors: Vec<ReconcileMoveError>,
+    /// The account's moves still pending after this call.
     pub operations: Vec<PendingMove>,
+}
+
+/// One reconciliation attempt that could not decide anything.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct ReconcileMoveError {
+    pub operation_id: String,
+    pub error: String,
 }
 
 /// Response for create_mailbox.

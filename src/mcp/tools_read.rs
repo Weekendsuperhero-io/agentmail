@@ -229,7 +229,7 @@ impl AgentMailServer {
     #[tool(
         name = "list_flags",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ListFlagsOutput>().expect("valid list_flags output schema"),
-        description = "List all IMAP flags in use with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without Trash/Junk/Drafts or virtual aggregate views. Resolves Apple Mail $MailFlagBit color flags to color names (red, orange, yellow, green, blue, purple, gray).",
+        description = "List all IMAP flags in use with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without Trash/Junk/Drafts or virtual aggregate views. Resolves Apple Mail $MailFlagBit color flags to color names (red, orange, yellow, green, blue, purple, gray). An account-wide scan lists in skipped the mailboxes it did not cover — one it couldn't open, or every mailbox after a lost connection; their messages are in none of the counts.",
         annotations(title = "List Flags", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -261,7 +261,7 @@ impl AgentMailServer {
     #[tool(
         name = "find_attachments",
         output_schema = rmcp::handler::server::tool::schema_for_output::<FindAttachmentsOutput>().expect("valid find_attachments output schema"),
-        description = "Find messages with attachments (multipart/mixed or multipart/related), newest-first. Each hit includes mailbox, UIDVALIDITY, UID, and date so account-wide UID collisions are unambiguous, and rides the result as a resource_link. Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without excluded or virtual views. Defaults: offset=0, limit=25 (max 100). To save files, pass a hit's mailbox, uid, and uidValidity as expectedUidValidity to download_attachments.",
+        description = "Find messages with attachments (multipart/mixed or multipart/related), newest-first. Each hit includes mailbox, UIDVALIDITY, UID, and date so account-wide UID collisions are unambiguous, and rides the result as a resource_link. Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without excluded or virtual views. Defaults: offset=0, limit=25 (max 100). To save files, pass a hit's mailbox, uid, and uidValidity as expectedUidValidity to download_attachments. An account-wide scan lists in skipped the mailboxes it did not cover; their messages are not in total.",
         annotations(title = "Find Attachments", read_only_hint = true),
         execution(task_support = "optional")
     )]

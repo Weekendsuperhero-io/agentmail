@@ -526,7 +526,9 @@ impl ServerHandler for AgentMailServer {
              \n\
              A server without native MOVE may return `reconciliationPending` or\n\
              `needsAttention` with an `operationId`. Inspect it with `list_pending_moves` and\n\
-             retry with `reconcile_moves`.\n\
+             retry with `reconcile_moves`, which examines `needsAttention` moves again. One it\n\
+             still can't finish is closed with `reconcile_moves` `dismiss: true` and its\n\
+             `operationId`, after checking both mailboxes; that moves and deletes nothing.\n\
              \n\
              ## Rankings\n\
              \n\

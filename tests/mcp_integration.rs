@@ -1972,6 +1972,8 @@ async fn reconciliation_tools_expose_durable_operation_state() {
         "pending",
         "needsAttention",
         "failed",
+        "dismissed",
+        "errors",
         "operations",
     ] {
         assert!(
@@ -1979,6 +1981,68 @@ async fn reconciliation_tools_expose_durable_operation_state() {
             "reconcile_moves must expose `{field}`: {reconcile:#}"
         );
     }
+    let error = object_schema(&reconcile["outputSchema"]["properties"]["errors"]["items"])
+        .expect("reconcile error row");
+    for field in ["operationId", "error"] {
+        assert!(
+            error["properties"].get(field).is_some(),
+            "a reconcile error must name `{field}`: {error:#}"
+        );
+    }
+    let dismiss = &reconcile["inputSchema"]["properties"]["dismiss"];
+    assert_eq!(dismiss["type"], json!("boolean"), "{reconcile:#}");
+    let described = dismiss["description"].as_str().unwrap_or_default();
+    assert!(
+        described.contains("Requires operationId") && described.contains("deletes nothing"),
+        "dismiss must say what it needs and what it leaves alone: {described}"
+    );
+}
+
+/// An account-wide scan that loses its connection, or can't open a mailbox,
+/// reports what it did not cover — the sweeps always did, and `list_flags`
+/// and `find_attachments` now do too.
+#[tokio::test]
+async fn account_wide_scans_report_the_mailboxes_they_did_not_cover() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in [
+        "list_flags",
+        "find_attachments",
+        "delete_by_sender",
+        "move_subscription",
+    ] {
+        let properties = find_tool(tools, name)["outputSchema"]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("`{name}` output properties"));
+        for field in ["skipped", "skippedTotal", "skippedTruncated"] {
+            assert!(
+                properties.contains_key(field),
+                "`{name}` must expose coverage field `{field}`"
+            );
+        }
+    }
+}
+
+/// Dismissing closes one named move; closing every pending move at once is
+/// not offered, so `dismiss` without `operationId` fails before any work.
+#[tokio::test]
+async fn dismissing_a_move_requires_naming_it() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "reconcile_moves",
+                "arguments": { "account": "dummy", "dismiss": true }
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "dismiss without operationId is invalid params: {resp:#}"
+    );
 }
 
 #[tokio::test]

@@ -116,6 +116,114 @@ must too. A backwards wall clock cannot say how much time passed; treating it
 as expired costs at most one reconnect or one LIST, while trusting it could
 stretch a cooldown by however far the clock moved.
 
+## 0.7.0 — A Scanned Mailbox Counts Once The Connection Answers After It
+
+### Decision
+
+An account-wide scan or sweep counts a mailbox only after
+`imap_client::confirm_alive` — a `NOOP` that only its own tagged `OK` passes —
+succeeds following the mailbox's last command. A lost connection ends the scan
+at once: that mailbox and every later one go to `skipped`, and the session is
+dropped, not pooled. A mailbox that failed on a connection the probe then
+proves alive is skipped on its own and the scan goes on. `list_flags` and
+`find_attachments` gain `skipped` like the sweeps; a single-mailbox scan, and
+`preview_thread_record`, fail instead of answering partially.
+
+### Rationale
+
+async-imap ends SELECT/EXAMINE (`parse_mailbox`), SEARCH (`parse_ids`) and FETCH
+quietly at end-of-stream, so a dropped connection is not an error but an empty
+mailbox, an empty search, a short fetch. The loops classified failures per
+mailbox and moved on, so after a drop every remaining mailbox "drained" with
+nothing found — or failed on its own and was skipped — and the sweep returned
+`Ok` with `session_usable` still true, pooling the dead session. On a hung
+connection each remaining mailbox instead waited out the timeout, 120 s in the
+app. Checking errors with `is_connection_error()` alone could not fix it,
+because the commonest failure was not an error at all.
+
+A connection that ended can't answer a NOOP afterwards, so one probe per mailbox
+proves every answer before it came from a live connection — a property no
+per-command check gives without rewriting every command by hand, which is what
+the async-imap fork (finding 15) would do upstream. It costs one round trip per
+mailbox. It does not catch a tagged `NO` that async-imap swallows on a live
+connection; that is still finding 15.
+
+### Consequence
+
+`ListFlagsResponse` and `FindAttachmentsResponse` gain `skipped` (outputs:
+`skipped`, `skippedTotal`, `skippedTruncated`). In a sweep, a mailbox whose
+connection became unusable mid-mailbox is now listed in `skipped` as well as
+in `mailboxes`, since later passes never ran. Pinned by
+`a_sweep_stops_at_a_lost_connection_and_reports_what_it_did_not_cover`,
+`a_flag_scan_reports_the_mailboxes_a_lost_connection_left_unscanned`,
+`a_flag_scan_skips_a_refused_mailbox_and_scans_the_rest`,
+`a_single_mailbox_flag_scan_fails_on_a_lost_connection`,
+`an_attachment_scan_reports_the_mailboxes_a_lost_connection_left_unscanned`,
+and `thread_discovery_fails_when_the_connection_is_lost`.
+
+## 0.7.0 — Move Reconciliation Acts Only On A Live Server's Answer
+
+### Decision
+
+`reconcile_journaled_move` changes the journal only on an answer a live server
+gave. Opening a mailbox: a new UIDVALIDITY, `NO [NONEXISTENT]`, or an open
+without UIDVALIDITY on a connection a NOOP then proves alive parks the move as
+`needsAttention`; anything else — a dropped connection, a timeout, a refusal
+such as `[UNAVAILABLE]` — returns the error and leaves the operation exactly as
+it was (`reconcile_moves` counts it `pending` and lists it in `errors`).
+"Not there" comes from `uid_search_checked`, which needs the search's own
+tagged `OK`, and counts only on a session that sees the whole mailbox. A source
+is deleted only right after its copy (the `COPYUID`) has been seen in the
+destination. `needsAttention` moves are examined again on every reconcile,
+resuming from what the journal knows for certain: `Copied` with a COPYUID,
+otherwise `CopyInFlight`, whose UIDNEXT rule never copies twice. `dismiss`
+(`reconcile_moves` `dismiss: true` + `operationId`, `Agentmail::dismiss_move`)
+closes one move for good and touches neither mailbox.
+
+### Rationale
+
+async-imap returns `Ok` from SELECT at end-of-stream and drains SEARCH with
+`take_while`, so one dropped connection read as two different facts. During
+SELECT it looked like a mailbox without UIDVALIDITY — "source mailbox epoch
+changed" — and parked the move as `needsAttention`, which reconcile then
+returned unexamined. A pending move holds its source and destination against
+rename and delete, and the only remedy offered was to reconcile it: one
+connection drop could lock two mailboxes for good. After SELECT it looked like
+an empty search — "source gone" — and marked the move complete, releasing the
+claim while the source survived beside its copy.
+
+Re-examining is what unsticks the moves the old classification parked, and the
+copy check is what makes re-examining safe. A move can wait days, and the very
+symptom of a pending move — the message still showing in its old mailbox — is
+what invites a person to delete the "duplicate" copy. Reconcile used to delete
+the source anyway; now it keeps it and asks. (The tool description already
+promised it removes a source "only after it can prove the destination copy".)
+Without a COPYUID (`UIDNOTSTICKY`) there is no copy to look for, and the COPY's
+`OK` stays the only evidence.
+
+On a Limited Mode session (Yahoo/AOL outside UID Mode) UIDs below the window
+search as absent, so absence proves nothing there. Yahoo and AOL advertise
+MOVE, so the journal never runs on them today; the guard is for a server that
+pairs UIDONLY with no MOVE.
+
+`dismiss` names one operation because closing every pending move at once is
+the bulk "forget what we were doing" the journal exists to prevent.
+
+### Consequence
+
+Journal state `dismissed`, pruned with `complete` and `copy_failed`; no schema
+change, since older builds read inactive rows only by id. `ReconcileMovesResponse`
+gains `dismissed` and `errors`, and `failed` now means only a rejected COPY (an
+attempt error used to count there). Pinned by
+`a_connection_lost_while_selecting_leaves_the_move_as_it_was`,
+`a_connection_lost_after_selecting_does_not_complete_the_move`,
+`a_copy_gone_from_the_destination_keeps_the_source`,
+`a_move_needing_attention_is_re_examined_and_finished`,
+`re_examining_without_a_copyuid_never_copies_twice`,
+`a_dismissed_move_no_longer_blocks_its_mailboxes`, and
+`async_imaps_own_search_reports_a_closed_stream_as_no_match` (the upstream
+behavior, so the day it changes is visible).
+
 ---
 
 ## 0.5.0 — Two Tool Pairs Become One Tool Each

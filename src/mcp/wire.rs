@@ -585,6 +585,11 @@ pub(super) struct ListFlagsOutput {
     pub(super) per_mailbox: Vec<MailboxFlagBreakdownOutput>,
     pub(super) per_mailbox_total: usize,
     pub(super) per_mailbox_truncated: bool,
+    /// Mailboxes the account-wide scan did not cover; their messages are in
+    /// none of the counts.
+    pub(super) skipped: Vec<String>,
+    pub(super) skipped_total: usize,
+    pub(super) skipped_truncated: bool,
 }
 
 impl From<crate::ListFlagsResponse> for ListFlagsOutput {
@@ -595,6 +600,7 @@ impl From<crate::ListFlagsResponse> for ListFlagsOutput {
             .map(MailboxFlagBreakdownOutput::from)
             .collect();
         let (per_mailbox, per_mailbox_total, per_mailbox_truncated) = truncate_rows(per_mailbox);
+        let (skipped, skipped_total, skipped_truncated) = truncate_rows(value.skipped);
         Self {
             account: value.account,
             mailbox: value.mailbox,
@@ -608,6 +614,9 @@ impl From<crate::ListFlagsResponse> for ListFlagsOutput {
             per_mailbox,
             per_mailbox_total,
             per_mailbox_truncated,
+            skipped,
+            skipped_total,
+            skipped_truncated,
         }
     }
 }
@@ -649,6 +658,11 @@ pub(super) struct FindAttachmentsOutput {
     pub(super) per_mailbox: Vec<MailboxAttachmentCountOutput>,
     pub(super) per_mailbox_total: usize,
     pub(super) per_mailbox_truncated: bool,
+    /// Mailboxes the account-wide scan did not cover; their messages are not
+    /// in `total`.
+    pub(super) skipped: Vec<String>,
+    pub(super) skipped_total: usize,
+    pub(super) skipped_truncated: bool,
 }
 
 impl From<crate::FindAttachmentsResponse> for FindAttachmentsOutput {
@@ -675,6 +689,7 @@ impl From<crate::FindAttachmentsResponse> for FindAttachmentsOutput {
             })
             .collect();
         let (per_mailbox, per_mailbox_total, per_mailbox_truncated) = truncate_rows(per_mailbox);
+        let (skipped, skipped_total, skipped_truncated) = truncate_rows(value.skipped);
         Self {
             account,
             mailbox: value.mailbox,
@@ -686,6 +701,9 @@ impl From<crate::FindAttachmentsResponse> for FindAttachmentsOutput {
             per_mailbox,
             per_mailbox_total,
             per_mailbox_truncated,
+            skipped,
+            skipped_total,
+            skipped_truncated,
         }
     }
 }
@@ -1552,13 +1570,28 @@ impl WireOutput for ListPendingMovesOutput {}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub(super) struct ReconcileMoveErrorOutput {
+    pub(super) operation_id: String,
+    pub(super) error: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct ReconcileMovesOutput {
     pub(super) account: String,
     pub(super) examined: usize,
     pub(super) completed: usize,
+    /// Still waiting on reconciliation, including every attempt in `errors`.
     pub(super) pending: usize,
     pub(super) needs_attention: usize,
+    /// Moves whose COPY the server rejected; the source was never touched.
     pub(super) failed: usize,
+    /// Moves closed without touching either mailbox.
+    pub(super) dismissed: usize,
+    /// Attempts that learned nothing (a dropped connection, a timeout); each
+    /// operation was left exactly as it was.
+    pub(super) errors: Vec<ReconcileMoveErrorOutput>,
     pub(super) operations: Vec<PendingMoveOutput>,
 }
 
@@ -1571,6 +1604,15 @@ impl From<crate::ReconcileMovesResponse> for ReconcileMovesOutput {
             pending: value.pending,
             needs_attention: value.needs_attention,
             failed: value.failed,
+            dismissed: value.dismissed,
+            errors: value
+                .errors
+                .into_iter()
+                .map(|error| ReconcileMoveErrorOutput {
+                    operation_id: error.operation_id,
+                    error: error.error,
+                })
+                .collect(),
             operations: value
                 .operations
                 .into_iter()

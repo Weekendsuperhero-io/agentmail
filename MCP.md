@@ -167,10 +167,13 @@ needed. A tool result never carries a URI in its JSON — see
   "flags": [{ "flag": "\\Seen", "count": 5000 }],
   "colors?": [{ "color": "red", "count": 8 }],
   "perMailbox?": [{ "mailbox", "totalFlags", "flags": [...] }],
-  "perMailboxTotal", "perMailboxTruncated" }
+  "perMailboxTotal", "perMailboxTruncated",
+  "skipped": ["mailbox"], "skippedTotal", "skippedTruncated" }
 ```
 `colors` is present when Apple $MailFlagBit flags exist. Account-wide mailbox
 breakdowns are capped at 50 rows and include total/truncation metadata.
+`skipped` lists the mailboxes an account-wide scan did not cover (see
+**Coverage** below); their messages are in none of the counts.
 
 **find_attachments**
 ```json
@@ -178,12 +181,24 @@ breakdowns are capped at 50 rows and include total/truncation metadata.
   "nextOffset?",
   "messages": [{ "mailbox", "uidValidity", "uid", "date?" }],
   "perMailbox?": [{ "mailbox", "count" }],
-  "perMailboxTotal", "perMailboxTruncated" }
+  "perMailboxTotal", "perMailboxTruncated",
+  "skipped": ["mailbox"], "skippedTotal", "skippedTruncated" }
 ```
 
 Results are paginated newest-first (default 25, maximum 100). Every hit carries
 its owning mailbox and UID epoch, so account-wide UIDs are never ambiguous.
 Mailbox breakdowns are capped at 50 rows and include total/truncation metadata.
+`skipped` lists the mailboxes the scan did not cover; they are not in `total`.
+
+**Coverage.** A mailbox counts as scanned only once the connection answers a
+`NOOP` after its last command: on a closed stream SELECT, EXAMINE, SEARCH and
+FETCH come back empty or short instead of failing, so without the check a
+dropped connection would report every remaining mailbox as covered and empty.
+A mailbox that fails on its own is skipped and the scan goes on; a lost
+connection ends an account-wide scan or sweep at once, and that mailbox and
+every later one are listed in `skipped` rather than each waiting out a
+timeout. A single-mailbox scan fails instead, and `preview_thread_record`
+fails rather than return a graph missing what it could no longer search.
 
 **top_senders**
 ```json
@@ -426,7 +441,7 @@ truncation fields preserve audit completeness.
   "skipped": ["mailbox"], "skippedTotal", "skippedTruncated",
   "permanent": bool }
 ```
-`mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched; policy-excluded special-use views are not reported as errors.
+`mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched, were not fully drained, or came after a lost connection (see **Coverage** under find_attachments); policy-excluded special-use views are not reported as errors.
 
 **delete_by_domain**
 ```json
@@ -491,8 +506,17 @@ truncation fields preserve audit completeness.
 **reconcile_moves**
 ```json
 { "account", "examined", "completed", "pending", "needsAttention",
-  "failed", "operations": [PendingMove] }
+  "failed", "dismissed",
+  "errors": [{ "operationId", "error" }],
+  "operations": [PendingMove] }
 ```
+
+`failed` counts moves whose COPY the server rejected (the source was never
+touched). An attempt that learned nothing — a dropped connection, a timeout —
+leaves its operation as it was, counts in `pending`, and is listed in
+`errors`. `operations` is what is still pending after the call. With
+`dismiss: true` and an `operationId`, the call closes that one move instead
+(`dismissed: 1`).
 
 ```json
 PendingMove = {
@@ -524,9 +548,20 @@ session is discarded and the response reports `reconciliationPending` with an
 `operationId` rather than claiming success or issuing an unsafe second COPY.
 `reconcile_moves` retries COPY only when unchanged destination `UIDNEXT` proves
 that the earlier attempt created nothing; otherwise it continues source cleanup
-or reports `needsAttention` for explicit review. The journal uses
-`synchronous=FULL` and remains enabled even when the disposable ranking cache
-is disabled.
+or reports `needsAttention` for explicit review. It acts only on a live
+server's answer: a new `UIDVALIDITY`, `NO [NONEXISTENT]`, or a mailbox opened
+without `UIDVALIDITY` on a connection a `NOOP` then proves alive parks the move
+as `needsAttention`; a dropped connection, a timeout or an unrelated refusal
+changes nothing. "Not found" comes from a `UID SEARCH` that must see its own
+tagged `OK`, and counts only on a session that sees the whole mailbox (not
+Yahoo/AOL Limited Mode). A source is deleted only right after its copy (the
+`COPYUID`) has been seen in the destination; a copy deleted in the meantime
+keeps the source and asks for review. `needsAttention` moves are examined again
+on every call, and one that still can't finish is closed with `dismiss: true`
+and its `operationId` once both mailboxes have been checked — that moves,
+copies and deletes nothing, and frees both mailboxes for rename and delete. The
+journal uses `synchronous=FULL` and remains enabled even when the disposable
+ranking cache is disabled.
 
 **create_mailbox**
 ```json
@@ -551,7 +586,7 @@ preflight data:
 
 The confirmed call must echo `expectedMessageCount`. A changed count fails
 closed. INBOX and mailboxes referenced by a pending MOVE journal are never
-eligible. Special-use and descendant-bearing mailboxes need separate
+eligible (reconcile the move, or dismiss it, to release them). Special-use and descendant-bearing mailboxes need separate
 acknowledgements; deleting a non-empty mailbox needs `confirmNonEmpty` as well.
 The rename destination must not exist. A missing delete target is an idempotent
 success. After a transport error, AgentMail re-lists the mailbox catalog and

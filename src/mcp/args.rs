@@ -770,6 +770,11 @@ pub(super) struct ReconcileMovesArgs {
         description = "Optional operationId from list_pending_moves. Omit to reconcile every pending operation for the account."
     )]
     pub(super) operation_id: Option<String>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "Close operationId for good instead of reconciling it — for a needsAttention move reconciliation can't finish, once both mailboxes have been checked and set right by hand. Moves, copies and deletes nothing; it releases the source message and both mailboxes for rename and delete. Requires operationId."
+    )]
+    pub(super) dismiss: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

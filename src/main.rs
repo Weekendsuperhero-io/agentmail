@@ -192,6 +192,10 @@ enum CliCommand {
         /// Operation ID from list-pending-moves; omit to reconcile all
         #[arg(long)]
         operation_id: Option<String>,
+        /// Close --operation-id for good without touching either mailbox,
+        /// once both have been checked by hand
+        #[arg(long, requires = "operation_id")]
+        dismiss: bool,
     },
 }
 
@@ -451,11 +455,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CliCommand::ReconcileMoves {
             account,
             operation_id,
+            dismiss,
         } => {
             let mk = agentmail::Agentmail::from_default_config()?;
-            let value = mk
-                .reconcile_moves(&account, operation_id.as_deref(), None, None)
-                .await?;
+            let value = match operation_id.as_deref() {
+                Some(operation_id) if dismiss => mk.dismiss_move(&account, operation_id).await?,
+                operation_id => {
+                    mk.reconcile_moves(&account, operation_id, None, None)
+                        .await?
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -1120,12 +1129,44 @@ mod tests {
             CliCommand::ReconcileMoves {
                 account,
                 operation_id,
+                dismiss,
             } => {
                 assert_eq!(account, "work");
                 assert_eq!(operation_id.as_deref(), Some("operation-123"));
+                assert!(!dismiss);
             }
             _ => panic!("expected reconcile-moves"),
         }
+    }
+
+    #[test]
+    fn reconcile_moves_cli_dismisses_only_a_named_operation() {
+        let cli = Cli::try_parse_from([
+            "agentmail",
+            "reconcile-moves",
+            "--account",
+            "work",
+            "--operation-id",
+            "operation-123",
+            "--dismiss",
+        ])
+        .expect("valid command");
+        match cli.command.expect("subcommand") {
+            CliCommand::ReconcileMoves { dismiss, .. } => assert!(dismiss),
+            _ => panic!("expected reconcile-moves"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "agentmail",
+                "reconcile-moves",
+                "--account",
+                "work",
+                "--dismiss",
+            ])
+            .is_err(),
+            "dismissing every pending move at once is not offered"
+        );
     }
 
     #[test]
