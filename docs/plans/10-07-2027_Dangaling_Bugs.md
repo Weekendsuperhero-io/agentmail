@@ -1,6 +1,6 @@
 # 10-07-2027_Dangaling_Bugs
 
-Here are the 16 Part 5 findings, each re-checked against today's code, with an effort level. All 16 still hold, and two came out different on the re-check (see below the table).
+Here are the 16 Part 5 findings, each re-checked against today's code, with an effort level. All 16 still hold, and two came out different on the re-check (see below the table). #17–#19 turned up while fixing #1 and #2.
 
 **Effort scale:** XS = up to 2 hours · S = about half a day · M = 1–2 days · L = 3+ days. Each includes tests.
 
@@ -22,22 +22,18 @@ Here are the 16 Part 5 findings, each re-checked against today's code, with an e
 | 14 | Low | `AGENTMAIL_CACHE_DIR` means `<dir>/agentmail/` for the header cache but `<dir>/` for the move journal | `header_cache.rs:1394` vs `mutation_journal.rs:117` | XS | Move the header cache (a one-time rebuild), never the journal: pending moves live there. | Done A layout test covering both files, with and without the variable. |
 | 15 | Upstream | async-imap 0.12 still swallows a tagged NO/BAD after SEARCH/FETCH | async-imap `parse.rs` | M | Carry a fork like the imap-proto one, plus an upstream PR. Filing the issue alone is XS. |
 | 16 | Docs | CHANGELOG has no 0.5/0.6 sections; ARCHITECTURE.md points at a nonexistent path | `CHANGELOG.md`, parent `ARCHITECTURE.md:266` | XS + S | There are no v0.5.0/v0.6.0 git tags, so the release boundaries have to be reconstructed from history. | Half done: the ARCHITECTURE.md path is fixed; the CHANGELOG 0.5/0.6 sections are still missing. |
+| 17 | Med | `sync` (the post-mutation NOOP) is async-imap's unchecked one, and five call sites `?` it after the mutation landed: a server that drops the client right after answering turns a finished CREATE, delete, move or superseded-draft cleanup into an error, and a closed stream passes, so the dead session is pooled | `imap_client.rs` `sync`; `lib.rs` `create_mailbox`, `update_flags`, `delete_messages`, `move_message`, `discard_superseded_draft` | S | One release path for every post-mutation site. | Done. `sync` is checked; `PooledSession::release_after_mutation` pools only a session that answers and never fails the call. Different for `update_flags` than reported: its STOREs were never checked, so there was no confirmed change to misreport. Its real faults were in the read-back — `MessageNotFound` on a dropped connection, and another message's flags taken from an unsolicited FETCH — both fixed. |
+| 18 | Med | `list_mailbox_layout` reads LIST to end-of-stream, so a connection lost mid-LIST caches a partial mailbox catalog for its TTL, and account-wide scans silently skip the missing mailboxes | `imap_client.rs` `list_mailbox_layout`, `mailbox_catalog.rs` | S | Every LIST goes through one function. | Done. A checked NOOP follows the LIST; a short list is never returned or cached. |
+| 19 | Med | Single-mailbox reads (`search_messages`, `get_messages`, `list_identities`) still take an empty or short SEARCH/FETCH from a closed stream as the answer | `connection.rs` `with_session_retry`; `imap_client.rs` FETCH-by-UID helpers; `lib.rs` `sample_subjects` | S | Probe where the reads already meet: the retry wrapper, and the comparison of requested and answered UIDs. | Done. `with_session_retry` probes after the read, so a closed stream triggers its one retry on a fresh connection. A missing UID counts only after a probe, everywhere a single message is read. |
 
 **Fixed alongside (not in the 16):**
 - Attachment names past a filesystem's 255-byte limit could not be downloaded; the canonical name is now capped at 240 bytes for both the download and `/info`.
 - `to`/`cc`/`bcc`/`replyTo` document `Name <address>`; Mail Accounts settings offer the account's Sent From addresses as aliases.
 
-**New findings while fixing #1 and #2 (reported, not fixed):**
-
-| # | Sev | Finding | Where | Effort |
-|---|---|---|---|---|
-| 17 | Med | `sync` (the post-mutation NOOP) is async-imap's unchecked one, and five call sites `?` it after the mutation landed: a timeout there reports a completed CREATE, flag change, delete, move or superseded-draft cleanup as failed. On a closed stream it passes, so the dead session is pooled (the next acquire's ping catches it). | `imap_client.rs` `sync`; `lib.rs` `create_mailbox`, `update_flags`, `delete_messages`, `move_message`, `discard_superseded_draft` | S |
-| 18 | Med | `list_mailbox_layout` reads LIST to end-of-stream, so a connection lost mid-LIST caches a partial mailbox catalog for its TTL, and account-wide scans silently skip the missing mailboxes. | `imap_client.rs` `list_mailbox_layout`, `mailbox_catalog.rs` | S |
-| 19 | Low | Single-mailbox reads (`search_messages`, `get_messages`, `list_identities`) still take an empty or short SEARCH/FETCH from a closed stream as the answer. Same root as #15; `confirm_alive` after the read would close it per call. | `lib.rs` | S |
-
 **Changed on re-check:**
 - **#2 is worse than reported, so I've raised it to High.** A stuck move also blocks renaming or deleting both its source and destination mailboxes. The only remedy offered is "reconcile that operation", and reconcile returns `NeedsAttention` immediately. So one transient connection drop can lock two mailboxes for good.
 - **#3 is narrower.** A `[LIMIT]` reply itself is already exempt from retry; only the auth-failure retries remain.
+- **#19 is wider than reported, so I've raised it from Low to Med.** "Message not found" from a closed stream did more than mislead: the subscription move, unsubscribe and the ranking samples prune the ranking cache on it, so a dropped connection made the cache forget messages that still existed. The samples' code even documents "an outage must not masquerade as deletion".
 
 **Suggested order:**
 1. The quick wins: #9, #12, #14, the ARCHITECTURE.md path, #5, #7, #8, #13.

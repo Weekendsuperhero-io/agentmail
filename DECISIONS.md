@@ -161,6 +161,38 @@ in `mailboxes`, since later passes never ran. Pinned by
 `an_attachment_scan_reports_the_mailboxes_a_lost_connection_left_unscanned`,
 and `thread_discovery_fails_when_the_connection_is_lost`.
 
+### Addendum: reads, LIST, missing messages and the NOOP after a mutation
+
+The same rule now covers every answer that decides something, each where its
+callers already meet:
+
+- `ConnectionPool::with_session_retry` probes after the read. A closed stream
+  becomes the connection error its one retry exists for, so the read reruns on
+  a fresh connection instead of returning what little arrived.
+- `list_mailbox_layout` probes after LIST, so the catalog never caches a short
+  list for scans to plan from.
+- A FETCH answer that leaves out a requested UID (`answered_fetches`,
+  `answer_for_uid`) counts only after a probe. `MessageNotFound` is what the
+  subscription move, unsubscribe and the ranking samples prune the cache on,
+  and the samples' own rule — "an outage must not masquerade as deletion" —
+  was broken by an outage that doesn't look like one.
+- After a mutation, `PooledSession::release_after_mutation` sends the
+  (now checked) `sync` NOOP and pools the session only if it answers, but
+  never fails: the mutation's own tagged reply is the result. Five call sites
+  `?`-ed the unchecked NOOP, so a server dropping the client right after an
+  EXPUNGE reported the finished delete as failed.
+
+`update_flags` differs: async-imap's STOREs don't check their tagged reply, so
+its read-back is the only evidence of what landed, and a connection lost before
+it is an error (repeating the idempotent update is the remedy). Pinned by
+`a_read_cut_off_by_a_closed_connection_is_retried_on_a_fresh_one`,
+`a_list_cut_short_by_a_closed_connection_is_an_error`,
+`a_closed_connection_is_not_a_missing_message`,
+`a_closed_connection_prunes_no_ranking_samples`,
+`a_delete_whose_connection_closes_after_the_expunge_still_reports_it`,
+`a_session_that_dies_after_a_delete_is_not_pooled`, and
+`a_flag_read_back_answers_for_the_message_that_was_changed`.
+
 ## 0.7.0 — Move Reconciliation Acts Only On A Live Server's Answer
 
 ### Decision

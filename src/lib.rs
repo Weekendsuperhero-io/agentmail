@@ -716,8 +716,7 @@ impl Agentmail {
         // Fence a catalog refresh that raced the server-side CREATE.
         self.invalidate_mailbox_catalog(account);
         create_result?;
-        imap_client::sync(session.session()).await?;
-        session.release().await;
+        session.release_after_mutation().await;
 
         Ok(CreateMailboxResponse {
             account: account.to_string(),
@@ -3021,10 +3020,13 @@ impl Agentmail {
             imap_client::add_flags(session.session(), uid, add).await?;
         }
 
-        imap_client::sync(session.session()).await?;
+        // The read-back is the result: async-imap's STOREs don't check their
+        // tagged reply, so these flags are the only evidence of what landed.
+        // A connection lost before they arrive is reported as that — never as
+        // a missing message — and repeating the idempotent update is the fix.
         let updated_flags = imap_client::get_flags(session.session(), uid).await?;
         let resolved_color = bits_to_color(&updated_flags).map(|c| c.to_string());
-        session.release().await;
+        session.release_after_mutation().await;
 
         Ok(UpdateFlagsResponse {
             mailbox: mailbox.to_string(),
@@ -3200,8 +3202,7 @@ impl Agentmail {
         )
         .await?;
         if result.session_usable {
-            imap_client::sync(session.session()).await?;
-            session.release().await;
+            session.release_after_mutation().await;
         } else {
             drop(session);
         }
@@ -3783,12 +3784,7 @@ impl Agentmail {
                         MoveStatus::NeedsAttention => needs_attention += 1,
                     }
                     if outcome.session_usable {
-                        let sync = imap_client::sync(session.session()).await;
-                        if sync.is_ok() {
-                            session.release().await;
-                        } else {
-                            drop(session);
-                        }
+                        session.release_after_mutation().await;
                     } else {
                         drop(session);
                     }
@@ -3942,8 +3938,7 @@ impl Agentmail {
         )
         .await?;
         if outcome.session_usable {
-            imap_client::sync(session.session()).await?;
-            session.release().await;
+            session.release_after_mutation().await;
         } else {
             drop(session);
         }
@@ -4497,8 +4492,7 @@ impl Agentmail {
         )
         .await?;
         if result.session_usable {
-            imap_client::sync(session.session()).await?;
-            session.release().await;
+            session.release_after_mutation().await;
         } else {
             drop(session);
         }
@@ -6535,21 +6529,34 @@ where
         else {
             continue;
         };
+        let Ok(answers) = imap_client::answering_fetches(fetched, &uids) else {
+            continue;
+        };
         // Which requested UIDs the server acknowledged with a row at all —
         // a row with no Subject header still proves the message is alive.
         let mut returned: hashbrown::HashSet<u32> = hashbrown::HashSet::new();
-        for item in fetched {
-            let Ok(fetch) = item else { continue };
-            let Some(uid) = fetch.uid else { continue };
+        for (uid, fetch) in answers {
             returned.insert(uid);
             if let Some(subject) = fetch.header().and_then(parser::parse_subject) {
                 subjects.insert((mailbox.to_string(), expected_uid_validity, uid), subject);
             }
         }
+        let absent: Vec<u32> = uids
+            .iter()
+            .copied()
+            .filter(|uid| !returned.contains(uid))
+            .collect();
+        // An absent row means deleted only from a live connection: on a
+        // closed stream the FETCH ends quietly with no rows, and every sample
+        // would be pruned. The rows that did arrive stand either way; a failed
+        // probe means there is nothing more to ask this connection.
+        if !absent.is_empty() && imap_client::confirm_alive(session).await.is_err() {
+            break;
+        }
         missing.extend(
-            uids.iter()
-                .filter(|uid| !returned.contains(*uid))
-                .map(|uid| (mailbox.to_string(), expected_uid_validity, *uid)),
+            absent
+                .into_iter()
+                .map(|uid| (mailbox.to_string(), expected_uid_validity, uid)),
         );
     }
     SampleSubjects { subjects, missing }
@@ -8338,6 +8345,9 @@ mod tests {
                         plain.len(),
                         encoded.len()
                     )
+                } else if line.contains("NOOP") {
+                    // The absent UID 9 is checked against a live connection.
+                    format!("{tag} OK NOOP completed\r\n")
                 } else {
                     panic!("unexpected command: {line:?}");
                 };
@@ -9053,6 +9063,170 @@ mod tests {
         assert_eq!(found.total, 2);
         assert!(found.messages.iter().all(|hit| hit.mailbox == "Clients"));
         drop(mk);
+        server.commands().await;
+    }
+
+    /// A scripted INBOX (UIDVALIDITY 9) for a permanent delete of UID 7. The
+    /// first NOOP is the pool's ping on acquire; the one after the delete gets
+    /// no answer. With `close_after_expunge`, the server instead closes the
+    /// connection as soon as it has answered the EXPUNGE.
+    fn permanent_delete_account(
+        close_after_expunge: bool,
+    ) -> impl Fn(&str, &str) -> Option<String> + Send + 'static {
+        let noops = std::sync::atomic::AtomicUsize::new(0);
+        move |tag, command| {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            match (words.get(1).copied(), words.get(2).copied()) {
+                (Some("NOOP"), _) => (noops.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0)
+                    .then(|| format!("{tag} OK NOOP completed\r\n")),
+                (Some("CAPABILITY"), _) => Some(format!(
+                    "* CAPABILITY IMAP4rev1 UIDPLUS\r\n{tag} OK CAPABILITY completed\r\n"
+                )),
+                (Some("SELECT"), _) => {
+                    Some(imap_client::test_support::examine_reply(tag, 9, 100, 3))
+                }
+                (Some("UID"), Some("STORE")) => Some(format!("{tag} OK STORE completed\r\n")),
+                (Some("UID"), Some("EXPUNGE")) => Some(format!(
+                    "* 1 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n{}",
+                    if close_after_expunge {
+                        imap_client::test_support::THEN_HANG_UP
+                    } else {
+                        ""
+                    }
+                )),
+                _ => None,
+            }
+        }
+    }
+
+    async fn delete_uid_7(mk: &Agentmail) -> Result<DeleteMessagesResponse> {
+        mk.delete_messages("INBOX", "work", &[7], 9, DeleteMode::Permanent, None, None)
+            .await
+    }
+
+    /// The EXPUNGE was answered OK, so the message is gone; a connection that
+    /// closes right after must not turn that into a failed delete.
+    #[tokio::test]
+    async fn a_delete_whose_connection_closes_after_the_expunge_still_reports_it() {
+        let (mk, server) = agentmail_on(permanent_delete_account(true)).await;
+
+        let deleted = delete_uid_7(&mk)
+            .await
+            .expect("the delete happened; only the connection is gone");
+
+        assert_eq!(deleted.deleted, 1);
+        assert_eq!(mk.pool.idle_sessions("work").await, 0);
+        drop(mk);
+        server.commands().await;
+    }
+
+    /// The NOOP after a delete passed on a closed stream, so the dead
+    /// connection went back to the pool for the next caller to trip over.
+    #[tokio::test]
+    async fn a_session_that_dies_after_a_delete_is_not_pooled() {
+        let (mk, server) = agentmail_on(permanent_delete_account(false)).await;
+
+        let deleted = delete_uid_7(&mk).await.expect("deleted");
+
+        assert_eq!(deleted.deleted, 1);
+        assert_eq!(
+            mk.pool.idle_sessions("work").await,
+            0,
+            "a connection that did not answer is closed, not pooled"
+        );
+        drop(mk);
+        server.commands().await;
+    }
+
+    /// INBOX (UIDVALIDITY 9) for `update_flags` on UID 7: SELECT, STORE and
+    /// NOOP succeed, and `flags_reply` answers the read-back FETCH (`None`
+    /// hangs up).
+    fn flag_account(
+        flags_reply: Option<&'static str>,
+    ) -> impl Fn(&str, &str) -> Option<String> + Send + 'static {
+        move |tag, command| {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            match (words.get(1).copied(), words.get(2).copied()) {
+                (Some("NOOP"), _) => Some(format!("{tag} OK NOOP completed\r\n")),
+                (Some("SELECT"), _) => {
+                    Some(imap_client::test_support::examine_reply(tag, 9, 100, 3))
+                }
+                (Some("UID"), Some("STORE")) => Some(format!("{tag} OK STORE completed\r\n")),
+                (Some("UID"), Some("FETCH")) => {
+                    flags_reply.map(|rows| format!("{rows}{tag} OK FETCH completed\r\n"))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    async fn mark_uid_7_seen(mk: &Agentmail) -> Result<UpdateFlagsResponse> {
+        mk.update_flags(
+            "INBOX",
+            "work",
+            7,
+            9,
+            &["\\Seen".to_string()],
+            &[],
+            FlagColorChange::Leave,
+        )
+        .await
+    }
+
+    /// The read-back after the STOREs is the result. A connection that drops
+    /// before it arrives is that, not "message not found" — the message is
+    /// still there, and repeating the idempotent update is the remedy.
+    #[tokio::test]
+    async fn a_flag_read_back_on_a_closed_connection_is_a_connection_error() {
+        let (mk, server) = agentmail_on(flag_account(None)).await;
+
+        let error = mark_uid_7_seen(&mk)
+            .await
+            .expect_err("nothing was read back");
+
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(mk);
+        server.commands().await;
+    }
+
+    /// Another client's change to UID 12 arrives as an unsolicited FETCH
+    /// ahead of the answer; the result is UID 7's flags, not UID 12's.
+    #[tokio::test]
+    async fn a_flag_read_back_answers_for_the_message_that_was_changed() {
+        let (mk, server) = agentmail_on(flag_account(Some(
+            "* 3 FETCH (UID 12 FLAGS (\\Flagged))\r\n* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n",
+        )))
+        .await;
+
+        let updated = mark_uid_7_seen(&mk).await.expect("updated");
+
+        assert_eq!(updated.flags, vec!["\\Seen".to_string()]);
+        drop(mk);
+        server.commands().await;
+    }
+
+    /// A sample FETCH on a closed stream returned no rows, so every sample
+    /// was reported deleted and pruned from the ranking cache — the "an
+    /// outage must not masquerade as deletion" rule, broken by a failure that
+    /// does not look like one.
+    #[tokio::test]
+    async fn a_closed_connection_prunes_no_ranking_samples() {
+        let (mut session, server) = imap_client::test_support::scripted_session(|tag, command| {
+            command
+                .contains("EXAMINE")
+                .then(|| imap_client::test_support::examine_reply(tag, 9, 100, 3))
+        })
+        .await;
+        let samples = [5, 7].map(|uid| MailboxMessageIdentity {
+            mailbox: "INBOX".to_string(),
+            uid_validity: 9,
+            uid,
+        });
+
+        let SampleSubjects { missing, .. } = sample_subjects(&mut session, &samples, None).await;
+
+        assert!(missing.is_empty(), "{missing:?}");
+        drop(session);
         server.commands().await;
     }
 }

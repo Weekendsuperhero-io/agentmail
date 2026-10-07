@@ -115,6 +115,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and every later one in `skipped`. A single-mailbox `list_flags` or
   `find_attachments`, and `preview_thread_record`, fail instead of returning a
   partial answer.
+- **A connection lost after a mutation could report it failed, or pool a dead
+  session.** The NOOP that follows a CREATE, delete, move, flag change or
+  superseded-draft cleanup was async-imap's unchecked one and was `?`-ed: a
+  server that dropped the client after answering turned a finished delete into
+  an error, and a closed stream passed and went back to the pool. That NOOP is
+  now checked and decides only whether the session is pooled; the mutation's
+  own answer stands.
+- **A connection lost mid-LIST cached a short mailbox list**, and account-wide
+  scans then silently skipped the mailboxes it left out. LIST now counts only
+  once the connection answers a checked `NOOP` after it.
+- **A connection lost mid-read passed for an empty or short answer.**
+  `search_messages`, `get_messages`, `list_identities`, `list_mailboxes` and
+  the other retried reads now probe the connection after reading, so a dead
+  socket triggers their one retry on a fresh connection instead of returning
+  what little arrived. A message is reported missing — and pruned from the
+  ranking cache, which the subscription move, unsubscribe and ranking samples
+  do — only when a live server leaves it out. `update_flags` reads its result
+  back for the message it changed, not another client's concurrent update.
 - **Pool and catalog timers stopped while the Mac slept.** Idle eviction, the
   `[LIMIT]` login cooldown and the mailbox-catalog TTL now run on the wall
   clock; a clock set back counts as expired.

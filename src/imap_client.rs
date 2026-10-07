@@ -97,6 +97,11 @@ pub(crate) mod test_support {
     use super::{ImapSession, ImapTransport};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    /// Ends a scripted reply when the server should send it and then close the
+    /// connection, so the client's next command fails to send — what a server
+    /// does when it drops a client right after answering it.
+    pub(crate) const THEN_HANG_UP: &str = "\u{0}then hang up";
+
     /// A running scripted server. Drop the session, then call
     /// [`ScriptedServer::commands`] to collect every line the client sent.
     pub(crate) struct ScriptedServer {
@@ -141,7 +146,11 @@ pub(crate) mod test_support {
                     respond(&tag, &command)
                 };
                 let Some(reply) = reply else { break };
-                if writer.write_all(reply.as_bytes()).await.is_err() {
+                let (reply, hang_up) = match reply.strip_suffix(THEN_HANG_UP) {
+                    Some(reply) => (reply.to_string(), true),
+                    None => (reply, false),
+                };
+                if writer.write_all(reply.as_bytes()).await.is_err() || hang_up {
                     break;
                 }
             }
@@ -300,7 +309,7 @@ where
 /// item that carries a fetched section, else its first item. An item is never
 /// dropped for lacking a section alone — a requested message whose section came
 /// back `NIL` still answers, and callers that prune unanswered UIDs rely on it.
-fn answering_fetches(
+pub(crate) fn answering_fetches(
     fetched: Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>,
     requested: &[u32],
 ) -> Result<Vec<(u32, async_imap::types::Fetch)>> {
@@ -328,6 +337,47 @@ fn answering_fetches(
         }
     }
     Ok(answers)
+}
+
+/// [`answering_fetches`], trusted only from a live connection.
+///
+/// An answer that leaves out a requested UID means the message is gone — or
+/// that the stream closed, since async-imap ends a FETCH quietly at
+/// end-of-stream. Callers report "no longer exists" and prune caches on a
+/// missing UID, so a short answer counts only once a NOOP proves the
+/// connection alive; otherwise the lost connection is the error.
+async fn answered_fetches<T>(
+    session: &mut Session<T>,
+    fetched: Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>,
+    requested: &[u32],
+) -> Result<Vec<(u32, async_imap::types::Fetch)>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    let answers = answering_fetches(fetched, requested)?;
+    let distinct: hashbrown::HashSet<u32> = requested.iter().copied().collect();
+    if answers.len() < distinct.len() {
+        confirm_alive(session).await?;
+    }
+    Ok(answers)
+}
+
+/// The FETCH item answering `uid`, or `MessageNotFound` once a live
+/// connection has shown the message gone (see [`answered_fetches`]).
+async fn answer_for_uid<T>(
+    session: &mut Session<T>,
+    fetched: Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>,
+    uid: u32,
+) -> Result<async_imap::types::Fetch>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    answered_fetches(session, fetched, &[uid])
+        .await?
+        .into_iter()
+        .next()
+        .map(|(_, fetch)| fetch)
+        .ok_or(AgentmailError::MessageNotFound(uid))
 }
 
 /// Select a mailbox with timeout. Use this instead of calling `session.select()` directly.
@@ -1326,6 +1376,9 @@ pub(crate) async fn list_mailbox_layout(session: &mut ImapSession) -> Result<Vec
         Ok::<_, async_imap::error::Error>(stream.collect::<Vec<_>>().await)
     })
     .await?;
+    // LIST also ends quietly at end-of-stream, and a short list is cached by
+    // the mailbox catalog for every account-wide scan to plan from.
+    confirm_alive(session).await?;
 
     let mut result = Vec::with_capacity(names.len());
     for item in names {
@@ -1771,12 +1824,7 @@ pub async fn fetch_sender(session: &mut ImapSession, uid: u32) -> Result<(String
     let uid_str = uid.to_string();
     let fetched =
         timed_uid_fetch_collect(session, &uid_str, "BODY.PEEK[HEADER.FIELDS (FROM)]").await?;
-
-    let fetch = fetched
-        .into_iter()
-        .next()
-        .ok_or(AgentmailError::MessageNotFound(uid))?
-        .map_err(AgentmailError::Imap)?;
+    let fetch = answer_for_uid(session, fetched, uid).await?;
 
     let header_bytes = fetch.header().unwrap_or(&[]);
     let (email, name, _date, _msgid) = parser::parse_sender_date(header_bytes)?;
@@ -2018,7 +2066,7 @@ async fn fetch_rank_header_rows(
 
         let fetched = timed_uid_fetch_collect(session, &uid_set, items).await?;
 
-        for (uid, fetch) in answering_fetches(fetched, chunk)? {
+        for (uid, fetch) in answered_fetches(session, fetched, chunk).await? {
             let header_bytes = fetch.header().unwrap_or(&[]);
             let header_str = String::from_utf8_lossy(header_bytes);
 
@@ -2092,7 +2140,7 @@ where
             "(UID BODY.PEEK[HEADER.FIELDS (List-Id)])",
         )
         .await?;
-        for (uid, fetch) in answering_fetches(fetched, chunk)? {
+        for (uid, fetch) in answered_fetches(session, fetched, chunk).await? {
             let header_str = String::from_utf8_lossy(fetch.header().unwrap_or(&[]));
             results.push((uid, extract_header_value(&header_str, "List-Id")));
         }
@@ -2138,7 +2186,7 @@ pub async fn fetch_by_uids(
 
     // Extract owned data from the IMAP fetch results so we can parse off-thread
     let mut raw_items: RawFetchItems = Vec::with_capacity(fetched.len());
-    for (uid, fetch) in answering_fetches(fetched, uids)? {
+    for (uid, fetch) in answered_fetches(session, fetched, uids).await? {
         let size = fetch.size;
         if include_content && size.is_none_or(|value| value as usize > MAX_TRANSIENT_MESSAGE_BYTES)
         {
@@ -2210,11 +2258,7 @@ pub async fn fetch_by_uids(
 pub async fn get_flags(session: &mut ImapSession, uid: u32) -> Result<Vec<String>> {
     let uid_str = uid.to_string();
     let fetched = timed_uid_fetch_collect(session, &uid_str, "(FLAGS)").await?;
-    let fetch = fetched
-        .into_iter()
-        .next()
-        .ok_or(AgentmailError::MessageNotFound(uid))?
-        .map_err(AgentmailError::Imap)?;
+    let fetch = answer_for_uid(session, fetched, uid).await?;
     Ok(fetch.flags().map(|f| flag_to_string(&f)).collect())
 }
 
@@ -2274,14 +2318,14 @@ pub async fn remove_flags(session: &mut ImapSession, uid: u32, flags: &[String])
 // ---------------------------------------------------------------------------
 
 /// Flush pending server-side state after a mutation (EXPUNGE, EXISTS, etc.).
-/// Issues NOOP which forces the server to send any queued untagged responses,
-/// ensuring the session view is up-to-date before release back to the pool.
+/// Issues a NOOP, which makes the server send any queued untagged responses,
+/// and passes only on its own tagged OK — async-imap's `noop()` would pass a
+/// closed stream, and its session would go back to the pool dead.
 pub async fn sync<T>(session: &mut Session<T>) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
-    imap_timeout(session.noop()).await?;
-    Ok(())
+    confirm_alive(session).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3679,15 +3723,11 @@ where
     examine_with_expected_uid_validity(session, mailbox, expected_uid_validity).await?;
     let uid_str = uid.to_string();
     let metadata = timed_uid_fetch_collect(session, &uid_str, "(UID RFC822.SIZE)").await?;
-    let mut size = None;
-    for item in metadata {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            size = fetch.size.map(|value| value as usize);
-            break;
-        }
-    }
-    let size = size.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let size = answer_for_uid(session, metadata, uid)
+        .await?
+        .size
+        .map(|value| value as usize)
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
     if size > max_bytes {
         return Err(AgentmailError::Other(format!(
             "message UID {uid} is {size} bytes; this resource is limited to {max_bytes} bytes"
@@ -3696,16 +3736,11 @@ where
 
     let fetch_items = format!("(UID BODY.PEEK[]<0.{}>)", max_bytes.saturating_add(1));
     let fetched = timed_uid_fetch_collect(session, &uid_str, &fetch_items).await?;
-
-    let mut body = None;
-    for item in fetched {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            body = fetch.body().map(<[u8]>::to_vec);
-            break;
-        }
-    }
-    let body = body.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let body = answer_for_uid(session, fetched, uid)
+        .await?
+        .body()
+        .map(<[u8]>::to_vec)
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
     if body.len() > max_bytes || body.len() != size {
         return Err(AgentmailError::Other(format!(
             "message UID {uid} source was truncated or exceeded the {max_bytes} byte resource limit"
@@ -3728,15 +3763,12 @@ where
     examine_with_expected_uid_validity(session, mailbox, expected_uid_validity).await?;
     let fetch_items = format!("(UID BODY.PEEK[HEADER]<0.{}>)", max_bytes.saturating_add(1));
     let fetched = timed_uid_fetch_collect(session, &uid.to_string(), &fetch_items).await?;
-    let mut headers = None;
-    for item in fetched {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            headers = fetch.header().or_else(|| fetch.body()).map(<[u8]>::to_vec);
-            break;
-        }
-    }
-    let headers = headers.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let fetch = answer_for_uid(session, fetched, uid).await?;
+    let headers = fetch
+        .header()
+        .or_else(|| fetch.body())
+        .map(<[u8]>::to_vec)
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
     if headers.len() > max_bytes {
         return Err(AgentmailError::Other(format!(
             "message UID {uid} headers exceed the {max_bytes} byte resource limit"
@@ -3798,15 +3830,8 @@ where
     let uid_set = uid.to_string();
     check_cancel(cancel)?;
     let metadata = timed_uid_fetch_collect(session, &uid_set, "(UID RFC822.SIZE)").await?;
-    let mut expected_size = None;
-    for item in metadata {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            expected_size = Some(validate_unsubscribe_message_size(uid, fetch.size)?);
-            break;
-        }
-    }
-    let expected_size = expected_size.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let expected_size =
+        validate_unsubscribe_message_size(uid, answer_for_uid(session, metadata, uid).await?.size)?;
 
     check_cancel(cancel)?;
     // Request at most limit+1 octets. If a server understates RFC822.SIZE, the
@@ -3814,15 +3839,11 @@ where
     // this matters for DKIM signatures that use an `l=` body-length tag.
     let body_items = format!("(UID BODY.PEEK[]<0.{}>)", MAX_UNSUBSCRIBE_MESSAGE_BYTES + 1);
     let fetched = timed_uid_fetch_collect(session, &uid_set, &body_items).await?;
-    let mut raw_message = None;
-    for item in fetched {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            raw_message = fetch.body().map(<[u8]>::to_vec);
-            break;
-        }
-    }
-    let raw_message = raw_message.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let raw_message = answer_for_uid(session, fetched, uid)
+        .await?
+        .body()
+        .map(<[u8]>::to_vec)
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
     // Yahoo/AOL's RFC822.SIZE is unreliable metadata — observed deltas run
     // in BOTH directions (line-ending/charset accounting at ingestion), so a
     // mismatch is not evidence of truncation. The only case where a clipped
@@ -3870,12 +3891,7 @@ where
         "BODY.PEEK[HEADER.FIELDS (List-Unsubscribe List-Unsubscribe-Post List-Id)]",
     )
     .await?;
-
-    let fetch = fetched
-        .into_iter()
-        .next()
-        .ok_or(AgentmailError::MessageNotFound(uid))?
-        .map_err(AgentmailError::Imap)?;
+    let fetch = answer_for_uid(session, fetched, uid).await?;
 
     let header_bytes = fetch.header().unwrap_or(&[]);
     let header_str = String::from_utf8_lossy(header_bytes);
@@ -5870,6 +5886,80 @@ mod tests {
                 .await
                 .is_ok_and(|found| found.is_empty()),
             "async-imap 0.12 still reads end-of-stream as an empty SEARCH"
+        );
+        drop(session);
+        server.commands().await;
+    }
+
+    /// A connection that closes partway through LIST hands back a short list,
+    /// which the mailbox catalog caches and every account-wide scan then
+    /// plans from — skipping the mailboxes it never heard about.
+    #[tokio::test]
+    async fn a_list_cut_short_by_a_closed_connection_is_an_error() {
+        let (mut session, server) = test_support::scripted_session(|_, command| {
+            command.contains(" LIST ").then(|| {
+                format!(
+                    "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n{}",
+                    test_support::THEN_HANG_UP
+                )
+            })
+        })
+        .await;
+
+        let error = list_mailbox_layout(&mut session)
+            .await
+            .expect_err("a list without its tagged OK is not the account's mailboxes");
+
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(session);
+        server.commands().await;
+    }
+
+    /// A FETCH on a closed stream returns no row. Read as "the message no
+    /// longer exists", it made callers prune the ranking cache of a message
+    /// that is still there.
+    #[tokio::test]
+    async fn a_closed_connection_is_not_a_missing_message() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command
+                .contains("EXAMINE")
+                .then(|| test_support::examine_reply(tag, 9, 100, 3))
+        })
+        .await;
+
+        let error = get_message_headers_bounded(&mut session, "INBOX", 7, 9, 4096)
+            .await
+            .expect_err("no answer came");
+
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(session);
+        server.commands().await;
+    }
+
+    /// The other side of the same rule: a live server that answers without
+    /// the UID still means the message is gone.
+    #[tokio::test]
+    async fn a_live_server_without_the_row_reports_the_message_missing() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            if command.contains("EXAMINE") {
+                Some(test_support::examine_reply(tag, 9, 100, 3))
+            } else if command.contains("UID FETCH") {
+                Some(format!("{tag} OK FETCH completed\r\n"))
+            } else if command.contains(" NOOP") {
+                Some(format!("{tag} OK NOOP completed\r\n"))
+            } else {
+                None
+            }
+        })
+        .await;
+
+        let error = get_message_headers_bounded(&mut session, "INBOX", 7, 9, 4096)
+            .await
+            .expect_err("the server has no UID 7");
+
+        assert!(
+            matches!(error, AgentmailError::MessageNotFound(7)),
+            "{error:?}"
         );
         drop(session);
         server.commands().await;

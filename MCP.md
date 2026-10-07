@@ -199,6 +199,9 @@ connection ends an account-wide scan or sweep at once, and that mailbox and
 every later one are listed in `skipped` rather than each waiting out a
 timeout. A single-mailbox scan fails instead, and `preview_thread_record`
 fails rather than return a graph missing what it could no longer search.
+Reads (`search_messages`, `get_messages`, `list_mailboxes`, `list_identities`
+and the like) probe the same way and are retried once on a fresh connection,
+and a message is reported missing only when a live server leaves it out.
 
 **top_senders**
 ```json

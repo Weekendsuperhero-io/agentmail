@@ -640,6 +640,16 @@ impl ConnectionPool {
             });
     }
 
+    /// How many idle connections `account_name` holds, in either store.
+    #[cfg(test)]
+    pub(crate) async fn idle_sessions(&self, account_name: &str) -> usize {
+        let mut count = 0;
+        for store in [&self.pools, &self.uid_pools] {
+            count += store.lock().await.get(account_name).map_or(0, Vec::len);
+        }
+        count
+    }
+
     async fn pop_idle_any(&self, account_name: &str) -> Option<(ImapSession, bool)> {
         for (store, uid_mode) in [(&self.uid_pools, true), (&self.pools, false)] {
             let maybe_idle = {
@@ -886,15 +896,25 @@ impl ConnectionPool {
     /// retry). This closes the connection-died-*during*-an-op race that the
     /// idle-TTL eviction can't see. Control flow lives in the `retry_once!`
     /// macro, which is unit-tested without real sessions.
+    ///
+    /// An answer counts only once the connection answers a NOOP after it — one
+    /// that passes only on its own tagged OK: async-imap ends SELECT, SEARCH, FETCH
+    /// and LIST quietly on a closed stream, so a socket that died mid-read
+    /// returns an empty or short `Ok` rather than the error this retry is for.
+    /// The probe turns it into that error.
     pub async fn with_session_retry<T>(
         &self,
         account: &str,
-        op: impl AsyncFnMut(&mut ImapSession) -> crate::Result<T>,
+        mut op: impl AsyncFnMut(&mut ImapSession) -> crate::Result<T>,
     ) -> crate::Result<T> {
         retry_once!(
             || self.acquire(account),
             PooledSession::session,
-            op,
+            async |session: &mut ImapSession| -> crate::Result<T> {
+                let answer = op(session).await?;
+                imap_client::confirm_alive(session).await?;
+                Ok(answer)
+            },
             PooledSession::release,
         )
     }
@@ -955,6 +975,23 @@ impl PooledSession {
     /// Limited pool.
     pub fn mark_uid_mode(&mut self) {
         self.uid_mode = true;
+    }
+
+    /// Return the session to the pool after a mutation, once a checked NOOP
+    /// ([`imap_client::sync`]) has flushed the server's queued updates and
+    /// proven the connection alive; one that doesn't answer is closed instead.
+    /// Never fails: the mutation's own commands were answered, so its result
+    /// stands whatever becomes of the connection afterwards.
+    pub async fn release_after_mutation(mut self) {
+        match imap_client::sync(self.session()).await {
+            Ok(()) => self.release().await,
+            Err(error) => tracing::debug!(
+                target: "agentmail",
+                account = %self.account_name,
+                error = %error,
+                "connection did not answer after a mutation; closing it instead of pooling it"
+            ),
+        }
     }
 
     /// Return the session to the pool for reuse — the UID-Mode store when this
@@ -1515,6 +1552,52 @@ mod tests {
             text.contains("rate-limited LOGIN") && text.contains("strike 1"),
             "fast-fail carries the strike-aware cooldown message: {text}"
         );
+    }
+
+    /// A read on a closed stream comes back empty instead of failing, so
+    /// `with_session_retry` never saw the drop it exists to retry, and the
+    /// empty answer stood. Probing the connection after the read turns it
+    /// into the connection error it is, and the read runs again on a fresh
+    /// connection.
+    #[tokio::test]
+    async fn a_read_cut_off_by_a_closed_connection_is_retried_on_a_fresh_one() {
+        let noop = |tag: &str| format!("{tag} OK NOOP completed\r\n");
+        let (healthy, healthy_server) =
+            imap_client::test_support::scripted_session(move |tag, command| {
+                if command.contains(" NOOP") {
+                    Some(noop(tag))
+                } else if command.contains("UID SEARCH") {
+                    Some(format!("* SEARCH 4 9\r\n{tag} OK SEARCH completed\r\n"))
+                } else {
+                    None
+                }
+            })
+            .await;
+        // Answers the pool's ping, then drops the connection at the SEARCH.
+        let (dying, dying_server) =
+            imap_client::test_support::scripted_session(move |tag, command| {
+                command.contains(" NOOP").then(|| noop(tag))
+            })
+            .await;
+        let pool = ConnectionPool::new(Config::from_accounts(vec![(
+            "work".to_string(),
+            AccountConfig::new("imap.example.com", "me@example.com"),
+        )]));
+        pool.hold_idle_for_test("work", healthy).await;
+        pool.hold_idle_for_test("work", dying).await; // handed out first
+
+        let mut uids = pool
+            .with_session_retry("work", async |session| {
+                imap_client::search_uids(session, "ALL").await
+            })
+            .await
+            .expect("the read is retried, not answered empty");
+
+        uids.sort_unstable();
+        assert_eq!(uids, vec![4, 9]);
+        drop(pool);
+        dying_server.commands().await;
+        healthy_server.commands().await;
     }
 
     /// Handle whose release-vs-drop fate is observable: the flag flips only if
