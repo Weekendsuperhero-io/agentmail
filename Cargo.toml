@@ -47,7 +47,9 @@ hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 idna = "1"
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 mail-parser = "0.11"
-mail-auth = { version = "0.13.3", default-features = false, features = ["ring"] }
+# aws-lc-rs, not ring: Agent Muse links this crate and ships one rustls crypto
+# provider. The feature also picks hickory's TLS and DNSSEC backends.
+mail-auth = { version = "0.13.3", default-features = false, features = ["aws-lc-rs"] }
 native-tls = "0.2"
 parking_lot = "0.12"
 percent-encoding = "2"
