@@ -25,9 +25,6 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-
       - name: Run 216K-message cache stress test
         run: >-
           cargo test --locked --all-features --lib

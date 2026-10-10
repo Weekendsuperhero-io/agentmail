@@ -553,7 +553,7 @@ fn init_platform_keyring() {
 
     #[cfg(target_os = "linux")]
     {
-        match dbus_secret_service_keyring_store::Store::new() {
+        match zbus_secret_service_keyring_store::Store::new() {
             Ok(store) => keyring_core::set_default_store(store),
             Err(e) => tracing::warn!(
                 "keychain: D-Bus secret service unavailable: {e}. \

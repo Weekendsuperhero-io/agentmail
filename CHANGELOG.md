@@ -60,6 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `native_tls::Error`, and is no longer a `From` conversion.
   `imap_client::tls_client_config()` is public.
 - **Rust 1.99 or newer** (`rust-version`).
+- **Linux's credential store talks D-Bus in Rust.** `zbus-secret-service-keyring-store`
+  (zbus, its own async-io executor, pure-Rust crypto) replaces
+  `dbus-secret-service-keyring-store`, which linked the C libdbus. It is the
+  same store over a different transport: the same Secret Service attributes
+  (`service`, `username`, `target`), so passwords saved before are found.
+  Building on Linux no longer needs `libdbus-1-dev` or `pkg-config`; CI,
+  release, security and nightly-stress no longer install them.
 - **Replies are From the address the original reached** — the original's own
   `From` for a follow-up to this account's mail, else the first identity in its
   `To`, then `Cc`. `update_draft` keeps the draft's current `From` (name
