@@ -17,7 +17,7 @@ during protocol design and review.
 
 ## Requirements
 
-- Rust 1.94 or newer (edition 2024)
+- Rust 1.99 or newer (edition 2024)
 - An IMAP-enabled email account on a server that advertises IMAP4rev1 (Gmail, iCloud, Yahoo, Fastmail, self-hosted, etc.). Dual rev1/rev2 servers are used in rev1 mode; pure IMAP4rev2 support is not yet available.
 
 ## Build

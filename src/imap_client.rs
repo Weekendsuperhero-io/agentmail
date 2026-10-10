@@ -9,7 +9,8 @@ use async_imap::extensions::compress::DeflateStream;
 use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls;
 use tracing::{debug, warn};
 
 use crate::AgentmailError;
@@ -744,6 +745,32 @@ pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSessi
     unreachable!("loop returns on the final attempt")
 }
 
+/// The TLS client configuration every IMAP connection shares: rustls on
+/// aws-lc-rs, TLS 1.2 and 1.3, and the OS's own certificate check
+/// (rustls-platform-verifier), so the trust a person or their MDM set up
+/// applies here as it does in their mail app. Built once per process. On
+/// macOS and Windows the verifier asks the OS on every handshake, so a trust
+/// change applies at once; on Linux it reads the system roots when built, so
+/// a root added later counts from the next start. Public so
+/// `examples/probe_xoauth2.rs` diagnoses the connection this crate makes.
+pub fn tls_client_config() -> Result<Arc<rustls::ClientConfig>> {
+    use rustls_platform_verifier::BuilderVerifierExt as _;
+
+    static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Ok(Arc::clone(config));
+    }
+    // The provider is named rather than taken from the process default, so
+    // agentmail works the same whether or not its host installed one.
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .and_then(|builder| builder.with_platform_verifier())
+        .map_err(|e| AgentmailError::Tls(std::io::Error::other(e)))?
+        .with_no_client_auth();
+    Ok(Arc::clone(CONFIG.get_or_init(|| Arc::new(config))))
+}
+
 /// A single TLS connect + login, no retry.
 async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSession> {
     if !config.tls {
@@ -751,13 +778,23 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
             "tls=false is unsupported; refusing to send IMAP credentials without TLS".to_string(),
         ));
     }
+    let server_name =
+        rustls::pki_types::ServerName::try_from(config.host.clone()).map_err(|e| {
+            AgentmailError::Config(format!(
+                "IMAP host {:?} is not a name or address TLS can verify: {e}",
+                config.host
+            ))
+        })?;
+    let connector = tokio_rustls::TlsConnector::from(tls_client_config()?);
     let addr = format!("{}:{}", config.host, config.port);
     let tcp = imap_timeout(TcpStream::connect(&addr)).await?;
-
-    let connector = native_tls::TlsConnector::new()
-        .map_err(|e| AgentmailError::Other(format!("TLS connector error: {}", e)))?;
-    let connector = tokio_native_tls::TlsConnector::from(connector);
-    let tls = imap_timeout(connector.connect(&config.host, tcp)).await?;
+    let tls = imap_timeout(async {
+        connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(AgentmailError::Tls)
+    })
+    .await?;
 
     let transport = ImapTransport::Tls(Box::new(tls));
     let mut client = async_imap::Client::new(transport);
@@ -4212,6 +4249,37 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
     use super::*;
+
+    /// The OS verifier can fail to start (no system roots on a bare Linux
+    /// image); this is where that shows, not at an account's first connect.
+    #[test]
+    fn the_tls_client_config_builds_with_the_platform_verifier() {
+        tls_client_config().expect("the TLS client configuration builds");
+    }
+
+    /// A real handshake, the certificate checked by the OS, against a public
+    /// IMAP server: what no scripted session can show.
+    #[tokio::test]
+    #[ignore = "network: completes a TLS handshake with imap.gmail.com:993"]
+    async fn a_tls_handshake_with_a_public_imap_server_is_verified_by_the_os() {
+        let connector = tokio_rustls::TlsConnector::from(tls_client_config().unwrap());
+        let tcp = TcpStream::connect(("imap.gmail.com", 993)).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("imap.gmail.com").unwrap();
+        let mut tls = connector
+            .connect(name, tcp)
+            .await
+            .expect("verified handshake");
+        // TLS 1.3: Secure Transport, native-tls's engine on macOS, never
+        // offered it.
+        let version = tls.get_ref().1.protocol_version();
+        assert_eq!(version, Some(rustls::ProtocolVersion::TLSv1_3));
+        let mut greeting = String::new();
+        BufReader::new(&mut tls)
+            .read_line(&mut greeting)
+            .await
+            .unwrap();
+        assert!(greeting.starts_with("* OK"), "greeting {greeting:?}");
+    }
 
     async fn scripted_unsubscribe_session(
         uid_validity: Option<u32>,

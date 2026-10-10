@@ -68,8 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let tcp = TcpStream::connect((host.as_str(), port)).await?;
-    let connector = tokio_native_tls::TlsConnector::from(native_tls::TlsConnector::new()?);
-    let tls = connector.connect(&host, tcp).await?;
+    // The crate's own TLS configuration, so this probes the connection it makes.
+    let connector = tokio_rustls::TlsConnector::from(agentmail::imap_client::tls_client_config()?);
+    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.clone())?;
+    let tls = connector.connect(server_name, tcp).await?;
     let mut client = async_imap::Client::new(tls);
 
     // Consume the greeting first (the fix): the AUTHENTICATE handshake does not

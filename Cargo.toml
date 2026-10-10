@@ -11,7 +11,7 @@ imap-proto = { path = "vendor/imap-proto" }
 name = "agentmail"
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
 documentation = "https://docs.rs/agentmail"
 readme = "README.md"
@@ -50,7 +50,6 @@ mail-parser = "0.11"
 # aws-lc-rs, not ring: Agent Muse links this crate and ships one rustls crypto
 # provider. The feature also picks hickory's TLS and DNSSEC backends.
 mail-auth = { version = "0.13.3", default-features = false, features = ["aws-lc-rs"] }
-native-tls = "0.2"
 parking_lot = "0.12"
 percent-encoding = "2"
 printpdf = { version = "0.12", default-features = false }
@@ -72,7 +71,13 @@ serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-native-tls = "0.3"
+# IMAP's TLS. rustls on aws-lc-rs, the one crypto provider Agent Muse ships
+# (`tokio_rustls::rustls` is the rustls this uses, so the two can't drift),
+# with the certificate check handed to the OS by rustls-platform-verifier,
+# so the roots a person or their MDM installed still count. native-tls ran
+# Secure Transport on macOS, which never gained TLS 1.3, and OpenSSL on Linux.
+rustls-platform-verifier = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
 tokio-util = "0.7"
 toml = "1.1"
 tracing = { version = "0.1", features = ["release_max_level_info"] }

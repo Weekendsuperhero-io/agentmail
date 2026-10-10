@@ -5,8 +5,12 @@ pub enum AgentmailError {
     #[error("IMAP error: {0}")]
     Imap(#[from] async_imap::error::Error),
 
+    /// The IMAP connection's TLS: building the client configuration, or the
+    /// handshake. tokio-rustls reports a failed handshake, a refused
+    /// certificate included, as an I/O error carrying rustls's own, so this
+    /// takes one and is never converted from `?` (that's [`Self::Io`]).
     #[error("TLS error: {0}")]
-    Tls(#[from] native_tls::Error),
+    Tls(std::io::Error),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

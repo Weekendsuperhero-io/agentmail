@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-10-06T00:00
+updated: 2026-10-10T00:00
 ---
 # Changelog
 
@@ -48,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **IMAP's TLS is rustls, with the OS checking certificates.** `native-tls`
+  and `tokio-native-tls` are gone; connections use `tokio-rustls` on aws-lc-rs,
+  and `rustls-platform-verifier` hands the certificate check to the OS
+  (Security.framework, CryptoAPI, the system store on Linux), so roots a person
+  or their MDM installed still count. On macOS IMAP now negotiates TLS 1.3:
+  native-tls ran Secure Transport there, which never offered it. A server whose
+  TLS 1.2 offers only non-forward-secret (RSA key exchange) or CBC suites no
+  longer connects; Linux no longer links OpenSSL. **Breaking:**
+  `AgentmailError::Tls` carries the handshake's `std::io::Error` instead of a
+  `native_tls::Error`, and is no longer a `From` conversion.
+  `imap_client::tls_client_config()` is public.
+- **Rust 1.99 or newer** (`rust-version`).
 - **Replies are From the address the original reached** — the original's own
   `From` for a follow-up to this account's mail, else the first identity in its
   `To`, then `Cc`. `update_draft` keeps the draft's current `From` (name
