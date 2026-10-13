@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MCP 2025-11-25, by decision** — the server speaks 2025-11-25 and every
+  earlier revision, and nothing newer, whatever rmcp calls latest (3.5.0 made
+  that 2026-07-28). A client asking for 2026-07-28 is answered in 2025-11-25.
+  `server/discover` (2026-07-28) is refused with `-32022` listing the versions
+  spoken, or with method-not-found at a 2025 version, so a probing client falls
+  back to `initialize`.
 - **IMAP's TLS is rustls, with the OS checking certificates.** `native-tls`
   and `tokio-native-tls` are gone; connections use `tokio-rustls` on aws-lc-rs,
   and `rustls-platform-verifier` hands the certificate check to the OS
@@ -104,8 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebased onto 0.17.0 (nom 8) and its UIDFETCH patch re-applied; mail-auth
   0.12.1 → 0.13.3; dirs 6 → 7; semver-compatible updates across the lockfile.
   rusqlite stays at 0.39 (the embedding app's sqlx-sqlite caps libsqlite3-sys
-  below 0.38) and rmcp at 2.2.0 (3.x removes the task API; its own decision in
-  the embedding workspace).
+  below 0.38). rmcp 2.2.0 → 3.5.1, exact-pinned to the embedding app's copy;
+  the MCP revision does not move with it (below).
 - **`fresh_logins` / `idle_reuses` are labelled as pool-wide** — the log lines
   that carry them now name them `pool_fresh_logins` and `pool_idle_reuses`,
   and `ConnectionStats` documents that the counts cover every account since the
@@ -122,12 +128,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `notifications/tasks/status` push. Agent Muse, which embeds this server,
   measured the task surface unused (no task-augmented call, no `tasks/*`
   request in two weeks of traffic), and every rmcp 3.x release removes the
-  MCP 2025-11-25 task model. A task-augmented `tools/call` is refused and the
-  tool does not run. Long operations still report `notifications/progress` and
+  MCP 2025-11-25 task model. A task-augmented `tools/call` runs as a plain
+  call, the spec's rule for a server without the capability. Long operations still report `notifications/progress` and
   honour `notifications/cancelled`. Tasks may return as the SEP-2663
   extension. A breaking change, hence the minor version bump.
 - **The `io.modelcontextprotocol/related-task` marker** on progress
   notifications and task results went with them.
+
 
 ### Fixed
 

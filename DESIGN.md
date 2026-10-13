@@ -4,7 +4,7 @@
 
 Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 36 tools and 6 prompts for reading, searching, composing, organizing, archiving, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
 
-MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | rmcp 2.2
+MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05; nothing newer) | rmcp 3.5.1
 
 No Mail.app dependency. Pure IMAP over TLS. Works on macOS, Linux, and Windows.
 
