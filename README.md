@@ -437,14 +437,14 @@ To pass passwords via environment variables instead of keychain:
 npx @modelcontextprotocol/inspector /path/to/agentmail serve
 ```
 
-Opens a web UI to exercise all advertised tools, 6 prompts, and task calls interactively.
+Opens a web UI to exercise all advertised tools and 6 prompts interactively.
 
 ## MCP Tools
 
 36 tools cover account discovery, mailbox management, message reading, search,
-bulk operations, recovery, evidence archiving, flag management, and composition. AgentMail saves drafts but never sends mail. 22 long-running tools support
-optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/tasks)
-(SEP-1686) for asynchronous execution.
+bulk operations, recovery, evidence archiving, flag management, and composition. AgentMail saves drafts but never sends mail. Long-running tools
+report progress notifications. (MCP task-based invocation, SEP-1686, was
+retired in 0.8.0.)
 
 | Tool                   | Description                                                                           |
 | ---------------------- | ------------------------------------------------------------------------------------- |
@@ -521,8 +521,7 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   `senders` preview nested inside one `top_mailing_lists` row, whose
   `senderCount` still reports the complete count.
 - All reads use `BODY.PEEK` to avoid marking messages as `\Seen`.
-- Tools marked taskable in [MCP.md](MCP.md) support MCP progress notifications
-  and optional task-based invocation.
+- Long-running tools support MCP progress notifications.
 - Cancelling a request (`notifications/cancelled`) stops long scans at the next mailbox/fetch chunk and polls DNS, DKIM, and HTTP work every 25 ms. An HTTP cancellation cannot retract a POST already received by the remote server, so it never reports that an in-flight request was definitely unsent.
 - Delete tools take a `permanent` flag (default false): false moves to Trash when available, true expunges directly (bypassing Trash, irreversible; requires server UIDPLUS).
 - The `top_*` tools share a persistent, live-validated UID/header cache. Each invocation uses `EXAMINE` before reuse. An unchanged `UIDVALIDITY`/`UIDNEXT`/message-count tuple is a hit; a proven append fetches only new UIDs; deletions and mixed changes reconcile UID membership while reusing unchanged header rows. A changed or missing `UIDVALIDITY` prevents unsafe UID reuse. If discovery enumerates folders, results dedupe by Message-ID and exclude your own configured email and aliases.
@@ -565,8 +564,8 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   client IP, HELO, and envelope-sender inputs that are not present in an RFC822
   archive.
 - Embedded AgentMail accepts the workspace root only as trusted request
-  metadata from Agent Muse (`io.agentmuse/workspaceRoot`) on direct and
-  task-augmented calls. Missing or invalid metadata fails closed. Standalone
+  metadata from Agent Muse (`io.agentmuse/workspaceRoot`) on every call.
+  Missing or invalid metadata fails closed. Standalone
   `agentmail serve` instead uses `AGENTMAIL_FILE_ROOT` (falling back to
   `~/.agentmail/files`). Caller-supplied output directories are confined below
   that root; a process-wide environment variable is never used for embedded
@@ -605,7 +604,6 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - Tool calls return one compact text summary for compatibility plus one
   authoritative `structuredContent` object. The full JSON value is not repeated
   in the text content block.
-- Destructive tasks targeting the same account are automatically serialized to prevent IMAP state conflicts. Tasks are capped at 128 live entries, retained for 24 hours from creation, listed newest-first in opaque-cursor pages of 25, and may have their terminal result retrieved repeatedly until expiry.
 
 ### Ranking cache privacy and configuration
 
@@ -771,7 +769,7 @@ Argument autocompletion (`completion/complete`) is supported for the prompts and
 ```
 agentmail (binary crate: agentmail-mcp)
   ├── serve                → MCP stdio server (tokio + rmcp)
-  │                          36 tools + 6 prompts, tasks, progress notifications
+  │                          36 tools + 6 prompts, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
   ├── create-mailbox       → CLI
@@ -795,7 +793,7 @@ agentmail (binary crate: agentmail-mcp)
 src/ (library + binary)
   ├── lib.rs          → Public API facade (25+ async methods)
   ├── main.rs         → CLI dispatch (clap), account configuration
-  ├── mcp/            → MCP server: 36 tools, 6 prompts, tasks, resources, completions
+  ├── mcp/            → MCP server: 36 tools, 6 prompts, resources, completions
   ├── config.rs       → TOML config loading, default account resolution
   ├── credentials.rs  → Password resolution (env → config secret → default keyring)
   ├── connection.rs   → IMAP connection pool (provider-aware per-account cap)

@@ -177,8 +177,7 @@ impl AgentMailServer {
         name = "search_messages",
         output_schema = rmcp::handler::server::tool::schema_for_output::<SearchMessagesOutput>().expect("valid search_messages output schema"),
         description = "Search one required mailbox with filters: senderContains, subjectContains, toContains, query (IMAP full-text), read, flagged, headerKey/headerValueContains, since/before (YYYY-MM-DD), and largerThan/smallerThan (bytes). Filters are AND-combined. Returns metadata-only results newest-first with the mailbox UIDVALIDITY and pagination data (offset, limit, total, nextOffset). Every row's message rides the result as a resource_link — the markdown body, plus that message's /info for headers, source, and attachments. Follow those links; the result carries no URI in its JSON. Get mailbox names from list_mailboxes. Defaults: offset=0, limit=25 (max 50).",
-        annotations(title = "Search Messages", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Search Messages", read_only_hint = true)
     )]
     async fn search_messages_tool(
         &self,
@@ -230,8 +229,7 @@ impl AgentMailServer {
         name = "list_flags",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ListFlagsOutput>().expect("valid list_flags output schema"),
         description = "List all IMAP flags in use with counts per flag (e.g. \\Seen: 1234, \\Flagged: 56). Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without Trash/Junk/Drafts or virtual aggregate views. Resolves Apple Mail $MailFlagBit color flags to color names (red, orange, yellow, green, blue, purple, gray). An account-wide scan lists in skipped the mailboxes it did not cover — one it couldn't open, or every mailbox after a lost connection; their messages are in none of the counts.",
-        annotations(title = "List Flags", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "List Flags", read_only_hint = true)
     )]
     async fn list_flags_tool(
         &self,
@@ -262,8 +260,7 @@ impl AgentMailServer {
         name = "find_attachments",
         output_schema = rmcp::handler::server::tool::schema_for_output::<FindAttachmentsOutput>().expect("valid find_attachments output schema"),
         description = "Find messages with attachments (multipart/mixed or multipart/related), newest-first. Each hit includes mailbox, UIDVALIDITY, UID, and date so account-wide UID collisions are unambiguous, and rides the result as a resource_link. Omit mailbox for account-wide discovery: one selectable \\All mailbox is preferred, otherwise selectable storage mailboxes are enumerated without excluded or virtual views. Defaults: offset=0, limit=25 (max 100). To save files, pass a hit's mailbox, uid, and uidValidity as expectedUidValidity to download_attachments. An account-wide scan lists in skipped the mailboxes it did not cover; their messages are not in total.",
-        annotations(title = "Find Attachments", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Find Attachments", read_only_hint = true)
     )]
     async fn find_attachments_tool(
         &self,
@@ -298,8 +295,7 @@ impl AgentMailServer {
         name = "top_senders",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopSendersOutput>().expect("valid top_senders output schema"),
         description = "List the senders who email you most, by message count. Omit mailbox for account-wide discovery: one selectable \\All mailbox is scanned alone when available; otherwise selectable storage mailboxes are enumerated, virtual/excluded views are skipped, and Message-ID deduplicates across folders. Excludes your own address and groups by exact address + display name. Every row has a safe nested sample {mailbox, uidValidity, uid} for inspection, linked from the result as a resource_link; pass its exact address and displayName to delete_by_sender or move_by_sender. Live offset pagination defaults to 10 rows (max 100).",
-        annotations(title = "Top Senders", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Top Senders", read_only_hint = true)
     )]
     async fn top_senders_tool(
         &self,
@@ -334,8 +330,7 @@ impl AgentMailServer {
         name = "top_domains",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopDomainsOutput>().expect("valid top_domains output schema"),
         description = "List exact canonical Header From domains by message count. A parent and each subdomain are separate rows: example.com never includes mail.example.com. Each row supplies registrableDomain and subdomain as Public Suffix List context, plus a UIDVALIDITY-safe sample and its decoded subject when available. Header From is organizational metadata, not proof of DKIM ownership. Omit mailbox for account-wide discovery. Live offset pagination defaults to 20 rows (max 100); use the exact domain value with delete_by_domain or move_by_domain.",
-        annotations(title = "Top Domains", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Top Domains", read_only_hint = true)
     )]
     async fn top_domains_tool(
         &self,
@@ -370,8 +365,7 @@ impl AgentMailServer {
         name = "top_subscriptions",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopSubscriptionsOutput>().expect("valid top_subscriptions output schema"),
         description = "List bulk/marketing subscriptions by message count. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Rows are grouped only by normalized sender email; display names and List-Id values do not split a sender's row. Rows are sorted by advertised one-click syntax, then count. Each has a nested sample {mailbox, uidValidity, uid}, linked from the result as a resource_link, and, when available, the sample message's decoded subject — what this subscription's mail actually looks like. Map the sample to move_subscription to file exact bulk-mail matches without an unsubscribe request, or to unsubscribe_message for a consented verified unsubscribe. advertisedOneClick is syntactic only—the unsubscribe action re-fetches the complete message and verifies DKIM. Live offset pagination defaults to 10 rows (max 100).",
-        annotations(title = "Top Subscriptions", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Top Subscriptions", read_only_hint = true)
     )]
     async fn top_subscriptions_tool(
         &self,
@@ -406,8 +400,7 @@ impl AgentMailServer {
         name = "top_mailing_lists",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopMailingListsOutput>().expect("valid top_mailing_lists output schema"),
         description = "List mailing lists by normalized List-Id (RFC 2919), highest volume first, including List-Id-only messages and grouping across senders. Each row includes a bounded sender preview, senderCount, a UIDVALIDITY-safe nested sample for inspection, and, when available, the sample message's decoded subject — what this list's mail actually looks like. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Live offset pagination defaults to 10 rows (max 100). Use delete_list_id or move_list_id with an approved exact listId.",
-        annotations(title = "Top Mailing Lists", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Top Mailing Lists", read_only_hint = true)
     )]
     async fn top_mailing_lists_tool(
         &self,
@@ -466,8 +459,7 @@ impl AgentMailServer {
             title = "Preview Thread Record",
             read_only_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn preview_thread_record_tool(
         &self,

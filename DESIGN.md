@@ -20,7 +20,7 @@ graph TB
     end
 
     subgraph "agentmail-mcp (in-process)"
-        MCP[AgentMailServer<br/>36 tools, 6 prompts, tasks]
+        MCP[AgentMailServer<br/>36 tools, 6 prompts]
         MK[Agentmail Facade]
         POOL[ConnectionPool<br/>provider-aware cap/account]
         CRED[Credential Resolver]
@@ -82,7 +82,7 @@ agentmail/
   src/
     lib.rs          # Agentmail facade (25+ async methods)
     main.rs         # CLI dispatch (clap), account configuration
-    mcp/            # AgentMailServer, tools, prompts, tasks, resources, transports
+    mcp/            # AgentMailServer, tools, prompts, resources, transports
     imap_client.rs  # Raw IMAP operations (SELECT, FETCH, SEARCH, STORE)
     connection.rs   # Per-account session pool + semaphore concurrency
     config.rs       # AccountConfig, Config (file + programmatic)
@@ -266,9 +266,9 @@ Email content flows through a pipeline:
 - **Config file for standalone, runtime injection for in-process** — same library code, different config sources
 - **Passwords in OS keyring, never in DB** — proper security, no key management burden
 - **Mailbox attributes** — RFC 6154 special-use roles (trash, junk, drafts, sent, archive, all, flagged) and RFC 3501 flags (noSelect, noInferiors) surfaced from IMAP LIST. Scan-all operations use roles to skip Trash/Junk/Drafts with string-matching fallback for servers without RFC 6154 support
-- **Tool annotations** — `read_only_hint`, `destructive_hint`, `idempotent_hint`, and optional task execution per MCP 2025-11-25
+- **Tool annotations** — `read_only_hint`, `destructive_hint`, `idempotent_hint` per MCP 2025-11-25
 - **Progress notifications** — long operations report progress to the MCP client
-- **Task support (SEP-1686)** — taskable operations support enqueue, poll, repeatable result retrieval, and cancellation. Destructive tasks targeting the same account are serialized to prevent IMAP state conflicts
+- **No MCP tasks** — the SEP-1686 task surface (enqueue, poll, result, cancel, per-account serialization of destructive tasks) was retired in 0.8.0, measured unused; long operations report progress and honour `notifications/cancelled`
 - **Forward recovery for MOVE** — servers without native UID MOVE use a separate `synchronous=FULL` journal. Ambiguous COPY/cleanup outcomes return durable operation IDs and explicit pending/attention states; reconciliation never repeats COPY without evidence that the earlier attempt created nothing
 
 ## Configuration and Local Security

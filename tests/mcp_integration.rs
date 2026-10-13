@@ -14,8 +14,6 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 
 struct McpClient {
-    /// Notifications seen while awaiting responses (see `request`).
-    notifications: Vec<Value>,
     reader: BufReader<ReadHalf<tokio::io::DuplexStream>>,
     writer: WriteHalf<tokio::io::DuplexStream>,
     next_id: i64,
@@ -49,7 +47,6 @@ impl McpClient {
         });
         let (r, w) = tokio::io::split(client_io);
         let mut client = Self {
-            notifications: Vec::new(),
             reader: BufReader::new(r),
             writer: w,
             next_id: 0,
@@ -98,57 +95,11 @@ impl McpClient {
                 if value.get("id").and_then(Value::as_i64) == Some(id) {
                     return value;
                 }
-                // BUFFER, don't drop. A fast task can publish its terminal
-                // status before the enqueue response is even written, so a
-                // test that only reads AFTER the response would miss the
-                // notification entirely and wrongly conclude the server never
-                // pushes.
-                if value.get("id").is_none() {
-                    self.notifications.push(value);
-                }
+                // Anything else (a notification) is skipped.
             }
         })
         .await
         .unwrap_or_else(|_| panic!("timeout waiting for `{method}` response"))
-    }
-}
-
-impl McpClient {
-    /// Read frames until a NOTIFICATION with `method` arrives, discarding
-    /// responses along the way.
-    ///
-    /// `request` deliberately SKIPS notifications, so a test written only with
-    /// it cannot tell a server that pushes from one that never does.
-    async fn wait_for_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
-        // Already buffered by an earlier `request`? A fast task's push can beat
-        // the very response that started it.
-        if let Some(pos) = self
-            .notifications
-            .iter()
-            .position(|v| v.get("method").and_then(Value::as_str) == Some(method))
-        {
-            return Some(self.notifications.remove(pos));
-        }
-        tokio::time::timeout(timeout, async {
-            loop {
-                let mut buf = String::new();
-                let n = self.reader.read_line(&mut buf).await.ok()?;
-                if n == 0 {
-                    return None;
-                }
-                let Ok(value) = serde_json::from_str::<Value>(&buf) else {
-                    continue;
-                };
-                if value.get("id").is_none()
-                    && value.get("method").and_then(Value::as_str) == Some(method)
-                {
-                    return Some(value);
-                }
-            }
-        })
-        .await
-        .ok()
-        .flatten()
     }
 }
 
@@ -262,27 +213,18 @@ async fn initialize_reports_capabilities_and_identity() {
     let caps = init["capabilities"]
         .as_object()
         .expect("capabilities object");
-    for cap in ["tools", "prompts", "resources", "completions", "tasks"] {
+    for cap in ["tools", "prompts", "resources", "completions"] {
         assert!(
             caps.contains_key(cap),
             "missing `{cap}` capability: {caps:?}"
         );
     }
-    for path in [
-        &["tasks", "list"][..],
-        &["tasks", "cancel"][..],
-        &["tasks", "requests", "tools", "call"][..],
-    ] {
-        let mut value = &init["capabilities"];
-        for segment in path {
-            value = &value[*segment];
-        }
-        assert!(
-            value.is_object(),
-            "task capability `{}` must be advertised: {caps:?}",
-            path.join(".")
-        );
-    }
+    // The SEP-1686 (v1) task surface is retired (0.8.0): measured unused, and
+    // every rmcp 3.x release removes it.
+    assert!(
+        !caps.contains_key("tasks"),
+        "`tasks` must not be advertised: {caps:?}"
+    );
 
     assert_eq!(
         init["serverInfo"]["name"].as_str(),
@@ -361,7 +303,6 @@ async fn message_archive_tools_expose_evidence_fields_and_safety_contracts() {
     let tools = resp["result"]["tools"].as_array().expect("tools array");
 
     let source = find_tool(tools, "download_message_source");
-    assert_eq!(source["execution"]["taskSupport"], json!("optional"));
     assert_eq!(source["annotations"]["destructiveHint"], json!(false));
     let source_output = source["outputSchema"]["properties"]
         .as_object()
@@ -385,7 +326,6 @@ async fn message_archive_tools_expose_evidence_fields_and_safety_contracts() {
     }
 
     let thread = find_tool(tools, "download_thread");
-    assert_eq!(thread["execution"]["taskSupport"], json!("optional"));
     assert!(
         thread["description"]
             .as_str()
@@ -638,11 +578,6 @@ async fn list_identities_is_a_bounded_read_only_tool() {
 
     assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
     assert_eq!(tool["annotations"]["idempotentHint"], json!(true));
-    assert!(
-        tool.get("execution")
-            .is_none_or(|execution| execution["taskSupport"].is_null()),
-        "a bounded read is not a task tool: {tool:#}"
-    );
     let sent = &tool["inputSchema"]["properties"]["sentMessages"];
     assert_eq!(schema_minimum(sent), Some(1.0));
     assert_eq!(schema_maximum(sent), Some(1000.0));
@@ -664,10 +599,30 @@ async fn list_identities_is_a_bounded_read_only_tool() {
     );
 }
 
+/// No tool declares task support any more (0.8.0 retired the SEP-1686 task
+/// surface), so a client is never invited to task-augment a call.
 #[tokio::test]
-async fn task_result_is_repeatable_related_and_terminal_cancel_is_rejected() {
+async fn no_tool_declares_task_support() {
     let mut client = McpClient::start().await;
-    let queued = client
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for tool in tools {
+        assert!(
+            tool.get("execution").is_none(),
+            "`{}` still declares `execution`: {tool:#}",
+            tool["name"]
+        );
+    }
+}
+
+/// A task-augmented call is REFUSED and the tool never runs. The server no
+/// longer declares `tasks`, so a client MUST NOT send one; on rmcp 2.2 one
+/// that does gets rmcp's default refusal (a JSON-RPC error). Had the tool run,
+/// the dummy account would have produced an `isError` RESULT instead.
+#[tokio::test]
+async fn a_task_augmented_call_is_refused_never_run() {
+    let mut client = McpClient::start().await;
+    let resp = client
         .request(
             "tools/call",
             json!({
@@ -684,67 +639,8 @@ async fn task_result_is_repeatable_related_and_terminal_cancel_is_rejected() {
         )
         .await;
     assert!(
-        queued.get("error").is_none(),
-        "task enqueue failed: {queued:#}"
-    );
-    let task_id = queued["result"]["task"]["taskId"]
-        .as_str()
-        .expect("queued task id")
-        .to_string();
-
-    // tasks/result is the blocking result endpoint: the call must return the
-    // original tool result, never a transient "still running" error.
-    let first = client
-        .request("tasks/result", json!({"taskId": task_id}))
-        .await;
-    assert!(
-        first.get("error").is_none(),
-        "task result failed: {first:#}"
-    );
-    assert_eq!(first["result"]["isError"], json!(true));
-    assert_eq!(
-        first["result"]["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
-        json!(task_id)
-    );
-
-    let second = client
-        .request("tasks/result", json!({"taskId": task_id}))
-        .await;
-    assert_eq!(
-        second["result"], first["result"],
-        "retained task results must be repeatable"
-    );
-
-    let info = client
-        .request("tasks/get", json!({"taskId": task_id}))
-        .await;
-    assert_eq!(info["result"]["taskId"], json!(task_id));
-    assert_eq!(
-        info["result"]["status"],
-        json!("failed"),
-        "an isError tool result is a failed task: {info:#}"
-    );
-
-    let cancellation = client
-        .request("tasks/cancel", json!({"taskId": task_id}))
-        .await;
-    assert_eq!(
-        cancellation["error"]["code"],
-        json!(-32602),
-        "terminal task cancellation must be invalid params: {cancellation:#}"
-    );
-
-    let listed = client.request("tasks/list", json!({})).await;
-    let tasks = listed["result"]["tasks"]
-        .as_array()
-        .expect("task list array");
-    assert!(
-        tasks.iter().any(|task| task["taskId"] == task_id),
-        "retained task should be listed: {listed:#}"
-    );
-    assert!(
-        listed["result"].get("total").is_none(),
-        "tasks/list must not add a non-spec total field: {listed:#}"
+        resp.get("error").is_some() && resp.get("result").is_none(),
+        "a task-augmented call must be refused, not run: {resp:#}"
     );
 }
 
@@ -1451,7 +1347,6 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             "legacy flat flag {legacy} must not survive the cleanup object"
         );
     }
-    assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
 
     let missing = client
         .request(
@@ -1861,7 +1756,6 @@ async fn domain_tools_expose_exact_hierarchy_and_action_contracts() {
                 .is_some_and(|description| description.contains("never includes")),
             "`{name}` must document exact-domain scope: {input:#}"
         );
-        assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
     }
     assert_eq!(
         find_tool(tools, "delete_by_domain")["annotations"]["destructiveHint"],
@@ -1907,7 +1801,6 @@ async fn top_subscription_move_maps_the_nested_sample_and_stays_non_destructive(
         "sample UIDVALIDITY must be non-zero"
     );
     assert_eq!(tool["annotations"]["destructiveHint"], json!(false));
-    assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
 
     let output = tool["outputSchema"]["properties"]
         .as_object()
@@ -1965,7 +1858,6 @@ async fn reconciliation_tools_expose_durable_operation_state() {
     let reconcile = find_tool(tools, "reconcile_moves");
     assert_eq!(reconcile["annotations"]["destructiveHint"], json!(true));
     assert_eq!(reconcile["annotations"]["idempotentHint"], json!(true));
-    assert_eq!(reconcile["execution"]["taskSupport"], json!("optional"));
     for field in [
         "examined",
         "completed",
@@ -2597,65 +2489,5 @@ async fn check_connection_unknown_account_is_an_iserror_result() {
     assert!(
         text.contains("Account not found"),
         "the error message reaches the caller: {result:#}"
-    );
-}
-
-/// A task-augmented call must PUSH `notifications/tasks/status` when it
-/// reaches a terminal state.
-///
-/// Task status is computed LAZILY here (`refresh_managed_task` runs on read),
-/// so before this the transition was observable only by polling `tasks/get` —
-/// a client that started a `delete_by_domain` over thousands of messages had
-/// no way to be told it finished.
-///
-/// Asserting on the notification specifically matters: every other task test
-/// in this file uses `request`, which skips notifications, so all of them
-/// passed against a server that never pushed at all.
-#[tokio::test]
-async fn task_terminal_transition_is_pushed_as_a_notification() {
-    let mut client = McpClient::start().await;
-    let queued = client
-        .request(
-            "tools/call",
-            json!({
-                "name": "unsubscribe_message",
-                "arguments": {
-                    "account": "dummy",
-                    "mailbox": "INBOX",
-                    "uid": 1,
-                    "expectedUidValidity": 1,
-                    "confirmOneClick": false
-                },
-                "task": {"ttl": 60_000}
-            }),
-        )
-        .await;
-    assert!(queued.get("error").is_none(), "enqueue failed: {queued:#}");
-    let task_id = queued["result"]["task"]["taskId"]
-        .as_str()
-        .expect("task id")
-        .to_string();
-
-    let note = client
-        .wait_for_notification("notifications/tasks/status", Duration::from_secs(10))
-        .await
-        .expect("server must PUSH tasks/status on the terminal transition");
-
-    assert_eq!(note["params"]["taskId"], task_id.as_str());
-    let pushed = note["params"]["status"].as_str().unwrap_or("");
-    assert!(
-        matches!(pushed, "completed" | "failed"),
-        "pushed status must be terminal, got {pushed:?}"
-    );
-
-    // The PUSHED status must agree with the POLLED one — they are produced by
-    // the same lazy refresh, and a disagreement would be worse than no push.
-    let polled = client
-        .request("tasks/get", json!({"taskId": task_id}))
-        .await;
-    assert_eq!(
-        polled["result"]["status"].as_str(),
-        Some(pushed),
-        "pushed status must match a subsequent tasks/get: {polled:#}"
     );
 }

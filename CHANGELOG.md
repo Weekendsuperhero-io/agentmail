@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-10-10T00:00
+updated: 2026-10-13T00:00
 ---
 # Changelog
 
@@ -106,6 +106,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rusqlite stays at 0.39 (the embedding app's sqlx-sqlite caps libsqlite3-sys
   below 0.38) and rmcp at 2.2.0 (3.x removes the task API; its own decision in
   the embedding workspace).
+- **`fresh_logins` / `idle_reuses` are labelled as pool-wide** — the log lines
+  that carry them now name them `pool_fresh_logins` and `pool_idle_reuses`,
+  and `ConnectionStats` documents that the counts cover every account since the
+  pool was created. Printed beside one `account`, they read as that account's
+  own counts; a server that is rebuilt (the embedding app does so when mail
+  accounts change) starts them from zero.
+
+### Removed
+
+- **MCP tasks (SEP-1686), version 0.8.0** — the server no longer advertises
+  `capabilities.tasks`, no tool declares `execution.taskSupport` (22 did), and
+  `tasks/list`, `tasks/get`, `tasks/result` and `tasks/cancel` are gone, with
+  the per-account serialization of destructive tasks and the
+  `notifications/tasks/status` push. Agent Muse, which embeds this server,
+  measured the task surface unused (no task-augmented call, no `tasks/*`
+  request in two weeks of traffic), and every rmcp 3.x release removes the
+  MCP 2025-11-25 task model. A task-augmented `tools/call` is refused and the
+  tool does not run. Long operations still report `notifications/progress` and
+  honour `notifications/cancelled`. Tasks may return as the SEP-2663
+  extension. A breaking change, hence the minor version bump.
+- **The `io.modelcontextprotocol/related-task` marker** on progress
+  notifications and task results went with them.
 
 ### Fixed
 

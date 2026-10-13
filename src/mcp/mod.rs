@@ -1,32 +1,28 @@
-//! MCP server: tools, prompts, and tasks over stdio or in-process transports.
+//! MCP server: tools, prompts, resources and completions over stdio or
+//! in-process transports.
 
 mod args;
 mod file_access;
 mod prompts;
 mod resources;
-mod tasks;
 mod tools_read;
 mod tools_write;
 mod wire;
 
-use self::tasks::{DESTRUCTIVE_TOOLS, TaskCompletion, TaskManager, extract_account};
-use futures::{FutureExt as _, StreamExt as _};
+use futures::StreamExt as _;
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
     model::{
-        CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
-        CompleteRequestParams, CompleteResult, CreateTaskResult, GetTaskParams,
-        GetTaskPayloadParams, GetTaskPayloadResult, GetTaskResult, Implementation,
-        ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, Meta,
-        PaginatedRequestParams, ProgressNotificationParam, ReadResourceRequestParams,
-        ReadResourceResult, RelatedTaskMetadata, ServerCapabilities, ServerInfo, TasksCapability,
+        CompleteRequestParams, CompleteResult, Implementation, ListResourceTemplatesResult,
+        ListResourcesResult, Meta, PaginatedRequestParams, ProgressNotificationParam,
+        ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
     },
     prompt_handler,
     service::RequestContext,
     tool_handler,
 };
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::sync::Arc;
 
 const PREWARM_CONCURRENCY: usize = 3;
 const PREWARM_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -70,18 +66,6 @@ fn account_log_hint(account: &str) -> String {
     }
 
     mask_prefix_for_log(account)
-}
-
-fn insert_related_task(meta: &mut Meta, task_id: &str) {
-    meta.0.insert(
-        RelatedTaskMetadata::META_KEY.to_string(),
-        serde_json::json!({ "taskId": task_id }),
-    );
-}
-
-fn attach_related_task(result: &mut CallToolResult, task_id: &str) {
-    let meta = result.meta.get_or_insert_with(Meta::new);
-    insert_related_task(meta, task_id);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +122,6 @@ fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> ProgressReporter {
     let Some(token) = meta.get_progress_token() else {
         return ProgressReporter::disabled();
     };
-    let related_task = meta.0.get(RelatedTaskMetadata::META_KEY).cloned();
     let peer = peer.clone();
     let (sender, mut receiver) = tokio::sync::watch::channel(None::<ProgressUpdate>);
     let latest = Arc::new(parking_lot::Mutex::new(None::<ProgressUpdate>));
@@ -156,15 +139,9 @@ fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> ProgressReporter {
             let Some(update) = *receiver.borrow_and_update() else {
                 continue;
             };
-            let mut notification =
+            let notification =
                 ProgressNotificationParam::new(token.clone(), update.completed as f64)
                     .with_total(update.total as f64);
-            if let Some(related_task) = related_task.clone() {
-                let mut meta = Meta::new();
-                meta.0
-                    .insert(RelatedTaskMetadata::META_KEY.to_string(), related_task);
-                notification.meta = Some(meta);
-            }
             if peer.notify_progress(notification).await.is_err() {
                 break;
             }
@@ -262,7 +239,6 @@ impl Pagination {
 #[derive(Clone)]
 pub struct AgentMailServer {
     agentmail: Arc<crate::Agentmail>,
-    task_manager: Arc<parking_lot::Mutex<TaskManager>>,
     /// Sandbox for LLM-supplied filesystem paths (attachment reads, download
     /// writes). See [`file_access::FileAccessPolicy`].
     file_access: Option<file_access::FileAccessPolicy>,
@@ -272,7 +248,6 @@ impl AgentMailServer {
     pub fn new(agentmail: crate::Agentmail) -> Self {
         Self {
             agentmail: Arc::new(agentmail),
-            task_manager: Arc::new(parking_lot::Mutex::new(TaskManager::new())),
             file_access: Some(file_access::FileAccessPolicy::from_env()),
         }
     }
@@ -280,7 +255,6 @@ impl AgentMailServer {
     fn new_embedded(agentmail: crate::Agentmail) -> Self {
         Self {
             agentmail: Arc::new(agentmail),
-            task_manager: Arc::new(parking_lot::Mutex::new(TaskManager::new())),
             file_access: None,
         }
     }
@@ -412,17 +386,14 @@ impl ServerHandler for AgentMailServer {
     }
 
     fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::builder()
+        // No `tasks`: the SEP-1686 (MCP 2025-11-25) task surface was retired,
+        // measured unused — every rmcp 3.x release removes it (0.8.0).
+        let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
             .enable_resources()
             .enable_completions()
-            .enable_tasks()
             .build();
-        // `enable_tasks()` only switches the capability on. The protocol also
-        // requires the server to declare the supported lifecycle methods and
-        // which requests may be task-augmented.
-        capabilities.tasks = Some(TasksCapability::server_default());
         ServerInfo::new(capabilities)
             // Without this the server announces itself as "rmcp" — rmcp's
             // Implementation::from_build_env() bakes in its own crate name.
@@ -666,156 +637,6 @@ impl ServerHandler for AgentMailServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, McpError> {
         self.handle_complete(request).await
-    }
-
-    async fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        mut context: RequestContext<RoleServer>,
-    ) -> Result<CreateTaskResult, McpError> {
-        let task_id = uuid::Uuid::new_v4().to_string();
-
-        let is_destructive = DESTRUCTIVE_TOOLS.contains(&request.name.as_ref());
-        let destructive_lock = if is_destructive {
-            let account = extract_account(&request.arguments).ok_or_else(|| {
-                McpError::invalid_params(
-                    "destructive tools require an 'account' argument for task queuing",
-                    None,
-                )
-            })?;
-            Some(self.task_manager.lock().destructive_lock(&account))
-        } else {
-            None
-        };
-
-        // Reserve before spawning so capacity rejection cannot start work.
-        let task = self.task_manager.lock().reserve_task(task_id.clone())?;
-
-        let server = self.clone();
-        let completion = Arc::new(TaskCompletion::new());
-        let worker_completion = Arc::clone(&completion);
-        // Keep transport cancellation inherited from the request while also
-        // giving tasks/cancel a token that reaches cooperative library work
-        // and spawn_blocking SQLite publication.
-        let task_cancel = context.ct.child_token();
-        context.ct = task_cancel.clone();
-        insert_related_task(&mut context.meta, &task_id);
-        // Captured BEFORE `context` moves into the worker: the push target.
-        let peer = context.peer.clone();
-        let notify_id = task_id.clone();
-        let notify_manager = Arc::clone(&self.task_manager);
-        let handle = tokio::spawn(async move {
-            // If destructive, acquire the per-account lock first.
-            // This serializes destructive tasks — the task waits here until
-            // any previously-enqueued destructive task on the same account
-            // finishes.
-            let _guard = match destructive_lock {
-                Some(ref lock) => Some(lock.lock().await),
-                None => None,
-            };
-            let result = AssertUnwindSafe(server.call_tool(request, context))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    Err(McpError::internal_error(
-                        "task worker panicked while executing the tool",
-                        None,
-                    ))
-                });
-            worker_completion.complete(result);
-        });
-
-        self.task_manager.lock().commit_task(
-            &task_id,
-            Arc::clone(&completion),
-            task_cancel,
-            handle,
-        )?;
-
-        // Status watcher — the single producer of `notifications/tasks/status`.
-        //
-        // Spawned AFTER `commit_task` on purpose. The worker above can finish
-        // before the task is committed (a fast failure beats the commit to the
-        // lock), and `task_info` cannot resolve a task that is still only
-        // RESERVED — pushing from the worker therefore dropped the
-        // notification exactly when the task failed fastest.
-        //
-        // Waiting on the completion also unifies the two ways a task ends:
-        // `cancel_task` publishes a cancelled result, so cancellation wakes
-        // this same watcher rather than needing its own push (which would
-        // double-notify).
-        tokio::spawn(async move {
-            // A never-cancelled token: this watcher waits for the TASK, and
-            // must not be torn down by any one request's cancellation.
-            let _ = completion
-                .wait(&tokio_util::sync::CancellationToken::new())
-                .await;
-            // Read back through `task_info`, which runs the same lazy refresh
-            // a `tasks/get` would — so the pushed status can never contradict
-            // a subsequent poll.
-            let Ok(task) = notify_manager.lock().task_info(&notify_id) else {
-                return;
-            };
-            let notification = rmcp::model::ServerNotification::TaskStatusNotification(
-                rmcp::model::TaskStatusNotification::new(
-                    rmcp::model::TaskStatusNotificationParam::new(task),
-                ),
-            );
-            if let Err(error) = peer.send_notification(notification).await {
-                tracing::debug!(
-                    target: "agentmail",
-                    task = %notify_id,
-                    "tasks/status push failed — client gone: {error}"
-                );
-            }
-        });
-
-        Ok(CreateTaskResult::new(task))
-    }
-
-    async fn list_tasks(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListTasksResult, McpError> {
-        self.task_manager
-            .lock()
-            .list_page(request.as_ref().and_then(|params| params.cursor.as_deref()))
-    }
-
-    async fn get_task_info(
-        &self,
-        request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskResult, McpError> {
-        let task = self.task_manager.lock().task_info(&request.task_id)?;
-        Ok(GetTaskResult::new(task))
-    }
-
-    async fn get_task_result(
-        &self,
-        request: GetTaskPayloadParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskPayloadResult, McpError> {
-        let completion = self.task_manager.lock().task_completion(&request.task_id)?;
-        let mut result = completion.wait(&context.ct).await?;
-        attach_related_task(&mut result, &request.task_id);
-        let value = serde_json::to_value(result)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(GetTaskPayloadResult::new(value))
-    }
-
-    async fn cancel_task(
-        &self,
-        request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<CancelTaskResult, McpError> {
-        // No push here: `cancel_task` publishes a cancelled result, which wakes
-        // the status watcher spawned in `enqueue_task`. That single watcher is
-        // the ONLY producer of `notifications/tasks/status`, so cancel and
-        // natural completion cannot double-notify.
-        let task = self.task_manager.lock().cancel_task(&request.task_id)?;
-        Ok(CancelTaskResult::new(task))
     }
 }
 
@@ -1322,23 +1143,6 @@ mod tests {
                 .iter()
                 .any(|field| field.as_str() == Some("account"))
         );
-    }
-
-    /// `DESTRUCTIVE_TOOLS` gates task serialization and must stay in sync with
-    /// the per-tool annotations (MCP default: destructive unless read-only).
-    #[test]
-    fn destructive_tools_const_matches_annotations() {
-        for tool in AgentMailServer::tool_router().list_all() {
-            let destructive = tool.annotations.as_ref().is_none_or(|a| {
-                !a.read_only_hint.unwrap_or(false) && a.destructive_hint.unwrap_or(true)
-            });
-            assert_eq!(
-                DESTRUCTIVE_TOOLS.contains(&tool.name.as_ref()),
-                destructive,
-                "DESTRUCTIVE_TOOLS drifted for `{}` — update the const or the annotations",
-                tool.name
-            );
-        }
     }
 
     #[test]

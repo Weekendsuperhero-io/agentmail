@@ -703,8 +703,7 @@ impl AgentMailServer {
             title = "Delete Messages",
             destructive_hint = true,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn delete_messages_tool(
         &self,
@@ -754,8 +753,7 @@ impl AgentMailServer {
         name = "delete_by_sender",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteBySenderOutput>().expect("valid delete_by_sender output schema"),
         description = "Delete all messages from an exact sender identity. Pass the address and displayName exactly as returned by a top_senders row; matching is exact on both fields, confirmed live before any deletion. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views. Do not use this for mailing-list cleanup (use delete_list_id or unsubscribe_message cleanup).",
-        annotations(title = "Delete by Sender", destructive_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Delete by Sender", destructive_hint = true)
     )]
     async fn delete_by_sender_tool(
         &self,
@@ -797,8 +795,7 @@ impl AgentMailServer {
             title = "Delete by Exact Domain",
             destructive_hint = true,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn delete_by_domain_tool(
         &self,
@@ -840,8 +837,7 @@ impl AgentMailServer {
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn download_attachments_tool(
         &self,
@@ -889,8 +885,7 @@ impl AgentMailServer {
             read_only_hint = false,
             destructive_hint = false,
             open_world_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn download_message_source_tool(
         &self,
@@ -935,8 +930,7 @@ impl AgentMailServer {
             read_only_hint = false,
             destructive_hint = false,
             open_world_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn download_thread_tool(
         &self,
@@ -1058,8 +1052,7 @@ impl AgentMailServer {
             destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn export_thread_record_tool(
         &self,
@@ -1290,8 +1283,7 @@ impl AgentMailServer {
             title = "Unsubscribe from Mailing List",
             destructive_hint = true,
             open_world_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn unsubscribe_message_tool(
         &self,
@@ -1332,8 +1324,7 @@ impl AgentMailServer {
         name = "delete_list_id",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteListIdOutput>().expect("valid delete_list_id output schema"),
         description = "Delete all messages with a specific List-Id. Identifies the list by its exact List-Id value from top_mailing_lists and deletes matching messages regardless of sender. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views.",
-        annotations(title = "Delete Mailing List by List-Id", destructive_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Delete Mailing List by List-Id", destructive_hint = true)
     )]
     async fn delete_list_id_tool(
         &self,
@@ -1370,8 +1361,7 @@ impl AgentMailServer {
             title = "Move Mailing List by List-Id",
             read_only_hint = false,
             destructive_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn move_list_id_tool(
         &self,
@@ -1411,8 +1401,7 @@ impl AgentMailServer {
             title = "Move by Sender",
             read_only_hint = false,
             destructive_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn move_by_sender_tool(
         &self,
@@ -1457,8 +1446,7 @@ impl AgentMailServer {
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn move_by_domain_tool(
         &self,
@@ -1501,8 +1489,7 @@ impl AgentMailServer {
             title = "Move Top Subscription",
             read_only_hint = false,
             destructive_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn move_subscription_tool(
         &self,
@@ -1546,8 +1533,7 @@ impl AgentMailServer {
             title = "Reconcile Pending Moves",
             destructive_hint = true,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn reconcile_moves_tool(
         &self,
