@@ -109,6 +109,10 @@ pub struct ConnectionPool {
 /// acquire and keepalive tick regardless of log level (plain atomics, not
 /// `tracing` macros that compile out in release), so "are we actually holding
 /// the connections we open?" is answerable by reading numbers, not just logs.
+///
+/// POOL-WIDE: one set per [`ConnectionPool`], summed over every account, and
+/// gone with the pool — a server that is rebuilt (the app does so when mail
+/// accounts change) starts again from zero.
 #[derive(Debug, Default)]
 struct PoolStats {
     fresh_logins: AtomicU64,
@@ -118,7 +122,9 @@ struct PoolStats {
 }
 
 /// A snapshot of the pool's connection-lifecycle counters — the direct
-/// evidence for whether connections are being held and reused.
+/// evidence for whether connections are being held and reused. The counts are
+/// POOL-WIDE (every account together, since this pool was created), not per
+/// account; the log lines that carry them name them `pool_*` for that reason.
 ///
 /// `fresh_logins` counts accepted LOGINs (the expensive, rate-limited event);
 /// `idle_reuses` counts pooled-session hits that skipped a LOGIN entirely. In a
@@ -744,8 +750,8 @@ impl ConnectionPool {
             let reuses = self.stats.idle_reuses.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 account = %account_name,
-                idle_reuses = reuses,
-                fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
+                pool_idle_reuses = reuses,
+                pool_fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
                 uid_mode,
                 "reused a held IMAP session (no LOGIN)",
             );
@@ -782,8 +788,8 @@ impl ConnectionPool {
             let reuses = self.stats.idle_reuses.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 account = %account_name,
-                idle_reuses = reuses,
-                fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
+                pool_idle_reuses = reuses,
+                pool_fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
                 uid_mode,
                 "reused a held IMAP session (no LOGIN)",
             );
@@ -818,8 +824,8 @@ impl ConnectionPool {
                 let logins = self.stats.fresh_logins.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::info!(
                     account = %account_name,
-                    fresh_logins = logins,
-                    idle_reuses = self.stats.idle_reuses.load(Ordering::Relaxed),
+                    pool_fresh_logins = logins,
+                    pool_idle_reuses = self.stats.idle_reuses.load(Ordering::Relaxed),
                     "opened a fresh IMAP connection (LOGIN); later ops should reuse it",
                 );
                 session
