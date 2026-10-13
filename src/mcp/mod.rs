@@ -15,14 +15,20 @@ use rmcp::{
     handler::server::router::tool::ToolRouter,
     model::{
         CompleteRequestParams, CompleteResult, Implementation, ListResourceTemplatesResult,
-        ListResourcesResult, Meta, PaginatedRequestParams, ProgressNotificationParam,
-        ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
+        ListResourcesResult, PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
+        ReadResourceRequestParams, RequestMetaObject, ServerCapabilities, ServerConfig,
     },
     prompt_handler,
     service::RequestContext,
     tool_handler,
 };
 use std::sync::Arc;
+
+/// The MCP revision this server speaks: 2025-11-25, by decision rather than
+/// whatever the SDK calls latest. rmcp's `Default` follows its `LATEST`, which
+/// is 2026-07-28 from 3.5.0 on, a revision whose lifecycle this server has not
+/// adopted (the embedding workspace's bridge D41 holds the go criteria).
+const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 const PREWARM_CONCURRENCY: usize = 3;
 const PREWARM_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -118,7 +124,7 @@ fn normalized_progress(
 /// Build a bounded, coalescing progress stream. One worker serializes all
 /// notifications for the request, preserving monotonic progress and avoiding
 /// a detached Tokio task per callback.
-fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> ProgressReporter {
+fn make_progress_fn(meta: &RequestMetaObject, peer: &Peer<RoleServer>) -> ProgressReporter {
     let Some(token) = meta.get_progress_token() else {
         return ProgressReporter::disabled();
     };
@@ -261,7 +267,7 @@ impl AgentMailServer {
 
     fn file_access_for_request(
         &self,
-        meta: &Meta,
+        meta: &RequestMetaObject,
     ) -> Result<file_access::FileAccessPolicy, McpError> {
         if let Some(policy) = &self.file_access {
             return Ok(policy.clone());
@@ -382,10 +388,35 @@ impl ServerHandler for AgentMailServer {
             tools,
             meta: None,
             next_cursor: None,
+            ..Default::default()
         })
     }
 
-    fn get_info(&self) -> ServerInfo {
+    /// Every revision up to `PROTOCOL_VERSION` and nothing newer. rmcp's
+    /// default is every version it knows, 2026-07-28 included, so
+    /// `server/discover` would advertise it and `initialize` would agree to
+    /// it. This one list bounds discovery, the handshake and the version a
+    /// request names in its own `_meta`.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&PROTOCOL_VERSION))
+    }
+
+    /// `server/discover` does not exist in 2025-11-25, so it is answered as a
+    /// 2025-11-25 server answers it. A probe at 2026-07-28 never gets here:
+    /// rmcp refuses it first with `-32022` and the list above, which a probing
+    /// client reads as "legacy, use `initialize`". A probe at a 2025 version
+    /// does, and rmcp's default would answer it with a discover result and let
+    /// the client run the 2026 stateless lifecycle at a 2025 version.
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::DiscoverResult, McpError> {
+        Err(McpError::method_not_found::<
+            rmcp::model::DiscoverRequestMethod,
+        >())
+    }
+
+    fn get_info(&self) -> ServerConfig {
         // No `tasks`: the SEP-1686 (MCP 2025-11-25) task surface was retired,
         // measured unused — every rmcp 3.x release removes it (0.8.0).
         let capabilities = ServerCapabilities::builder()
@@ -394,7 +425,8 @@ impl ServerHandler for AgentMailServer {
             .enable_resources()
             .enable_completions()
             .build();
-        ServerInfo::new(capabilities)
+        ServerConfig::new(capabilities)
+            .with_protocol_version(PROTOCOL_VERSION)
             // Without this the server announces itself as "rmcp" — rmcp's
             // Implementation::from_build_env() bakes in its own crate name.
             // Version carries the build SHA so `initialize` responses and logs
@@ -627,8 +659,8 @@ impl ServerHandler for AgentMailServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
-        self.read_email_resource(&request.uri).await
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        self.read_email_resource(&request.uri).await.map(Into::into)
     }
 
     async fn complete(

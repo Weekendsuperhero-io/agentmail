@@ -55,11 +55,10 @@ percent-encoding = "2"
 printpdf = { version = "0.12", default-features = false }
 psl = "2"
 reqwest = { version = "0.13", features = ["json"] }
-# Pinned to the bridge's rmcp until the 3.x bump lands across the Agent Muse
-# bridge, agentmail and eventkit-rs. The v1 task API that 3.x removes is gone
-# from this server since 0.8.0; the protocol stays at MCP 2025-11-25 (the
-# embedding workspace's bridge D41).
-rmcp = { version = "=2.2.0", features = ["server", "macros", "transport-io"] }
+# Exact-pinned to the embedding Agent Muse workspace's rmcp, so the app links
+# one copy. The protocol does not move with the SDK: it stays at MCP
+# 2025-11-25 (`mcp::PROTOCOL_VERSION`; the workspace's bridge D41).
+rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io"] }
 # Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native
 # sqlite — libsqlite3-sys has `links = "sqlite3"`, so exactly one version may

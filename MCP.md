@@ -6,6 +6,11 @@ updated: 2026-08-23T00:00
 
 MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK) | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
 
+Nothing newer: a client asking for 2026-07-28 is answered in 2025-11-25, and a
+2026-07-28 `server/discover` probe is refused with `-32022` listing the versions
+spoken (method-not-found at a 2025 version), which tells a probing client to
+fall back to `initialize`. The revision moves by decision, never with rmcp.
+
 **Supported capabilities:** tools, prompts, resources, completions, progress notifications, request cancellation
 
 **Contract conventions:**

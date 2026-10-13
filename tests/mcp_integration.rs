@@ -22,36 +22,11 @@ struct McpClient {
 
 impl McpClient {
     async fn start() -> Self {
-        let config = Config::from_accounts(vec![(
-            "dummy".to_string(),
-            AccountConfig {
-                host: "imap.invalid".to_string(),
-                port: 993,
-                username: "dummy@example.invalid".to_string(),
-                email: None,
-                aliases: Vec::new(),
-                display_name: None,
-                password: Some(Secret::new_raw("unused")),
-                tls: true,
-                max_connections: None,
-                auth: agentmail::AuthMethod::Password,
-            },
-        )]);
-        Self::start_with(config).await
+        Self::start_with(dummy_config()).await
     }
 
     async fn start_with(config: Config) -> Self {
-        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
-        tokio::spawn(async move {
-            let _ = agentmail::mcp::serve_on(server_io, Agentmail::new(config)).await;
-        });
-        let (r, w) = tokio::io::split(client_io);
-        let mut client = Self {
-            reader: BufReader::new(r),
-            writer: w,
-            next_id: 0,
-            init_result: Value::Null,
-        };
+        let mut client = Self::connect(config).await;
         let resp = client
             .request(
                 "initialize",
@@ -65,6 +40,22 @@ impl McpClient {
         client.init_result = resp["result"].clone();
         client.notify("notifications/initialized", json!({})).await;
         client
+    }
+
+    /// A running server and nothing sent yet, for a test that chooses its
+    /// own first frame.
+    async fn connect(config: Config) -> Self {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            let _ = agentmail::mcp::serve_on(server_io, Agentmail::new(config)).await;
+        });
+        let (r, w) = tokio::io::split(client_io);
+        Self {
+            reader: BufReader::new(r),
+            writer: w,
+            next_id: 0,
+            init_result: Value::Null,
+        }
     }
 
     async fn notify(&mut self, method: &str, params: Value) {
@@ -615,12 +606,14 @@ async fn no_tool_declares_task_support() {
     }
 }
 
-/// A task-augmented call is REFUSED and the tool never runs. The server no
-/// longer declares `tasks`, so a client MUST NOT send one; on rmcp 2.2 one
-/// that does gets rmcp's default refusal (a JSON-RPC error). Had the tool run,
-/// the dummy account would have produced an `isError` RESULT instead.
+/// A task-augmented call RUNS as a plain call. The server declares no
+/// `tasks`, and the 2025-11-25 spec says a receiver without the capability
+/// "MUST process requests of that type normally, ignoring any
+/// task-augmentation metadata"; rmcp 3.x does so by construction (its call
+/// params have no `task` field). rmcp 2.2 refused it with a JSON-RPC error.
+/// The dummy account cannot connect, so the run shows as an `isError` RESULT.
 #[tokio::test]
-async fn a_task_augmented_call_is_refused_never_run() {
+async fn a_task_augmented_call_runs_as_a_plain_call() {
     let mut client = McpClient::start().await;
     let resp = client
         .request(
@@ -639,9 +632,95 @@ async fn a_task_augmented_call_is_refused_never_run() {
         )
         .await;
     assert!(
-        resp.get("error").is_some() && resp.get("result").is_none(),
-        "a task-augmented call must be refused, not run: {resp:#}"
+        resp.get("error").is_none() && resp["result"]["isError"] == json!(true),
+        "a task-augmented call must run as a plain call: {resp:#}"
     );
+    assert!(
+        resp["result"].get("task").is_none(),
+        "the answer is a CallToolResult, not a task handle: {resp:#}"
+    );
+}
+
+/// One account that is never connected: only config-backed tools and
+/// validation paths run, so no network is touched.
+fn dummy_config() -> Config {
+    Config::from_accounts(vec![(
+        "dummy".to_string(),
+        AccountConfig {
+            host: "imap.invalid".to_string(),
+            port: 993,
+            username: "dummy@example.invalid".to_string(),
+            email: None,
+            aliases: Vec::new(),
+            display_name: None,
+            password: Some(Secret::new_raw("unused")),
+            tls: true,
+            max_connections: None,
+            auth: agentmail::AuthMethod::Password,
+        },
+    )])
+}
+
+/// The probe a 2026-07-28 client opens with: `server/discover` carrying its
+/// version, identity and capabilities in `_meta`.
+fn discover_probe(version: &str) -> Value {
+    json!({"_meta": {
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {"name": "agentmail-tests", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }})
+}
+
+/// An `initialize` asking for 2026-07-28 is answered in 2025-11-25, the
+/// revision this server speaks, rather than agreed to because rmcp knows it.
+#[tokio::test]
+async fn a_2026_07_28_client_is_negotiated_down_to_2025_11_25() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let resp = client
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": {"name": "agentmail-tests", "version": "0"}
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp:#}");
+}
+
+/// A 2026-07-28 probe is refused `-32022` with ONLY the versions this server
+/// speaks, which a probing client reads as "legacy, use `initialize`". A probe
+/// at a 2025 version is told the method does not exist. Then the legacy
+/// handshake still works on the same connection, which is the fallback.
+#[tokio::test]
+async fn server_discover_lists_only_versions_up_to_2025_11_25() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let resp = client
+        .request("server/discover", discover_probe("2026-07-28"))
+        .await;
+    assert_eq!(resp["error"]["code"], -32022, "{resp:#}");
+    assert_eq!(
+        resp["error"]["data"]["supported"],
+        json!(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]),
+    );
+
+    let resp = client
+        .request("server/discover", discover_probe("2025-11-25"))
+        .await;
+    assert_eq!(resp["error"]["code"], -32601, "{resp:#}");
+
+    let resp = client
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "agentmail-tests", "version": "0"}
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp:#}");
 }
 
 #[tokio::test]
