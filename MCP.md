@@ -9,8 +9,8 @@ MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07
 **Two lifecycles, one server.** A 2025-era client opens with `initialize`,
 answered in 2025-11-25 (also when it asks for 2026-07-28, which has no
 handshake). A 2026-07-28 client runs that revision's stateless lifecycle:
-`server/discover` answers with the revisions that need no handshake
-(2026-07-28 only), and every request carries its version, identity and
+`server/discover` answers with every revision this server implements (the
+list a `-32022` carries too), and every request carries its version, identity and
 capabilities in `_meta`. `server/discover` at a 2025 version is
 method-not-found, and a revision newer than 2026-07-28 is refused `-32022` with
 the supported list. The ceiling is `MAX_PROTOCOL_VERSION`, named in the source:

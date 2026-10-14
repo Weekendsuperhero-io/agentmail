@@ -65,7 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **MCP 2026-07-28 alongside 2025-11-25, version 0.9.0** — a 2026-07-28
   client runs that revision's stateless lifecycle: `server/discover` answers
-  with the revisions that need no handshake (2026-07-28 only), every request
+  with every revision this server implements (the same list a `-32022`
+  carries), every request
   carries its own version, identity and capabilities in `_meta`, and results
   carry `resultType` and cache hints. A 2025-era client still opens with
   `initialize`, answered in 2025-11-25 exactly as before, and a client asking
