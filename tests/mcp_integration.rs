@@ -703,9 +703,8 @@ async fn a_2026_07_28_client_is_negotiated_down_to_2025_11_25() {
 }
 
 /// A 2026-07-28 probe opens that revision's lifecycle: `server/discover`
-/// answers with the revisions that need no handshake (only 2026-07-28; a
-/// stateless client at a 2025 version would be running a lifecycle that
-/// revision does not define), the tasks extension and this server's identity.
+/// answers with every revision this server implements (the list a `-32022`
+/// carries too), the tasks extension and this server's identity.
 /// Then a request carrying its own `_meta`, with no `initialize` anywhere,
 /// is served, in that revision's result shape.
 #[tokio::test]
@@ -717,7 +716,13 @@ async fn server_discover_at_2026_07_28_opens_the_stateless_lifecycle() {
     let result = &resp["result"];
     assert_eq!(
         result["supportedVersions"],
-        json!(["2026-07-28"]),
+        json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]),
         "{resp:#}"
     );
     assert!(

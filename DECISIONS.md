@@ -13,8 +13,9 @@ The server speaks MCP 2026-07-28 and every earlier revision.
 with `MAX_PROTOCOL_VERSION` = 2026-07-28 written in the source. The
 `initialize` answer is `LATEST_WITH_INITIALIZE` (2025-11-25), which rmcp also
 gives a client that asks `initialize` for 2026-07-28. `server/discover` is
-answered only at a revision with no handshake, and lists only those (today
-2026-07-28 alone). At a 2025 version it is method-not-found.
+answered only at a revision with no handshake; at a 2025 version it is
+method-not-found. Its `supportedVersions` is every revision the server
+implements, the same list a `-32022` carries.
 
 ### Rationale
 
@@ -28,9 +29,14 @@ protocol on its own.
 
 The discover gate closes a trap in rmcp's default, which answers a probe at
 any supported version. A client probing at 2025-11-25 would then run the
-stateless lifecycle at a revision that defines none. Listing only the
-handshake-free revisions in `supportedVersions` closes the same door from the
-other side.
+stateless lifecycle at a revision that defines none.
+
+`supportedVersions` first listed only the handshake-free revisions, to close
+the same door from the other side. It was wrong: the version list a `-32022`
+gives and the one `discover` gives are one fact, and a client must be able to
+read them as one. The official suite's `sep-2575-server-unsupported-version-error`
+checks exactly that. The gate on `discover` itself is what keeps a stateless
+client off 2025.
 
 ### Consequence
 
