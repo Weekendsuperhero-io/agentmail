@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-10-13T00:00
+updated: 2026-10-14T00:00
 ---
 # Changelog
 
@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP tasks, as the SEP-2663 extension** (`io.modelcontextprotocol/tasks`,
+  offered on both revisions) — a call to one of 22 long-running tools (the
+  scans, bulk moves and deletes, unsubscribing, downloads and thread exports)
+  from a client that declared the extension becomes a task when it is still
+  running after 2 seconds: the client gets a task handle at once and polls
+  `tasks/get`. Quick calls, and every call from a client that did not declare
+  the extension, are answered inline as before. Up to 32 tasks run at once and
+  1,024 are held, past which a slow call simply stays a request; a task lives
+  4 hours. `tasks/cancel` stops the operation at its next check, never
+  mid-write: a task that saw the cancellation is `cancelled`, one that finished
+  first is `completed`, and a tool that panics is `failed`. Progress becomes
+  the task's status message, and `tasks/get` carries the numbers under
+  `_meta["io.agentmuse/progress"]`. Each operation runs on the connection's own
+  token, never its request's, which rmcp cancels as it answers the request.
+  Closing the connection stops its tasks (5 seconds' grace, then abort).
 - **Sender identity** — `display_name` in an account's config makes drafts
   `From: Mark Blake <you@example.com>`. `create_draft` and `update_draft` take an
   optional `from` (`Name <address>` or an address) that must be one of the
@@ -48,12 +63,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **MCP 2025-11-25, by decision** — the server speaks 2025-11-25 and every
-  earlier revision, and nothing newer, whatever rmcp calls latest (3.5.0 made
-  that 2026-07-28). A client asking for 2026-07-28 is answered in 2025-11-25.
-  `server/discover` (2026-07-28) is refused with `-32022` listing the versions
-  spoken, or with method-not-found at a 2025 version, so a probing client falls
-  back to `initialize`.
+- **MCP 2026-07-28 alongside 2025-11-25, version 0.9.0** — a 2026-07-28
+  client runs that revision's stateless lifecycle: `server/discover` answers
+  with the revisions that need no handshake (2026-07-28 only), every request
+  carries its own version, identity and capabilities in `_meta`, and results
+  carry `resultType` and cache hints. A 2025-era client still opens with
+  `initialize`, answered in 2025-11-25 exactly as before, and a client asking
+  `initialize` for 2026-07-28 is answered in 2025-11-25 too. `server/discover`
+  at a 2025 version is method-not-found, so no client runs the stateless
+  lifecycle at a revision that defines none, and a revision newer than
+  2026-07-28 is refused `-32022` with the list. The ceiling is named
+  (`MAX_PROTOCOL_VERSION`), never rmcp's `LATEST`, so a newer SDK cannot move
+  the protocol on its own.
+- **A mutation queued behind another on its account stops waiting when
+  cancelled.** The ten mutations that take a `CancelFn` (the bulk moves and
+  deletes, `delete_messages`, `reconcile_moves`, `unsubscribe_message`) leave
+  the per-account queue with `Cancelled` as soon as it fires, instead of when
+  the run ahead of them ends.
 - **IMAP's TLS is rustls, with the OS checking certificates.** `native-tls`
   and `tokio-native-tls` are gone; connections use `tokio-rustls` on aws-lc-rs,
   and `rustls-platform-verifier` hands the certificate check to the OS
@@ -130,8 +156,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request in two weeks of traffic), and every rmcp 3.x release removes the
   MCP 2025-11-25 task model. A task-augmented `tools/call` runs as a plain
   call, the spec's rule for a server without the capability. Long operations still report `notifications/progress` and
-  honour `notifications/cancelled`. Tasks may return as the SEP-2663
-  extension. A breaking change, hence the minor version bump.
+  honour `notifications/cancelled`. Tasks returned in 0.9.0 as the SEP-2663
+  extension (see Added). A breaking change, hence the minor version bump.
 - **The `io.modelcontextprotocol/related-task` marker** on progress
   notifications and task results went with them.
 

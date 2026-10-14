@@ -4,7 +4,7 @@
 
 Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 36 tools and 6 prompts for reading, searching, composing, organizing, archiving, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
 
-MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05; nothing newer) | rmcp 3.5.1
+MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) (stateless) and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (`initialize`; also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | rmcp 3.5.1
 
 No Mail.app dependency. Pure IMAP over TLS. Works on macOS, Linux, and Windows.
 
@@ -268,7 +268,7 @@ Email content flows through a pipeline:
 - **Mailbox attributes** — RFC 6154 special-use roles (trash, junk, drafts, sent, archive, all, flagged) and RFC 3501 flags (noSelect, noInferiors) surfaced from IMAP LIST. Scan-all operations use roles to skip Trash/Junk/Drafts with string-matching fallback for servers without RFC 6154 support
 - **Tool annotations** — `read_only_hint`, `destructive_hint`, `idempotent_hint` per MCP 2025-11-25
 - **Progress notifications** — long operations report progress to the MCP client
-- **No MCP tasks** — the SEP-1686 task surface (enqueue, poll, result, cancel, per-account serialization of destructive tasks) was retired in 0.8.0, measured unused; long operations report progress and honour `notifications/cancelled`
+- **MCP tasks, promoted late** — the SEP-2663 extension: a call from a client that declared it becomes a task only when it is still running after 2 seconds (`mcp/tasks.rs`), so quick calls stay quick. Each operation runs on the connection's lifetime token, because rmcp cancels a request's token as it answers the request, and a task's answer is its handle. Cancellation is cooperative, and the account mutation lock is the one serialization point (a queued mutation leaves the queue when cancelled). The SEP-1686 surface retired in 0.8.0 stays gone
 - **Forward recovery for MOVE** — servers without native UID MOVE use a separate `synchronous=FULL` journal. Ambiguous COPY/cleanup outcomes return durable operation IDs and explicit pending/attention states; reconciliation never repeats COPY without evidence that the earlier attempt created nothing
 
 ## Configuration and Local Security

@@ -9,7 +9,7 @@ imap-proto = { path = "vendor/imap-proto" }
 
 [package]
 name = "agentmail"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.99"
 description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
@@ -56,8 +56,8 @@ printpdf = { version = "0.12", default-features = false }
 psl = "2"
 reqwest = { version = "0.13", features = ["json"] }
 # Exact-pinned to the embedding Agent Muse workspace's rmcp, so the app links
-# one copy. The protocol does not move with the SDK: it stays at MCP
-# 2025-11-25 (`mcp::PROTOCOL_VERSION`; the workspace's bridge D41).
+# one copy. The protocol does not move with the SDK: the server speaks up to
+# `mcp::MAX_PROTOCOL_VERSION` (2026-07-28), named in the source.
 rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io"] }
 # Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native

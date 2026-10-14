@@ -5,6 +5,7 @@ mod args;
 mod file_access;
 mod prompts;
 mod resources;
+mod tasks;
 mod tools_read;
 mod tools_write;
 mod wire;
@@ -12,11 +13,13 @@ mod wire;
 use futures::StreamExt as _;
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
-    handler::server::router::tool::ToolRouter,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext},
     model::{
-        CompleteRequestParams, CompleteResult, Implementation, ListResourceTemplatesResult,
-        ListResourcesResult, PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
-        ReadResourceRequestParams, RequestMetaObject, ServerCapabilities, ServerConfig,
+        CallToolRequestParams, CallToolResponse, CancelTaskParams, CompleteRequestParams,
+        CompleteResult, DiscoverRequestMethod, DiscoverResult, GetTaskParams, GetTaskResult,
+        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ProgressNotificationParam, ProtocolVersion, ReadResourceRequestParams, RequestMetaObject,
+        ServerCapabilities, ServerConfig, UpdateTaskParams,
     },
     prompt_handler,
     service::RequestContext,
@@ -24,11 +27,13 @@ use rmcp::{
 };
 use std::sync::Arc;
 
-/// The MCP revision this server speaks: 2025-11-25, by decision rather than
-/// whatever the SDK calls latest. rmcp's `Default` follows its `LATEST`, which
-/// is 2026-07-28 from 3.5.0 on, a revision whose lifecycle this server has not
-/// adopted (the embedding workspace's bridge D41 holds the go criteria).
-const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+/// The newest MCP revision this server speaks. A 2025-era client still opens
+/// with `initialize`, answered in [`ProtocolVersion::LATEST_WITH_INITIALIZE`]
+/// (2025-11-25); a 2026-07-28 client runs that revision's stateless lifecycle,
+/// carrying its version, identity and capabilities in every request's `_meta`.
+/// Named rather than taken from rmcp's `LATEST`, so a newer SDK does not move
+/// the protocol on its own.
+const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 const PREWARM_CONCURRENCY: usize = 3;
 const PREWARM_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -124,38 +129,56 @@ fn normalized_progress(
 /// Build a bounded, coalescing progress stream. One worker serializes all
 /// notifications for the request, preserving monotonic progress and avoiding
 /// a detached Tokio task per callback.
+///
+/// A call that became a task ([`tasks`]) reports on the task instead: its
+/// request has been answered, so a `notifications/progress` on that request's
+/// token would describe a request that no longer exists.
 fn make_progress_fn(meta: &RequestMetaObject, peer: &Peer<RoleServer>) -> ProgressReporter {
-    let Some(token) = meta.get_progress_token() else {
+    let run = tasks::ToolRun::current();
+    let token = meta.get_progress_token();
+    if token.is_none() && run.is_none() {
         return ProgressReporter::disabled();
-    };
-    let peer = peer.clone();
+    }
     let (sender, mut receiver) = tokio::sync::watch::channel(None::<ProgressUpdate>);
     let latest = Arc::new(parking_lot::Mutex::new(None::<ProgressUpdate>));
     let callback_latest = Arc::clone(&latest);
+    let callback_run = run.clone();
     let callback = Arc::new(move |completed: u64, total: u64| {
         let mut previous = callback_latest.lock();
         let Some(update) = normalized_progress(*previous, completed, total) else {
             return;
         };
         *previous = Some(update);
+        if callback_run
+            .as_ref()
+            .is_some_and(|run| run.report_progress(update.completed, update.total))
+        {
+            return;
+        }
         sender.send_replace(Some(update));
     });
-    let worker = tokio::spawn(async move {
-        while receiver.changed().await.is_ok() {
-            let Some(update) = *receiver.borrow_and_update() else {
-                continue;
-            };
-            let notification =
-                ProgressNotificationParam::new(token.clone(), update.completed as f64)
-                    .with_total(update.total as f64);
-            if peer.notify_progress(notification).await.is_err() {
-                break;
+    let worker = token.map(|token| {
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            while receiver.changed().await.is_ok() {
+                let Some(update) = *receiver.borrow_and_update() else {
+                    continue;
+                };
+                if run.as_ref().is_some_and(|run| run.is_promoted()) {
+                    break;
+                }
+                let notification =
+                    ProgressNotificationParam::new(token.clone(), update.completed as f64)
+                        .with_total(update.total as f64);
+                if peer.notify_progress(notification).await.is_err() {
+                    break;
+                }
             }
-        }
+        })
     });
     ProgressReporter {
         callback: Some(callback),
-        worker: Some(worker),
+        worker,
     }
 }
 
@@ -163,8 +186,19 @@ fn make_progress_fn(meta: &RequestMetaObject, peer: &Peer<RoleServer>) -> Progre
 /// client sends `notifications/cancelled` for this request, or on transport
 /// shutdown (the token is a child of the serve-loop token). Long scans check
 /// it at mailbox and fetch-chunk boundaries.
+///
+/// In a call that may become a task the token is the operation's own (see
+/// [`tasks`]), and a check that finds it cancelled is recorded, so a task the
+/// tool stopped for `tasks/cancel` settles as `cancelled`.
 fn make_cancel_fn(ct: tokio_util::sync::CancellationToken) -> crate::CancelFn {
-    Arc::new(move || ct.is_cancelled())
+    let run = tasks::ToolRun::current();
+    Arc::new(move || {
+        let cancelled = ct.is_cancelled();
+        if cancelled && let Some(run) = &run {
+            run.note_cancel_observed();
+        }
+        cancelled
+    })
 }
 
 /// Map a library error to an MCP error code. Model-actionable failures
@@ -248,6 +282,8 @@ pub struct AgentMailServer {
     /// Sandbox for LLM-supplied filesystem paths (attachment reads, download
     /// writes). See [`file_access::FileAccessPolicy`].
     file_access: Option<file_access::FileAccessPolicy>,
+    /// This connection's tasks (SEP-2663). See [`tasks`].
+    tasks: Arc<tasks::TaskRuntime>,
 }
 
 impl AgentMailServer {
@@ -255,13 +291,19 @@ impl AgentMailServer {
         Self {
             agentmail: Arc::new(agentmail),
             file_access: Some(file_access::FileAccessPolicy::from_env()),
+            tasks: Arc::new(tasks::TaskRuntime::new(tasks::TaskConfig::DEFAULT)),
         }
     }
 
     fn new_embedded(agentmail: crate::Agentmail) -> Self {
+        Self::new_embedded_with(agentmail, tasks::TaskConfig::DEFAULT)
+    }
+
+    fn new_embedded_with(agentmail: crate::Agentmail, tasks: tasks::TaskConfig) -> Self {
         Self {
             agentmail: Arc::new(agentmail),
             file_access: None,
+            tasks: Arc::new(tasks::TaskRuntime::new(tasks)),
         }
     }
 
@@ -392,41 +434,112 @@ impl ServerHandler for AgentMailServer {
         })
     }
 
-    /// Every revision up to `PROTOCOL_VERSION` and nothing newer. rmcp's
-    /// default is every version it knows, 2026-07-28 included, so
-    /// `server/discover` would advertise it and `initialize` would agree to
-    /// it. This one list bounds discovery, the handshake and the version a
-    /// request names in its own `_meta`.
-    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&PROTOCOL_VERSION))
+    /// A call to one of `tasks::TASK_TOOLS` from a client that declared the
+    /// tasks extension may become a task once it has run for a while (see
+    /// `tasks`). Every other call is dispatched exactly as the generated
+    /// handler did.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let tasks_declared = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        if !(tasks_declared && tasks::TASK_TOOLS.contains(&request.name.as_ref())) {
+            return TOOL_ROUTER
+                .call(ToolCallContext::new(self, request, context))
+                .await;
+        }
+        let operation_ct = self.tasks.operation_token();
+        let request_ct = std::mem::replace(&mut context.ct, operation_ct.clone());
+        let tool = request.name.clone();
+        let server = self.clone();
+        self.tasks
+            .run_call(&tool, request_ct, operation_ct, async move {
+                TOOL_ROUTER
+                    .call(ToolCallContext::new(&server, request, context))
+                    .await
+            })
+            .await
     }
 
-    /// `server/discover` does not exist in 2025-11-25, so it is answered as a
-    /// 2025-11-25 server answers it. A probe at 2026-07-28 never gets here:
-    /// rmcp refuses it first with `-32022` and the list above, which a probing
-    /// client reads as "legacy, use `initialize`". A probe at a 2025 version
-    /// does, and rmcp's default would answer it with a discover result and let
-    /// the client run the 2026 stateless lifecycle at a 2025 version.
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.tasks.get(&request.task_id)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.update(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel(&request.task_id)
+    }
+
+    /// Every revision up to `MAX_PROTOCOL_VERSION` and nothing newer, so a
+    /// newer rmcp cannot widen what this server claims. This one list bounds
+    /// `server/discover`, the `initialize` negotiation and the version a
+    /// request names in its own `_meta`.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION))
+    }
+
+    /// `server/discover` opens the 2026-07-28 lifecycle, so it is answered
+    /// only at a revision without a handshake, and lists only those
+    /// revisions. A probe at a 2025 version is told the method does not
+    /// exist, which is how a 2025-11-25 server answers it: rmcp's default
+    /// would answer and let the client run the stateless lifecycle at a
+    /// revision that defines none. (A version this server does not speak at
+    /// all never gets here: rmcp refuses it with `-32022` first.)
     async fn discover(
         &self,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::DiscoverResult, McpError> {
-        Err(McpError::method_not_found::<
-            rmcp::model::DiscoverRequestMethod,
-        >())
+        context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        if context
+            .meta
+            .protocol_version()
+            .is_none_or(|version| version.has_initialize())
+        {
+            return Err(McpError::method_not_found::<DiscoverRequestMethod>());
+        }
+        let stateless = self
+            .supported_protocol_versions()
+            .iter()
+            .filter(|version| !version.has_initialize())
+            .cloned()
+            .collect();
+        Ok(DiscoverResult::from_server_info(stateless, self.get_info()))
     }
 
     fn get_info(&self) -> ServerConfig {
-        // No `tasks`: the SEP-1686 (MCP 2025-11-25) task surface was retired,
-        // measured unused — every rmcp 3.x release removes it (0.8.0).
+        // `tasks` is the SEP-2663 extension (`extensions`), offered on both
+        // revisions: a client opts in by declaring it, and only a slow call
+        // from one that did ever becomes a task. The SEP-1686 `capabilities.
+        // tasks` slot retired in 0.8.0 stays gone.
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
             .enable_resources()
             .enable_completions()
+            .enable_tasks()
             .build();
         ServerConfig::new(capabilities)
-            .with_protocol_version(PROTOCOL_VERSION)
+            // The `initialize` answer: the newest revision that still has a
+            // handshake. rmcp answers a client asking for 2026-07-28 there
+            // with this too.
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
             // Without this the server announces itself as "rmcp" — rmcp's
             // Implementation::from_build_env() bakes in its own crate name.
             // Version carries the build SHA so `initialize` responses and logs
@@ -696,11 +809,25 @@ where
         build = env!("AGENTMAIL_BUILD_SHA"),
         "agentmail MCP server starting"
     );
-    let server = AgentMailServer::new_embedded(mk);
+    serve_server(transport, AgentMailServer::new_embedded(mk)).await
+}
+
+/// Serve one connection, then end its tasks: nothing can poll them once the
+/// client is gone.
+async fn serve_server<T>(
+    transport: T,
+    server: AgentMailServer,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let tasks = Arc::clone(&server.tasks);
     let service = server.serve(transport).await.inspect_err(|e| {
         eprintln!("agentmail: server error: {}", e);
     })?;
-    service.waiting().await?;
+    let result = service.waiting().await;
+    tasks.shutdown().await;
+    result?;
     Ok(())
 }
 
@@ -710,6 +837,7 @@ where
 pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error::Error>> {
     let server = AgentMailServer::new(mk);
     let prewarm_agentmail = Arc::clone(&server.agentmail);
+    let tasks = Arc::clone(&server.tasks);
     let service = server
         .serve(rmcp::transport::io::stdio())
         .await
@@ -758,6 +886,7 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
     let result = service.waiting().await;
     prewarm.abort();
     let _ = prewarm.await;
+    tasks.shutdown().await;
     result?;
     Ok(())
 }
@@ -1187,5 +1316,150 @@ mod tests {
         assert!(cancel());
         let err = crate::imap_client::check_cancel(Some(&cancel)).unwrap_err();
         assert_eq!(err.to_string(), "cancelled by client");
+    }
+}
+
+/// Tasks over the real JSON-RPC wire, with the promotion budget at zero so a
+/// call that has to touch the network is promoted at once.
+#[cfg(test)]
+mod task_wire_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
+
+    struct Wire {
+        reader: BufReader<ReadHalf<DuplexStream>>,
+        writer: WriteHalf<DuplexStream>,
+        next_id: i64,
+    }
+
+    impl Wire {
+        /// A server whose every eligible call is promoted at once, and a
+        /// session that declared the tasks extension.
+        async fn start() -> Self {
+            let config = crate::Config::from_accounts(vec![(
+                "dummy".to_string(),
+                crate::config::AccountConfig {
+                    // Never connects: `.invalid` cannot resolve, so the call
+                    // has to wait on the network before it fails.
+                    host: "imap.invalid".to_string(),
+                    port: 993,
+                    username: "dummy@example.invalid".to_string(),
+                    email: None,
+                    aliases: Vec::new(),
+                    display_name: None,
+                    password: Some(crate::secret::Secret::new_raw("unused")),
+                    tls: true,
+                    max_connections: None,
+                    auth: crate::config::AuthMethod::Password,
+                },
+            )]);
+            let server = AgentMailServer::new_embedded_with(
+                crate::Agentmail::new(config),
+                tasks::TaskConfig {
+                    promote_after: std::time::Duration::ZERO,
+                    ..tasks::TaskConfig::DEFAULT
+                },
+            );
+            let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+            tokio::spawn(async move {
+                let _ = serve_server(server_io, server).await;
+            });
+            let (reader, writer) = tokio::io::split(client_io);
+            let mut wire = Self {
+                reader: BufReader::new(reader),
+                writer,
+                next_id: 0,
+            };
+            let init = wire
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {
+                            "extensions": { "io.modelcontextprotocol/tasks": {} }
+                        },
+                        "clientInfo": { "name": "agentmail-tests", "version": "0" }
+                    }),
+                )
+                .await;
+            assert_eq!(init["result"]["protocolVersion"], "2025-11-25", "{init:#}");
+            wire.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+                .await;
+            wire
+        }
+
+        async fn send(&mut self, frame: Value) {
+            let mut line = serde_json::to_string(&frame).unwrap();
+            line.push('\n');
+            self.writer.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        async fn request(&mut self, method: &str, params: Value) -> Value {
+            self.next_id += 1;
+            let id = self.next_id;
+            self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let mut line = String::new();
+                    let read = self.reader.read_line(&mut line).await.unwrap();
+                    assert!(read > 0, "server closed the stream awaiting `{method}`");
+                    let frame: Value = serde_json::from_str(&line).unwrap();
+                    if frame["id"].as_i64() == Some(id) {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no answer to `{method}`"))
+        }
+    }
+
+    /// The whole flow a task-aware client sees: the call is answered with a
+    /// task handle, `tasks/get` reports it working, then completed, and the
+    /// result is the tool's own (an `isError` result here, since the account
+    /// cannot connect, which SEP-2663 counts as `completed`).
+    #[tokio::test]
+    async fn a_slow_call_becomes_a_task_the_client_polls_to_its_result() {
+        let mut wire = Wire::start().await;
+        let call = wire
+            .request(
+                "tools/call",
+                json!({ "name": "top_senders", "arguments": { "account": "dummy" } }),
+            )
+            .await;
+        let created = &call["result"];
+        assert_eq!(created["resultType"], "task", "{call:#}");
+        assert_eq!(created["status"], "working", "{call:#}");
+        assert_eq!(created["statusMessage"], "Running top_senders", "{call:#}");
+        let task_id = created["taskId"].as_str().expect("a task id").to_string();
+
+        let mut last = Value::Null;
+        for _ in 0..300 {
+            last = wire
+                .request("tasks/get", json!({ "taskId": task_id }))
+                .await;
+            if last["result"]["status"] != "working" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(last["result"]["status"], "completed", "{last:#}");
+        assert_eq!(last["result"]["result"]["isError"], true, "{last:#}");
+    }
+
+    /// A tool outside the task list is never promoted, however long it takes.
+    #[tokio::test]
+    async fn a_tool_outside_the_task_list_answers_inline() {
+        let mut wire = Wire::start().await;
+        let call = wire
+            .request(
+                "tools/call",
+                json!({ "name": "check_connection", "arguments": { "account": "dummy" } }),
+            )
+            .await;
+        assert!(call["result"].get("taskId").is_none(), "{call:#}");
+        assert!(call["result"]["content"].is_array(), "{call:#}");
     }
 }

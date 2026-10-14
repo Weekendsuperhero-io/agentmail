@@ -4,6 +4,115 @@ Architectural decisions, deferred work, and rationale for future reference.
 
 ---
 
+## 0.9.0 — Both Lifecycles From One Server, Up To A Named Ceiling
+
+### Decision
+
+The server speaks MCP 2026-07-28 and every earlier revision.
+`supported_protocol_versions()` is `ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION)`,
+with `MAX_PROTOCOL_VERSION` = 2026-07-28 written in the source. The
+`initialize` answer is `LATEST_WITH_INITIALIZE` (2025-11-25), which rmcp also
+gives a client that asks `initialize` for 2026-07-28. `server/discover` is
+answered only at a revision with no handshake, and lists only those (today
+2026-07-28 alone). At a 2025 version it is method-not-found.
+
+### Rationale
+
+0.8.0 pinned 2025-11-25 because nothing yet needed 2026-07-28, and the
+embedding app's bridge held the go criteria. Agent Muse now offers 2026-07-28
+to agents and backends as a choice. A server that supports both lifecycles
+costs nothing for a 2025 client, so this server offers both.
+
+The ceiling stays named, never rmcp's `LATEST`: an SDK bump must not move the
+protocol on its own.
+
+The discover gate closes a trap in rmcp's default, which answers a probe at
+any supported version. A client probing at 2025-11-25 would then run the
+stateless lifecycle at a revision that defines none. Listing only the
+handshake-free revisions in `supportedVersions` closes the same door from the
+other side.
+
+### Consequence
+
+A 2026-07-28 client carries its version, identity and capabilities in every
+request's `_meta`. rmcp validates them and shapes results for that revision:
+it adds `resultType`, defaults cache hints to `private`, TTL 0, and turns
+resource-not-found into `-32602`. A 2025 client sees exactly what 0.8.0 sent,
+plus the tasks extension in `capabilities.extensions`.
+
+---
+
+## 0.9.0 — Tasks Return As The SEP-2663 Extension, Promoted Late
+
+### Decision
+
+`io.modelcontextprotocol/tasks` is offered on both revisions (`mcp/tasks.rs`).
+A `tools/call` becomes a task only when four things hold:
+
+- the client declared the extension;
+- the tool is one of the 22 long-running ones (`TASK_TOOLS`, the 0.8.0 list
+  of task-eligible tools);
+- the call is still running after 2 seconds;
+- admission allows it: 32 running, 1,024 held.
+
+Otherwise it is answered inline. Each task lives 4 hours and suggests
+1-second polls.
+
+**The operation token.** It is a child of the connection's lifetime token,
+linked to the request's token only until promotion.
+
+**Cancellation.** `tasks/cancel` cancels that token and waits for the
+operation to stop at its next check. A task whose tool saw the cancellation
+(through its `CancelFn`) settles `cancelled`; one that finished first settles
+`completed`.
+
+**Progress.** After promotion, progress goes to the task's status message
+and to `_meta["io.agentmuse/progress"]` on `tasks/get`.
+
+### Rationale
+
+**Promoted late.** SEP-2663 makes the server the sole decider. The tasks a
+client actually wants are the calls that would outlive its request timeout.
+A task costs the client a round trip and keeps a result for hours. Deciding
+after a short run makes only those calls tasks. Quick calls, which are nearly
+all calls, see no difference.
+
+**The token is not the request's.** rmcp cancels a request's token as it
+sends that request's response, and a task's response is its handle. The
+SEP-1686 implementation retired in 0.8.0 had exactly this self-cancel bug
+until its token was re-parented. Here the rule is structural, and pinned by
+`a_promoted_task_outlives_its_request_token`.
+
+**Cooperative, never aborted.** A bulk move cut at an arbitrary await could
+leave a COPY without its EXPUNGE. The library already stops cleanly at its
+`CancelFn` checks, and now also while queued behind another mutation on its
+account (`lock_account_mutation_unless_cancelled`). Only rmcp's TTL aborts,
+and nothing here runs for 4 hours.
+
+**`cancelled` follows what the tool did.** Most tools report a library error
+as an `isError` result, so the result alone cannot tell a cancelled scan from
+a failed one. `make_cancel_fn` records the check that found the token
+cancelled, which can.
+
+**Status, not notifications, after promotion.** The request is answered once
+the handle is sent. A `notifications/progress` on its token would describe a
+request that no longer exists.
+
+### Consequence
+
+The operation runs in its own spawned task, so a panic fails the task instead
+of leaving it `working` until the TTL. rmcp's completion path never runs for
+a future that unwinds.
+
+Tasks live with the connection. Closing it cancels every operation token,
+waits 5 seconds, then aborts what is left.
+
+The per-account destructive-task queue of 0.8.0's predecessor does not
+return. The library's account mutation lock already serializes every
+mutation.
+
+---
+
 ## 0.7.0 — A Draft Is From One Of The Account's Own Identities
 
 ### Decision

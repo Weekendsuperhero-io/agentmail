@@ -1,17 +1,22 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-08-23T00:00
+updated: 2026-10-14T00:00
 ---
 # Agentmail MCP — Tool & Prompt Reference
 
-MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK) | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
+MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK) | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
 
-Nothing newer: a client asking for 2026-07-28 is answered in 2025-11-25, and a
-2026-07-28 `server/discover` probe is refused with `-32022` listing the versions
-spoken (method-not-found at a 2025 version), which tells a probing client to
-fall back to `initialize`. The revision moves by decision, never with rmcp.
+**Two lifecycles, one server.** A 2025-era client opens with `initialize`,
+answered in 2025-11-25 (also when it asks for 2026-07-28, which has no
+handshake). A 2026-07-28 client runs that revision's stateless lifecycle:
+`server/discover` answers with the revisions that need no handshake
+(2026-07-28 only), and every request carries its version, identity and
+capabilities in `_meta`. `server/discover` at a 2025 version is
+method-not-found, and a revision newer than 2026-07-28 is refused `-32022` with
+the supported list. The ceiling is `MAX_PROTOCOL_VERSION`, named in the source:
+the revision moves by decision, never with rmcp.
 
-**Supported capabilities:** tools, prompts, resources, completions, progress notifications, request cancellation
+**Supported capabilities:** tools, prompts, resources, completions, progress notifications, request cancellation, and the `io.modelcontextprotocol/tasks` extension (see [Tasks](#tasks-sep-2663))
 
 **Contract conventions:**
 
@@ -880,17 +885,49 @@ Returns the full updated flag set after the operation.
 | 5   | `unsubscribe-cleanup` | Rank subscriptions; offer filing or verified unsubscribe | `account`                    |
 | 6   | `list-id-cleanup`     | Identify mailing lists by List-Id, bulk-delete    | `account`                    |
 
-## Tasks (SEP-1686) — retired in 0.8.0
+## Tasks (SEP-2663)
 
-AgentMail no longer offers MCP tasks: no `tasks` capability, no
-`execution.taskSupport` on any tool, no `tasks/*` methods. The task surface was
-measured unused by the app that embeds this server, and every rmcp 3.x release
-removes the MCP 2025-11-25 task model; tasks may return as the SEP-2663
-extension. Long operations report `notifications/progress`, and a direct call
-is cancelled with `notifications/cancelled`: scans stop at mailbox/fetch-chunk
-boundaries and unsubscribe DNS, DKIM and HTTP waits are interrupted through a
-25 ms cancellation poll. Cancellation during an HTTP send is inherently
-ambiguous because the endpoint may already have received the POST.
+AgentMail offers the `io.modelcontextprotocol/tasks` extension on both
+revisions. The server decides which calls become tasks, never the client: a
+call becomes one only when the client declared the extension, the tool is one
+of the 22 below, and the call is still running after **2 seconds**. Everything
+else, quick calls included, is answered inline exactly as without the
+extension. A promoted call is answered with a task handle (`resultType:
+"task"`, the `taskId`, `pollIntervalMs` 1000, `ttlMs` 4 hours) and the client
+polls `tasks/get`.
+
+Task-eligible tools: `search_messages`, `list_flags`, `find_attachments`,
+`top_senders`, `top_domains`, `top_subscriptions`, `top_mailing_lists`,
+`preview_thread_record`, `delete_messages`, `delete_by_sender`,
+`delete_by_domain`, `delete_list_id`, `move_by_sender`, `move_by_domain`,
+`move_list_id`, `move_subscription`, `unsubscribe_message`, `reconcile_moves`,
+`download_attachments`, `download_message_source`, `download_thread`,
+`export_thread_record`.
+
+| | |
+| --- | --- |
+| Admission | at most 32 tasks running and 1,024 held (running and finished); past either, a slow call stays a request |
+| Terminal status | `completed` with the tool's result (an `isError` result is still `completed`); `failed` when the tool produced no result (a protocol error, or a panic); `cancelled` when the tool saw a `tasks/cancel` |
+| `tasks/cancel` | stops the operation at its next check, never mid-write; a task that finished first is `completed` |
+| Progress | the task's `statusMessage` (`"3 of 10"`), and `_meta["io.agentmuse/progress"] = {"progress", "total"}` on `tasks/get` |
+| `tasks/update` | accepted for any held task; no tool asks for input mid-task |
+| Lifetime | 4 hours from creation, after which rmcp fails a task still running; a finished task is kept 4 more hours. Tasks live with the connection: closing it stops them (5 seconds' grace, then abort) |
+
+A request's cancellation token is cancelled by rmcp as it answers the request,
+and a task's answer is its handle, so each task's operation runs on the
+connection's own token instead.
+
+Before a call is promoted, and for every call that never is, long operations
+report `notifications/progress`, and a direct call is cancelled with
+`notifications/cancelled`: scans stop at mailbox/fetch-chunk boundaries,
+unsubscribe DNS, DKIM and HTTP waits are interrupted through a 25 ms
+cancellation poll, and a mutation queued behind another on its account stops
+waiting. Cancellation during an HTTP send is inherently ambiguous because the
+endpoint may already have received the POST.
+
+The SEP-1686 surface retired in 0.8.0 stays gone: no `capabilities.tasks`, no
+`execution.taskSupport`, no `tasks/list` or `tasks/result`, and a client's
+`task` parameter on `tools/call` is ignored.
 
 ## Tool Result Encoding
 
