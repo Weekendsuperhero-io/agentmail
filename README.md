@@ -1,12 +1,12 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-08-23T00:00
+updated: 2026-10-14T00:00
 ---
 # agentmail
 
 IMAP email client exposed as both a CLI and an MCP (Model Context Protocol) server, built with Rust.
 
-MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK)
+MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK)
 
 One binary: `agentmail serve` starts the MCP stdio server, all other subcommands are a direct CLI.
 
@@ -443,8 +443,9 @@ Opens a web UI to exercise all advertised tools and 6 prompts interactively.
 
 36 tools cover account discovery, mailbox management, message reading, search,
 bulk operations, recovery, evidence archiving, flag management, and composition. AgentMail saves drafts but never sends mail. Long-running tools
-report progress notifications. (MCP task-based invocation, SEP-1686, was
-retired in 0.8.0.)
+report progress notifications, and for a client that declared the MCP tasks
+extension (SEP-2663) a slow call becomes a task it polls; see
+[MCP.md](MCP.md#tasks-sep-2663).
 
 | Tool                   | Description                                                                           |
 | ---------------------- | ------------------------------------------------------------------------------------- |

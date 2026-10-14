@@ -210,12 +210,19 @@ async fn initialize_reports_capabilities_and_identity() {
             "missing `{cap}` capability: {caps:?}"
         );
     }
-    // The SEP-1686 (v1) task surface is retired (0.8.0): measured unused, and
-    // every rmcp 3.x release removes it.
+    // Tasks are the SEP-2663 extension, never the SEP-1686 (v1) slot retired
+    // in 0.8.0.
     assert!(
         !caps.contains_key("tasks"),
-        "`tasks` must not be advertised: {caps:?}"
+        "the v1 `tasks` slot must not be advertised: {caps:?}"
     );
+    assert!(
+        caps["extensions"]
+            .as_object()
+            .is_some_and(|extensions| extensions.contains_key("io.modelcontextprotocol/tasks")),
+        "the tasks extension is offered: {caps:?}"
+    );
+    assert_eq!(init["protocolVersion"], "2025-11-25");
 
     assert_eq!(
         init["serverInfo"]["name"].as_str(),
@@ -606,12 +613,11 @@ async fn no_tool_declares_task_support() {
     }
 }
 
-/// A task-augmented call RUNS as a plain call. The server declares no
-/// `tasks`, and the 2025-11-25 spec says a receiver without the capability
-/// "MUST process requests of that type normally, ignoring any
-/// task-augmentation metadata"; rmcp 3.x does so by construction (its call
-/// params have no `task` field). rmcp 2.2 refused it with a JSON-RPC error.
-/// The dummy account cannot connect, so the run shows as an `isError` RESULT.
+/// The SEP-1686 `task` parameter asks for nothing any more: SEP-2663 leaves
+/// the decision to the server, and only for a client that declared the
+/// extension, which this one did not. So the call RUNS as a plain call (rmcp
+/// 3.x has no `task` field to read). The dummy account cannot connect, so the
+/// run shows as an `isError` RESULT.
 #[tokio::test]
 async fn a_task_augmented_call_runs_as_a_plain_call() {
     let mut client = McpClient::start().await;
@@ -661,18 +667,25 @@ fn dummy_config() -> Config {
     )])
 }
 
+/// The `_meta` a 2026-07-28 client puts on every request: its version,
+/// identity and capabilities, since that revision has no handshake to carry
+/// them.
+fn stateless_meta(version: &str, capabilities: &Value) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {"name": "agentmail-tests", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": capabilities,
+    })
+}
+
 /// The probe a 2026-07-28 client opens with: `server/discover` carrying its
 /// version, identity and capabilities in `_meta`.
 fn discover_probe(version: &str) -> Value {
-    json!({"_meta": {
-        "io.modelcontextprotocol/protocolVersion": version,
-        "io.modelcontextprotocol/clientInfo": {"name": "agentmail-tests", "version": "0"},
-        "io.modelcontextprotocol/clientCapabilities": {},
-    }})
+    json!({ "_meta": stateless_meta(version, &json!({})) })
 }
 
-/// An `initialize` asking for 2026-07-28 is answered in 2025-11-25, the
-/// revision this server speaks, rather than agreed to because rmcp knows it.
+/// An `initialize` asking for 2026-07-28 is answered in 2025-11-25: that
+/// revision has no handshake, so the newest one with one is the answer.
 #[tokio::test]
 async fn a_2026_07_28_client_is_negotiated_down_to_2025_11_25() {
     let mut client = McpClient::connect(dummy_config()).await;
@@ -689,22 +702,58 @@ async fn a_2026_07_28_client_is_negotiated_down_to_2025_11_25() {
     assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp:#}");
 }
 
-/// A 2026-07-28 probe is refused `-32022` with ONLY the versions this server
-/// speaks, which a probing client reads as "legacy, use `initialize`". A probe
-/// at a 2025 version is told the method does not exist. Then the legacy
-/// handshake still works on the same connection, which is the fallback.
+/// A 2026-07-28 probe opens that revision's lifecycle: `server/discover`
+/// answers with the revisions that need no handshake (only 2026-07-28; a
+/// stateless client at a 2025 version would be running a lifecycle that
+/// revision does not define), the tasks extension and this server's identity.
+/// Then a request carrying its own `_meta`, with no `initialize` anywhere,
+/// is served, in that revision's result shape.
 #[tokio::test]
-async fn server_discover_lists_only_versions_up_to_2025_11_25() {
+async fn server_discover_at_2026_07_28_opens_the_stateless_lifecycle() {
     let mut client = McpClient::connect(dummy_config()).await;
     let resp = client
         .request("server/discover", discover_probe("2026-07-28"))
         .await;
-    assert_eq!(resp["error"]["code"], -32022, "{resp:#}");
+    let result = &resp["result"];
     assert_eq!(
-        resp["error"]["data"]["supported"],
-        json!(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]),
+        result["supportedVersions"],
+        json!(["2026-07-28"]),
+        "{resp:#}"
+    );
+    assert!(
+        result["capabilities"]["extensions"]
+            .as_object()
+            .is_some_and(|extensions| extensions.contains_key("io.modelcontextprotocol/tasks")),
+        "{resp:#}"
+    );
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "agentmail",
+        "{resp:#}"
     );
 
+    let resp = client
+        .request(
+            "tools/list",
+            json!({ "_meta": stateless_meta("2026-07-28", &json!({})) }),
+        )
+        .await;
+    let result = &resp["result"];
+    assert!(
+        result["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "{resp:#}"
+    );
+    assert_eq!(result["resultType"], "complete", "{resp:#}");
+    assert_eq!(result["cacheScope"], "private", "{resp:#}");
+}
+
+/// A probe at a 2025 version is told the method does not exist, which is how
+/// a 2025-11-25 server answers it, and the handshake still works on the same
+/// connection: that is the fallback.
+#[tokio::test]
+async fn server_discover_at_a_2025_version_is_method_not_found() {
+    let mut client = McpClient::connect(dummy_config()).await;
     let resp = client
         .request("server/discover", discover_probe("2025-11-25"))
         .await;
@@ -721,6 +770,59 @@ async fn server_discover_lists_only_versions_up_to_2025_11_25() {
         )
         .await;
     assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp:#}");
+}
+
+/// A revision newer than 2026-07-28 is refused `-32022` with every version
+/// this server speaks, so a probing client can pick one.
+#[tokio::test]
+async fn an_unknown_revision_is_refused_with_the_supported_list() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let resp = client
+        .request("server/discover", discover_probe("2099-01-01"))
+        .await;
+    assert_eq!(resp["error"]["code"], -32022, "{resp:#}");
+    assert_eq!(
+        resp["error"]["data"]["supported"],
+        json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]),
+    );
+}
+
+/// `tasks/*` belongs to clients that declared the extension: a session that
+/// did not is refused `-32021`, naming the capability it lacks.
+#[tokio::test]
+async fn tasks_methods_require_the_declared_extension() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request("tasks/get", json!({ "taskId": "nope" }))
+        .await;
+    assert_eq!(resp["error"]["code"], -32021, "{resp:#}");
+    assert!(
+        resp["error"]["data"]
+            .to_string()
+            .contains("io.modelcontextprotocol/tasks"),
+        "{resp:#}"
+    );
+}
+
+/// A stateless 2026-07-28 client that declared the extension reaches
+/// `tasks/get`, and an id this server never issued is an invalid parameter.
+#[tokio::test]
+async fn an_unknown_task_is_an_invalid_parameter() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let tasks = json!({ "extensions": { "io.modelcontextprotocol/tasks": {} } });
+    let resp = client
+        .request(
+            "tasks/get",
+            json!({ "taskId": "nope", "_meta": stateless_meta("2026-07-28", &tasks) }),
+        )
+        .await;
+    assert_eq!(resp["error"]["code"], -32602, "{resp:#}");
 }
 
 #[tokio::test]

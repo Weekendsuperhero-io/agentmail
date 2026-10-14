@@ -45,6 +45,9 @@ const MAX_MAILBOX_PAGE_LIMIT: usize = 500;
 const MAX_SUBSCRIPTION_SAMPLE_HEADER_BYTES: usize = 256 * 1024;
 const MAX_THREAD_RECORD_MESSAGES: usize = 100;
 const MAX_THREAD_RECORD_HEADER_BYTES: usize = 256 * 1024;
+/// How often a mutation queued behind another on its account re-checks its
+/// `CancelFn` ([`Agentmail::lock_account_mutation_unless_cancelled`]).
+const MUTATION_QUEUE_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// High-level facade for IMAP operations.
 /// Owns the connection pool and configuration.
@@ -443,6 +446,41 @@ impl Agentmail {
             }
         };
         lock.lock_owned().await
+    }
+
+    /// [`Self::lock_account_mutation`] for a mutation that can be cancelled:
+    /// the wait in the queue ends with [`AgentmailError::Cancelled`] as soon
+    /// as `cancel` fires.
+    ///
+    /// A mutation queued behind another on the same account can wait a long
+    /// time, since a bulk move holds the lock for its whole run. A caller that
+    /// gives up while queued (a `tasks/cancel`, a `notifications/cancelled`)
+    /// should stop then, not when the run ahead of it ends. `cancel` is a
+    /// predicate rather than a future, so the wait checks it on a short tick.
+    async fn lock_account_mutation_unless_cancelled(
+        &self,
+        account: &str,
+        cancel: Option<&CancelFn>,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        imap_client::check_cancel(cancel)?;
+        let Some(cancel) = cancel else {
+            return Ok(self.lock_account_mutation(account).await);
+        };
+        let lock = self.lock_account_mutation(account);
+        tokio::pin!(lock);
+        let mut tick = tokio::time::interval(MUTATION_QUEUE_CANCEL_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                guard = &mut lock => return Ok(guard),
+                _ = tick.tick() => {
+                    if cancel() {
+                        return Err(AgentmailError::Cancelled);
+                    }
+                }
+            }
+        }
     }
 
     /// Resolve server capabilities for an account, using the pool's cache and
@@ -2710,7 +2748,9 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteListIdResponse> {
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self
@@ -3153,7 +3193,9 @@ impl Agentmail {
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteMessagesResponse> {
         Self::validate_uid_selector(mailbox, expected_uid_validity, uids)?;
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         imap_client::select_with_expected_uid_validity(
@@ -3244,7 +3286,9 @@ impl Agentmail {
             ));
         }
         let email = parser::canonical_sender_address(email);
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self
@@ -3322,7 +3366,9 @@ impl Agentmail {
         let domain = domain::canonicalize_domain(domain).ok_or_else(|| {
             AgentmailError::Other("domain must be a valid DNS domain name".to_string())
         })?;
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
         let mut session = self.pool.acquire(account).await?;
         let caps = self.pool.server_caps(account, session.session()).await?;
         let trash = self
@@ -3464,7 +3510,9 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<MoveListIdResponse> {
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
         let totals = self
             .move_sweep(
                 mailbox,
@@ -3515,7 +3563,9 @@ impl Agentmail {
             ));
         }
         let email = parser::canonical_sender_address(email);
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
         let sender_display = if name.is_empty() {
             email.clone()
         } else {
@@ -3564,7 +3614,9 @@ impl Agentmail {
         let domain = domain::canonicalize_domain(domain).ok_or_else(|| {
             AgentmailError::Other("domain must be a valid DNS domain name".to_string())
         })?;
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
         let totals = self
             .move_sweep(
                 mailbox,
@@ -3612,8 +3664,9 @@ impl Agentmail {
         if destination.trim().is_empty() {
             return Err(AgentmailError::Other("destination is required".to_string()));
         }
-        imap_client::check_cancel(cancel)?;
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
 
         let mut session = self.pool.acquire(account).await?;
         let sample_headers = match imap_client::get_message_headers_bounded(
@@ -3726,7 +3779,9 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<ReconcileMovesResponse> {
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
         let account_key = self.mutation_account_key(account)?;
         let operations = if let Some(operation_id) = operation_id {
             vec![
@@ -5032,8 +5087,9 @@ impl Agentmail {
         if uid == 0 {
             return Err(AgentmailError::MessageNotFound(0));
         }
-        imap_client::check_cancel(cancel)?;
-        let _mutation_guard = self.lock_account_mutation(account).await;
+        let _mutation_guard = self
+            .lock_account_mutation_unless_cancelled(account, cancel)
+            .await?;
 
         // Bind the numeric UID to the exact epoch returned by discovery, then
         // fetch the complete message transiently for local DKIM verification.
