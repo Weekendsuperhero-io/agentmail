@@ -93,7 +93,14 @@ until its token was re-parented. Here the rule is structural, and pinned by
 leave a COPY without its EXPUNGE. The library already stops cleanly at its
 `CancelFn` checks, and now also while queued behind another mutation on its
 account (`lock_account_mutation_unless_cancelled`). Only rmcp's TTL aborts,
-and nothing here runs for 4 hours.
+and nothing here runs for 4 hours; even then the operation's token is
+cancelled first, so it stops at its next check if the abort cannot reach it.
+Closing the connection does NOT abort: an operation still running when the
+5-second shutdown grace ends is detached, finishes the chunk it is in, and
+stops at its next check (`Operation`'s drop; review of the 0.9.0 work,
+2026-10-21, which found the grace ending in an abort that could cut a move
+between COPY and EXPUNGE on a slow server). Pinned by
+`shutdown_lets_an_operation_reach_its_next_check`.
 
 **`cancelled` follows what the tool did.** Most tools report a library error
 as an `isError` result, so the result alone cannot tell a cancelled scan from

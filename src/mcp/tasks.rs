@@ -26,7 +26,9 @@
 //! terminal status follows what it did: `cancelled` when it saw the
 //! cancellation, `completed` when it finished first (SEP-2663 lets a task
 //! reach a non-`cancelled` status after a cancel). rmcp's TTL is the only hard
-//! stop.
+//! stop. Closing the connection is not one: an operation still running when
+//! the shutdown grace ends is detached, not aborted, and stops at its next
+//! check like any cancelled one (see [`Operation`]).
 //!
 //! **Progress.** Before promotion a call reports `notifications/progress` on
 //! the request's token, as it always did. After, that request has been
@@ -195,19 +197,39 @@ impl ProgressBoard {
     }
 }
 
-/// The spawned operation behind a call. Aborted if dropped before it ends, so
-/// nothing outlives the request or task that owns it.
-struct Operation(JoinHandle<Result<CallToolResponse, McpError>>);
+/// The spawned operation behind a call, with the token it runs on and the
+/// connection's lifetime.
+///
+/// Dropped before it ends, it is stopped, and how depends on why:
+///
+/// - The connection is shutting down (its lifetime is cancelled, so this
+///   operation's token already is): DETACHED. It runs on to its next
+///   cancellation check and ends there. Aborting it at an arbitrary await
+///   could cut a bulk move between its COPY and its EXPUNGE, or leave a
+///   half-written download, which is exactly what cooperative cancellation
+///   exists to prevent; its token being cancelled is what keeps the work
+///   bounded.
+/// - Anything else (rmcp's TTL, the one hard stop): its token is cancelled
+///   first, so work the abort cannot reach still stops at its next check,
+///   then it is aborted.
+struct Operation {
+    handle: JoinHandle<Result<CallToolResponse, McpError>>,
+    token: CancellationToken,
+    lifetime: CancellationToken,
+}
 
 impl Operation {
     async fn join(&mut self) -> Result<Result<CallToolResponse, McpError>, JoinError> {
-        (&mut self.0).await
+        (&mut self.handle).await
     }
 }
 
 impl Drop for Operation {
     fn drop(&mut self) {
-        self.0.abort();
+        self.token.cancel();
+        if !self.lifetime.is_cancelled() {
+            self.handle.abort();
+        }
     }
 }
 
@@ -258,7 +280,11 @@ impl TaskRuntime {
         F: Future<Output = Result<CallToolResponse, McpError>> + Send + 'static,
     {
         let run = Arc::new(ToolRun::default());
-        let mut operation = Operation(tokio::spawn(TOOL_RUN.scope(Arc::clone(&run), operation)));
+        let mut operation = Operation {
+            handle: tokio::spawn(TOOL_RUN.scope(Arc::clone(&run), operation)),
+            token: operation_ct.clone(),
+            lifetime: self.lifetime.clone(),
+        };
         let promote_at = tokio::time::sleep(self.config.promote_after);
         tokio::pin!(promote_at);
         let mut promotable = true;
@@ -376,7 +402,9 @@ impl TaskRuntime {
 
     /// The connection is gone, and its tasks with it: nothing can poll them
     /// any more. Ask every operation to stop, give them
-    /// [`TaskConfig::shutdown_grace`] to do so, then abort what is left.
+    /// [`TaskConfig::shutdown_grace`] to do so, then drop the tasks. An
+    /// operation still running is detached rather than aborted (see
+    /// [`Operation`]): it stops at its next check, never mid-write.
     pub(super) async fn shutdown(&self) {
         self.lifetime.cancel();
         let deadline = tokio::time::Instant::now() + self.config.shutdown_grace;
@@ -673,7 +701,8 @@ mod tests {
     }
 
     /// rmcp's TTL is the hard stop: a task still running past it is aborted
-    /// and fails, and its operation does not run on.
+    /// and fails, and its operation does not run on. Its token is cancelled
+    /// too, so work an abort cannot reach stops at its next check.
     #[tokio::test]
     async fn the_ttl_aborts_a_task_that_runs_past_it() {
         let runtime = TaskRuntime::new(TaskConfig {
@@ -682,11 +711,13 @@ mod tests {
         });
         let finished = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&finished);
+        let operation_ct = runtime.operation_token();
+        let token = operation_ct.clone();
         let response = runtime
             .run_call(
                 "top_senders",
                 CancellationToken::new(),
-                runtime.operation_token(),
+                operation_ct,
                 async move {
                     tokio::time::sleep(Duration::from_millis(400)).await;
                     flag.store(true, Ordering::SeqCst);
@@ -702,6 +733,10 @@ mod tests {
         assert!(
             !finished.load(Ordering::SeqCst),
             "the aborted operation must not run on"
+        );
+        assert!(
+            token.is_cancelled(),
+            "the TTL cancels the operation's token"
         );
     }
 
@@ -761,8 +796,8 @@ mod tests {
         }
     }
 
-    /// Closing the connection cancels every operation token, and what does
-    /// not stop within the grace period is aborted.
+    /// Closing the connection cancels every operation token and drops every
+    /// task.
     #[tokio::test]
     async fn shutdown_stops_running_tasks() {
         let runtime = TaskRuntime::new(TaskConfig {
@@ -786,5 +821,48 @@ mod tests {
         runtime.shutdown().await;
         assert_eq!(runtime.manager.running_task_count(), 0);
         assert!(runtime.get(&task_id).is_err(), "shutdown drops every task");
+    }
+
+    /// An operation still between two checks when the grace runs out (one
+    /// chunk of a bulk move on a slow server) is not cut there: it is detached,
+    /// finishes the chunk, and stops at its next check. Aborting it could
+    /// leave a COPY without its EXPUNGE.
+    #[tokio::test]
+    async fn shutdown_lets_an_operation_reach_its_next_check() {
+        let runtime = TaskRuntime::new(TaskConfig {
+            shutdown_grace: Duration::from_millis(100),
+            ..quick()
+        });
+        let chunk_done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&chunk_done);
+        let operation_ct = runtime.operation_token();
+        let watched = operation_ct.clone();
+        let response = runtime
+            .run_call(
+                "move_by_sender",
+                CancellationToken::new(),
+                operation_ct,
+                async move {
+                    // Mid-chunk: no check until the chunk is written.
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    flag.store(true, Ordering::SeqCst);
+                    if watched.is_cancelled() {
+                        return done("stopped after the chunk");
+                    }
+                    done("all moved")
+                },
+            )
+            .await;
+        task_id(response);
+        runtime.shutdown().await;
+        assert!(
+            !chunk_done.load(Ordering::SeqCst),
+            "the grace ended before the chunk did"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            chunk_done.load(Ordering::SeqCst),
+            "the chunk was finished, not cut"
+        );
     }
 }

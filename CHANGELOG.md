@@ -27,7 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the task's status message, and `tasks/get` carries the numbers under
   `_meta["io.agentmuse/progress"]`. Each operation runs on the connection's own
   token, never its request's, which rmcp cancels as it answers the request.
-  Closing the connection stops its tasks (5 seconds' grace, then abort).
+  Closing the connection stops its tasks: each is asked to stop, and one
+  still running after 5 seconds is detached to finish the chunk it is in and
+  stop at its next check, never aborted mid-write. A task that outlives its
+  4-hour TTL is aborted, with its operation's token cancelled first.
 - **Sender identity** — `display_name` in an account's config makes drafts
   `From: Mark Blake <you@example.com>`. `create_draft` and `update_draft` take an
   optional `from` (`Name <address>` or an address) that must be one of the
