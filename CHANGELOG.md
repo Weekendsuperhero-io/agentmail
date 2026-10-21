@@ -137,7 +137,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebased onto 0.17.0 (nom 8) and its UIDFETCH patch re-applied; mail-auth
   0.12.1 → 0.13.3; dirs 6 → 7; semver-compatible updates across the lockfile.
   rusqlite stays at 0.39 (the embedding app's sqlx-sqlite caps libsqlite3-sys
-  below 0.38). rmcp 2.2.0 → 3.5.1, exact-pinned to the embedding app's copy;
+  below 0.38). rmcp 2.2.0 → 3.6.0, exact-pinned to the embedding app's copy;
   the MCP revision does not move with it (below).
 - **`fresh_logins` / `idle_reuses` are labelled as pool-wide** — the log lines
   that carry them now name them `pool_fresh_logins` and `pool_idle_reuses`,
