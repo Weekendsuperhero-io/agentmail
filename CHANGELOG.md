@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-08-04T00:00
+updated: 2026-10-14T00:00
 ---
 # Changelog
 
@@ -13,11 +13,246 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP tasks, as the SEP-2663 extension** (`io.modelcontextprotocol/tasks`,
+  offered on both revisions) — a call to one of 22 long-running tools (the
+  scans, bulk moves and deletes, unsubscribing, downloads and thread exports)
+  from a client that declared the extension becomes a task when it is still
+  running after 2 seconds: the client gets a task handle at once and polls
+  `tasks/get`. Quick calls, and every call from a client that did not declare
+  the extension, are answered inline as before. Up to 32 tasks run at once and
+  1,024 are held, past which a slow call simply stays a request; a task lives
+  4 hours. `tasks/cancel` stops the operation at its next check, never
+  mid-write: a task that saw the cancellation is `cancelled`, one that finished
+  first is `completed`, and a tool that panics is `failed`. Progress becomes
+  the task's status message, and `tasks/get` carries the numbers under
+  `_meta["io.agentmuse/progress"]`. Each operation runs on the connection's own
+  token, never its request's, which rmcp cancels as it answers the request.
+  Closing the connection stops its tasks: each is asked to stop, and one
+  still running after 5 seconds is detached to finish the chunk it is in and
+  stop at its next check, never aborted mid-write. A task that outlives its
+  4-hour TTL is aborted, with its operation's token cancelled first.
+- **Sender identity** — `display_name` in an account's config makes drafts
+  `From: Mark Blake <you@example.com>`. `create_draft` and `update_draft` take an
+  optional `from` (`Name <address>` or an address) that must be one of the
+  account's identities — the primary address, then its aliases — and refuse any
+  other address with the list of usable ones. Both results report the `from`
+  actually written. The CLI gains `create-draft --from`, and `configure` asks
+  for "Your name (shown on drafts)". `AccountConfig::identities()`,
+  `with_display_name` and `validate_display_name` are public.
+- **`list_identities` tool** (36 tools) — an account's configured identities
+  plus the From addresses among its newest Sent messages (default 200, max
+  1000; `EXAMINE` + `BODY.PEEK`), each with a count, the display names used and
+  when it was last used. Evidence only: a discovered address is not sendable
+  until it is added as an alias. `list_accounts` now carries each account's
+  `displayName` and `addresses`.
+- **`ListIdentitiesResponse` and `SenderIdentity` implement `Deserialize`**, so
+  an embedder can read the `list_identities` tool's structured result back into
+  the library type (the wire output is asserted to round-trip). Agent Muse's
+  Mail Accounts settings use it to offer the Sent addresses as aliases.
+- **Every recipient field documents `Name <address>`** — `to`, `cc`, `bcc` and
+  `replyTo` on both draft tools, and the handshake instructions — so agents keep
+  the names users write instead of stripping them to bare addresses.
+- **A stuck move can be dismissed** — `reconcile_moves` with `dismiss: true`
+  and an `operationId` (CLI `reconcile-moves --dismiss`, library
+  `Agentmail::dismiss_move`) closes a move reconciliation can't finish, once
+  both mailboxes have been checked. It moves, copies and deletes nothing; it
+  releases the source message and frees both mailboxes for rename and delete.
+  Results gain `dismissed` and `errors`.
 - **Evidence-grade RFC822 archive tools** — `download_message_source` writes one
   exact `BODY.PEEK[]` result directly to a create-new private file, returning
   its SHA-256, parsed message metadata, and a contemporaneous DNS-backed local
   DKIM result. `download_thread` applies the same contract to a caller-selected
   set of up to 100 UIDs and creates a JSON manifest.
+
+### Changed
+
+- **MCP 2026-07-28 alongside 2025-11-25, version 0.9.0** — a 2026-07-28
+  client runs that revision's stateless lifecycle: `server/discover` answers
+  with every revision this server implements (the same list a `-32022`
+  carries), every request
+  carries its own version, identity and capabilities in `_meta`, and results
+  carry `resultType` and cache hints. A 2025-era client still opens with
+  `initialize`, answered in 2025-11-25 exactly as before, and a client asking
+  `initialize` for 2026-07-28 is answered in 2025-11-25 too. `server/discover`
+  at a 2025 version is method-not-found, so no client runs the stateless
+  lifecycle at a revision that defines none, and a revision newer than
+  2026-07-28 is refused `-32022` with the list. The ceiling is named
+  (`MAX_PROTOCOL_VERSION`), never rmcp's `LATEST`, so a newer SDK cannot move
+  the protocol on its own.
+- **A mutation queued behind another on its account stops waiting when
+  cancelled.** The ten mutations that take a `CancelFn` (the bulk moves and
+  deletes, `delete_messages`, `reconcile_moves`, `unsubscribe_message`) leave
+  the per-account queue with `Cancelled` as soon as it fires, instead of when
+  the run ahead of them ends.
+- **IMAP's TLS is rustls, with the OS checking certificates.** `native-tls`
+  and `tokio-native-tls` are gone; connections use `tokio-rustls` on aws-lc-rs,
+  and `rustls-platform-verifier` hands the certificate check to the OS
+  (Security.framework, CryptoAPI, the system store on Linux), so roots a person
+  or their MDM installed still count. On macOS IMAP now negotiates TLS 1.3:
+  native-tls ran Secure Transport there, which never offered it. A server whose
+  TLS 1.2 offers only non-forward-secret (RSA key exchange) or CBC suites no
+  longer connects; Linux no longer links OpenSSL. **Breaking:**
+  `AgentmailError::Tls` carries the handshake's `std::io::Error` instead of a
+  `native_tls::Error`, and is no longer a `From` conversion.
+  `imap_client::tls_client_config()` is public.
+- **Rust 1.99 or newer** (`rust-version`).
+- **Linux's credential store talks D-Bus in Rust.** `zbus-secret-service-keyring-store`
+  (zbus, its own async-io executor, pure-Rust crypto) replaces
+  `dbus-secret-service-keyring-store`, which linked the C libdbus. It is the
+  same store over a different transport: the same Secret Service attributes
+  (`service`, `username`, `target`), so passwords saved before are found.
+  Building on Linux no longer needs `libdbus-1-dev` or `pkg-config`; CI,
+  release, security and nightly-stress no longer install them.
+- **Replies are From the address the original reached** — the original's own
+  `From` for a follow-up to this account's mail, else the first identity in its
+  `To`, then `Cc`. `update_draft` keeps the draft's current `From` (name
+  included) when it is one of the account's identities instead of overwriting
+  it with the primary address.
+- **Replies go to every Reply-To address.** `MessageInfo.reply_to` is now
+  `Vec<String>` (JSON `replyTo` is an array), where only the first address was
+  kept before.
+- **Breaking library API (0.7.0)** — `create_draft_with_headers`,
+  `create_reply_draft` and `update_draft` take `from: Option<&str>`;
+  `CreateDraftResponse`/`UpdateDraftResponse` gain `from`; `AccountConfig`
+  gains `display_name`; `AccountInfo` gains `display_name` and `addresses`.
+- **A distinct login is never a sending identity** unless listed in `aliases`;
+  an alias equal to the login is now kept rather than normalized away.
+- **`AGENTMAIL_CACHE_DIR` holds both caches directly** —
+  `<dir>/header-cache-v1.sqlite3` beside `<dir>/mutation-journal.sqlite3`, the
+  layout the builder's `cache_dir(dir)` already used. The header cache used to
+  sit one level deeper (`<dir>/agentmail/`); that copy is no longer read and
+  rebuilds on its own.
+- **`SecretError` gains `NoEntry` and `KeyringTimedOut`** (breaking for
+  exhaustive matches): a missing keychain entry was `Backend(..)`.
+- **`list_flags` and `find_attachments` report `skipped`** (with
+  `skippedTotal`/`skippedTruncated`, as the sweeps do): the mailboxes an
+  account-wide scan did not cover. A mailbox it could not open used to vanish
+  from the result without a trace.
+- **`reconcile_moves` examines `needsAttention` moves again** and deletes a
+  source only right after seeing its copy (the `COPYUID`) in the destination; a
+  copy deleted in the meantime keeps the source and asks for review. An attempt
+  that learns nothing counts as `pending` and is listed in `errors`, so `failed`
+  now means only a COPY the server rejected.
+- **The tool router is built once per process**, not on every `call_tool`,
+  `list_tools` and `get_tool`.
+- **Dependencies** — async-imap 0.11.3 → 0.12.0 (LOGIN no longer fails on a
+  `NO` for another tag; unicode banners parse) with the vendored imap-proto
+  rebased onto 0.17.0 (nom 8) and its UIDFETCH patch re-applied; mail-auth
+  0.12.1 → 0.13.3; dirs 6 → 7; semver-compatible updates across the lockfile.
+  rusqlite stays at 0.39 (the embedding app's sqlx-sqlite caps libsqlite3-sys
+  below 0.38). rmcp 2.2.0 → 3.6.0, exact-pinned to the embedding app's copy;
+  the MCP revision does not move with it (below).
+- **`fresh_logins` / `idle_reuses` are labelled as pool-wide** — the log lines
+  that carry them now name them `pool_fresh_logins` and `pool_idle_reuses`,
+  and `ConnectionStats` documents that the counts cover every account since the
+  pool was created. Printed beside one `account`, they read as that account's
+  own counts; a server that is rebuilt (the embedding app does so when mail
+  accounts change) starts them from zero.
+
+### Removed
+
+- **MCP tasks (SEP-1686), version 0.8.0** — the server no longer advertises
+  `capabilities.tasks`, no tool declares `execution.taskSupport` (22 did), and
+  `tasks/list`, `tasks/get`, `tasks/result` and `tasks/cancel` are gone, with
+  the per-account serialization of destructive tasks and the
+  `notifications/tasks/status` push. Agent Muse, which embeds this server,
+  measured the task surface unused (no task-augmented call, no `tasks/*`
+  request in two weeks of traffic), and every rmcp 3.x release removes the
+  MCP 2025-11-25 task model. A task-augmented `tools/call` runs as a plain
+  call, the spec's rule for a server without the capability. Long operations still report `notifications/progress` and
+  honour `notifications/cancelled`. Tasks returned in 0.9.0 as the SEP-2663
+  extension (see Added). A breaking change, hence the minor version bump.
+- **The `io.modelcontextprotocol/related-task` marker** on progress
+  notifications and task results went with them.
+
+
+### Fixed
+
+- **Dead pooled sessions passed their liveness check.** async-imap's `NOOP`
+  treats end-of-stream as success, and on macOS a reset connection reads as
+  end-of-stream, so after sleep or a server `BYE` the pool handed out dead
+  sessions and drafts reported a false "APPEND outcome is ambiguous". `NOOP` now
+  passes only on its own tagged `OK`.
+- **One dropped connection could strand a COPY-fallback move for good.** Any
+  failure opening the source mailbox during reconciliation — a lost connection
+  included — parked the move as `needsAttention`, which reconciliation then
+  returned unexamined, and a pending move blocks rename and delete of both its
+  mailboxes. Now only a live server's answer (a new `UIDVALIDITY`,
+  `NO [NONEXISTENT]`) parks a move; anything else leaves it as it was.
+- **A connection lost right after SELECT could mark a move complete** while
+  the source survived, releasing its claim: async-imap reads end-of-stream as
+  an empty SEARCH. The check now needs the search's own tagged `OK`, and on a
+  Yahoo/AOL Limited Mode session "not found" proves nothing.
+- **A dropped connection made account-wide scans and sweeps report mailboxes
+  they never read.** On a closed stream SELECT, EXAMINE, SEARCH and FETCH come
+  back empty instead of failing, so every remaining mailbox "drained" or
+  counted as empty, the dead session went back to the pool, and a hung one
+  waited out the timeout (120 s in the app) once per remaining mailbox. A
+  mailbox now counts only once the connection answers a checked `NOOP` after
+  it; a lost connection ends the scan or sweep at once and lists that mailbox
+  and every later one in `skipped`. A single-mailbox `list_flags` or
+  `find_attachments`, and `preview_thread_record`, fail instead of returning a
+  partial answer.
+- **A connection lost after a mutation could report it failed, or pool a dead
+  session.** The NOOP that follows a CREATE, delete, move, flag change or
+  superseded-draft cleanup was async-imap's unchecked one and was `?`-ed: a
+  server that dropped the client after answering turned a finished delete into
+  an error, and a closed stream passed and went back to the pool. That NOOP is
+  now checked and decides only whether the session is pooled; the mutation's
+  own answer stands.
+- **A connection lost mid-LIST cached a short mailbox list**, and account-wide
+  scans then silently skipped the mailboxes it left out. LIST now counts only
+  once the connection answers a checked `NOOP` after it.
+- **A connection lost mid-read passed for an empty or short answer.**
+  `search_messages`, `get_messages`, `list_identities`, `list_mailboxes` and
+  the other retried reads now probe the connection after reading, so a dead
+  socket triggers their one retry on a fresh connection instead of returning
+  what little arrived. A message is reported missing — and pruned from the
+  ranking cache, which the subscription move, unsubscribe and ranking samples
+  do — only when a live server leaves it out. `update_flags` reads its result
+  back for the message it changed, not another client's concurrent update.
+- **Pool and catalog timers stopped while the Mac slept.** Idle eviction, the
+  `[LIMIT]` login cooldown and the mailbox-catalog TTL now run on the wall
+  clock; a clock set back counts as expired.
+- **Replying to a sender with a comma or `@` in their name failed.** Display
+  names holding RFC 5322 specials are quoted (`"Blake, Mark" <m@x>`), and an
+  agent-written `Blake, Mark <m@x>` is accepted as one mailbox — while
+  `Bob <b@y>, Alice <a@x>` is still refused rather than losing Bob.
+- **A draft for an account with no email address** failed as "Invalid email
+  address 'johnappleseed'"; it now says to set `email`.
+- **`download_attachments` returned the bare filename as `path`**; it is now the
+  absolute, canonical path, as `download_message_source` returns.
+- **An expired task's status watcher waited forever** — the TTL prune aborted
+  the worker without publishing a result. Expiry now publishes a cancelled one.
+- **The UID Mode walk could loop forever** on a server that ignores the UID
+  range, re-fetching the same page until cancelled. A page that does not move
+  the range down is now refused.
+- **Unsolicited FETCH responses** — another client changing flags while a
+  fetch runs — failed `get_messages` ("message UID 0") and could add empty or
+  duplicate rows to the ranking projection. Only the requested UIDs, each with
+  its fetched section, are kept.
+- **The keepalive could open a second connection** on one-connection
+  providers (Yahoo/AOL): it took idle sessions out of the pool without a
+  connection permit, so an acquire during the ping LOGINed anew. It now pings
+  under a permit and skips accounts whose connections are all busy.
+- **A locked keychain** could stall every connect for the account (the read
+  had no deadline and runs under the connect lock), and without a configured
+  `password` it was reported as "No password found". Keychain calls now give
+  up after 30 s with a reason, and only a genuinely absent entry reads as
+  missing.
+- **Attachments named past a filesystem's 255-byte limit could not be
+  downloaded** ("File name too long"). The canonical `{uid}_{index}_{name}` is
+  now shortened to 240 bytes, its extension kept and never split mid-character,
+  and `/info` advertises exactly that name.
+- **A `download_attachments` failure partway left files behind**, unreported.
+  The download is now all or nothing: every name is checked before writing,
+  and a failure removes what was already written.
+- **`configure` wrote Rust escapes into TOML** (`\u{301}` for a decomposed
+  accent), producing a config file that failed to parse; every string is now
+  written by the TOML serializer.
+- **README claimed `~/.config/agentmail/config.toml` works on macOS**; only
+  `~/Library/Application Support/agentmail/config.toml` (or
+  `AGENTMAIL_CONFIG`) is read.
 
 ### Security
 

@@ -1,12 +1,12 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-08-23T00:00
+updated: 2026-10-14T00:00
 ---
 # agentmail
 
 IMAP email client exposed as both a CLI and an MCP (Model Context Protocol) server, built with Rust.
 
-MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK)
+MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK)
 
 One binary: `agentmail serve` starts the MCP stdio server, all other subcommands are a direct CLI.
 
@@ -17,7 +17,7 @@ during protocol design and review.
 
 ## Requirements
 
-- Rust 1.94 or newer (edition 2024)
+- Rust 1.99 or newer (edition 2024)
 - An IMAP-enabled email account on a server that advertises IMAP4rev1 (Gmail, iCloud, Yahoo, Fastmail, self-hosted, etc.). Dual rev1/rev2 servers are used in rev1 mode; pure IMAP4rev2 support is not yet available.
 
 ## Build
@@ -30,14 +30,18 @@ Output binary: `target/release/agentmail`
 
 ## Configuration
 
-agentmail reads its config from a single TOML file:
+agentmail reads its config from a single TOML file, at the platform's config
+directory unless `AGENTMAIL_CONFIG` names another path:
 
-| Location | Path                                                        |
+| Platform | Default path                                                |
 | -------- | ----------------------------------------------------------- |
-| Default  | `~/.config/agentmail/config.toml`                           |
-| Override | Set the `AGENTMAIL_CONFIG` environment variable to any path |
+| macOS    | `~/Library/Application Support/agentmail/config.toml`       |
+| Linux    | `$XDG_CONFIG_HOME/agentmail/config.toml` (`~/.config/…`)    |
+| Windows  | `%APPDATA%\agentmail\config.toml`                           |
+| Any      | Set the `AGENTMAIL_CONFIG` environment variable to any path |
 
-On macOS the default expands to `~/Library/Application Support/agentmail/config.toml` if `dirs::config_dir()` returns `Library/Application Support`, but `~/.config/agentmail/config.toml` is more conventional and works fine — just pick one.
+On macOS, `~/.config/agentmail/config.toml` is NOT read. To keep the file there,
+point `AGENTMAIL_CONFIG` at it.
 
 ### Quick start
 
@@ -79,6 +83,7 @@ host = "imap.mail.me.com"
 username = "johnappleseed"
 email = "john@example.com"
 aliases = ["john@icloud.com", "john@me.com"]
+display_name = "John Appleseed"
 password.cmd = "security find-internet-password -s imap.mail.me.com -a johnappleseed -w"
 
 [accounts.work]
@@ -96,8 +101,9 @@ All accounts are available simultaneously — the MCP tools and CLI commands acc
 | `host`            | string | **required** | Non-empty IMAP hostname or IP address               |
 | `port`            | u16    | `993`        | IMAP port; must be non-zero                         |
 | `username`        | string | **required** | Non-empty login username / email                    |
-| `email`           | string | —            | Primary mailbox address when it differs from the login |
-| `aliases`         | string[] | `[]`       | Additional own addresses, canonicalized and deduplicated |
+| `email`           | string | —            | Primary mailbox address when it differs from the login; a draft's default `From` |
+| `aliases`         | string[] | `[]`       | Other addresses this account sends as, canonicalized and deduplicated |
+| `display_name`    | string | —            | Sender name on drafts: `Mark Blake <you@example.com>`. No control characters, at most 256 characters |
 | `password`        | Secret | —            | Password source (see [Passwords](#passwords) below) |
 | `tls`             | bool   | `true`       | TLS is mandatory; `false` is rejected               |
 | `max_connections` | usize  | provider-specific | `1..=32`; defaults to 1 for Yahoo/AOL and 3 otherwise |
@@ -109,6 +115,30 @@ and unsafe transport or connection-pool values fail fast. `email`, aliases, and
 email-shaped login usernames are canonicalized for own-address comparisons;
 opaque IMAP login names remain valid. Set `email` for providers such as iCloud
 when the login name is not an address, and list any delivery aliases separately.
+
+### Sender identity
+
+A draft is `From` one of the account's **identities**: the primary address
+(`email`, or an email-shaped `username` when `email` is unset), then each alias.
+`display_name` is the name shown with it, so `display_name = "Mark Blake"` makes
+drafts `From: Mark Blake <you@example.com>`.
+
+- **Default:** the primary address, under `display_name`.
+- **`from`:** `create_draft` and `update_draft` (and the CLI's `create-draft
+  --from`) take `Name <address>` or a bare address. The address must be one of
+  the identities; anything else is refused with the list of them. Add an
+  address as an alias to send as it.
+- **Replies** are `From` the identity the original involved: its own `From` for
+  a follow-up to your own mail, else the first identity in its `To`, then `Cc`.
+- **`update_draft`** keeps the draft's current `From` — name included — when it
+  is one of the identities, so a sender chosen in another mail client survives.
+- An account with no identity at all (an opaque login and no `email`) cannot
+  create drafts until `email` is set.
+
+A distinct email-shaped login is used to recognize your own mail but is never a
+sending identity unless you list it in `aliases`. `list_accounts` reports each
+account's identities; `list_identities` adds the addresses its recent Sent mail
+actually went out from.
 
 Trash and drafts mailboxes are auto-detected at runtime via RFC 6154 special-use attributes (`\Trash`, `\Drafts`), with string-matching fallback for servers that don't support RFC 6154.
 
@@ -362,8 +392,10 @@ agentmail download-attachments --account gmail --mailbox INBOX --uid 123 --expec
 agentmail list-flags --account gmail
 agentmail add-flags --account gmail --mailbox INBOX --uid 123 --expected-uid-validity 3857529045 --flags "\\Seen" --color red
 agentmail create-draft --account gmail --subject "Hello" --body "Hi there" --to user@example.com
+agentmail create-draft --account gmail --from "Mark Blake <sales@example.com>" --subject "Hello" --body "Hi" --to user@example.com
 agentmail list-pending-moves --account gmail
 agentmail reconcile-moves --account gmail --operation-id <operation-id>
+agentmail reconcile-moves --account gmail --operation-id <operation-id> --dismiss
 ```
 
 Full subcommand list: `agentmail --help`
@@ -405,18 +437,20 @@ To pass passwords via environment variables instead of keychain:
 npx @modelcontextprotocol/inspector /path/to/agentmail serve
 ```
 
-Opens a web UI to exercise all advertised tools, 6 prompts, and task calls interactively.
+Opens a web UI to exercise all advertised tools and 6 prompts interactively.
 
 ## MCP Tools
 
-37 tools cover account discovery, mailbox management, message reading, search,
-bulk operations, recovery, evidence archiving, flag management, and composition. AgentMail saves drafts but never sends mail. 22 long-running tools support
-optional [task-based invocation](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/tasks)
-(SEP-1686) for asynchronous execution.
+36 tools cover account discovery, mailbox management, message reading, search,
+bulk operations, recovery, evidence archiving, flag management, and composition. AgentMail saves drafts but never sends mail. Long-running tools
+report progress notifications, and for a client that declared the MCP tasks
+extension (SEP-2663) a slow call becomes a task it polls; see
+[MCP.md](MCP.md#tasks-sep-2663).
 
 | Tool                   | Description                                                                           |
 | ---------------------- | ------------------------------------------------------------------------------------- |
-| `list_accounts`        | Return configured account names (use this first)                                      |
+| `list_accounts`        | Return configured account names, the default, and each account's sending addresses    |
+| `list_identities`      | An account's sending addresses: configured ones plus those its recent Sent mail used  |
 | `list_mailboxes`       | Paginate selectable mailboxes with counts and registered special-use roles             |
 | `create_mailbox`       | Create a new mailbox (folder) on the server                                           |
 | `rename_mailbox`       | Preview, then confirm a guarded mailbox rename                                        |
@@ -454,9 +488,10 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 
 ### Key parameters
 
-- `account` is **required** for most tools, including `list_mailboxes`. Use
-  `list_accounts` to discover valid names. MCP account discovery returns names
-  and default status, not IMAP hosts or usernames.
+- `account` is **required** for most tools, including `list_mailboxes`. The
+  configured names are in every `account` argument's schema. `list_accounts`
+  returns names, default status, the display name and the addresses each
+  account sends as — never IMAP hosts or login usernames.
 - `mailbox` is required for single-mailbox readers and every UID consumer. It
   may be omitted only on account-wide tools such as `top_*`, `list_flags`, and
   `find_attachments`. Discovery uses one selectable server-declared `\All`
@@ -487,8 +522,7 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   `senders` preview nested inside one `top_mailing_lists` row, whose
   `senderCount` still reports the complete count.
 - All reads use `BODY.PEEK` to avoid marking messages as `\Seen`.
-- Tools marked taskable in [MCP.md](MCP.md) support MCP progress notifications
-  and optional task-based invocation.
+- Long-running tools support MCP progress notifications.
 - Cancelling a request (`notifications/cancelled`) stops long scans at the next mailbox/fetch chunk and polls DNS, DKIM, and HTTP work every 25 ms. An HTTP cancellation cannot retract a POST already received by the remote server, so it never reports that an in-flight request was definitely unsent.
 - Delete tools take a `permanent` flag (default false): false moves to Trash when available, true expunges directly (bypassing Trash, irreversible; requires server UIDPLUS).
 - The `top_*` tools share a persistent, live-validated UID/header cache. Each invocation uses `EXAMINE` before reuse. An unchanged `UIDVALIDITY`/`UIDNEXT`/message-count tuple is a hit; a proven append fetches only new UIDs; deletions and mixed changes reconcile UID membership while reusing unchanged header rows. A changed or missing `UIDVALIDITY` prevents unsafe UID reuse. If discovery enumerates folders, results dedupe by Message-ID and exclude your own configured email and aliases.
@@ -531,8 +565,8 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
   client IP, HELO, and envelope-sender inputs that are not present in an RFC822
   archive.
 - Embedded AgentMail accepts the workspace root only as trusted request
-  metadata from Agent Muse (`io.agentmuse/workspaceRoot`) on direct and
-  task-augmented calls. Missing or invalid metadata fails closed. Standalone
+  metadata from Agent Muse (`io.agentmuse/workspaceRoot`) on every call.
+  Missing or invalid metadata fails closed. Standalone
   `agentmail serve` instead uses `AGENTMAIL_FILE_ROOT` (falling back to
   `~/.agentmail/files`). Caller-supplied output directories are confined below
   that root; a process-wide environment variable is never used for embedded
@@ -555,7 +589,9 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - Non-ASCII `search_messages` text is sent with `CHARSET UTF-8`. Drafts include
   `Date`, `Message-ID`, and Apple Mail draft markers. Bcc is retained in the
   saved draft, Reply-To is supported, and reply drafts use RFC
-  `In-Reply-To`/`References` headers. Draft bodies are Markdown and ship as
+  `In-Reply-To`/`References` headers. A draft is `From` one of the account's
+  identities (see [Sender identity](#sender-identity)); `from` picks another,
+  and the result reports the sender written. Draft bodies are Markdown and ship as
   `multipart/alternative` — the source verbatim as `text/plain` plus an HTML
   rendering — so formatting arrives rendered rather than as literal syntax;
   raw HTML in a body is escaped, never rendered, and `plainTextOnly: true`
@@ -569,15 +605,18 @@ optional [task-based invocation](https://modelcontextprotocol.io/specification/2
 - Tool calls return one compact text summary for compatibility plus one
   authoritative `structuredContent` object. The full JSON value is not repeated
   in the text content block.
-- Destructive tasks targeting the same account are automatically serialized to prevent IMAP state conflicts. Tasks are capped at 128 live entries, retained for 24 hours from creation, listed newest-first in opaque-cursor pages of 25, and may have their terminal result retrieved repeatedly until expiry.
 
 ### Ranking cache privacy and configuration
 
 The ranking cache defaults to
-`dirs::cache_dir()/agentmail/header-cache-v1.sqlite3`. Set
-`AGENTMAIL_CACHE_DIR` to override the cache root, or set
-`AGENTMAIL_DISABLE_HEADER_CACHE=1` (`true` and `yes` also work) to use live scans
-only. SQLite failures automatically fall back to live IMAP behavior.
+`dirs::cache_dir()/agentmail/header-cache-v1.sqlite3`. Set `AGENTMAIL_CACHE_DIR`
+to keep it and the recovery journal directly in another directory —
+`<dir>/header-cache-v1.sqlite3` and `<dir>/mutation-journal.sqlite3`, the same
+layout as the builder's `cache_dir(dir)` (before 0.7 the header cache went one
+level deeper, in `<dir>/agentmail/`; that copy is no longer read, rebuilds on its
+own, and can be deleted). Set `AGENTMAIL_DISABLE_HEADER_CACHE=1` (`true` and
+`yes` also work) to use live scans only. SQLite failures automatically fall back
+to live IMAP behavior.
 
 Embedding applications configure the same knobs programmatically — explicit
 builder settings override the environment variables:
@@ -648,13 +687,20 @@ with:
 agentmail list-pending-moves --account gmail
 agentmail reconcile-moves --account gmail --operation-id <operation-id>
 # Omit --operation-id to reconcile every pending operation for the account.
+agentmail reconcile-moves --account gmail --operation-id <operation-id> --dismiss
+# Closes one move reconciliation can't finish. Check both mailboxes first:
+# dismissing moves, copies and deletes nothing.
 ```
 
-The recovery database lives beside the ranking cache (or under
-`AGENTMAIL_CACHE_DIR`), uses `synchronous=FULL`, and has owner-only permissions
+The recovery database lives beside the ranking cache (both directly in
+`AGENTMAIL_CACHE_DIR` when it is set), uses `synchronous=FULL`, and has owner-only permissions
 on Unix. It remains enabled when header-cache persistence is disabled because
 mutation intent is not disposable. Reconciliation repeats COPY only when
-unchanged destination `UIDNEXT` proves the ambiguous attempt created nothing.
+unchanged destination `UIDNEXT` proves the ambiguous attempt created nothing,
+deletes a source only right after seeing its copy in the destination, and
+changes nothing on an attempt that loses its connection. `needsAttention`
+moves are examined again each time. A pending move holds its source and
+destination against rename and delete until it finishes or is dismissed.
 
 ## MCP Prompts
 
@@ -724,7 +770,7 @@ Argument autocompletion (`completion/complete`) is supported for the prompts and
 ```
 agentmail (binary crate: agentmail-mcp)
   ├── serve                → MCP stdio server (tokio + rmcp)
-  │                          37 tools + 6 prompts, tasks, progress notifications
+  │                          36 tools + 6 prompts, progress notifications
   ├── list-accounts        → CLI
   ├── list-mailboxes       → CLI
   ├── create-mailbox       → CLI
@@ -748,7 +794,7 @@ agentmail (binary crate: agentmail-mcp)
 src/ (library + binary)
   ├── lib.rs          → Public API facade (25+ async methods)
   ├── main.rs         → CLI dispatch (clap), account configuration
-  ├── mcp/            → MCP server: 37 tools, 6 prompts, tasks, resources, completions
+  ├── mcp/            → MCP server: 36 tools, 6 prompts, resources, completions
   ├── config.rs       → TOML config loading, default account resolution
   ├── credentials.rs  → Password resolution (env → config secret → default keyring)
   ├── connection.rs   → IMAP connection pool (provider-aware per-account cap)

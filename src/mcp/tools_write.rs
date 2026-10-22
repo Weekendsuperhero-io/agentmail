@@ -18,7 +18,7 @@ use crate::{
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Meta},
+    model::{CallToolResult, RequestMetaObject},
     tool, tool_router,
 };
 use tokio::io::AsyncReadExt as _;
@@ -456,7 +456,7 @@ fn body_format(plain_text_only: bool) -> crate::draft::BodyFormat {
 /// only attaching to one is.
 async fn load_draft_attachments(
     server: &AgentMailServer,
-    meta: &Meta,
+    meta: &RequestMetaObject,
     attachments: &[DraftAttachmentArg],
 ) -> Result<Vec<DraftAttachment>, McpError> {
     if attachments.is_empty() {
@@ -594,7 +594,7 @@ async fn load_draft_attachments(
 impl AgentMailServer {
     #[tool(
         name = "create_mailbox",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<CreateMailboxOutput>().expect("valid create_mailbox output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CreateMailboxOutput>(),
         description = "Create a mailbox on the IMAP server. For a nested mailbox, use the hierarchy delimiter reported by list_mailboxes (commonly '/').",
         annotations(
             title = "Create Mailbox",
@@ -622,7 +622,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "rename_mailbox",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<RenameMailboxOutput>().expect("valid rename_mailbox output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<RenameMailboxOutput>(),
         description = "Preview or confirm a guarded mailbox rename. The first call returns live message count, special-use roles, descendants, and exact confirmations. The confirmed call requires expectedMessageCount from that preview, refuses INBOX and pending MOVE journals, and re-lists after an ambiguous transport outcome.",
         annotations(
             title = "Rename Mailbox",
@@ -661,7 +661,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "delete_mailbox",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteMailboxOutput>().expect("valid delete_mailbox output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteMailboxOutput>(),
         description = "Preview or confirm guarded mailbox deletion. The first call returns live message count, special-use roles, descendants, and required confirmations. A confirmed delete requires the exact preview count plus separate acknowledgements for non-empty, special-use, or descendant-bearing mailboxes. INBOX and mailboxes referenced by pending MOVE journals are always blocked; an already-missing mailbox is an idempotent success.",
         annotations(
             title = "Delete Mailbox",
@@ -697,18 +697,17 @@ impl AgentMailServer {
 
     #[tool(
         name = "delete_messages",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteMessagesOutput>().expect("valid delete_messages output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteMessagesOutput>(),
         description = "Delete one or more messages by UID. Requires expectedUidValidity from the same mailbox discovery response and fails before mutation if the UID epoch changed. Moves to Trash when available; otherwise permanent fallback follows the requested policy. Supports 1 to 500 non-zero UIDs per call.",
         annotations(
             title = "Delete Messages",
             destructive_hint = true,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn delete_messages_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteMessagesArgs>,
@@ -752,14 +751,13 @@ impl AgentMailServer {
 
     #[tool(
         name = "delete_by_sender",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteBySenderOutput>().expect("valid delete_by_sender output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteBySenderOutput>(),
         description = "Delete all messages from an exact sender identity. Pass the address and displayName exactly as returned by a top_senders row; matching is exact on both fields, confirmed live before any deletion. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views. Do not use this for mailing-list cleanup (use delete_list_id or unsubscribe_message cleanup).",
-        annotations(title = "Delete by Sender", destructive_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Delete by Sender", destructive_hint = true)
     )]
     async fn delete_by_sender_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteBySenderArgs>,
@@ -791,18 +789,17 @@ impl AgentMailServer {
 
     #[tool(
         name = "delete_by_domain",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteByDomainOutput>().expect("valid delete_by_domain output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteByDomainOutput>(),
         description = "Delete every message whose first parsed Header From address has one exact canonical domain. Pass domain exactly as returned by top_domains: example.com never includes mail.example.com or any other subdomain. Omit mailbox to sweep the account-wide mutation plan, which excludes Trash/Junk/Drafts and aggregate views. With permanent=false, Trash is preferred but permanent fallback may be used when Trash is unavailable; permanent=true bypasses Trash. Header From matching is organizational cleanup, not DKIM authentication.",
         annotations(
             title = "Delete by Exact Domain",
             destructive_hint = true,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn delete_by_domain_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteByDomainArgs>,
@@ -833,19 +830,18 @@ impl AgentMailServer {
 
     #[tool(
         name = "download_attachments",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadAttachmentsOutput>().expect("valid download_attachments output schema"),
-        description = "Download all attachments from one message to disk. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Each file is saved as {uid}_{index}_{name} with the name sanitized — the same canonical filename /info reports for that part. Omit outputDir to write into the session workspace. Returns paths, content types, and sizes.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadAttachmentsOutput>(),
+        description = "Download all attachments from one message to disk. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Each file is saved as {uid}_{index}_{name} with the name sanitized (and shortened, extension kept, when it is too long for a filesystem) — the same canonical filename /info reports for that part. Omit outputDir to write into the session workspace. Returns absolute paths, content types, and sizes. All or nothing: a name that already exists is refused before anything is written, and a failure partway removes the files already written.",
         annotations(
             title = "Download Attachments",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn download_attachments_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         Parameters(args): Parameters<DownloadAttachmentsArgs>,
     ) -> Result<CallToolResult, McpError> {
         if args.mailbox.trim().is_empty() {
@@ -882,19 +878,18 @@ impl AgentMailServer {
 
     #[tool(
         name = "download_message_source",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadMessageSourceOutput>().expect("valid download_message_source output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadMessageSourceOutput>(),
         description = "Save one exact RFC822 message source directly from IMAP to disk without passing the bytes through model context. Requires mailbox, uid, and expectedUidValidity from one discovery result. Uses BODY.PEEK[] so the message is not marked read, refuses files above 64 MiB, confines outputDir to the active session workspace (standalone server: AGENTMAIL_FILE_ROOT), and never overwrites. Returns the absolute path, byte count, SHA-256, Message-ID/date/from/subject metadata, and a contemporaneous local DKIM verification against DNS. SPF is omitted because it cannot be independently recomputed from an archived RFC822 message without SMTP connection and envelope data.",
         annotations(
             title = "Download Message Source",
             read_only_hint = false,
             destructive_hint = false,
             open_world_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn download_message_source_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         ct: CancellationToken,
         Parameters(args): Parameters<DownloadMessageSourceArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -928,19 +923,18 @@ impl AgentMailServer {
 
     #[tool(
         name = "download_thread",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadThreadOutput>().expect("valid download_thread output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadThreadOutput>(),
         description = "Save a caller-supplied set of one to 100 exact RFC822 sources from the same mailbox UIDVALIDITY epoch directly to disk as {uid}.eml, then write a JSON evidence manifest. This tool does not discover thread membership; pass the UIDs selected by prior discovery. Bytes never pass through model context. Every source uses BODY.PEEK[], is capped at 64 MiB, receives SHA-256 plus parsed envelope metadata and local DNS-backed DKIM verification, and is created without overwrite inside the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). SPF is omitted because an archived message lacks the SMTP inputs required for independent verification. Returns the manifest path and its complete message entries.",
         annotations(
             title = "Download Message Thread",
             read_only_hint = false,
             destructive_hint = false,
             open_world_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn download_thread_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<DownloadThreadArgs>,
@@ -1050,7 +1044,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "export_thread_record",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::ThreadRecordExportResponse>().expect("valid export_thread_record output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::ThreadRecordExportResponse>(),
         description = "After preview_thread_record, export that exact confirmed selection into the active session workspace as a private bundle containing a styled, page-numbered PDF; one immutable RFC822 .eml source per selected storage identity; and a JSON integrity manifest. Re-discovers the graph and refuses selectionDigest drift, never overwrites, caps each source at 64 MiB and the bundle at 512 MiB, verifies DKIM against DNS, then reopens/parses/hash-checks every artifact before returning recorded=true and submittable=true. Those flags describe packet completeness, not legal admissibility. This tool never sends or mutates mail.",
         annotations(
             title = "Export Verified Thread Record",
@@ -1058,12 +1052,11 @@ impl AgentMailServer {
             destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn export_thread_record_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<ExportThreadRecordArgs>,
@@ -1100,8 +1093,8 @@ impl AgentMailServer {
 
     #[tool(
         name = "create_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>().expect("valid create_draft output schema"),
-        description = "Create and save a draft — a fresh message, or a reply to a live one. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Compose fresh by giving recipients: at least one of to, cc or bcc. Reply instead by giving replyToMessage {mailbox, uid, expectedUidValidity, mode} from a discovery result — that derives the recipients (Reply-To before From, excluding this account's own addresses and aliases), a Re: subject you may override, and the RFC In-Reply-To/References headers; to, cc, inReplyTo and references must then be omitted, and bcc is still never inferred. Subject and body are optional; attachments may reference local file paths. The body is read as Markdown and sent as multipart/alternative — the text exactly as written, plus an HTML rendering — so **bold**, lists, links and tables arrive formatted rather than as literal syntax. Raw HTML in the body is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part. Returns the new draft's uid and uidValidity when the server allows recovering them, and links the draft as a resource_link. A draft's UID is NOT durable — re-saving it (here, or in any other mail client) appends a new message and expunges the old one, and some servers discard an APPENDed draft outright. Re-read the link from a fresh get_messages rather than reusing one from an earlier turn. This tool never sends mail.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<CreateDraftOutput>(),
+        description = "Create and save a draft — a fresh message, or a reply to a live one. Resolves the account's selectable \\Drafts special-use mailbox, falls back to Drafts and creates it when needed, then APPENDs the message with the \\Draft flag. Compose fresh by giving recipients: at least one of to, cc or bcc. Reply instead by giving replyToMessage {mailbox, uid, expectedUidValidity, mode} from a discovery result — that derives the recipients (Reply-To before From, excluding this account's own addresses and aliases), a Re: subject you may override, and the RFC In-Reply-To/References headers; to, cc, inReplyTo and references must then be omitted, and bcc is still never inferred. Subject and body are optional; attachments may reference local file paths. The body is read as Markdown and sent as multipart/alternative — the text exactly as written, plus an HTML rendering — so **bold**, lists, links and tables arrive formatted rather than as literal syntax. Raw HTML in the body is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part. The draft is From the account's primary address under its display name; pass `from` (Name <address> or an address) to use another of the account's own addresses — list_accounts lists them, and any other address is refused. A reply is From the address the original was sent to unless `from` says otherwise. Returns the sender actually written as `from`, plus the new draft's uid and uidValidity when the server allows recovering them, and links the draft as a resource_link. A draft's UID is NOT durable — re-saving it (here, or in any other mail client) appends a new message and expunges the old one, and some servers discard an APPENDed draft outright. Re-read the link from a fresh get_messages rather than reusing one from an earlier turn. This tool never sends mail.",
         annotations(
             title = "Create Draft",
             read_only_hint = false,
@@ -1110,7 +1103,7 @@ impl AgentMailServer {
     )]
     async fn create_draft_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         Parameters(args): Parameters<CreateDraftArgs>,
     ) -> Result<CallToolResult, McpError> {
         let loaded = load_draft_attachments(self, &meta, &args.attachments).await?;
@@ -1143,6 +1136,7 @@ impl AgentMailServer {
                 .agentmail
                 .create_reply_draft(
                     &args.account,
+                    args.from.as_deref(),
                     source.mailbox.trim(),
                     source.uid,
                     source.expected_uid_validity,
@@ -1172,6 +1166,7 @@ impl AgentMailServer {
             .agentmail
             .create_draft_with_headers(
                 &args.account,
+                args.from.as_deref(),
                 args.subject.trim(),
                 &args.body,
                 &args.to,
@@ -1193,8 +1188,8 @@ impl AgentMailServer {
 
     #[tool(
         name = "update_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<UpdateDraftOutput>().expect("valid update_draft output schema"),
-        description = "Replace one live IMAP draft with a complete new draft specification. Requires mailbox, uid, and expectedUidValidity; verifies the target still has the \\Draft flag. Uses RFC 8508 REPLACE where the server has it and otherwise emulates it, so this succeeds on servers without REPLACE (Gmail and iCloud among them) — do not hand-roll create_draft + delete_messages. Returns the NEW uid and uidValidity: a replaced draft always has a new identity, so discard the old one. A `warning` field appears only if the superseded draft could not be removed. Attachments are a complete replacement list, and this tool never sends mail. The body is read as Markdown and sent as multipart/alternative (the text as written plus an HTML rendering); raw HTML in it is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<UpdateDraftOutput>(),
+        description = "Replace one live IMAP draft with a complete new draft specification. Requires mailbox, uid, and expectedUidValidity; verifies the target still has the \\Draft flag. Uses RFC 8508 REPLACE where the server has it and otherwise emulates it, so this succeeds on servers without REPLACE (Gmail and iCloud among them) — do not hand-roll create_draft + delete_messages. Returns the NEW uid and uidValidity: a replaced draft always has a new identity, so discard the old one. A `warning` field appears only if the superseded draft could not be removed. Attachments are a complete replacement list, and this tool never sends mail. The draft keeps its current sender when that is one of the account's addresses (so one chosen in another mail client survives); `from` replaces it with another of the account's own addresses, and the result's `from` is the sender written. The body is read as Markdown and sent as multipart/alternative (the text as written plus an HTML rendering); raw HTML in it is escaped, never rendered. Set plainTextOnly=true for a single unrendered text/plain part.",
         annotations(
             title = "Update Draft Atomically",
             read_only_hint = false,
@@ -1204,7 +1199,7 @@ impl AgentMailServer {
     )]
     async fn update_draft_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         Parameters(args): Parameters<UpdateDraftArgs>,
     ) -> Result<CallToolResult, McpError> {
         if args.mailbox.trim().is_empty() {
@@ -1221,6 +1216,7 @@ impl AgentMailServer {
             .agentmail
             .update_draft(
                 &args.account,
+                args.from.as_deref(),
                 args.mailbox.trim(),
                 args.uid,
                 args.expected_uid_validity,
@@ -1244,7 +1240,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "move_message",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveMessageOutput>().expect("valid move_message output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveMessageOutput>(),
         description = "Move one message between mailboxes. Requires source mailbox, destination, uid, and expectedUidValidity from the message's discovery response; the action fails before mutation if the source UID epoch changed. Success confirms source-to-destination completion but does not claim a destination UID.",
         annotations(
             title = "Move Message",
@@ -1281,18 +1277,17 @@ impl AgentMailServer {
 
     #[tool(
         name = "unsubscribe_message",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<UnsubscribeMessageOutput>().expect("valid unsubscribe_message output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<UnsubscribeMessageOutput>(),
         description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally delete matching messages account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. Omit cleanup to only unsubscribe. When cleanup is present it deletes by the DKIM-authenticated List-Id, or (identity \"listIdOrSender\", the default) falls back to exact sender email + List-Unsubscribe-Post + the target's List-Id when it has one; cleanup.when gates running after a failed attempt and cleanup.deletion controls Trash versus permanent disposal.",
         annotations(
             title = "Unsubscribe from Mailing List",
             destructive_hint = true,
             open_world_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn unsubscribe_message_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<UnsubscribeMessageArgs>,
@@ -1327,14 +1322,13 @@ impl AgentMailServer {
 
     #[tool(
         name = "delete_list_id",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteListIdOutput>().expect("valid delete_list_id output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteListIdOutput>(),
         description = "Delete all messages with a specific List-Id. Identifies the list by its exact List-Id value from top_mailing_lists and deletes matching messages regardless of sender. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views.",
-        annotations(title = "Delete Mailing List by List-Id", destructive_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Delete Mailing List by List-Id", destructive_hint = true)
     )]
     async fn delete_list_id_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<DeleteListIdArgs>,
@@ -1361,18 +1355,17 @@ impl AgentMailServer {
 
     #[tool(
         name = "move_list_id",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveListIdOutput>().expect("valid move_list_id output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveListIdOutput>(),
         description = "Move all messages with a specific List-Id to a destination mailbox in one operation — e.g. archive a newsletter or statement list without per-message calls. Identifies the list by its exact List-Id value from top_mailing_lists. The destination must already exist (create_mailbox first if needed). Omit mailbox to sweep selectable storage mailboxes account-wide; the destination itself is always excluded, and mutation planning excludes Trash/Junk/Drafts and aggregate views.",
         annotations(
             title = "Move Mailing List by List-Id",
             read_only_hint = false,
             destructive_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn move_list_id_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<MoveListIdArgs>,
@@ -1402,18 +1395,17 @@ impl AgentMailServer {
 
     #[tool(
         name = "move_by_sender",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveBySenderOutput>().expect("valid move_by_sender output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveBySenderOutput>(),
         description = "Move all messages from an exact sender identity to a destination mailbox in one operation — e.g. file monthly statements from a bank into a folder. Pass the address and displayName exactly as returned by a top_senders row; matching is exact on both fields, confirmed live before any move. The destination must already exist. Omit mailbox to sweep selectable storage mailboxes account-wide; the destination itself is always excluded.",
         annotations(
             title = "Move by Sender",
             read_only_hint = false,
             destructive_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn move_by_sender_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<MoveBySenderArgs>,
@@ -1447,19 +1439,18 @@ impl AgentMailServer {
 
     #[tool(
         name = "move_by_domain",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveByDomainOutput>().expect("valid move_by_domain output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveByDomainOutput>(),
         description = "Move every message whose first parsed Header From address has one exact canonical domain to an existing destination mailbox. Pass domain exactly as returned by top_domains: example.com never includes mail.example.com or any other subdomain. Omit mailbox to sweep selectable storage mailboxes account-wide; the destination itself is excluded. Header From matching is organizational cleanup, not DKIM authentication.",
         annotations(
             title = "Move by Exact Domain",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn move_by_domain_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<MoveByDomainArgs>,
@@ -1492,18 +1483,17 @@ impl AgentMailServer {
 
     #[tool(
         name = "move_subscription",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveSubscriptionOutput>().expect("valid move_subscription output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MoveSubscriptionOutput>(),
         description = "Move the exact bulk-mail subscription represented by one top_subscriptions row to an existing destination mailbox. Map the row's nested sample to mailbox, expectedUidValidity, and uid; the action re-fetches that sample live, derives its canonical sender email and single List-Id when present, then sweeps the account-wide mutation plan. Every moved message must have the exact sender plus List-Unsubscribe or List-Unsubscribe-Post, and must also have the same List-Id when the sample has one. The destination is excluded. This files mail only; it does not send an unsubscribe request.",
         annotations(
             title = "Move Top Subscription",
             read_only_hint = false,
             destructive_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn move_subscription_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<MoveSubscriptionArgs>,
@@ -1537,18 +1527,17 @@ impl AgentMailServer {
 
     #[tool(
         name = "reconcile_moves",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ReconcileMovesOutput>().expect("valid reconcile_moves output schema"),
-        description = "Safely reconcile durable non-native IMAP MOVE operations after a connection loss or ambiguous COPY/delete boundary. Pass one operationId from list_pending_moves, or omit it to process all pending operations for the account. The reconciler only removes a source message after it can prove the destination copy; ambiguous cases remain needsAttention instead of risking loss or duplicate deletion.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ReconcileMovesOutput>(),
+        description = "Safely reconcile durable non-native IMAP MOVE operations after a connection loss or ambiguous COPY/delete boundary. Pass one operationId from list_pending_moves, or omit it to process all pending operations for the account. A source message is removed only right after its destination copy has been seen, and COPY is retried only when the destination's UIDNEXT proves the first attempt created nothing; cases it can't prove stay needsAttention instead of risking loss or a duplicate. needsAttention operations are examined again on every call. An attempt that learns nothing (a dropped connection, a timeout) leaves its operation as it was and is listed in errors. To close a move that still can't finish, check both mailboxes, then pass its operationId with dismiss: true — that moves and deletes nothing.",
         annotations(
             title = "Reconcile Pending Moves",
             destructive_hint = true,
             idempotent_hint = true
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn reconcile_moves_tool(
         &self,
-        meta: Meta,
+        meta: RequestMetaObject,
         client: Peer<RoleServer>,
         ct: CancellationToken,
         Parameters(args): Parameters<ReconcileMovesArgs>,
@@ -1562,6 +1551,22 @@ impl AgentMailServer {
                 "operationId cannot be empty",
                 None,
             ));
+        }
+        if args.dismiss {
+            let Some(operation_id) = args.operation_id.as_deref() else {
+                return Err(McpError::invalid_params(
+                    "dismiss requires operationId: name the one move to close",
+                    None,
+                ));
+            };
+            return match self
+                .agentmail
+                .dismiss_move(&args.account, operation_id)
+                .await
+            {
+                Ok(data) => compact_result(ReconcileMovesOutput::from(data)),
+                Err(e) => Ok(tool_error_result(&e)),
+            };
         }
         let progress = make_progress_fn(&meta, &client);
         let cancel = make_cancel_fn(ct);
@@ -1583,7 +1588,7 @@ impl AgentMailServer {
 
     #[tool(
         name = "update_flags",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<UpdateFlagsOutput>().expect("valid update_flags output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<UpdateFlagsOutput>(),
         description = "Add flags, remove flags, and set or clear the Apple Mail color on one message — in a single call. Requires mailbox, uid, and expectedUidValidity; fails before any change if the mailbox UID epoch moved. Adding and removing in ONE call is the point: doing them as two calls opens two epoch windows and can leave the first applied and the second refused. Order is remove, then color, then add, so a flag named in both lists ends up SET. Unnamed flags are never touched. Cannot set or remove \\Deleted (use delete_messages) or \\Recent (read-only). Returns the message's complete resulting flag set.",
         annotations(
             title = "Update Flags / Color",
@@ -1717,7 +1722,7 @@ mod tests {
             crate::Agentmail::builder(crate::Config::empty()).build(),
         );
         // An EMPTY meta is exactly a session that never got a workspace root.
-        let meta = rmcp::model::Meta::new();
+        let meta = rmcp::model::RequestMetaObject::default();
 
         let loaded = super::load_draft_attachments(&server, &meta, &[])
             .await

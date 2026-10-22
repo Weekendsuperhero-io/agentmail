@@ -1,7 +1,7 @@
 use hashbrown::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::AgentmailError;
@@ -12,7 +12,30 @@ use crate::imap_client::{self, ImapSession};
 /// evict ones the IMAP server has very likely already dropped.
 struct IdleSession {
     session: ImapSession,
-    idle_since: Instant,
+    /// Wall-clock, not `Instant` — see [`wall_elapsed`].
+    idle_since: SystemTime,
+}
+
+impl IdleSession {
+    /// Whether this session has been idle for less than `max_idle` as of `now`.
+    fn is_fresh(&self, max_idle: Duration, now: SystemTime) -> bool {
+        idle_is_fresh(wall_elapsed(self.idle_since, now), max_idle)
+    }
+}
+
+/// Wall-clock time from `since` to `now`, or `None` when the clock reads
+/// earlier than `since` — it was set back — which every caller treats as
+/// expired.
+///
+/// The pool's timers measure wall time on purpose. `Instant` is
+/// `CLOCK_UPTIME_RAW` on macOS and stops while the machine sleeps, so after a
+/// night asleep an idle session looked seconds old and was handed out, a
+/// `[LIMIT]` cooldown resumed where it paused, and the mailbox catalog served a
+/// layout loaded hours earlier. The server's clocks run through our sleep — it
+/// drops idle connections and lifts its penalties on its own time — so these
+/// must too.
+pub(crate) fn wall_elapsed(since: SystemTime, now: SystemTime) -> Option<Duration> {
+    now.duration_since(since).ok()
 }
 
 /// Connection pool managing IMAP sessions across accounts.
@@ -86,6 +109,10 @@ pub struct ConnectionPool {
 /// acquire and keepalive tick regardless of log level (plain atomics, not
 /// `tracing` macros that compile out in release), so "are we actually holding
 /// the connections we open?" is answerable by reading numbers, not just logs.
+///
+/// POOL-WIDE: one set per [`ConnectionPool`], summed over every account, and
+/// gone with the pool — a server that is rebuilt (the app does so when mail
+/// accounts change) starts again from zero.
 #[derive(Debug, Default)]
 struct PoolStats {
     fresh_logins: AtomicU64,
@@ -95,7 +122,9 @@ struct PoolStats {
 }
 
 /// A snapshot of the pool's connection-lifecycle counters — the direct
-/// evidence for whether connections are being held and reused.
+/// evidence for whether connections are being held and reused. The counts are
+/// POOL-WIDE (every account together, since this pool was created), not per
+/// account; the log lines that carry them name them `pool_*` for that reason.
 ///
 /// `fresh_logins` counts accepted LOGINs (the expensive, rate-limited event);
 /// `idle_reuses` counts pooled-session hits that skipped a LOGIN entirely. In a
@@ -163,9 +192,82 @@ const MAX_IDLE_UID_MODE: usize = 1;
 const MIN_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// Whether a session idle for `idle_for` is fresh enough to attempt reuse
-/// against the pool's configured threshold.
-fn idle_is_fresh(idle_for: Duration, max_idle: Duration) -> bool {
-    idle_for < max_idle
+/// against the pool's configured threshold. An unknown idle time (the clock was
+/// set back) is not fresh.
+fn idle_is_fresh(idle_for: Option<Duration>, max_idle: Duration) -> bool {
+    idle_for.is_some_and(|idle_for| idle_for < max_idle)
+}
+
+/// One store of idle sessions, keyed by account.
+type IdleStore = Arc<Mutex<HashMap<String, Vec<IdleSession>>>>;
+
+/// One keepalive pass over the idle stores: NOOP every idle session OUTSIDE
+/// the store lock (an acquiring caller must never wait behind a slow
+/// dead-socket ping) and return the survivors with refreshed idle stamps. A
+/// failed ping drops that session; the next acquire reconnects fresh.
+///
+/// A session leaves the store only with one of its account's connection
+/// permits, held until the ping ends. Without it an acquire during the ping
+/// took a permit, found the store empty and LOGINed a second connection — on a
+/// one-connection provider (Yahoo/AOL) the very login that trips `[LIMIT]`. With
+/// the permit held that acquire waits, and gets the pinged session back. No
+/// permit free means every connection is busy with real work; there is nothing
+/// idle worth pinging, so the account is skipped until the next tick.
+async fn keepalive_tick(
+    stores: &[IdleStore],
+    semaphores: &Mutex<HashMap<String, Arc<Semaphore>>>,
+    stats: &PoolStats,
+) {
+    for store in stores {
+        let accounts: Vec<String> = store.lock().await.keys().cloned().collect();
+        for account in accounts {
+            // Every pooled session was released after an acquire, which
+            // created the account's semaphore — none means nothing to ping.
+            let Some(semaphore) = semaphores.lock().await.get(&account).cloned() else {
+                continue;
+            };
+            let mut permits = Vec::new();
+            let mut idle_set = Vec::new();
+            loop {
+                let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+                    break;
+                };
+                let Some(idle) = store.lock().await.get_mut(&account).and_then(Vec::pop) else {
+                    break;
+                };
+                permits.push(permit);
+                idle_set.push(idle);
+            }
+            if idle_set.is_empty() {
+                continue;
+            }
+            let mut alive = Vec::with_capacity(idle_set.len());
+            for mut idle in idle_set {
+                if imap_client::ping(&mut idle.session).await.is_ok() {
+                    idle.idle_since = SystemTime::now();
+                    alive.push(idle);
+                    stats.keepalive_pings.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // dead — dropped; the next acquire reconnects.
+                    stats.keepalive_drops.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        account = %account,
+                        "keepalive: dropped a dead idle session; next acquire reconnects",
+                    );
+                }
+            }
+            if !alive.is_empty() {
+                tracing::debug!(
+                    account = %account,
+                    held = alive.len(),
+                    "keepalive: kept idle session(s) alive",
+                );
+                store.lock().await.entry(account).or_default().extend(alive);
+            }
+            // Released only now that the sessions are back in the store.
+            drop(permits);
+        }
+    }
 }
 
 /// Ceiling for the escalating login cooldown. One hour outlasts observed
@@ -179,15 +281,25 @@ const LOGIN_RATE_LIMIT_COOLDOWN_CAP: Duration = Duration::from_secs(3600);
 /// is the memory that decides whether the next LIMIT counts as consecutive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LoginCooldown {
-    /// New LOGINs are refused until this instant.
-    until: Instant,
+    /// When this cooldown was armed. Wall-clock, like `until` — see
+    /// [`wall_elapsed`].
+    armed_at: SystemTime,
+    /// New LOGINs are refused until this time.
+    until: SystemTime,
     /// Consecutive LIMIT strikes; 1 = first (or lapsed-episode) LIMIT.
     strikes: u32,
 }
 
-/// Time left on a login cooldown that ends at `until`, `None` once it lifted.
-fn cooldown_remaining(until: Instant, now: Instant) -> Option<Duration> {
-    (until > now).then(|| until - now)
+/// Time left on a login cooldown, `None` once it lifted — or once the clock has
+/// been set back past the moment it was armed, which would otherwise stretch
+/// the gate by however far the clock moved.
+fn cooldown_remaining(cooldown: LoginCooldown, now: SystemTime) -> Option<Duration> {
+    wall_elapsed(cooldown.armed_at, now)?;
+    cooldown
+        .until
+        .duration_since(now)
+        .ok()
+        .filter(|remaining| !remaining.is_zero())
 }
 
 /// Cooldown applied at the given strike count: the base doubled per extra
@@ -205,17 +317,21 @@ fn cooldown_after_strikes(base: Duration, strikes: u32) -> Duration {
 /// length — covering both a LIMIT while still armed and one shortly after
 /// expiry (the "server penalty outlasts our cooldown" case, where each
 /// expiry's single probing LOGIN gets re-LIMITed). At or past the window
-/// boundary the episode has lapsed and the account starts over at strike 1.
-fn next_cooldown(prev: Option<LoginCooldown>, base: Duration, now: Instant) -> LoginCooldown {
+/// boundary the episode has lapsed and the account starts over at strike 1, as
+/// it does when the clock was set back past the previous arming.
+fn next_cooldown(prev: Option<LoginCooldown>, base: Duration, now: SystemTime) -> LoginCooldown {
     let strikes = match prev {
         Some(prev)
-            if now < prev.until + cooldown_after_strikes(base, prev.strikes).saturating_mul(2) =>
+            if wall_elapsed(prev.armed_at, now).is_some()
+                && now
+                    < prev.until + cooldown_after_strikes(base, prev.strikes).saturating_mul(2) =>
         {
             prev.strikes.saturating_add(1)
         }
         _ => 1,
     };
     LoginCooldown {
+        armed_at: now,
         until: now + cooldown_after_strikes(base, strikes),
         strikes,
     }
@@ -376,15 +492,15 @@ impl ConnectionPool {
     }
 
     /// Spawn the keepalive task once, if configured. Called from the async
-    /// acquire paths so a Tokio runtime is guaranteed. Each tick drains every
-    /// idle session — Limited pool and UID-Mode pool alike — NOOPs each
-    /// OUTSIDE the pool lock (an acquiring caller must never wait behind a
-    /// slow dead-socket ping), and returns survivors with refreshed idle
-    /// stamps, so they never cross the `max_idle` threshold and the server
-    /// never sees them as idle. This is what makes the process behave like a
-    /// mainstream mail client: a few long-lived connections, each LOGINed
-    /// once, instead of a login per gap in traffic. A failed ping drops that
-    /// session; the next acquire reconnects fresh.
+    /// acquire paths so a Tokio runtime is guaranteed. Each tick
+    /// ([`keepalive_tick`]) NOOPs every idle session — Limited pool and
+    /// UID-Mode pool alike — under a connection permit and outside the pool
+    /// lock, and returns survivors with refreshed idle stamps, so they never
+    /// cross the `max_idle` threshold and the server never sees them as idle.
+    /// This is what makes the process behave like a mainstream mail client: a
+    /// few long-lived connections, each LOGINed once, instead of a login per
+    /// gap in traffic. A failed ping drops that session; the next acquire
+    /// reconnects fresh.
     fn ensure_keepalive(&self) {
         let Some(interval) = self.keepalive else {
             return;
@@ -394,48 +510,14 @@ impl ConnectionPool {
             return;
         }
         let stores = [Arc::clone(&self.pools), Arc::clone(&self.uid_pools)];
+        let semaphores = Arc::clone(&self.semaphores);
         let stats = Arc::clone(&self.stats);
         *slot = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                for store in &stores {
-                    let accounts: Vec<String> = store.lock().await.keys().cloned().collect();
-                    for account in accounts {
-                        // Take the whole idle set while locked; ping outside
-                        // the lock; return survivors.
-                        let idle_set = store
-                            .lock()
-                            .await
-                            .get_mut(&account)
-                            .map(std::mem::take)
-                            .unwrap_or_default();
-                        let mut alive = Vec::with_capacity(idle_set.len());
-                        for mut idle in idle_set {
-                            if imap_client::ping(&mut idle.session).await.is_ok() {
-                                idle.idle_since = Instant::now();
-                                alive.push(idle);
-                                stats.keepalive_pings.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                // dead — dropped; the next acquire reconnects.
-                                stats.keepalive_drops.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(
-                                    account = %account,
-                                    "keepalive: dropped a dead idle session; next acquire reconnects",
-                                );
-                            }
-                        }
-                        if !alive.is_empty() {
-                            tracing::debug!(
-                                account = %account,
-                                held = alive.len(),
-                                "keepalive: kept idle session(s) alive",
-                            );
-                            store.lock().await.entry(account).or_default().extend(alive);
-                        }
-                    }
-                }
+                keepalive_tick(&stores, &semaphores, &stats).await;
             }
         }));
     }
@@ -452,7 +534,7 @@ impl ConnectionPool {
     pub(crate) fn note_login_rate_limit(&self, account_name: &str) {
         let mut cooldowns = self.login_cooldowns.lock();
         let prev = cooldowns.get(account_name).copied();
-        let next = next_cooldown(prev, self.login_cooldown, Instant::now());
+        let next = next_cooldown(prev, self.login_cooldown, SystemTime::now());
         cooldowns.insert(account_name.to_string(), next);
         drop(cooldowns);
         tracing::warn!(
@@ -484,7 +566,7 @@ impl ConnectionPool {
     /// strike-aware fast-fail message. `None` once the gate has lifted.
     pub(crate) fn login_cooldown_status(&self, account_name: &str) -> Option<(Duration, u32)> {
         let state = *self.login_cooldowns.lock().get(account_name)?;
-        cooldown_remaining(state.until, Instant::now()).map(|remaining| (remaining, state.strikes))
+        cooldown_remaining(state, SystemTime::now()).map(|remaining| (remaining, state.strikes))
     }
 
     /// Get the server capabilities for an account, fetching once and caching.
@@ -547,6 +629,33 @@ impl ConnectionPool {
     /// right store. Stale/dead candidates are dropped (connection closes) and
     /// the next store is tried. The pool lock is held only for each pop — never
     /// across the liveness ping.
+    /// Park `session` as an idle Limited-Mode connection for `account_name`, so
+    /// a test can drive the library's own `acquire` against a scripted server.
+    /// `acquire` pings it before handing it out, so the script must answer
+    /// `NOOP`.
+    #[cfg(test)]
+    pub(crate) async fn hold_idle_for_test(&self, account_name: &str, session: ImapSession) {
+        self.pools
+            .lock()
+            .await
+            .entry(account_name.to_string())
+            .or_default()
+            .push(IdleSession {
+                session,
+                idle_since: SystemTime::now(),
+            });
+    }
+
+    /// How many idle connections `account_name` holds, in either store.
+    #[cfg(test)]
+    pub(crate) async fn idle_sessions(&self, account_name: &str) -> usize {
+        let mut count = 0;
+        for store in [&self.pools, &self.uid_pools] {
+            count += store.lock().await.get(account_name).map_or(0, Vec::len);
+        }
+        count
+    }
+
     async fn pop_idle_any(&self, account_name: &str) -> Option<(ImapSession, bool)> {
         for (store, uid_mode) in [(&self.uid_pools, true), (&self.pools, false)] {
             let maybe_idle = {
@@ -554,10 +663,9 @@ impl ConnectionPool {
                 pools.get_mut(account_name).and_then(|pool| pool.pop())
             }; // lock released here — before any network I/O
             if let Some(idle) = maybe_idle {
+                let fresh = idle.is_fresh(self.max_idle, SystemTime::now());
                 let mut session = idle.session;
-                if idle_is_fresh(idle.idle_since.elapsed(), self.max_idle)
-                    && imap_client::ping(&mut session).await.is_ok()
-                {
+                if fresh && imap_client::ping(&mut session).await.is_ok() {
                     return Some((session, uid_mode));
                 }
                 // too old or stale → `session` drops here (connection closes);
@@ -642,8 +750,8 @@ impl ConnectionPool {
             let reuses = self.stats.idle_reuses.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 account = %account_name,
-                idle_reuses = reuses,
-                fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
+                pool_idle_reuses = reuses,
+                pool_fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
                 uid_mode,
                 "reused a held IMAP session (no LOGIN)",
             );
@@ -680,8 +788,8 @@ impl ConnectionPool {
             let reuses = self.stats.idle_reuses.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 account = %account_name,
-                idle_reuses = reuses,
-                fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
+                pool_idle_reuses = reuses,
+                pool_fresh_logins = self.stats.fresh_logins.load(Ordering::Relaxed),
                 uid_mode,
                 "reused a held IMAP session (no LOGIN)",
             );
@@ -716,8 +824,8 @@ impl ConnectionPool {
                 let logins = self.stats.fresh_logins.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::info!(
                     account = %account_name,
-                    fresh_logins = logins,
-                    idle_reuses = self.stats.idle_reuses.load(Ordering::Relaxed),
+                    pool_fresh_logins = logins,
+                    pool_idle_reuses = self.stats.idle_reuses.load(Ordering::Relaxed),
                     "opened a fresh IMAP connection (LOGIN); later ops should reuse it",
                 );
                 session
@@ -767,10 +875,9 @@ impl ConnectionPool {
             pools.get_mut(account_name).and_then(|pool| pool.pop())
         };
         if let Some(idle) = maybe_idle {
+            let fresh = idle.is_fresh(self.max_idle, SystemTime::now());
             let mut session = idle.session;
-            if idle_is_fresh(idle.idle_since.elapsed(), self.max_idle)
-                && imap_client::ping(&mut session).await.is_ok()
-            {
+            if fresh && imap_client::ping(&mut session).await.is_ok() {
                 return Ok(Some(PooledSession {
                     session: Some(session),
                     account_name: account_name.to_string(),
@@ -795,15 +902,25 @@ impl ConnectionPool {
     /// retry). This closes the connection-died-*during*-an-op race that the
     /// idle-TTL eviction can't see. Control flow lives in the `retry_once!`
     /// macro, which is unit-tested without real sessions.
+    ///
+    /// An answer counts only once the connection answers a NOOP after it — one
+    /// that passes only on its own tagged OK: async-imap ends SELECT, SEARCH, FETCH
+    /// and LIST quietly on a closed stream, so a socket that died mid-read
+    /// returns an empty or short `Ok` rather than the error this retry is for.
+    /// The probe turns it into that error.
     pub async fn with_session_retry<T>(
         &self,
         account: &str,
-        op: impl AsyncFnMut(&mut ImapSession) -> crate::Result<T>,
+        mut op: impl AsyncFnMut(&mut ImapSession) -> crate::Result<T>,
     ) -> crate::Result<T> {
         retry_once!(
             || self.acquire(account),
             PooledSession::session,
-            op,
+            async |session: &mut ImapSession| -> crate::Result<T> {
+                let answer = op(session).await?;
+                imap_client::confirm_alive(session).await?;
+                Ok(answer)
+            },
             PooledSession::release,
         )
     }
@@ -866,6 +983,23 @@ impl PooledSession {
         self.uid_mode = true;
     }
 
+    /// Return the session to the pool after a mutation, once a checked NOOP
+    /// ([`imap_client::sync`]) has flushed the server's queued updates and
+    /// proven the connection alive; one that doesn't answer is closed instead.
+    /// Never fails: the mutation's own commands were answered, so its result
+    /// stands whatever becomes of the connection afterwards.
+    pub async fn release_after_mutation(mut self) {
+        match imap_client::sync(self.session()).await {
+            Ok(()) => self.release().await,
+            Err(error) => tracing::debug!(
+                target: "agentmail",
+                account = %self.account_name,
+                error = %error,
+                "connection did not answer after a mutation; closing it instead of pooling it"
+            ),
+        }
+    }
+
     /// Return the session to the pool for reuse — the UID-Mode store when this
     /// connection has UIDONLY enabled, the Limited pool otherwise.
     /// The concurrency permit is released when this PooledSession is dropped.
@@ -881,7 +1015,7 @@ impl PooledSession {
             if pool.len() < cap {
                 pool.push(IdleSession {
                     session,
-                    idle_since: Instant::now(),
+                    idle_since: SystemTime::now(),
                 });
             }
             // else: drop the session (connection closes)
@@ -989,29 +1123,147 @@ mod tests {
     #[test]
     fn idle_freshness_threshold() {
         assert!(
-            idle_is_fresh(Duration::from_secs(0), MAX_IDLE),
+            idle_is_fresh(Some(Duration::from_secs(0)), MAX_IDLE),
             "fresh session reusable"
         );
         assert!(
-            idle_is_fresh(MAX_IDLE - Duration::from_secs(1), MAX_IDLE),
+            idle_is_fresh(Some(MAX_IDLE - Duration::from_secs(1)), MAX_IDLE),
             "just under the threshold is still reusable",
         );
         assert!(
-            !idle_is_fresh(MAX_IDLE, MAX_IDLE),
+            !idle_is_fresh(Some(MAX_IDLE), MAX_IDLE),
             "exactly at the threshold is evicted"
         );
         assert!(
-            !idle_is_fresh(MAX_IDLE + Duration::from_secs(30 * 60), MAX_IDLE),
+            !idle_is_fresh(Some(MAX_IDLE + Duration::from_secs(30 * 60)), MAX_IDLE),
             "long-idle (likely server-dropped) session is evicted",
         );
         // A raised threshold (builder .max_idle) keeps older sessions eligible.
         assert!(
             idle_is_fresh(
-                MAX_IDLE + Duration::from_secs(60),
+                Some(MAX_IDLE + Duration::from_secs(60)),
                 Duration::from_secs(20 * 60)
             ),
             "a raised max_idle admits sessions the default would evict",
         );
+        assert!(
+            !idle_is_fresh(None, Duration::from_secs(20 * 60)),
+            "an idle time the clock cannot vouch for is not fresh",
+        );
+    }
+
+    /// A fixed wall-clock origin, so the timer tests are deterministic.
+    fn wall(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)
+    }
+
+    /// The bug the wall clock fixes: idle time is measured from the stamps, so
+    /// a night asleep (which `Instant` on macOS does not count) still ages the
+    /// session past `max_idle`.
+    #[test]
+    fn wall_elapsed_measures_forward_time_and_refuses_a_clock_set_back() {
+        assert_eq!(
+            wall_elapsed(wall(0), wall(8 * 3600)),
+            Some(Duration::from_secs(8 * 3600))
+        );
+        assert_eq!(wall_elapsed(wall(60), wall(60)), Some(Duration::ZERO));
+        assert_eq!(wall_elapsed(wall(60), wall(0)), None);
+        assert!(
+            !idle_is_fresh(wall_elapsed(wall(0), wall(8 * 3600)), MAX_IDLE),
+            "a session idled overnight is evicted, not pinged and reused"
+        );
+    }
+
+    /// One account's idle store holding `session`, and a one-permit
+    /// semaphore for it — a Yahoo/AOL account's shape.
+    async fn one_idle_session(
+        session: ImapSession,
+    ) -> (
+        IdleStore,
+        Arc<Semaphore>,
+        Mutex<HashMap<String, Arc<Semaphore>>>,
+    ) {
+        let store: IdleStore = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert(
+            "aol".to_string(),
+            vec![IdleSession {
+                session,
+                idle_since: SystemTime::now(),
+            }],
+        );
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut semaphores = HashMap::new();
+        semaphores.insert("aol".to_string(), Arc::clone(&semaphore));
+        (store, semaphore, Mutex::new(semaphores))
+    }
+
+    /// With every permit held by in-flight work there is nothing idle to keep
+    /// alive: taking the session out anyway is what let a concurrent acquire
+    /// find the store empty and LOGIN a second connection.
+    #[tokio::test]
+    async fn keepalive_takes_no_session_while_every_permit_is_in_use() {
+        let (session, server) = imap_client::test_support::scripted_session(|_, _| None).await;
+        let (store, semaphore, semaphores) = one_idle_session(session).await;
+        let stats = PoolStats::default();
+        let _in_flight = Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .expect("the only permit");
+
+        keepalive_tick(&[Arc::clone(&store)], &semaphores, &stats).await;
+
+        assert_eq!(
+            store.lock().await.get("aol").map(Vec::len),
+            Some(1),
+            "the idle session stays in the store"
+        );
+        assert_eq!(stats.keepalive_pings.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.keepalive_drops.load(Ordering::Relaxed), 0);
+        drop(store);
+        let commands = server.commands().await;
+        assert!(!commands.iter().any(|c| c.contains("NOOP")), "{commands:?}");
+    }
+
+    /// A session out of the store for its ping is covered by a permit for the
+    /// whole ping, so an acquire in that window waits for the session to come
+    /// back instead of opening another connection; both return afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_holds_a_permit_for_the_session_it_is_pinging() {
+        let (noop_seen, noop_arrived) = std::sync::mpsc::channel::<()>();
+        let (release_reply, reply_released) = std::sync::mpsc::channel::<()>();
+        let (session, server) = imap_client::test_support::scripted_session(move |tag, command| {
+            command.contains(" NOOP").then(|| {
+                // Hold the reply until the test has looked at the permit.
+                noop_seen.send(()).expect("test listening");
+                reply_released.recv().expect("test releases the reply");
+                format!("{tag} OK NOOP completed\r\n")
+            })
+        })
+        .await;
+        let (store, semaphore, semaphores) = one_idle_session(session).await;
+        let stats = Arc::new(PoolStats::default());
+
+        let tick = tokio::spawn({
+            let store = Arc::clone(&store);
+            let stats = Arc::clone(&stats);
+            async move { keepalive_tick(&[store], &semaphores, &stats).await }
+        });
+        tokio::task::spawn_blocking(move || noop_arrived.recv())
+            .await
+            .expect("join")
+            .expect("the NOOP reached the server");
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "the session being pinged holds the account's permit"
+        );
+        release_reply.send(()).expect("server waiting");
+        tick.await.expect("tick");
+
+        assert_eq!(semaphore.available_permits(), 1, "and gives it back");
+        assert_eq!(store.lock().await.get("aol").map(Vec::len), Some(1));
+        assert_eq!(stats.keepalive_pings.load(Ordering::Relaxed), 1);
+        drop(store);
+        server.commands().await;
     }
 
     /// The keepalive task spawns once on first pool use when configured, and
@@ -1044,24 +1296,51 @@ mod tests {
 
     #[test]
     fn cooldown_remaining_counts_down_and_lifts() {
-        let now = Instant::now();
+        let now = wall(0);
         let until = now + Duration::from_secs(120);
+        let cooldown = LoginCooldown {
+            armed_at: now,
+            until,
+            strikes: 1,
+        };
         assert_eq!(
-            cooldown_remaining(until, now),
+            cooldown_remaining(cooldown, now),
             Some(Duration::from_secs(120))
         );
         assert_eq!(
-            cooldown_remaining(until, now + Duration::from_secs(60)),
+            cooldown_remaining(cooldown, now + Duration::from_secs(60)),
             Some(Duration::from_secs(60))
         );
         assert_eq!(
-            cooldown_remaining(until, until),
+            cooldown_remaining(cooldown, until),
             None,
             "the gate lifts exactly at the deadline"
         );
         assert_eq!(
-            cooldown_remaining(until, until + Duration::from_secs(1)),
+            cooldown_remaining(cooldown, until + Duration::from_secs(1)),
             None
+        );
+    }
+
+    /// A cooldown armed before a sleep keeps counting through it, and a clock
+    /// set back past the arming lifts the gate rather than stretching it.
+    #[test]
+    fn cooldown_runs_on_the_wall_clock_and_a_clock_set_back_lifts_it() {
+        let cooldown = next_cooldown(None, Duration::from_secs(300), wall(1000));
+        assert_eq!(
+            cooldown_remaining(cooldown, wall(1000 + 3600)),
+            None,
+            "an hour asleep outlasts a five-minute cooldown"
+        );
+        assert_eq!(
+            cooldown_remaining(cooldown, wall(999)),
+            None,
+            "a clock set back past the arming cannot extend the gate"
+        );
+        assert_eq!(
+            next_cooldown(Some(cooldown), Duration::from_secs(300), wall(999)).strikes,
+            1,
+            "nor count as a consecutive LIMIT"
         );
     }
 
@@ -1126,7 +1405,7 @@ mod tests {
     #[test]
     fn next_cooldown_first_limit_is_strike_one() {
         let base = Duration::from_secs(300);
-        let now = Instant::now();
+        let now = wall(0);
         let state = next_cooldown(None, base, now);
         assert_eq!(state.strikes, 1);
         assert_eq!(state.until, now + base);
@@ -1135,7 +1414,7 @@ mod tests {
     #[test]
     fn next_cooldown_relimit_within_window_escalates() {
         let base = Duration::from_secs(300);
-        let t0 = Instant::now();
+        let t0 = wall(0);
         let first = next_cooldown(None, base, t0);
         // Re-LIMIT while still armed → strike 2.
         let while_armed = next_cooldown(Some(first), base, t0 + Duration::from_secs(100));
@@ -1151,8 +1430,9 @@ mod tests {
     #[test]
     fn next_cooldown_relimit_at_or_after_window_starts_over() {
         let base = Duration::from_secs(300);
-        let t0 = Instant::now();
+        let t0 = wall(0);
         let third = LoginCooldown {
+            armed_at: t0,
             until: t0 + Duration::from_secs(1200),
             strikes: 3,
         };
@@ -1169,12 +1449,12 @@ mod tests {
     #[test]
     fn next_cooldown_walks_the_escalation_ladder() {
         let base = Duration::from_secs(300);
-        let mut now = Instant::now();
+        let mut now = wall(0);
         let mut state: Option<LoginCooldown> = None;
         let mut applied = Vec::new();
         for _ in 0..6 {
             let next = next_cooldown(state, base, now);
-            applied.push((next.until - now).as_secs());
+            applied.push(next.until.duration_since(now).unwrap().as_secs());
             // The next probe fires just after this cooldown expires — the
             // exact leak pattern observed live.
             now = next.until + Duration::from_secs(1);
@@ -1261,6 +1541,7 @@ mod tests {
                 username: "user@example.com".to_string(),
                 email: None,
                 aliases: Vec::new(),
+                display_name: None,
                 password: Some(crate::secret::Secret::new_raw("unused")),
                 tls: true,
                 max_connections: None,
@@ -1277,6 +1558,52 @@ mod tests {
             text.contains("rate-limited LOGIN") && text.contains("strike 1"),
             "fast-fail carries the strike-aware cooldown message: {text}"
         );
+    }
+
+    /// A read on a closed stream comes back empty instead of failing, so
+    /// `with_session_retry` never saw the drop it exists to retry, and the
+    /// empty answer stood. Probing the connection after the read turns it
+    /// into the connection error it is, and the read runs again on a fresh
+    /// connection.
+    #[tokio::test]
+    async fn a_read_cut_off_by_a_closed_connection_is_retried_on_a_fresh_one() {
+        let noop = |tag: &str| format!("{tag} OK NOOP completed\r\n");
+        let (healthy, healthy_server) =
+            imap_client::test_support::scripted_session(move |tag, command| {
+                if command.contains(" NOOP") {
+                    Some(noop(tag))
+                } else if command.contains("UID SEARCH") {
+                    Some(format!("* SEARCH 4 9\r\n{tag} OK SEARCH completed\r\n"))
+                } else {
+                    None
+                }
+            })
+            .await;
+        // Answers the pool's ping, then drops the connection at the SEARCH.
+        let (dying, dying_server) =
+            imap_client::test_support::scripted_session(move |tag, command| {
+                command.contains(" NOOP").then(|| noop(tag))
+            })
+            .await;
+        let pool = ConnectionPool::new(Config::from_accounts(vec![(
+            "work".to_string(),
+            AccountConfig::new("imap.example.com", "me@example.com"),
+        )]));
+        pool.hold_idle_for_test("work", healthy).await;
+        pool.hold_idle_for_test("work", dying).await; // handed out first
+
+        let mut uids = pool
+            .with_session_retry("work", async |session| {
+                imap_client::search_uids(session, "ALL").await
+            })
+            .await
+            .expect("the read is retried, not answered empty");
+
+        uids.sort_unstable();
+        assert_eq!(uids, vec![4, 9]);
+        drop(pool);
+        dying_server.commands().await;
+        healthy_server.commands().await;
     }
 
     /// Handle whose release-vs-drop fate is observable: the flag flips only if

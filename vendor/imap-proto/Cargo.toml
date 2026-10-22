@@ -11,9 +11,9 @@
 
 [package]
 edition = "2021"
-rust-version = "1.61"
+rust-version = "1.70"
 name = "imap-proto"
-version = "0.16.7"
+version = "0.17.0"
 build = false
 autolib = false
 autobins = false
@@ -21,7 +21,6 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "IMAP protocol parser and data structures"
-homepage = "https://github.com/djc/tokio-imap"
 documentation = "https://docs.rs/imap-proto"
 readme = "README.md"
 keywords = [
@@ -34,10 +33,7 @@ categories = [
     "parser-implementations",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/djc/tokio-imap"
-
-[badges.maintenance]
-status = "passively-maintained"
+repository = "https://github.com/djc/imap-proto"
 
 [lib]
 name = "imap_proto"
@@ -48,7 +44,7 @@ name = "parse_response"
 path = "examples/parse_response.rs"
 
 [dependencies.nom]
-version = "7"
+version = "8"
 
 [dev-dependencies.assert_matches]
 version = "1.3"

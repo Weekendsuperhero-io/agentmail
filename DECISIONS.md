@@ -4,6 +4,382 @@ Architectural decisions, deferred work, and rationale for future reference.
 
 ---
 
+## 0.9.0 — Both Lifecycles From One Server, Up To A Named Ceiling
+
+### Decision
+
+The server speaks MCP 2026-07-28 and every earlier revision.
+`supported_protocol_versions()` is `ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION)`,
+with `MAX_PROTOCOL_VERSION` = 2026-07-28 written in the source. The
+`initialize` answer is `LATEST_WITH_INITIALIZE` (2025-11-25), which rmcp also
+gives a client that asks `initialize` for 2026-07-28. `server/discover` is
+answered only at a revision with no handshake; at a 2025 version it is
+method-not-found. Its `supportedVersions` is every revision the server
+implements, the same list a `-32022` carries.
+
+### Rationale
+
+0.8.0 pinned 2025-11-25 because nothing yet needed 2026-07-28, and the
+embedding app's bridge held the go criteria. Agent Muse now offers 2026-07-28
+to agents and backends as a choice. A server that supports both lifecycles
+costs nothing for a 2025 client, so this server offers both.
+
+The ceiling stays named, never rmcp's `LATEST`: an SDK bump must not move the
+protocol on its own.
+
+The discover gate closes a trap in rmcp's default, which answers a probe at
+any supported version. A client probing at 2025-11-25 would then run the
+stateless lifecycle at a revision that defines none.
+
+`supportedVersions` first listed only the handshake-free revisions, to close
+the same door from the other side. It was wrong: the version list a `-32022`
+gives and the one `discover` gives are one fact, and a client must be able to
+read them as one. The official suite's `sep-2575-server-unsupported-version-error`
+checks exactly that. The gate on `discover` itself is what keeps a stateless
+client off 2025.
+
+### Consequence
+
+A 2026-07-28 client carries its version, identity and capabilities in every
+request's `_meta`. rmcp validates them and shapes results for that revision:
+it adds `resultType`, defaults cache hints to `private`, TTL 0, and turns
+resource-not-found into `-32602`. A 2025 client sees exactly what 0.8.0 sent,
+plus the tasks extension in `capabilities.extensions`.
+
+---
+
+## 0.9.0 — Tasks Return As The SEP-2663 Extension, Promoted Late
+
+### Decision
+
+`io.modelcontextprotocol/tasks` is offered on both revisions (`mcp/tasks.rs`).
+A `tools/call` becomes a task only when four things hold:
+
+- the client declared the extension;
+- the tool is one of the 22 long-running ones (`TASK_TOOLS`, the 0.8.0 list
+  of task-eligible tools);
+- the call is still running after 2 seconds;
+- admission allows it: 32 running, 1,024 held.
+
+Otherwise it is answered inline. Each task lives 4 hours and suggests
+1-second polls.
+
+**The operation token.** It is a child of the connection's lifetime token,
+linked to the request's token only until promotion.
+
+**Cancellation.** `tasks/cancel` cancels that token and waits for the
+operation to stop at its next check. A task whose tool saw the cancellation
+(through its `CancelFn`) settles `cancelled`; one that finished first settles
+`completed`.
+
+**Progress.** After promotion, progress goes to the task's status message
+and to `_meta["io.agentmuse/progress"]` on `tasks/get`.
+
+### Rationale
+
+**Promoted late.** SEP-2663 makes the server the sole decider. The tasks a
+client actually wants are the calls that would outlive its request timeout.
+A task costs the client a round trip and keeps a result for hours. Deciding
+after a short run makes only those calls tasks. Quick calls, which are nearly
+all calls, see no difference.
+
+**The token is not the request's.** rmcp cancels a request's token as it
+sends that request's response, and a task's response is its handle. The
+SEP-1686 implementation retired in 0.8.0 had exactly this self-cancel bug
+until its token was re-parented. Here the rule is structural, and pinned by
+`a_promoted_task_outlives_its_request_token`.
+
+**Cooperative, never aborted.** A bulk move cut at an arbitrary await could
+leave a COPY without its EXPUNGE. The library already stops cleanly at its
+`CancelFn` checks, and now also while queued behind another mutation on its
+account (`lock_account_mutation_unless_cancelled`). Only rmcp's TTL aborts,
+and nothing here runs for 4 hours; even then the operation's token is
+cancelled first, so it stops at its next check if the abort cannot reach it.
+Closing the connection does NOT abort: an operation still running when the
+5-second shutdown grace ends is detached, finishes the chunk it is in, and
+stops at its next check (`Operation`'s drop; review of the 0.9.0 work,
+2026-10-21, which found the grace ending in an abort that could cut a move
+between COPY and EXPUNGE on a slow server). Pinned by
+`shutdown_lets_an_operation_reach_its_next_check`.
+
+**`cancelled` follows what the tool did.** Most tools report a library error
+as an `isError` result, so the result alone cannot tell a cancelled scan from
+a failed one. `make_cancel_fn` records the check that found the token
+cancelled, which can.
+
+**Status, not notifications, after promotion.** The request is answered once
+the handle is sent. A `notifications/progress` on its token would describe a
+request that no longer exists.
+
+### Consequence
+
+The operation runs in its own spawned task, so a panic fails the task instead
+of leaving it `working` until the TTL. rmcp's completion path never runs for
+a future that unwinds.
+
+Tasks live with the connection. Closing it cancels every operation token,
+waits 5 seconds, then aborts what is left.
+
+The per-account destructive-task queue of 0.8.0's predecessor does not
+return. The library's account mutation lock already serializes every
+mutation.
+
+---
+
+## 0.7.0 — A Draft Is From One Of The Account's Own Identities
+
+### Decision
+
+A draft's `From` is RESOLVED, never echoed. `draft::resolve_from` returns one of
+`AccountConfig::identities()` — the primary (`email`, or an email-shaped login
+when no `email` is set), then the aliases — under the configured
+`display_name`, so `display_name = "Mark Blake"` makes drafts
+`From: Mark Blake <you@example.com>`. `create_draft` and `update_draft` take an
+optional `from` (`Name <address>` or an address), and both results report the
+`from` actually written. `list_accounts` lists each account's identities, and
+`list_identities` adds what its Sent mail actually used.
+
+Before this, `From` was always the bare, lowercased `canonical_email()` — or the
+LOGIN NAME when there was none, which failed inside lettre as "Invalid email
+address 'johnappleseed'". No tool could choose a sender, the config had no
+name, and `update_draft` overwrote whatever `From` another client had set.
+
+### Why `from` is refused outside `identities()`
+
+An agent can be asked — or prompt-injected — to write a draft "from" anything.
+A `From` the account does not own is at best rewritten or rejected by the
+provider at send time, and at worst accepted by a permissive server as a spoof
+the user never meant. The account's configuration is the only authority on
+what the user sends as, so `from` must match it. The refusal lists the
+identities and names the fix (add the address as an alias), which turns a dead
+end into one settings change.
+
+A distinct email-shaped login is NOT an identity. A login is a credential, not
+an address the user chose to publish (MCP.md has always kept logins out of
+`list_accounts`); it stays in `canonical_addresses()`, which only recognizes the
+account's own mail. Listing it in `aliases` makes it sendable, so normalization
+no longer drops an alias equal to the login.
+
+### Why a reply uses the identity the original was addressed to
+
+Mail sent to `sales@` and answered from `mark@` leaks the personal address and
+reads as a different correspondent; every mainstream client answers from the
+address the message reached. The order is the original's own `From` when it is
+ours (a follow-up to our own mail stays on the address it went out from), then
+the first identity in its `To`, then its `Cc`. Mail that reached us by Bcc names
+no identity, so it falls back to the primary.
+
+### Why `update_draft` preserves `From`
+
+`update_draft` replaced `From` with the primary on every edit, so a draft the
+user began in Mail.app from an alias silently changed sender when an agent
+fixed a typo. Without `from`, the replacement now keeps the current `From` —
+name included, the display name filling a blank one — when that address is
+one of ours. A foreign `From` is replaced by the default, since keeping it would
+let an old draft carry a sender the account no longer owns.
+
+### Why the Sent scan, not provider APIs
+
+IMAP has no identity listing. Gmail's `sendAs` settings and Fastmail's JMAP
+`Identity` both need OAuth or API tokens, and the app-password accounts Agent
+Muse configures hold neither. What an account has actually sent is readable on
+every IMAP server: `list_identities` reads the `From` of the newest N Sent
+messages with `BODY.PEEK`. That is EVIDENCE, not permission — it never feeds
+`from` validation, so a forged or one-off `From` sitting in Sent cannot widen
+what a draft may claim. A discovered address must be added as an alias first.
+
+### Why `from` is in the results, and derived
+
+A caller cannot predict the reply rule or a preserved sender, so the result says
+what was written. It is formatted from the resolved mailbox, never copied from
+the request, and with our own quoting rather than lettre's `Mailbox` `Display`
+(which fails on a CR or LF in the name): a name with a comma comes back quoted
+and parses as one mailbox.
+
+### Consequence
+
+`AccountConfig` gains `display_name` (validated: no control characters, at most
+256 characters; `validate_display_name` is exported so an embedder applies the
+same rule). The draft facade (`create_draft_with_headers`, `create_reply_draft`,
+`update_draft`) gains `from`, and `MessageInfo.reply_to` becomes `Vec<String>`
+so a reply goes to EVERY Reply-To address — a breaking release, 0.7.0. 35 tools
+→ 36. Pinned by `the_default_sender_is_the_display_name_on_the_primary_address`,
+`an_explicit_sender_must_be_one_of_the_accounts_identities`,
+`a_reply_is_from_the_identity_the_original_was_sent_to`,
+`an_updated_draft_keeps_a_sender_of_ours_and_replaces_a_foreign_one`,
+`identities_are_the_primary_then_aliases_never_a_distinct_login`, and
+`draft_tools_take_a_sender_and_refuse_one_the_account_does_not_own`.
+
+## 0.7.0 — Liveness Means A Tagged OK, And Pool Clocks Count Sleep
+
+### Decision
+
+`imap_client::ping` sends `NOOP` by hand and passes only on its own tagged
+`OK`; end-of-stream and an untagged `BYE` are a lost connection. The pool's idle
+stamps, the `[LIMIT]` login cooldown and the mailbox-catalog TTL are measured on
+the WALL clock (`SystemTime`), and a clock set back past a stamp counts as
+expired.
+
+### Rationale
+
+async-imap's `noop()` drains with `take_while(filter)`, so a stream that simply
+ends is a successful NOOP. On macOS, security-framework maps a reset connection
+to a zero-byte read — that same end — so after sleep or a server `BYE` every
+pooled session passed its ping, and the next mutation failed on the dead
+socket; a draft APPEND then reported an "ambiguous" outcome it did not have.
+`async_imaps_own_noop_reports_a_closed_stream_as_alive` pins the upstream
+behavior, so the day it changes is visible.
+
+`Instant` on macOS is `CLOCK_UPTIME_RAW`, which stops while the machine sleeps.
+A session idled overnight therefore looked seconds old and was handed out
+instead of evicted, a cooldown resumed where it paused, and the catalog served a
+layout loaded hours earlier. The server's clocks run through our sleep, so ours
+must too. A backwards wall clock cannot say how much time passed; treating it
+as expired costs at most one reconnect or one LIST, while trusting it could
+stretch a cooldown by however far the clock moved.
+
+## 0.7.0 — A Scanned Mailbox Counts Once The Connection Answers After It
+
+### Decision
+
+An account-wide scan or sweep counts a mailbox only after
+`imap_client::confirm_alive` — a `NOOP` that only its own tagged `OK` passes —
+succeeds following the mailbox's last command. A lost connection ends the scan
+at once: that mailbox and every later one go to `skipped`, and the session is
+dropped, not pooled. A mailbox that failed on a connection the probe then
+proves alive is skipped on its own and the scan goes on. `list_flags` and
+`find_attachments` gain `skipped` like the sweeps; a single-mailbox scan, and
+`preview_thread_record`, fail instead of answering partially.
+
+### Rationale
+
+async-imap ends SELECT/EXAMINE (`parse_mailbox`), SEARCH (`parse_ids`) and FETCH
+quietly at end-of-stream, so a dropped connection is not an error but an empty
+mailbox, an empty search, a short fetch. The loops classified failures per
+mailbox and moved on, so after a drop every remaining mailbox "drained" with
+nothing found — or failed on its own and was skipped — and the sweep returned
+`Ok` with `session_usable` still true, pooling the dead session. On a hung
+connection each remaining mailbox instead waited out the timeout, 120 s in the
+app. Checking errors with `is_connection_error()` alone could not fix it,
+because the commonest failure was not an error at all.
+
+A connection that ended can't answer a NOOP afterwards, so one probe per mailbox
+proves every answer before it came from a live connection — a property no
+per-command check gives without rewriting every command by hand, which is what
+the async-imap fork (finding 15) would do upstream. It costs one round trip per
+mailbox. It does not catch a tagged `NO` that async-imap swallows on a live
+connection; that is still finding 15.
+
+### Consequence
+
+`ListFlagsResponse` and `FindAttachmentsResponse` gain `skipped` (outputs:
+`skipped`, `skippedTotal`, `skippedTruncated`). In a sweep, a mailbox whose
+connection became unusable mid-mailbox is now listed in `skipped` as well as
+in `mailboxes`, since later passes never ran. Pinned by
+`a_sweep_stops_at_a_lost_connection_and_reports_what_it_did_not_cover`,
+`a_flag_scan_reports_the_mailboxes_a_lost_connection_left_unscanned`,
+`a_flag_scan_skips_a_refused_mailbox_and_scans_the_rest`,
+`a_single_mailbox_flag_scan_fails_on_a_lost_connection`,
+`an_attachment_scan_reports_the_mailboxes_a_lost_connection_left_unscanned`,
+and `thread_discovery_fails_when_the_connection_is_lost`.
+
+### Addendum: reads, LIST, missing messages and the NOOP after a mutation
+
+The same rule now covers every answer that decides something, each where its
+callers already meet:
+
+- `ConnectionPool::with_session_retry` probes after the read. A closed stream
+  becomes the connection error its one retry exists for, so the read reruns on
+  a fresh connection instead of returning what little arrived.
+- `list_mailbox_layout` probes after LIST, so the catalog never caches a short
+  list for scans to plan from.
+- A FETCH answer that leaves out a requested UID (`answered_fetches`,
+  `answer_for_uid`) counts only after a probe. `MessageNotFound` is what the
+  subscription move, unsubscribe and the ranking samples prune the cache on,
+  and the samples' own rule — "an outage must not masquerade as deletion" —
+  was broken by an outage that doesn't look like one.
+- After a mutation, `PooledSession::release_after_mutation` sends the
+  (now checked) `sync` NOOP and pools the session only if it answers, but
+  never fails: the mutation's own tagged reply is the result. Five call sites
+  `?`-ed the unchecked NOOP, so a server dropping the client right after an
+  EXPUNGE reported the finished delete as failed.
+
+`update_flags` differs: async-imap's STOREs don't check their tagged reply, so
+its read-back is the only evidence of what landed, and a connection lost before
+it is an error (repeating the idempotent update is the remedy). Pinned by
+`a_read_cut_off_by_a_closed_connection_is_retried_on_a_fresh_one`,
+`a_list_cut_short_by_a_closed_connection_is_an_error`,
+`a_closed_connection_is_not_a_missing_message`,
+`a_closed_connection_prunes_no_ranking_samples`,
+`a_delete_whose_connection_closes_after_the_expunge_still_reports_it`,
+`a_session_that_dies_after_a_delete_is_not_pooled`, and
+`a_flag_read_back_answers_for_the_message_that_was_changed`.
+
+## 0.7.0 — Move Reconciliation Acts Only On A Live Server's Answer
+
+### Decision
+
+`reconcile_journaled_move` changes the journal only on an answer a live server
+gave. Opening a mailbox: a new UIDVALIDITY, `NO [NONEXISTENT]`, or an open
+without UIDVALIDITY on a connection a NOOP then proves alive parks the move as
+`needsAttention`; anything else — a dropped connection, a timeout, a refusal
+such as `[UNAVAILABLE]` — returns the error and leaves the operation exactly as
+it was (`reconcile_moves` counts it `pending` and lists it in `errors`).
+"Not there" comes from `uid_search_checked`, which needs the search's own
+tagged `OK`, and counts only on a session that sees the whole mailbox. A source
+is deleted only right after its copy (the `COPYUID`) has been seen in the
+destination. `needsAttention` moves are examined again on every reconcile,
+resuming from what the journal knows for certain: `Copied` with a COPYUID,
+otherwise `CopyInFlight`, whose UIDNEXT rule never copies twice. `dismiss`
+(`reconcile_moves` `dismiss: true` + `operationId`, `Agentmail::dismiss_move`)
+closes one move for good and touches neither mailbox.
+
+### Rationale
+
+async-imap returns `Ok` from SELECT at end-of-stream and drains SEARCH with
+`take_while`, so one dropped connection read as two different facts. During
+SELECT it looked like a mailbox without UIDVALIDITY — "source mailbox epoch
+changed" — and parked the move as `needsAttention`, which reconcile then
+returned unexamined. A pending move holds its source and destination against
+rename and delete, and the only remedy offered was to reconcile it: one
+connection drop could lock two mailboxes for good. After SELECT it looked like
+an empty search — "source gone" — and marked the move complete, releasing the
+claim while the source survived beside its copy.
+
+Re-examining is what unsticks the moves the old classification parked, and the
+copy check is what makes re-examining safe. A move can wait days, and the very
+symptom of a pending move — the message still showing in its old mailbox — is
+what invites a person to delete the "duplicate" copy. Reconcile used to delete
+the source anyway; now it keeps it and asks. (The tool description already
+promised it removes a source "only after it can prove the destination copy".)
+Without a COPYUID (`UIDNOTSTICKY`) there is no copy to look for, and the COPY's
+`OK` stays the only evidence.
+
+On a Limited Mode session (Yahoo/AOL outside UID Mode) UIDs below the window
+search as absent, so absence proves nothing there. Yahoo and AOL advertise
+MOVE, so the journal never runs on them today; the guard is for a server that
+pairs UIDONLY with no MOVE.
+
+`dismiss` names one operation because closing every pending move at once is
+the bulk "forget what we were doing" the journal exists to prevent.
+
+### Consequence
+
+Journal state `dismissed`, pruned with `complete` and `copy_failed`; no schema
+change, since older builds read inactive rows only by id. `ReconcileMovesResponse`
+gains `dismissed` and `errors`, and `failed` now means only a rejected COPY (an
+attempt error used to count there). Pinned by
+`a_connection_lost_while_selecting_leaves_the_move_as_it_was`,
+`a_connection_lost_after_selecting_does_not_complete_the_move`,
+`a_copy_gone_from_the_destination_keeps_the_source`,
+`a_move_needing_attention_is_re_examined_and_finished`,
+`re_examining_without_a_copyuid_never_copies_twice`,
+`a_dismissed_move_no_longer_blocks_its_mailboxes`, and
+`async_imaps_own_search_reports_a_closed_stream_as_no_match` (the upstream
+behavior, so the day it changes is visible).
+
+---
+
 ## 0.5.0 — Two Tool Pairs Become One Tool Each
 
 ### `add_flags` + `remove_flags` → `update_flags`
@@ -62,7 +438,9 @@ drive permission prompts.
 
 37 tools → 35. The count is asserted in two places
 (`tool_schemas_are_ref_free`, `tools_list_has_35_annotated_tools`) precisely so
-a drift like this cannot land without the docs being updated with it. Pinned by
+a drift like this cannot land without the docs being updated with it. (0.7.0
+added `list_identities`: 36, and the second guard is now
+`tools_list_has_36_annotated_tools`.) Pinned by
 `update_flags_exposes_add_remove_and_color_as_one_call`,
 `create_draft_absorbs_the_reply_form`, and
 `a_reply_draft_refuses_recipients_it_would_derive`.

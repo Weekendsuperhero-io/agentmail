@@ -13,7 +13,6 @@ jobs:
       check-os-json: '["ubuntu-latest","macos-latest","windows-latest"]'
       rust-cache-provider: github
       docs-os: ubuntu-latest
-      linux-packages: "libdbus-1-dev pkg-config"
       build-matrix-json: "[]"
       # Run nextest when available (preferred runner + .config/nextest.toml).
       # Falls back to `cargo test` if nextest is unavailable or on Windows.

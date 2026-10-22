@@ -1,6 +1,6 @@
 //!
 //!
-//! https://tools.ietf.org/html/rfc2971
+//! <https://tools.ietf.org/html/rfc2971>
 //!
 //! The IMAP4 ID extension
 //!
@@ -13,33 +13,34 @@ use nom::{
     character::complete::{char, space0, space1},
     combinator::map,
     multi::many0,
-    sequence::{preceded, separated_pair, tuple},
-    IResult,
+    sequence::{preceded, separated_pair},
+    IResult, Parser,
 };
 
 use crate::{
-    parser::core::{nil, nstring_utf8, string_utf8},
+    core::{nil, nstring_utf8, string_utf8},
     Response,
 };
 
 // A single id parameter (field and value).
 // Format: string SPACE nstring
 // [RFC2971 - Formal Syntax](https://tools.ietf.org/html/rfc2971#section-4)
-fn id_param(i: &[u8]) -> IResult<&[u8], (&str, Option<&str>)> {
-    separated_pair(string_utf8, space1, nstring_utf8)(i)
+#[allow(clippy::type_complexity)]
+fn id_param(i: &[u8]) -> IResult<&[u8], (Cow<'_, str>, Option<Cow<'_, str>>)> {
+    separated_pair(string_utf8, space1, nstring_utf8).parse(i)
 }
 
 // The non-nil case of id parameter list.
 // Format: "(" #(string SPACE nstring) ")"
 // [RFC2971 - Formal Syntax](https://tools.ietf.org/html/rfc2971#section-4)
-fn id_param_list_not_nil(i: &[u8]) -> IResult<&[u8], HashMap<&str, &str>> {
+fn id_param_list_not_nil(i: &[u8]) -> IResult<&[u8], HashMap<Cow<'_, str>, Cow<'_, str>>> {
     map(
-        tuple((
+        (
             char('('),
             id_param,
-            many0(tuple((space1, id_param))),
+            many0((space1, id_param)),
             preceded(space0, char(')')),
-        )),
+        ),
         |(_, first_param, rest_params, _)| {
             let mut params = vec![first_param];
             for (_, p) in rest_params {
@@ -52,32 +53,28 @@ fn id_param_list_not_nil(i: &[u8]) -> IResult<&[u8], HashMap<&str, &str>> {
                 .map(|(k, v)| (k, v.unwrap()))
                 .collect()
         },
-    )(i)
+    )
+    .parse(i)
 }
 
 // The id parameter list of all cases
 // id_params_list ::= "(" #(string SPACE nstring) ")" / nil
 // [RFC2971 - Formal Syntax](https://tools.ietf.org/html/rfc2971#section-4)
-fn id_param_list(i: &[u8]) -> IResult<&[u8], Option<HashMap<&str, &str>>> {
-    alt((map(id_param_list_not_nil, Some), map(nil, |_| None)))(i)
+#[allow(clippy::type_complexity)]
+fn id_param_list(i: &[u8]) -> IResult<&[u8], Option<HashMap<Cow<'_, str>, Cow<'_, str>>>> {
+    alt((map(id_param_list_not_nil, Some), map(nil, |_| None))).parse(i)
 }
 
 // id_response ::= "ID" SPACE id_params_list
 // [RFC2971 - Formal Syntax](https://tools.ietf.org/html/rfc2971#section-4)
 pub(crate) fn resp_id(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     let (rest, map) = map(
-        tuple((tag_no_case("ID"), space1, id_param_list)),
+        (tag_no_case("ID"), space1, id_param_list),
         |(_id, _sp, p)| p,
-    )(i)?;
+    )
+    .parse(i)?;
 
-    Ok((
-        rest,
-        Response::Id(map.map(|m| {
-            m.into_iter()
-                .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
-                .collect()
-        })),
-    ))
+    Ok((rest, Response::Id(map)))
 }
 
 #[cfg(test)]
@@ -91,7 +88,7 @@ mod tests {
             id_param(br#""name" "Cyrus""#),
             Ok((_, (name, value))) => {
                 assert_eq!(name, "name");
-                assert_eq!(value, Some("Cyrus"));
+                assert_eq!(value.as_deref(), Some("Cyrus"));
             }
         );
 
@@ -99,7 +96,7 @@ mod tests {
             id_param(br#""name" NIL"#),
             Ok((_, (name, value))) => {
                 assert_eq!(name, "name");
-                assert_eq!(value, None);
+                assert!(value.is_none());
             }
         );
     }
@@ -118,6 +115,7 @@ mod tests {
                         ("os-version", "5.5"),
                         ("support-url", "mailto:cyrus-bugs+@andrew.cmu.edu"),
                     ].into_iter()
+                    .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
                     .collect()
                 );
             }
@@ -138,6 +136,7 @@ mod tests {
                         ("os-version", "5.5"),
                         ("support-url", "mailto:cyrus-bugs+@andrew.cmu.edu"),
                     ].into_iter()
+                    .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
                     .collect()
                 );
             }

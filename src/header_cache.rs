@@ -1391,10 +1391,7 @@ fn default_cache_path() -> Option<PathBuf> {
     {
         return None;
     }
-    let root = std::env::var_os("AGENTMAIL_CACHE_DIR")
-        .map(PathBuf::from)
-        .or_else(dirs::cache_dir)?;
-    Some(root.join("agentmail").join(HeaderCache::FILE_NAME))
+    crate::default_cache_file(HeaderCache::FILE_NAME)
 }
 
 fn open_connection(path: &Path) -> CacheResult<Connection> {
@@ -3187,6 +3184,7 @@ mod tests {
             username: "user@verizon.net".to_string(),
             email: None,
             aliases: Vec::new(),
+            display_name: None,
             password: None,
             tls: true,
             max_connections: None,
@@ -3281,6 +3279,7 @@ mod tests {
             username: "user@example.com".to_string(),
             email: None,
             aliases: Vec::new(),
+            display_name: None,
             password: None,
             tls: true,
             max_connections: None,
@@ -3335,6 +3334,7 @@ mod tests {
             username: "user@example.com".to_string(),
             email: None,
             aliases: Vec::new(),
+            display_name: None,
             password: None,
             tls: true,
             max_connections: None,

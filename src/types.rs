@@ -13,6 +13,13 @@ pub struct AccountInfo {
     pub host: String,
     pub username: String,
     pub is_default: bool,
+    /// The sender name drafts carry, when one is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The addresses this account sends as — the primary first, then aliases.
+    /// A draft's `from` must be one of them.
+    #[serde(default)]
+    pub addresses: Vec<String>,
 }
 
 /// A mailbox on the server with message counts.
@@ -80,7 +87,9 @@ pub struct MessageInfo {
     pub uid: u32,
     pub subject: String,
     pub sender: String,
-    pub reply_to: String,
+    /// Every `Reply-To` address, in header order; empty when there is none.
+    #[serde(default)]
+    pub reply_to: Vec<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub mailbox: String,
@@ -218,6 +227,49 @@ pub struct ListAccountsResponse {
     pub accounts: Vec<AccountInfo>,
 }
 
+/// One address an account sends as, configured or seen in its Sent mail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct SenderIdentity {
+    /// Canonical (lowercased) address.
+    pub address: String,
+    /// One of the account's configured addresses — a draft may be `from` it.
+    /// An address seen only in Sent must be added as an alias first.
+    pub configured: bool,
+    /// The account's primary address, a draft's default sender.
+    pub primary: bool,
+    /// Names the scanned Sent mail went out under from this address, most used
+    /// first (at most five).
+    pub display_names: Vec<String>,
+    /// Scanned Sent messages from this address; 0 for a configured address
+    /// that does not appear in them.
+    pub messages: usize,
+    /// Date of the newest scanned message from this address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<DateTime<Utc>>,
+}
+
+/// Response for list_identities. Also `Deserialize`, so an embedder reading
+/// the `list_identities` tool's structured result gets this type back — the
+/// wire output is asserted to round-trip into it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListIdentitiesResponse {
+    pub account: String,
+    /// The configured sender name, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The Sent mailbox that was read; `None` when the account has none, in
+    /// which case only the configured addresses are reported.
+    pub sent_mailbox: Option<String>,
+    /// How many of the newest Sent messages were read.
+    pub scanned_messages: usize,
+    /// Configured addresses first (primary, then aliases), then addresses seen
+    /// only in Sent, most used first.
+    pub identities: Vec<SenderIdentity>,
+}
+
 /// Response for list_mailboxes.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -286,6 +338,9 @@ pub struct ListFlagsResponse {
     pub flags: Vec<FlagCount>,
     pub colors: Vec<ColorCount>,
     pub per_mailbox: Vec<MailboxFlagBreakdown>,
+    /// Mailboxes an account-wide scan did not cover — each failed, or came
+    /// after the connection was lost. Their messages are in none of the counts.
+    pub skipped: Vec<String>,
 }
 
 /// A flag name with its count.
@@ -327,6 +382,9 @@ pub struct FindAttachmentsResponse {
     pub limit: usize,
     pub messages: Vec<AttachmentMessage>,
     pub per_mailbox: Vec<MailboxAttachmentCount>,
+    /// Mailboxes an account-wide scan did not cover — each failed, or came
+    /// after the connection was lost. Their messages are not in `total`.
+    pub skipped: Vec<String>,
 }
 
 /// A mailbox-safe attachment search hit.
@@ -795,17 +853,34 @@ pub struct ListPendingMovesResponse {
     pub operations: Vec<PendingMove>,
 }
 
-/// Response for reconcile_moves.
+/// Response for reconcile_moves (and for dismissing one move).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconcileMovesResponse {
     pub account: String,
     pub examined: usize,
     pub completed: usize,
+    /// Still waiting on reconciliation, including every attempt in `errors`.
     pub pending: usize,
     pub needs_attention: usize,
+    /// Moves whose COPY the server rejected; the source was never touched.
     pub failed: usize,
+    /// Moves closed without touching either mailbox.
+    pub dismissed: usize,
+    /// Attempts that learned nothing (a dropped connection, a timeout). Each
+    /// operation was left exactly as it was, for the next reconcile.
+    pub errors: Vec<ReconcileMoveError>,
+    /// The account's moves still pending after this call.
     pub operations: Vec<PendingMove>,
+}
+
+/// One reconciliation attempt that could not decide anything.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct ReconcileMoveError {
+    pub operation_id: String,
+    pub error: String,
 }
 
 /// Response for create_mailbox.
@@ -881,6 +956,9 @@ pub struct CreateDraftResponse {
     pub created: bool,
     pub account: String,
     pub drafts_mailbox: String,
+    /// The sender written to the draft's `From`, as `Name <addr>` or `addr` —
+    /// what was resolved, not what was asked for.
+    pub from: String,
     pub subject: String,
     pub recipients: DraftRecipients,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -932,6 +1010,9 @@ pub struct UpdateDraftResponse {
     pub updated: bool,
     pub account: String,
     pub drafts_mailbox: String,
+    /// The sender written to the replacement's `From`, as `Name <addr>` or
+    /// `addr` — what was resolved, not what was asked for.
+    pub from: String,
     pub previous_uid_validity: u32,
     pub previous_uid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -951,7 +1032,9 @@ pub struct UpdateDraftResponse {
 #[schemars(inline)]
 pub struct DownloadedFile {
     pub index: usize,
+    /// `{uid}_{index}_{name}`, the name sanitized.
     pub filename: String,
+    /// Absolute, canonical path of the written file.
     pub path: String,
     pub content_type: String,
     pub size: usize,

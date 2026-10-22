@@ -1,17 +1,17 @@
 [workspace]
 
-# Local imap-proto fork adding RFC 9586 UIDFETCH response parsing (the enabler
-# for Yahoo/AOL UID Mode / ENABLE UIDONLY, which lifts the visible-window
-# limit). Applies to async-imap's transitive imap-proto too. See
+# Local imap-proto 0.17 fork adding RFC 9586 UIDFETCH response parsing (the
+# enabler for Yahoo/AOL UID Mode / ENABLE UIDONLY, which lifts the
+# visible-window limit). Applies to async-imap's transitive imap-proto too. See
 # docs/patches/imap-proto-uidfetch.md; upstream when possible to drop the fork.
 [patch.crates-io]
 imap-proto = { path = "vendor/imap-proto" }
 
 [package]
 name = "agentmail"
-version = "0.6.0"
+version = "0.9.1"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.99.1"
 description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
 documentation = "https://docs.rs/agentmail"
 readme = "README.md"
@@ -33,28 +33,32 @@ path = "src/main.rs"
 # IMAP protocol (tokio runtime). `compress` enables optional RFC 4978
 # COMPRESS=DEFLATE, negotiated after login only when the server advertises it.
 # It materially reduces transfer size for large full-header scans.
-async-imap = { version = "0.11", default-features = false, features = [
+async-imap = { version = "0.12", default-features = false, features = [
   "runtime-tokio",
   "compress",
 ] }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 fast_html2md = "0.0"
 futures = "0.3"
 hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 idna = "1"
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 mail-parser = "0.11"
-mail-auth = { version = "0.12.1", default-features = false, features = ["ring"] }
-native-tls = "0.2"
+# aws-lc-rs, not ring: Agent Muse links this crate and ships one rustls crypto
+# provider. The feature also picks hickory's TLS and DNSSEC backends.
+mail-auth = { version = "0.13.3", default-features = false, features = ["aws-lc-rs"] }
 parking_lot = "0.12"
 percent-encoding = "2"
 printpdf = { version = "0.12", default-features = false }
 psl = "2"
 reqwest = { version = "0.13", features = ["json"] }
-rmcp = { version = "=2.2.0", features = ["server", "macros", "transport-io"] }
+# Exact-pinned to the embedding Agent Muse workspace's rmcp, so the app links
+# one copy. The protocol does not move with the SDK: the server speaks up to
+# `mcp::MAX_PROTOCOL_VERSION` (2026-07-28), named in the source.
+rmcp = { version = "=3.7.0", features = ["server", "macros", "transport-io"] }
 # Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native
 # sqlite — libsqlite3-sys has `links = "sqlite3"`, so exactly one version may
@@ -67,7 +71,13 @@ serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-native-tls = "0.3"
+# IMAP's TLS. rustls on aws-lc-rs, the one crypto provider Agent Muse ships
+# (`tokio_rustls::rustls` is the rustls this uses, so the two can't drift),
+# with the certificate check handed to the OS by rustls-platform-verifier,
+# so the roots a person or their MDM installed still count. native-tls ran
+# Secure Transport on macOS, which never gained TLS 1.3, and OpenSSL on Linux.
+rustls-platform-verifier = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
 tokio-util = "0.7"
 toml = "1.1"
 tracing = { version = "0.1", features = ["release_max_level_info"] }
@@ -82,7 +92,7 @@ apple-native-keyring-store = { version = "1.0", features = ["keychain", "protect
 windows-native-keyring-store = "1.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-dbus-secret-service-keyring-store = { version = "1.0", features = ["crypto-rust"] }
+zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-async-io-crypto-rust"] }
 
 [lints.clippy]
 await_holding_lock = "deny"

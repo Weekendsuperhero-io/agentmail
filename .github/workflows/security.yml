@@ -25,9 +25,6 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 

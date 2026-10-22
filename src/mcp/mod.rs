@@ -1,4 +1,5 @@
-//! MCP server: tools, prompts, and tasks over stdio or in-process transports.
+//! MCP server: tools, prompts, resources and completions over stdio or
+//! in-process transports.
 
 mod args;
 mod file_access;
@@ -9,28 +10,43 @@ mod tools_read;
 mod tools_write;
 mod wire;
 
-use self::tasks::{DESTRUCTIVE_TOOLS, TaskCompletion, TaskManager, extract_account};
-use futures::{FutureExt as _, StreamExt as _};
+use futures::StreamExt as _;
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
-    handler::server::router::tool::ToolRouter,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext},
     model::{
-        CallToolRequestParams, CallToolResult, CancelTaskParams, CancelTaskResult,
-        CompleteRequestParams, CompleteResult, CreateTaskResult, GetTaskParams,
-        GetTaskPayloadParams, GetTaskPayloadResult, GetTaskResult, Implementation,
-        ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, Meta,
-        PaginatedRequestParams, ProgressNotificationParam, ReadResourceRequestParams,
-        ReadResourceResult, RelatedTaskMetadata, ServerCapabilities, ServerInfo, TasksCapability,
+        CallToolRequestParams, CallToolResponse, CancelTaskParams, CompleteRequestParams,
+        CompleteResult, DiscoverRequestMethod, DiscoverResult, GetTaskParams, GetTaskResult,
+        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ProgressNotificationParam, ProtocolVersion, ReadResourceRequestParams, RequestMetaObject,
+        ServerCapabilities, ServerConfig, UpdateTaskParams,
     },
     prompt_handler,
     service::RequestContext,
     tool_handler,
 };
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::sync::Arc;
+
+/// The newest MCP revision this server speaks. A 2025-era client still opens
+/// with `initialize`, answered in [`ProtocolVersion::LATEST_WITH_INITIALIZE`]
+/// (2025-11-25); a 2026-07-28 client runs that revision's stateless lifecycle,
+/// carrying its version, identity and capabilities in every request's `_meta`.
+/// Named rather than taken from rmcp's `LATEST`, so a newer SDK does not move
+/// the protocol on its own.
+const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 const PREWARM_CONCURRENCY: usize = 3;
 const PREWARM_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The session's PRIMARY workspace root, as a JSON string.
 pub const WORKSPACE_ROOT_META_KEY: &str = "io.agentmuse/workspaceRoot";
+/// The Project's OTHER bound directories, as a JSON array of strings.
+///
+/// A separate key rather than widening [`WORKSPACE_ROOT_META_KEY`] to
+/// string-or-array: the primary root is load-bearing on its own (relative
+/// paths join it, an omitted `outputDir` lands in it), so it keeps a field
+/// whose type says there is exactly one. Absent or empty means what it always
+/// meant — one root — so an older app, or the standalone server, is unchanged.
+pub const ADDITIONAL_ROOTS_META_KEY: &str = "io.agentmuse/additionalWorkspaceRoots";
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -61,18 +77,6 @@ fn account_log_hint(account: &str) -> String {
     }
 
     mask_prefix_for_log(account)
-}
-
-fn insert_related_task(meta: &mut Meta, task_id: &str) {
-    meta.0.insert(
-        RelatedTaskMetadata::META_KEY.to_string(),
-        serde_json::json!({ "taskId": task_id }),
-    );
-}
-
-fn attach_related_task(result: &mut CallToolResult, task_id: &str) {
-    let meta = result.meta.get_or_insert_with(Meta::new);
-    insert_related_task(meta, task_id);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,45 +129,56 @@ fn normalized_progress(
 /// Build a bounded, coalescing progress stream. One worker serializes all
 /// notifications for the request, preserving monotonic progress and avoiding
 /// a detached Tokio task per callback.
-fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> ProgressReporter {
-    let Some(token) = meta.get_progress_token() else {
+///
+/// A call that became a task ([`tasks`]) reports on the task instead: its
+/// request has been answered, so a `notifications/progress` on that request's
+/// token would describe a request that no longer exists.
+fn make_progress_fn(meta: &RequestMetaObject, peer: &Peer<RoleServer>) -> ProgressReporter {
+    let run = tasks::ToolRun::current();
+    let token = meta.get_progress_token();
+    if token.is_none() && run.is_none() {
         return ProgressReporter::disabled();
-    };
-    let related_task = meta.0.get(RelatedTaskMetadata::META_KEY).cloned();
-    let peer = peer.clone();
+    }
     let (sender, mut receiver) = tokio::sync::watch::channel(None::<ProgressUpdate>);
     let latest = Arc::new(parking_lot::Mutex::new(None::<ProgressUpdate>));
     let callback_latest = Arc::clone(&latest);
+    let callback_run = run.clone();
     let callback = Arc::new(move |completed: u64, total: u64| {
         let mut previous = callback_latest.lock();
         let Some(update) = normalized_progress(*previous, completed, total) else {
             return;
         };
         *previous = Some(update);
+        if callback_run
+            .as_ref()
+            .is_some_and(|run| run.report_progress(update.completed, update.total))
+        {
+            return;
+        }
         sender.send_replace(Some(update));
     });
-    let worker = tokio::spawn(async move {
-        while receiver.changed().await.is_ok() {
-            let Some(update) = *receiver.borrow_and_update() else {
-                continue;
-            };
-            let mut notification =
-                ProgressNotificationParam::new(token.clone(), update.completed as f64)
-                    .with_total(update.total as f64);
-            if let Some(related_task) = related_task.clone() {
-                let mut meta = Meta::new();
-                meta.0
-                    .insert(RelatedTaskMetadata::META_KEY.to_string(), related_task);
-                notification.meta = Some(meta);
+    let worker = token.map(|token| {
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            while receiver.changed().await.is_ok() {
+                let Some(update) = *receiver.borrow_and_update() else {
+                    continue;
+                };
+                if run.as_ref().is_some_and(|run| run.is_promoted()) {
+                    break;
+                }
+                let notification =
+                    ProgressNotificationParam::new(token.clone(), update.completed as f64)
+                        .with_total(update.total as f64);
+                if peer.notify_progress(notification).await.is_err() {
+                    break;
+                }
             }
-            if peer.notify_progress(notification).await.is_err() {
-                break;
-            }
-        }
+        })
     });
     ProgressReporter {
         callback: Some(callback),
-        worker: Some(worker),
+        worker,
     }
 }
 
@@ -171,8 +186,19 @@ fn make_progress_fn(meta: &Meta, peer: &Peer<RoleServer>) -> ProgressReporter {
 /// client sends `notifications/cancelled` for this request, or on transport
 /// shutdown (the token is a child of the serve-loop token). Long scans check
 /// it at mailbox and fetch-chunk boundaries.
+///
+/// In a call that may become a task the token is the operation's own (see
+/// [`tasks`]), and a check that finds it cancelled is recorded, so a task the
+/// tool stopped for `tasks/cancel` settles as `cancelled`.
 fn make_cancel_fn(ct: tokio_util::sync::CancellationToken) -> crate::CancelFn {
-    Arc::new(move || ct.is_cancelled())
+    let run = tasks::ToolRun::current();
+    Arc::new(move || {
+        let cancelled = ct.is_cancelled();
+        if cancelled && let Some(run) = &run {
+            run.note_cancel_observed();
+        }
+        cancelled
+    })
 }
 
 /// Map a library error to an MCP error code. Model-actionable failures
@@ -253,32 +279,37 @@ impl Pagination {
 #[derive(Clone)]
 pub struct AgentMailServer {
     agentmail: Arc<crate::Agentmail>,
-    task_manager: Arc<parking_lot::Mutex<TaskManager>>,
     /// Sandbox for LLM-supplied filesystem paths (attachment reads, download
     /// writes). See [`file_access::FileAccessPolicy`].
     file_access: Option<file_access::FileAccessPolicy>,
+    /// This connection's tasks (SEP-2663). See [`tasks`].
+    tasks: Arc<tasks::TaskRuntime>,
 }
 
 impl AgentMailServer {
     pub fn new(agentmail: crate::Agentmail) -> Self {
         Self {
             agentmail: Arc::new(agentmail),
-            task_manager: Arc::new(parking_lot::Mutex::new(TaskManager::new())),
             file_access: Some(file_access::FileAccessPolicy::from_env()),
+            tasks: Arc::new(tasks::TaskRuntime::new(tasks::TaskConfig::DEFAULT)),
         }
     }
 
     fn new_embedded(agentmail: crate::Agentmail) -> Self {
+        Self::new_embedded_with(agentmail, tasks::TaskConfig::DEFAULT)
+    }
+
+    fn new_embedded_with(agentmail: crate::Agentmail, tasks: tasks::TaskConfig) -> Self {
         Self {
             agentmail: Arc::new(agentmail),
-            task_manager: Arc::new(parking_lot::Mutex::new(TaskManager::new())),
             file_access: None,
+            tasks: Arc::new(tasks::TaskRuntime::new(tasks)),
         }
     }
 
     fn file_access_for_request(
         &self,
-        meta: &Meta,
+        meta: &RequestMetaObject,
     ) -> Result<file_access::FileAccessPolicy, McpError> {
         if let Some(policy) = &self.file_access {
             return Ok(policy.clone());
@@ -301,15 +332,42 @@ impl AgentMailServer {
                 None,
             ));
         }
-        Ok(file_access::FileAccessPolicy::with_root(root))
+        // The Project's other bound directories, if the app sent any. Each is
+        // filtered to an absolute path by `with_roots`; a malformed entry is
+        // dropped rather than failing the call, because the primary root
+        // alone is still a working session.
+        let additional: Vec<std::path::PathBuf> = meta
+            .get(ADDITIONAL_ROOTS_META_KEY)
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(file_access::FileAccessPolicy::with_roots(root, additional))
     }
 
-    /// Combined tool router — referenced by `#[tool_handler]`'s default
-    /// `Self::tool_router()` expression and by the regression tests.
+    /// Combined tool router. Built ONCE, into [`TOOL_ROUTER`]: `#[tool_handler]`
+    /// evaluates its router expression on every `call_tool`, `list_tools` and
+    /// `get_tool`, so calling this there rebuilt all 36 routes per request (and,
+    /// on each runtime thread's first request, every schema — rmcp caches them
+    /// per thread). The regression tests call it directly.
     fn tool_router() -> ToolRouter<Self> {
         Self::read_tools_router() + Self::write_tools_router()
     }
 }
+
+/// The one router every request dispatches through — see
+/// [`AgentMailServer::tool_router`]. `list_tools` clones its tools and patches
+/// the live accounts into the copies (`Arc::make_mut` copies a shared schema on
+/// write), so the shared definitions are never edited.
+static TOOL_ROUTER: std::sync::LazyLock<ToolRouter<AgentMailServer>> =
+    std::sync::LazyLock::new(AgentMailServer::tool_router);
 
 /// Constrain every `account` argument in a tool's input schema to the accounts
 /// this server actually has.
@@ -337,7 +395,7 @@ fn patch_account_enum(schema: &mut serde_json::Map<String, serde_json::Value>, a
     );
 }
 
-#[tool_handler]
+#[tool_handler(router = TOOL_ROUTER)]
 #[prompt_handler]
 impl ServerHandler for AgentMailServer {
     /// The tool list, with the LIVE account names patched into every `account`
@@ -360,7 +418,7 @@ impl ServerHandler for AgentMailServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, McpError> {
-        let mut tools = Self::tool_router().list_all();
+        let mut tools = TOOL_ROUTER.list_all();
         let accounts = self.agentmail.account_names();
         if !accounts.is_empty() {
             for tool in &mut tools {
@@ -372,22 +430,118 @@ impl ServerHandler for AgentMailServer {
             tools,
             meta: None,
             next_cursor: None,
+            ..Default::default()
         })
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::builder()
+    /// A call to one of `tasks::TASK_TOOLS` from a client that declared the
+    /// tasks extension may become a task once it has run for a while (see
+    /// `tasks`). Every other call is dispatched exactly as the generated
+    /// handler did.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let tasks_declared = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        if !(tasks_declared && tasks::TASK_TOOLS.contains(&request.name.as_ref())) {
+            return TOOL_ROUTER
+                .call(ToolCallContext::new(self, request, context))
+                .await;
+        }
+        let operation_ct = self.tasks.operation_token();
+        let request_ct = std::mem::replace(&mut context.ct, operation_ct.clone());
+        let tool = request.name.clone();
+        let server = self.clone();
+        self.tasks
+            .run_call(&tool, request_ct, operation_ct, async move {
+                TOOL_ROUTER
+                    .call(ToolCallContext::new(&server, request, context))
+                    .await
+            })
+            .await
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.tasks.get(&request.task_id)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.update(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel(&request.task_id)
+    }
+
+    /// Every revision up to `MAX_PROTOCOL_VERSION` and nothing newer, so a
+    /// newer rmcp cannot widen what this server claims. This one list bounds
+    /// `server/discover`, the `initialize` negotiation and the version a
+    /// request names in its own `_meta`.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION))
+    }
+
+    /// `server/discover` opens the 2026-07-28 lifecycle, so it is answered
+    /// only at a revision without a handshake. A probe at a 2025 version is
+    /// told the method does not exist, which is how a 2025-11-25 server
+    /// answers it: rmcp's default would answer and let the client run the
+    /// stateless lifecycle at a revision that defines none. (A version this
+    /// server does not speak at all never gets here: rmcp refuses it with
+    /// `-32022` first.)
+    ///
+    /// `supportedVersions` lists every revision this server implements, the
+    /// same list a `-32022` carries: a client must be able to read the two
+    /// answers as one fact (the official suite's `sep-2575` checks hold
+    /// them to it).
+    async fn discover(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        if context
+            .meta
+            .protocol_version()
+            .is_none_or(|version| version.has_initialize())
+        {
+            return Err(McpError::method_not_found::<DiscoverRequestMethod>());
+        }
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        // `tasks` is the SEP-2663 extension (`extensions`), offered on both
+        // revisions: a client opts in by declaring it, and only a slow call
+        // from one that did ever becomes a task. The SEP-1686 `capabilities.
+        // tasks` slot retired in 0.8.0 stays gone.
+        let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
             .enable_resources()
             .enable_completions()
             .enable_tasks()
             .build();
-        // `enable_tasks()` only switches the capability on. The protocol also
-        // requires the server to declare the supported lifecycle methods and
-        // which requests may be task-augmented.
-        capabilities.tasks = Some(TasksCapability::server_default());
-        ServerInfo::new(capabilities)
+        ServerConfig::new(capabilities)
+            // The `initialize` answer: the newest revision that still has a
+            // handshake. rmcp answers a client asking for 2026-07-28 there
+            // with this too.
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
             // Without this the server announces itself as "rmcp" — rmcp's
             // Implementation::from_build_env() bakes in its own crate name.
             // Version carries the build SHA so `initialize` responses and logs
@@ -413,7 +567,8 @@ impl ServerHandler for AgentMailServer {
              \n\
              The configured accounts are already listed in every `account` argument's\n\
              schema — choose one from there. Call `list_accounts` only when you need to know\n\
-             which account is the DEFAULT.\n\
+             which account is the DEFAULT, or which addresses an account sends as.\n\
+             `list_identities` adds the From addresses its recent Sent mail used.\n\
              \n\
              `list_mailboxes` takes one account and returns selectable mailboxes only, 100\n\
              per page.\n\
@@ -443,7 +598,14 @@ impl ServerHandler for AgentMailServer {
              ## Drafts\n\
              \n\
              `create_draft` and `update_draft`. Both accept Reply-To, Bcc,\n\
-             attachments and RFC threading headers.\n\
+             attachments and RFC threading headers. Every recipient field takes\n\
+             `Name <address>` or a bare address, one recipient per entry.\n\
+             \n\
+             A draft is From the account's primary address under its display name. Pass\n\
+             `from` (`Name <address>` or an address) to use another of the account's own\n\
+             addresses — any other address is refused. A reply is From the address the\n\
+             original was sent to; `update_draft` keeps the draft's current sender. The\n\
+             result's `from` is the sender actually written.\n\
 \n\
              To reply, give `create_draft` a `replyToMessage` — the mailbox, uid,\n\
              expectedUidValidity and mode of the live message. It derives the\n\
@@ -482,7 +644,9 @@ impl ServerHandler for AgentMailServer {
              \n\
              A server without native MOVE may return `reconciliationPending` or\n\
              `needsAttention` with an `operationId`. Inspect it with `list_pending_moves` and\n\
-             retry with `reconcile_moves`.\n\
+             retry with `reconcile_moves`, which examines `needsAttention` moves again. One it\n\
+             still can't finish is closed with `reconcile_moves` `dismiss: true` and its\n\
+             `operationId`, after checking both mailboxes; that moves and deletes nothing.\n\
              \n\
              ## Rankings\n\
              \n\
@@ -610,8 +774,8 @@ impl ServerHandler for AgentMailServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
-        self.read_email_resource(&request.uri).await
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        self.read_email_resource(&request.uri).await.map(Into::into)
     }
 
     async fn complete(
@@ -620,156 +784,6 @@ impl ServerHandler for AgentMailServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, McpError> {
         self.handle_complete(request).await
-    }
-
-    async fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        mut context: RequestContext<RoleServer>,
-    ) -> Result<CreateTaskResult, McpError> {
-        let task_id = uuid::Uuid::new_v4().to_string();
-
-        let is_destructive = DESTRUCTIVE_TOOLS.contains(&request.name.as_ref());
-        let destructive_lock = if is_destructive {
-            let account = extract_account(&request.arguments).ok_or_else(|| {
-                McpError::invalid_params(
-                    "destructive tools require an 'account' argument for task queuing",
-                    None,
-                )
-            })?;
-            Some(self.task_manager.lock().destructive_lock(&account))
-        } else {
-            None
-        };
-
-        // Reserve before spawning so capacity rejection cannot start work.
-        let task = self.task_manager.lock().reserve_task(task_id.clone())?;
-
-        let server = self.clone();
-        let completion = Arc::new(TaskCompletion::new());
-        let worker_completion = Arc::clone(&completion);
-        // Keep transport cancellation inherited from the request while also
-        // giving tasks/cancel a token that reaches cooperative library work
-        // and spawn_blocking SQLite publication.
-        let task_cancel = context.ct.child_token();
-        context.ct = task_cancel.clone();
-        insert_related_task(&mut context.meta, &task_id);
-        // Captured BEFORE `context` moves into the worker: the push target.
-        let peer = context.peer.clone();
-        let notify_id = task_id.clone();
-        let notify_manager = Arc::clone(&self.task_manager);
-        let handle = tokio::spawn(async move {
-            // If destructive, acquire the per-account lock first.
-            // This serializes destructive tasks — the task waits here until
-            // any previously-enqueued destructive task on the same account
-            // finishes.
-            let _guard = match destructive_lock {
-                Some(ref lock) => Some(lock.lock().await),
-                None => None,
-            };
-            let result = AssertUnwindSafe(server.call_tool(request, context))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    Err(McpError::internal_error(
-                        "task worker panicked while executing the tool",
-                        None,
-                    ))
-                });
-            worker_completion.complete(result);
-        });
-
-        self.task_manager.lock().commit_task(
-            &task_id,
-            Arc::clone(&completion),
-            task_cancel,
-            handle,
-        )?;
-
-        // Status watcher — the single producer of `notifications/tasks/status`.
-        //
-        // Spawned AFTER `commit_task` on purpose. The worker above can finish
-        // before the task is committed (a fast failure beats the commit to the
-        // lock), and `task_info` cannot resolve a task that is still only
-        // RESERVED — pushing from the worker therefore dropped the
-        // notification exactly when the task failed fastest.
-        //
-        // Waiting on the completion also unifies the two ways a task ends:
-        // `cancel_task` publishes a cancelled result, so cancellation wakes
-        // this same watcher rather than needing its own push (which would
-        // double-notify).
-        tokio::spawn(async move {
-            // A never-cancelled token: this watcher waits for the TASK, and
-            // must not be torn down by any one request's cancellation.
-            let _ = completion
-                .wait(&tokio_util::sync::CancellationToken::new())
-                .await;
-            // Read back through `task_info`, which runs the same lazy refresh
-            // a `tasks/get` would — so the pushed status can never contradict
-            // a subsequent poll.
-            let Ok(task) = notify_manager.lock().task_info(&notify_id) else {
-                return;
-            };
-            let notification = rmcp::model::ServerNotification::TaskStatusNotification(
-                rmcp::model::TaskStatusNotification::new(
-                    rmcp::model::TaskStatusNotificationParam::new(task),
-                ),
-            );
-            if let Err(error) = peer.send_notification(notification).await {
-                tracing::debug!(
-                    target: "agentmail",
-                    task = %notify_id,
-                    "tasks/status push failed — client gone: {error}"
-                );
-            }
-        });
-
-        Ok(CreateTaskResult::new(task))
-    }
-
-    async fn list_tasks(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListTasksResult, McpError> {
-        self.task_manager
-            .lock()
-            .list_page(request.as_ref().and_then(|params| params.cursor.as_deref()))
-    }
-
-    async fn get_task_info(
-        &self,
-        request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskResult, McpError> {
-        let task = self.task_manager.lock().task_info(&request.task_id)?;
-        Ok(GetTaskResult::new(task))
-    }
-
-    async fn get_task_result(
-        &self,
-        request: GetTaskPayloadParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskPayloadResult, McpError> {
-        let completion = self.task_manager.lock().task_completion(&request.task_id)?;
-        let mut result = completion.wait(&context.ct).await?;
-        attach_related_task(&mut result, &request.task_id);
-        let value = serde_json::to_value(result)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(GetTaskPayloadResult::new(value))
-    }
-
-    async fn cancel_task(
-        &self,
-        request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<CancelTaskResult, McpError> {
-        // No push here: `cancel_task` publishes a cancelled result, which wakes
-        // the status watcher spawned in `enqueue_task`. That single watcher is
-        // the ONLY producer of `notifications/tasks/status`, so cancel and
-        // natural completion cannot double-notify.
-        let task = self.task_manager.lock().cancel_task(&request.task_id)?;
-        Ok(CancelTaskResult::new(task))
     }
 }
 
@@ -797,11 +811,25 @@ where
         build = env!("AGENTMAIL_BUILD_SHA"),
         "agentmail MCP server starting"
     );
-    let server = AgentMailServer::new_embedded(mk);
+    serve_server(transport, AgentMailServer::new_embedded(mk)).await
+}
+
+/// Serve one connection, then end its tasks: nothing can poll them once the
+/// client is gone.
+async fn serve_server<T>(
+    transport: T,
+    server: AgentMailServer,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let tasks = Arc::clone(&server.tasks);
     let service = server.serve(transport).await.inspect_err(|e| {
         eprintln!("agentmail: server error: {}", e);
     })?;
-    service.waiting().await?;
+    let result = service.waiting().await;
+    tasks.shutdown().await;
+    result?;
     Ok(())
 }
 
@@ -811,6 +839,7 @@ where
 pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error::Error>> {
     let server = AgentMailServer::new(mk);
     let prewarm_agentmail = Arc::clone(&server.agentmail);
+    let tasks = Arc::clone(&server.tasks);
     let service = server
         .serve(rmcp::transport::io::stdio())
         .await
@@ -859,6 +888,7 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
     let result = service.waiting().await;
     prewarm.abort();
     let _ = prewarm.await;
+    tasks.shutdown().await;
     result?;
     Ok(())
 }
@@ -883,6 +913,7 @@ mod tests {
                         username: format!("{name}@example.com"),
                         email: None,
                         aliases: Vec::new(),
+                        display_name: None,
                         password: None,
                         tls: true,
                         max_connections: None,
@@ -1022,6 +1053,28 @@ mod tests {
         );
     }
 
+    /// `#[tool_handler]` evaluates its router expression on EVERY call_tool,
+    /// list_tools and get_tool. Rebuilt per call, the router re-creates all 36
+    /// routes each time, and on each runtime worker thread its first request
+    /// regenerates every schema (rmcp caches them per thread). Shared, a request
+    /// on any thread gets the same schema allocation back.
+    #[test]
+    fn the_tool_router_is_built_once_not_per_request() {
+        use rmcp::ServerHandler as _;
+        let server = server_with_accounts(&["work"]);
+        let here = server.get_tool("create_draft").expect("create_draft");
+        let elsewhere = std::thread::scope(|scope| {
+            scope
+                .spawn(|| server.get_tool("create_draft"))
+                .join()
+                .expect("thread")
+        })
+        .expect("create_draft");
+        assert!(
+            std::sync::Arc::ptr_eq(&here.input_schema, &elsewhere.input_schema),
+            "the router was rebuilt for a request on another thread"
+        );
+    }
     #[test]
     fn pagination_applies_defaults_and_bounds_consistently() {
         assert_eq!(
@@ -1150,7 +1203,7 @@ mod tests {
         let tools = AgentMailServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            35,
+            36,
             "tool count drifted — update docs and tests"
         );
         for tool in &tools {
@@ -1255,23 +1308,6 @@ mod tests {
         );
     }
 
-    /// `DESTRUCTIVE_TOOLS` gates task serialization and must stay in sync with
-    /// the per-tool annotations (MCP default: destructive unless read-only).
-    #[test]
-    fn destructive_tools_const_matches_annotations() {
-        for tool in AgentMailServer::tool_router().list_all() {
-            let destructive = tool.annotations.as_ref().is_none_or(|a| {
-                !a.read_only_hint.unwrap_or(false) && a.destructive_hint.unwrap_or(true)
-            });
-            assert_eq!(
-                DESTRUCTIVE_TOOLS.contains(&tool.name.as_ref()),
-                destructive,
-                "DESTRUCTIVE_TOOLS drifted for `{}` — update the const or the annotations",
-                tool.name
-            );
-        }
-    }
-
     #[test]
     fn cancel_fn_reflects_token_state() {
         let ct = tokio_util::sync::CancellationToken::new();
@@ -1282,5 +1318,150 @@ mod tests {
         assert!(cancel());
         let err = crate::imap_client::check_cancel(Some(&cancel)).unwrap_err();
         assert_eq!(err.to_string(), "cancelled by client");
+    }
+}
+
+/// Tasks over the real JSON-RPC wire, with the promotion budget at zero so a
+/// call that has to touch the network is promoted at once.
+#[cfg(test)]
+mod task_wire_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
+
+    struct Wire {
+        reader: BufReader<ReadHalf<DuplexStream>>,
+        writer: WriteHalf<DuplexStream>,
+        next_id: i64,
+    }
+
+    impl Wire {
+        /// A server whose every eligible call is promoted at once, and a
+        /// session that declared the tasks extension.
+        async fn start() -> Self {
+            let config = crate::Config::from_accounts(vec![(
+                "dummy".to_string(),
+                crate::config::AccountConfig {
+                    // Never connects: `.invalid` cannot resolve, so the call
+                    // has to wait on the network before it fails.
+                    host: "imap.invalid".to_string(),
+                    port: 993,
+                    username: "dummy@example.invalid".to_string(),
+                    email: None,
+                    aliases: Vec::new(),
+                    display_name: None,
+                    password: Some(crate::secret::Secret::new_raw("unused")),
+                    tls: true,
+                    max_connections: None,
+                    auth: crate::config::AuthMethod::Password,
+                },
+            )]);
+            let server = AgentMailServer::new_embedded_with(
+                crate::Agentmail::new(config),
+                tasks::TaskConfig {
+                    promote_after: std::time::Duration::ZERO,
+                    ..tasks::TaskConfig::DEFAULT
+                },
+            );
+            let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+            tokio::spawn(async move {
+                let _ = serve_server(server_io, server).await;
+            });
+            let (reader, writer) = tokio::io::split(client_io);
+            let mut wire = Self {
+                reader: BufReader::new(reader),
+                writer,
+                next_id: 0,
+            };
+            let init = wire
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {
+                            "extensions": { "io.modelcontextprotocol/tasks": {} }
+                        },
+                        "clientInfo": { "name": "agentmail-tests", "version": "0" }
+                    }),
+                )
+                .await;
+            assert_eq!(init["result"]["protocolVersion"], "2025-11-25", "{init:#}");
+            wire.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+                .await;
+            wire
+        }
+
+        async fn send(&mut self, frame: Value) {
+            let mut line = serde_json::to_string(&frame).unwrap();
+            line.push('\n');
+            self.writer.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        async fn request(&mut self, method: &str, params: Value) -> Value {
+            self.next_id += 1;
+            let id = self.next_id;
+            self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let mut line = String::new();
+                    let read = self.reader.read_line(&mut line).await.unwrap();
+                    assert!(read > 0, "server closed the stream awaiting `{method}`");
+                    let frame: Value = serde_json::from_str(&line).unwrap();
+                    if frame["id"].as_i64() == Some(id) {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no answer to `{method}`"))
+        }
+    }
+
+    /// The whole flow a task-aware client sees: the call is answered with a
+    /// task handle, `tasks/get` reports it working, then completed, and the
+    /// result is the tool's own (an `isError` result here, since the account
+    /// cannot connect, which SEP-2663 counts as `completed`).
+    #[tokio::test]
+    async fn a_slow_call_becomes_a_task_the_client_polls_to_its_result() {
+        let mut wire = Wire::start().await;
+        let call = wire
+            .request(
+                "tools/call",
+                json!({ "name": "top_senders", "arguments": { "account": "dummy" } }),
+            )
+            .await;
+        let created = &call["result"];
+        assert_eq!(created["resultType"], "task", "{call:#}");
+        assert_eq!(created["status"], "working", "{call:#}");
+        assert_eq!(created["statusMessage"], "Running top_senders", "{call:#}");
+        let task_id = created["taskId"].as_str().expect("a task id").to_string();
+
+        let mut last = Value::Null;
+        for _ in 0..300 {
+            last = wire
+                .request("tasks/get", json!({ "taskId": task_id }))
+                .await;
+            if last["result"]["status"] != "working" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(last["result"]["status"], "completed", "{last:#}");
+        assert_eq!(last["result"]["result"]["isError"], true, "{last:#}");
+    }
+
+    /// A tool outside the task list is never promoted, however long it takes.
+    #[tokio::test]
+    async fn a_tool_outside_the_task_list_answers_inline() {
+        let mut wire = Wire::start().await;
+        let call = wire
+            .request(
+                "tools/call",
+                json!({ "name": "check_connection", "arguments": { "account": "dummy" } }),
+            )
+            .await;
+        assert!(call["result"].get("taskId").is_none(), "{call:#}");
+        assert!(call["result"]["content"].is_array(), "{call:#}");
     }
 }

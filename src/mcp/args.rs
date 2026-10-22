@@ -18,6 +18,19 @@ pub(super) struct ListAccountsArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Arguments for listing the addresses an account sends as.")]
+pub(super) struct ListIdentitiesArgs {
+    #[schemars(description = "Account name (required).")]
+    pub(super) account: String,
+    #[schemars(
+        range(min = 1, max = 1000),
+        description = "How many of the newest Sent messages to read. Defaults to 200; maximum 1000."
+    )]
+    pub(super) sent_messages: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(description = "Arguments for listing mailboxes.")]
 pub(super) struct ListMailboxesArgs {
     #[schemars(description = "Account name (required).")]
@@ -224,22 +237,35 @@ pub(super) struct CreateDraftArgs {
     )]
     pub(super) account: String,
     #[serde(default)]
+    #[schemars(
+        description = "Sender, as `Name <address>` or a bare address. The address must be one of this account's own — list_accounts lists them — or the draft is refused; the name defaults to the account's display name. Omit it to send as the account's primary address, or, for a reply, as the address the original was sent to."
+    )]
+    pub(super) from: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Draft subject line.")]
     pub(super) subject: String,
     #[serde(default)]
     #[schemars(description = "Draft body content.")]
     pub(super) body: String,
     #[serde(default)]
-    #[schemars(description = "To recipient email addresses.")]
+    #[schemars(
+        description = "To recipients, one per entry: a bare address or `Name <address>`. A name with a comma or other punctuation can be quoted (`\"Blake, Mark\" <mark@example.com>`) or written as is (`Blake, Mark <mark@example.com>`). Never put two recipients in one entry."
+    )]
     pub(super) to: Vec<String>,
     #[serde(default)]
-    #[schemars(description = "Cc recipient email addresses.")]
+    #[schemars(
+        description = "Cc recipients, in the same forms as `to`: a bare address or `Name <address>`, one per entry."
+    )]
     pub(super) cc: Vec<String>,
     #[serde(default)]
-    #[schemars(description = "Bcc recipient email addresses.")]
+    #[schemars(
+        description = "Bcc recipients, in the same forms as `to`: a bare address or `Name <address>`, one per entry. Kept in the saved draft."
+    )]
     pub(super) bcc: Vec<String>,
     #[serde(default)]
-    #[schemars(description = "Reply-To header addresses for responses to this draft.")]
+    #[schemars(
+        description = "Reply-To addresses for responses to this draft, in the same forms as `to`: a bare address or `Name <address>`, one per entry."
+    )]
     pub(super) reply_to: Vec<String>,
     #[serde(default)]
     #[schemars(description = "Message-ID this draft replies to. Angle brackets are optional.")]
@@ -326,16 +352,33 @@ pub(super) struct UpdateDraftArgs {
     #[schemars(range(min = 1))]
     pub(super) expected_uid_validity: u32,
     #[serde(default)]
+    #[schemars(
+        description = "Sender, as `Name <address>` or a bare address. The address must be one of this account's own — list_accounts lists them — or the update is refused; the name defaults to the account's display name. Omit it to keep the draft's current sender when that is one of the account's addresses, otherwise the primary address."
+    )]
+    pub(super) from: Option<String>,
+    #[serde(default)]
     pub(super) subject: String,
     #[serde(default)]
     pub(super) body: String,
     #[serde(default)]
+    #[schemars(
+        description = "To recipients, one per entry: a bare address or `Name <address>`. A name with a comma or other punctuation can be quoted (`\"Blake, Mark\" <mark@example.com>`) or written as is (`Blake, Mark <mark@example.com>`). Never put two recipients in one entry."
+    )]
     pub(super) to: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Cc recipients, in the same forms as `to`: a bare address or `Name <address>`, one per entry."
+    )]
     pub(super) cc: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Bcc recipients, in the same forms as `to`: a bare address or `Name <address>`, one per entry. Kept in the saved draft."
+    )]
     pub(super) bcc: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Reply-To addresses for responses to this draft, in the same forms as `to`: a bare address or `Name <address>`, one per entry."
+    )]
     pub(super) reply_to: Vec<String>,
     #[serde(default)]
     pub(super) in_reply_to: Option<String>,
@@ -727,6 +770,11 @@ pub(super) struct ReconcileMovesArgs {
         description = "Optional operationId from list_pending_moves. Omit to reconcile every pending operation for the account."
     )]
     pub(super) operation_id: Option<String>,
+    #[serde(default = "default_false")]
+    #[schemars(
+        description = "Close operationId for good instead of reconciling it — for a needsAttention move reconciliation can't finish, once both mailboxes have been checked and set right by hand. Moves, copies and deletes nothing; it releases the source message and both mailboxes for rename and delete. Requires operationId."
+    )]
+    pub(super) dismiss: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -820,7 +868,7 @@ pub(super) struct DownloadAttachmentsArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace or one of the Project's other bound folders; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
 }
@@ -845,7 +893,7 @@ pub(super) struct DownloadMessageSourceArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace or one of the Project's other bound folders; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -880,7 +928,7 @@ pub(super) struct DownloadThreadArgs {
     )]
     pub(super) expected_uid_validity: u32,
     #[schemars(
-        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
+        description = "Where to write, resolved against the active session workspace (standalone server: AGENTMAIL_FILE_ROOT). OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace or one of the Project's other bound folders; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -926,7 +974,7 @@ pub(super) struct ExportThreadRecordArgs {
     )]
     pub(super) purpose: String,
     #[schemars(
-        description = "Where to write, resolved against the active session workspace. OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace; do not invent one."
+        description = "Where to write, resolved against the active session workspace. OMIT IT to write to the workspace root — that is the default and is normally what you want. An absolute path is accepted only if it already lies inside the workspace or one of the Project's other bound folders; do not invent one."
     )]
     pub(super) output_dir: Option<String>,
     #[schemars(
@@ -1002,7 +1050,9 @@ pub(super) struct FindAttachmentsPromptArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ComposeEmailArgs {
-    #[schemars(description = "Account name to send from.")]
+    #[schemars(
+        description = "Account name. The draft is saved to this account's Drafts, From one of its addresses."
+    )]
     pub(super) account: String,
     #[schemars(description = "Recipient email address.")]
     pub(super) to: Option<String>,

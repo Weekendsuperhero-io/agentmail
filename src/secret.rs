@@ -21,6 +21,12 @@ static SERVICE_NAME: OnceLock<String> = OnceLock::new();
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// How long a keychain call may take before it is reported instead of awaited.
+/// A locked keychain (after sleep, say) can hold the call until someone unlocks
+/// it, and a password read runs under the account's connect lock — so without
+/// a deadline every other connect for that account waited with it.
+const KEYRING_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Initialize the keyring service name.
 ///
 /// When embedded in the Agent app, this is set to the app's bundle identifier.
@@ -70,6 +76,15 @@ pub enum SecretError {
     )]
     NoDefaultStore,
 
+    #[error("no password is stored in the keychain under this name")]
+    NoEntry,
+
+    #[error(
+        "the keychain did not answer within {seconds}s; it may be locked (after sleep, for example) \
+         and waiting to be unlocked. Unlock it and retry, or set AGENTMAIL_PASSWORD_<ACCOUNT>."
+    )]
+    KeyringTimedOut { seconds: u64 },
+
     #[error("keyring backend error: {0}")]
     Backend(String),
 
@@ -109,6 +124,7 @@ pub(crate) fn map_keyring_error(err: keyring_core::error::Error) -> SecretError 
     use keyring_core::error::Error as KErr;
 
     match err {
+        KErr::NoEntry => SecretError::NoEntry,
         KErr::NoDefaultStore => SecretError::NoDefaultStore,
         KErr::PlatformFailure(ref inner) | KErr::NoStorageAccess(ref inner) => {
             classify_platform_message(&inner.to_string())
@@ -132,6 +148,21 @@ pub(crate) fn classify_platform_message(msg: &str) -> Option<SecretError> {
         Some(SecretError::MissingEntitlement)
     } else {
         None
+    }
+}
+
+/// Run one blocking keychain call, reporting it at `deadline` rather than
+/// waiting longer. The call itself cannot be cancelled; past the deadline it
+/// finishes, unobserved, on its blocking thread.
+async fn keyring_call<T: Send + 'static>(
+    deadline: Duration,
+    call: impl FnOnce() -> Result<T, SecretError> + Send + 'static,
+) -> Result<T, SecretError> {
+    match tokio::time::timeout(deadline, tokio::task::spawn_blocking(call)).await {
+        Ok(joined) => joined.map_err(|error| SecretError::Internal(error.to_string()))?,
+        Err(_elapsed) => Err(SecretError::KeyringTimedOut {
+            seconds: deadline.as_secs(),
+        }),
     }
 }
 
@@ -268,13 +299,12 @@ impl Secret {
             Secret::Keyring(key) => {
                 let service = service_name().to_string();
                 let key = key.clone();
-                tokio::task::spawn_blocking(move || {
+                keyring_call(KEYRING_TIMEOUT, move || {
                     let entry =
                         keyring_core::Entry::new(&service, &key).map_err(map_keyring_error)?;
                     entry.get_password().map_err(map_keyring_error)
                 })
                 .await
-                .map_err(|e| SecretError::Internal(e.to_string()))?
             }
             Secret::Command(cmd) => {
                 command_secret_with_limits(cmd, COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT_BYTES).await
@@ -293,13 +323,12 @@ impl Secret {
                 let service = service_name().to_string();
                 let key = key.clone();
                 let value = value.to_string();
-                tokio::task::spawn_blocking(move || {
+                keyring_call(KEYRING_TIMEOUT, move || {
                     let entry =
                         keyring_core::Entry::new(&service, &key).map_err(map_keyring_error)?;
                     entry.set_password(&value).map_err(map_keyring_error)
                 })
                 .await
-                .map_err(|e| SecretError::Internal(e.to_string()))?
             }
             Secret::Command(_) => Err(SecretError::CommandNotWritable),
         }
@@ -315,18 +344,29 @@ impl Secret {
             Secret::Keyring(key) => {
                 let service = service_name().to_string();
                 let key = key.clone();
-                tokio::task::spawn_blocking(move || {
+                keyring_call(KEYRING_TIMEOUT, move || {
                     if let Ok(entry) = keyring_core::Entry::new(&service, &key) {
                         let _ = entry.delete_credential();
                     }
                     Ok(())
                 })
                 .await
-                .map_err(|e| SecretError::Internal(e.to_string()))?
             }
             Secret::Command(_) => Ok(()),
         }
     }
+}
+
+/// Install ONE mock keyring store for the whole test process. The default
+/// store is process-global, so two tests each installing their own could trade
+/// stores mid-test when they share a process (`cargo test`); tests share this
+/// one and keep to their own entry names instead.
+#[cfg(test)]
+pub(crate) fn install_mock_keyring() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        keyring_core::set_default_store(keyring_core::mock::Store::new().expect("mock store"));
+    });
 }
 
 #[cfg(test)]
@@ -468,13 +508,33 @@ mod tests {
 
     #[tokio::test]
     async fn keyring_roundtrip_with_mock_store() {
-        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        install_mock_keyring();
 
         let mut s = Secret::new_keyring("agentmail.test.roundtrip");
         s.set("hunter2").await.unwrap();
         assert_eq!(s.get().await.unwrap(), "hunter2");
         s.delete().await.unwrap();
-        // After delete, get should fail with a backend error (NoEntry).
-        assert!(s.get().await.is_err());
+        // After delete there is nothing stored — distinct from the keychain
+        // failing to answer.
+        assert!(matches!(s.get().await, Err(SecretError::NoEntry)));
+    }
+
+    /// A keychain call that does not answer — a locked keychain can hold it
+    /// until someone unlocks it — is reported at the deadline, not awaited.
+    #[tokio::test]
+    async fn a_keychain_call_that_does_not_answer_is_reported_not_awaited() {
+        let started = std::time::Instant::now();
+
+        let result = keyring_call(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        })
+        .await;
+
+        assert!(
+            matches!(result, Err(SecretError::KeyringTimedOut { .. })),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(400));
     }
 }

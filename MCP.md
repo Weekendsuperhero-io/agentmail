@@ -1,12 +1,22 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-08-23T00:00
+updated: 2026-10-14T00:00
 ---
 # Agentmail MCP — Tool & Prompt Reference
 
-MCP protocol: [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK) | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
+MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK) | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
 
-**Supported capabilities:** tools, prompts, resources, completions, tasks (SEP-1686), progress notifications, request cancellation
+**Two lifecycles, one server.** A 2025-era client opens with `initialize`,
+answered in 2025-11-25 (also when it asks for 2026-07-28, which has no
+handshake). A 2026-07-28 client runs that revision's stateless lifecycle:
+`server/discover` answers with every revision this server implements (the
+list a `-32022` carries too), and every request carries its version, identity and
+capabilities in `_meta`. `server/discover` at a 2025 version is
+method-not-found, and a revision newer than 2026-07-28 is refused `-32022` with
+the supported list. The ceiling is `MAX_PROTOCOL_VERSION`, named in the source:
+the revision moves by decision, never with rmcp.
+
+**Supported capabilities:** tools, prompts, resources, completions, progress notifications, request cancellation, and the `io.modelcontextprotocol/tasks` extension (see [Tasks](#tasks-sep-2663))
 
 **Contract conventions:**
 
@@ -31,25 +41,55 @@ and complete on every `email://` resource template and every prompt. Call
 `list_accounts` only when the DEFAULT account matters, not to discover a
 selector.
 
-## Tools (35)
+## Tools (36)
 
 ### Discovery & Connection
 
 | #   | Tool                | Description                                      | Annotations |
 | --- | ------------------- | ------------------------------------------------ | ----------- |
-| 1   | `list_accounts`     | Return configured IMAP account names             | `read_only` |
-| 2   | `list_mailboxes`    | Paginate selectable folders with counts and registered special-use roles | `read_only` |
-| 3   | `check_connection`  | Test IMAP connectivity and auth for an account   | `read_only` |
-| 4   | `list_capabilities` | Query IMAP extensions (IDLE, MOVE, CONDSTORE)    | `read_only` |
+| 1   | `list_accounts`     | Return configured IMAP account names, the default, and each account's sending addresses | `read_only` |
+| 2   | `list_identities`   | An account's sending addresses: configured ones plus the From addresses its recent Sent mail used | `read_only`, `idempotent` |
+| 3   | `list_mailboxes`    | Paginate selectable folders with counts and registered special-use roles | `read_only` |
+| 4   | `check_connection`  | Test IMAP connectivity and auth for an account   | `read_only` |
+| 5   | `list_capabilities` | Query IMAP extensions (IDLE, MOVE, CONDSTORE)    | `read_only` |
 
 #### Output Schemas
 
 **list_accounts** → `ListAccountsResponse`
 ```json
-{ "accounts": [{ "name", "isDefault": bool }] }
+{ "accounts": [{ "name", "isDefault": bool, "displayName?",
+    "addresses": ["primary@example.com", "alias@example.com"] }] }
 ```
 
-The MCP projection intentionally omits IMAP hostnames and login usernames.
+`addresses` are the account's **identities** — the addresses a draft may be
+`From`: the primary (`email`, or an email-shaped login when no `email` is set)
+first, then the aliases. `displayName` is the sender name drafts carry. The MCP
+projection intentionally omits IMAP hostnames and login usernames; a login that
+differs from the configured `email` is never listed unless it is also an alias.
+
+**list_identities** → `ListIdentitiesResponse`
+```json
+{ "account", "displayName?", "sentMailbox": "Sent" | null, "scannedMessages",
+  "identities": [{ "address", "configured": bool, "primary": bool,
+    "displayNames": [], "messages", "lastUsed?" }] }
+```
+
+IMAP has no identity list (Gmail's send-as and JMAP `Identity` need API
+credentials an app-password account does not hold), so this reports the
+configured identities plus what the account has actually SENT: the From
+addresses among the newest `sentMessages` (default 200, `1..=1000`) messages of
+the selectable `\Sent` mailbox — exact names (`Sent`, `Sent Items`, `Sent
+Messages`, `Sent Mail`, `[Gmail]/Sent Mail`, `INBOX.Sent`) when the server
+declares no role. The read is `EXAMINE` plus `BODY.PEEK`, so nothing is marked
+read.
+
+Configured identities come first (primary, then aliases) and appear even with
+`messages: 0`; addresses seen only in Sent follow, most used first, at most 50
+rows and five display names each (most used first). With no Sent mailbox,
+`sentMailbox` is `null` and the configured identities are still returned — not
+an error. A discovered address (`configured: false`) is evidence, not
+permission: `from` accepts it only after it is added to the account as an
+alias.
 
 **list_mailboxes** → `ListMailboxesResponse`
 ```json
@@ -89,16 +129,16 @@ an unknown account raises `-32602`.
 
 | #   | Tool               | Description                                                                                         | Annotations            |
 | --- | ------------------ | --------------------------------------------------------------------------------------------------- | ---------------------- |
-| 5   | `get_messages`     | Paginated metadata discovery from one required mailbox, newest-first. Default: offset=0, limit=25 (max 50) | `read_only`            |
-| 6   | `search_messages`  | Paginated IMAP metadata search of one required mailbox with text, headers, status, date, and size filters. | `read_only`            |
-| 7   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only`, `taskable` |
-| 8   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only`, `taskable` |
-| 9   | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only`, `taskable` |
-| 10  | `top_subscriptions` | Top bulk-mail senders with advertised one-click syntax and UIDVALIDITY-guarded samples.             | `read_only`, `taskable` |
-| 11  | `top_mailing_lists`     | Top mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.           | `read_only`, `taskable` |
-| 12  | `top_domains`     | Exact canonical Header From domains and subdomains with counts, dates, and a live sample subject.   | `read_only`, `taskable` |
-| 13  | `list_pending_moves` | List durable COPY-fallback MOVE operations awaiting reconciliation or review.                       | `read_only`             |
-| 14  | `preview_thread_record` | Discover a bounded exact Message-ID graph and return a confirmation digest without writing files. | `read_only`, `taskable` |
+| 6   | `get_messages`     | Paginated metadata discovery from one required mailbox, newest-first. Default: offset=0, limit=25 (max 50) | `read_only`            |
+| 7   | `search_messages`  | Paginated IMAP metadata search of one required mailbox with text, headers, status, date, and size filters. | `read_only`            |
+| 8   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only` |
+| 9   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only` |
+| 10  | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only` |
+| 11  | `top_subscriptions` | Top bulk-mail senders with advertised one-click syntax and UIDVALIDITY-guarded samples.             | `read_only` |
+| 12  | `top_mailing_lists`     | Top mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.           | `read_only` |
+| 13  | `top_domains`     | Exact canonical Header From domains and subdomains with counts, dates, and a live sample subject.   | `read_only` |
+| 14  | `list_pending_moves` | List durable COPY-fallback MOVE operations awaiting reconciliation or review.                       | `read_only`             |
+| 15  | `preview_thread_record` | Discover a bounded exact Message-ID graph and return a confirmation digest without writing files. | `read_only` |
 
 #### Output Schemas
 
@@ -137,10 +177,13 @@ needed. A tool result never carries a URI in its JSON — see
   "flags": [{ "flag": "\\Seen", "count": 5000 }],
   "colors?": [{ "color": "red", "count": 8 }],
   "perMailbox?": [{ "mailbox", "totalFlags", "flags": [...] }],
-  "perMailboxTotal", "perMailboxTruncated" }
+  "perMailboxTotal", "perMailboxTruncated",
+  "skipped": ["mailbox"], "skippedTotal", "skippedTruncated" }
 ```
 `colors` is present when Apple $MailFlagBit flags exist. Account-wide mailbox
 breakdowns are capped at 50 rows and include total/truncation metadata.
+`skipped` lists the mailboxes an account-wide scan did not cover (see
+**Coverage** below); their messages are in none of the counts.
 
 **find_attachments**
 ```json
@@ -148,12 +191,27 @@ breakdowns are capped at 50 rows and include total/truncation metadata.
   "nextOffset?",
   "messages": [{ "mailbox", "uidValidity", "uid", "date?" }],
   "perMailbox?": [{ "mailbox", "count" }],
-  "perMailboxTotal", "perMailboxTruncated" }
+  "perMailboxTotal", "perMailboxTruncated",
+  "skipped": ["mailbox"], "skippedTotal", "skippedTruncated" }
 ```
 
 Results are paginated newest-first (default 25, maximum 100). Every hit carries
 its owning mailbox and UID epoch, so account-wide UIDs are never ambiguous.
 Mailbox breakdowns are capped at 50 rows and include total/truncation metadata.
+`skipped` lists the mailboxes the scan did not cover; they are not in `total`.
+
+**Coverage.** A mailbox counts as scanned only once the connection answers a
+`NOOP` after its last command: on a closed stream SELECT, EXAMINE, SEARCH and
+FETCH come back empty or short instead of failing, so without the check a
+dropped connection would report every remaining mailbox as covered and empty.
+A mailbox that fails on its own is skipped and the scan goes on; a lost
+connection ends an account-wide scan or sweep at once, and that mailbox and
+every later one are listed in `skipped` rather than each waiting out a
+timeout. A single-mailbox scan fails instead, and `preview_thread_record`
+fails rather than return a graph missing what it could no longer search.
+Reads (`search_messages`, `get_messages`, `list_mailboxes`, `list_identities`
+and the like) probe the same way and are retried once on a fresh connection,
+and a message is reported missing only when a live server leaves it out.
 
 **top_senders**
 ```json
@@ -261,7 +319,7 @@ server identities from colliding, but deliberately excludes the local account
 display name so renaming an account reuses the same projection. SQLite uses WAL mode with
 `synchronous=NORMAL`. Set
 `AGENTMAIL_DISABLE_HEADER_CACHE=1` to disable it or `AGENTMAIL_CACHE_DIR` to
-override its root; cache errors fall back to live IMAP.
+keep it directly in another directory; cache errors fall back to live IMAP.
 
 `list_flags` and `find_attachments` use the same discovery plan. Discovery uses one selectable `\All` mailbox exclusively when available. Enumerated fallback and account-wide destructive tools skip `\All`, `\Drafts`, `\Flagged`, `\Important`, `\Junk`, and `\Trash`, while retaining storage roles including `\Archive`, `\Sent`, `\Memos`, `\Scheduled`, and `\Snoozed`. A caller-provided mailbox bypasses planning and is honored directly. IMAP defines `\NoSelect`, not a separate `\NoScan` attribute; `\NoSelect` is always excluded automatically.
 
@@ -292,26 +350,26 @@ shown by the preview to a later `export_thread_record` confirmation.
 
 | #   | Tool                   | Description                                                                           | Annotations                              |
 | --- | ---------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------- |
-| 15  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`, `taskable`   |
-| 16  | `delete_by_sender`     | Delete all from an exact sender identity (`email` + `name` from a ranking row). Omit `mailbox` for account-wide. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
-| 17  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`, `taskable`                 |
-| 18  | `delete_by_domain`     | Delete all messages from one exact canonical domain from `top_domains`; subdomains are never implicit. | `destructive`, `taskable`                 |
-| 19  | `move_list_id`         | Move all messages with an **exact** List-Id to a destination mailbox in one operation (e.g. archive a statement list). Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
-| 20  | `move_by_sender`       | Move all messages from an exact sender identity (`email` + `name`) to a destination mailbox in one operation. Omit `mailbox` for account-wide; destination excluded. | `taskable`                               |
-| 21  | `move_by_domain`       | Move all messages from one exact canonical domain to a destination; subdomains are never implicit. | `taskable`                               |
-| 22  | `move_subscription`    | Move the exact bulk-mail subscription represented by a UIDVALIDITY-safe `top_subscriptions` sample; destination excluded. | `taskable`                               |
-| 23  | `move_message`         | IMAP MOVE between mailboxes (durable COPY+EXPUNGE fallback when MOVE is unavailable). |                                          |
-| 24  | `reconcile_moves`      | Safely resume one or all pending COPY-fallback MOVE operations.                       | `destructive`, `taskable`                |
-| 25  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
-| 26  | `rename_mailbox`       | Preview, then confirm a guarded mailbox rename.                                       | `destructive`                            |
-| 27  | `delete_mailbox`       | Preview, then confirm guarded mailbox deletion.                                       | `destructive`, `idempotent`              |
-| 28  | `create_draft`         | Save an RFC822 draft — fresh, or a reply derived from a live message via `replyToMessage`. |                                      |
-| 29  | `update_draft`         | Replace a live draft: RFC 8508 REPLACE where the server has it, APPEND-then-discard otherwise. | `destructive`                            |
-| 30  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | `taskable`                               |
-| 31  | `download_message_source` | Save exact RFC822 bytes directly to disk with SHA-256, metadata, and local DNS-backed DKIM evidence. | `open_world`, `taskable`                 |
-| 33  | `download_thread`      | Save a caller-selected set of up to 100 UIDs plus a JSON evidence manifest. Does not discover thread membership. | `open_world`, `taskable`                 |
-| 34  | `export_thread_record` | Confirm a preview digest and write PDF, exact EML sources, and an integrity manifest. | `open_world`, `taskable`                 |
-| 35  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional matching-message cleanup via the nested `cleanup {when, identity, deletion}` object (omitted = unsubscribe only). | `destructive`, `open_world`, `taskable`  |
+| 16  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`   |
+| 17  | `delete_by_sender`     | Delete all from an exact sender identity (`email` + `name` from a ranking row). Omit `mailbox` for account-wide. `permanent=true` bypasses Trash. | `destructive`                 |
+| 18  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`                 |
+| 19  | `delete_by_domain`     | Delete all messages from one exact canonical domain from `top_domains`; subdomains are never implicit. | `destructive`                 |
+| 20  | `move_list_id`         | Move all messages with an **exact** List-Id to a destination mailbox in one operation (e.g. archive a statement list). Omit `mailbox` for account-wide; destination excluded. | —                                        |
+| 21  | `move_by_sender`       | Move all messages from an exact sender identity (`email` + `name`) to a destination mailbox in one operation. Omit `mailbox` for account-wide; destination excluded. | —                                        |
+| 22  | `move_by_domain`       | Move all messages from one exact canonical domain to a destination; subdomains are never implicit. | —                                        |
+| 23  | `move_subscription`    | Move the exact bulk-mail subscription represented by a UIDVALIDITY-safe `top_subscriptions` sample; destination excluded. | —                                        |
+| 24  | `move_message`         | IMAP MOVE between mailboxes (durable COPY+EXPUNGE fallback when MOVE is unavailable). |                                          |
+| 25  | `reconcile_moves`      | Safely resume one or all pending COPY-fallback MOVE operations.                       | `destructive`                |
+| 26  | `create_mailbox`       | Create new folder                                                                     | `idempotent`                             |
+| 27  | `rename_mailbox`       | Preview, then confirm a guarded mailbox rename.                                       | `destructive`                            |
+| 28  | `delete_mailbox`       | Preview, then confirm guarded mailbox deletion.                                       | `destructive`, `idempotent`              |
+| 29  | `create_draft`         | Save an RFC822 draft — fresh, or a reply derived from a live message via `replyToMessage`. |                                      |
+| 30  | `update_draft`         | Replace a live draft: RFC 8508 REPLACE where the server has it, APPEND-then-discard otherwise. | `destructive`                            |
+| 31  | `download_attachments` | Extract attachments to disk as `{uid}_{index}_{filename}`                             | —                                        |
+| 32  | `download_message_source` | Save exact RFC822 bytes directly to disk with SHA-256, metadata, and local DNS-backed DKIM evidence. | `open_world`                 |
+| 33  | `download_thread`      | Save a caller-selected set of up to 100 UIDs plus a JSON evidence manifest. Does not discover thread membership. | `open_world`                 |
+| 34  | `export_thread_record` | Confirm a preview digest and write PDF, exact EML sources, and an integrity manifest. | `open_world`                 |
+| 35  | `unsubscribe_message`  | DKIM-verified RFC 8058 POST; optional matching-message cleanup via the nested `cleanup {when, identity, deletion}` object (omitted = unsubscribe only). | `destructive`, `open_world`  |
 
 **`permanent` flag (delete tools):** default false moves to Trash when a Trash mailbox exists, else permanently deletes. When true, flags `\Deleted` + UID EXPUNGE directly, bypassing Trash — irreversible. Permanent delete requires the server to advertise UIDPLUS; on servers without it the call is refused (plain EXPUNGE would purge unrelated `\Deleted` messages).
 
@@ -396,7 +454,7 @@ truncation fields preserve audit completeness.
   "skipped": ["mailbox"], "skippedTotal", "skippedTruncated",
   "permanent": bool }
 ```
-`mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched; policy-excluded special-use views are not reported as errors.
+`mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched, were not fully drained, or came after a lost connection (see **Coverage** under find_attachments); policy-excluded special-use views are not reported as errors.
 
 **delete_by_domain**
 ```json
@@ -461,8 +519,17 @@ truncation fields preserve audit completeness.
 **reconcile_moves**
 ```json
 { "account", "examined", "completed", "pending", "needsAttention",
-  "failed", "operations": [PendingMove] }
+  "failed", "dismissed",
+  "errors": [{ "operationId", "error" }],
+  "operations": [PendingMove] }
 ```
+
+`failed` counts moves whose COPY the server rejected (the source was never
+touched). An attempt that learned nothing — a dropped connection, a timeout —
+leaves its operation as it was, counts in `pending`, and is listed in
+`errors`. `operations` is what is still pending after the call. With
+`dismiss: true` and an `operationId`, the call closes that one move instead
+(`dismissed: 1`).
 
 ```json
 PendingMove = {
@@ -494,9 +561,20 @@ session is discarded and the response reports `reconciliationPending` with an
 `operationId` rather than claiming success or issuing an unsafe second COPY.
 `reconcile_moves` retries COPY only when unchanged destination `UIDNEXT` proves
 that the earlier attempt created nothing; otherwise it continues source cleanup
-or reports `needsAttention` for explicit review. The journal uses
-`synchronous=FULL` and remains enabled even when the disposable ranking cache
-is disabled.
+or reports `needsAttention` for explicit review. It acts only on a live
+server's answer: a new `UIDVALIDITY`, `NO [NONEXISTENT]`, or a mailbox opened
+without `UIDVALIDITY` on a connection a `NOOP` then proves alive parks the move
+as `needsAttention`; a dropped connection, a timeout or an unrelated refusal
+changes nothing. "Not found" comes from a `UID SEARCH` that must see its own
+tagged `OK`, and counts only on a session that sees the whole mailbox (not
+Yahoo/AOL Limited Mode). A source is deleted only right after its copy (the
+`COPYUID`) has been seen in the destination; a copy deleted in the meantime
+keeps the source and asks for review. `needsAttention` moves are examined again
+on every call, and one that still can't finish is closed with `dismiss: true`
+and its `operationId` once both mailboxes have been checked — that moves,
+copies and deletes nothing, and frees both mailboxes for rename and delete. The
+journal uses `synchronous=FULL` and remains enabled even when the disposable
+ranking cache is disabled.
 
 **create_mailbox**
 ```json
@@ -521,7 +599,7 @@ preflight data:
 
 The confirmed call must echo `expectedMessageCount`. A changed count fails
 closed. INBOX and mailboxes referenced by a pending MOVE journal are never
-eligible. Special-use and descendant-bearing mailboxes need separate
+eligible (reconcile the move, or dismiss it, to release them). Special-use and descendant-bearing mailboxes need separate
 acknowledgements; deleting a non-empty mailbox needs `confirmNonEmpty` as well.
 The rename destination must not exist. A missing delete target is an idempotent
 success. After a transport error, AgentMail re-lists the mailbox catalog and
@@ -529,10 +607,32 @@ reports success only when the resulting state is unambiguous.
 
 **create_draft**
 ```json
-{ "created": true, "account", "draftsMailbox", "attachmentCount",
+{ "created": true, "account", "draftsMailbox", "from", "attachmentCount",
   "replyToCount", "threadingApplied", "warning?",
   "uidValidity?", "uid?" }
 ```
+
+**The sender.** A draft is `From` one of the account's identities (the
+`addresses` `list_accounts` reports), under the configured display name:
+
+1. `from` — `Name <address>` or a bare address — must be one of the identities,
+   or the call is refused with the list of them. A name given with it replaces
+   the display name.
+2. A reply (`replyToMessage`) is From the identity the original involved: its
+   own `From` for a follow-up to this account's mail, else the first identity
+   in its `To`, then `Cc`.
+3. Otherwise the primary identity.
+
+**Recipients.** `to`, `cc`, `bcc` and `replyTo` take the same forms as `from`:
+a bare address or `Name <address>`, one recipient per entry. A name with a
+comma or other punctuation can be quoted (`"Blake, Mark" <mark@example.com>`)
+or written plainly (`Blake, Mark <mark@example.com>`); two recipients in one
+entry are refused rather than guessed apart.
+
+An account with no identity at all (an opaque login and no `email`) is refused
+with what to configure. The result's `from` is the sender actually written —
+resolved, not echoed — formatted so it parses back as one mailbox (a name with a
+comma or other special is quoted).
 
 Draft bodies are written in **Markdown** and sent as `multipart/alternative`
 (RFC 2046 §5.1.4): the text exactly as written as `text/plain`, then an HTML
@@ -589,14 +689,18 @@ reply goes to the wrong people. This tool never sends mail.
 **update_draft**
 
 ```json
-{ "updated": true, "account", "draftsMailbox",
+{ "updated": true, "account", "draftsMailbox", "from",
   "previousUidValidity", "previousUid",
   "uidValidity?", "uid?", "warning?" }
 ```
 
 The input is a complete replacement specification, including attachments.
 AgentMail verifies the live UIDVALIDITY and `\Draft` flag and preserves the
-Apple draft UUID.
+Apple draft UUID. It also preserves the draft's sender: without `from`, the
+replacement keeps the current `From` — name included, the display name filling
+a blank one — when that address is one of the account's identities, so a sender
+chosen in another mail client survives an edit here; a foreign `From` is
+replaced by the primary identity. `from` follows the `create_draft` rules.
 
 Where the server advertises RFC 8508 REPLACE the swap is one atomic command.
 Where it does not — Gmail and iCloud among them — AgentMail emulates it as
@@ -617,6 +721,11 @@ A replaced draft always has a NEW UID. Use the one this returns.
 { "mailbox", "account", "uidValidity", "uid",
   "downloaded": [{ "index", "filename", "path", "contentType", "size" }] }
 ```
+
+`path` is absolute. The download is all or nothing: every target name is
+checked before the first byte is written (an existing file is refused, never
+overwritten), and a failure partway removes the files already written, so a
+retry starts clean.
 
 **download_message_source**
 
@@ -649,8 +758,8 @@ belong to the same mailbox and UIDVALIDITY epoch; existing source or manifest
 filenames cause a no-overwrite failure.
 
 For embedded AgentMail, Agent Muse injects the trusted absolute workspace root
-as request metadata (`io.agentmuse/workspaceRoot`) on both direct and
-task-augmented calls. Only the in-process backend named `agentmail` receives
+as request metadata (`io.agentmuse/workspaceRoot`) on every call. Only the
+in-process backend named `agentmail` receives
 it; a missing or invalid root fails closed, and other backends never receive
 the value. Standalone `agentmail serve` uses `AGENTMAIL_FILE_ROOT` or its
 `~/.agentmail/files` default instead.
@@ -747,7 +856,7 @@ message ceiling and continues to mutate in 500-UID batches.
 
 | #   | Tool           | Description                                                                          | Annotations |
 | --- | -------------- | ------------------------------------------------------------------------------------ | ----------- |
-| 35  | `update_flags` | Add flags, remove flags, and set or clear the Apple Mail `color` in ONE call. Colors: red, orange, yellow, green, blue, purple, gray, or `none` to clear. Unnamed flags are untouched. | `idempotent` |
+| 36  | `update_flags` | Add flags, remove flags, and set or clear the Apple Mail `color` in ONE call. Colors: red, orange, yellow, green, blue, purple, gray, or `none` to clear. Unnamed flags are untouched. | `idempotent` |
 
 Adding and removing were two tools. Doing both then meant two calls across two
 UIDVALIDITY windows, so the second could be refused with the first already
@@ -776,23 +885,49 @@ Returns the full updated flag set after the operation.
 | 5   | `unsubscribe-cleanup` | Rank subscriptions; offer filing or verified unsubscribe | `account`                    |
 | 6   | `list-id-cleanup`     | Identify mailing lists by List-Id, bulk-delete    | `account`                    |
 
-## Task Support (SEP-1686)
+## Tasks (SEP-2663)
 
-The tools listed below support `execution.taskSupport = "optional"` — clients can invoke them normally (synchronous with progress notifications) or as background tasks (enqueue, poll, retrieve result).
+AgentMail offers the `io.modelcontextprotocol/tasks` extension on both
+revisions. The server decides which calls become tasks, never the client: a
+call becomes one only when the client declared the extension, the tool is one
+of the 22 below, and the call is still running after **2 seconds**. Everything
+else, quick calls included, is answered inline exactly as without the
+extension. A promoted call is answered with a task handle (`resultType:
+"task"`, the `taskId`, `pollIntervalMs` 1000, `ttlMs` 4 hours) and the client
+polls `tasks/get`.
 
-**Taskable tools:** `search_messages`, `list_flags`, `find_attachments`, `top_senders`, `top_domains`, `top_subscriptions`, `top_mailing_lists`, `preview_thread_record`, `delete_messages`, `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `move_list_id`, `move_by_sender`, `move_by_domain`, `move_subscription`, `reconcile_moves`, `download_attachments`, `download_message_source`, `download_thread`, `export_thread_record`, `unsubscribe_message`
+Task-eligible tools: `search_messages`, `list_flags`, `find_attachments`,
+`top_senders`, `top_domains`, `top_subscriptions`, `top_mailing_lists`,
+`preview_thread_record`, `delete_messages`, `delete_by_sender`,
+`delete_by_domain`, `delete_list_id`, `move_by_sender`, `move_by_domain`,
+`move_list_id`, `move_subscription`, `unsubscribe_message`, `reconcile_moves`,
+`download_attachments`, `download_message_source`, `download_thread`,
+`export_thread_record`.
 
-**Destructive task serialization:** Destructive tasks (`delete_messages`, `delete_mailbox`, `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `rename_mailbox`, `update_draft`, `reconcile_moves`, and `unsubscribe_message`) targeting the same account are serialized — each waits for the previous destructive task to finish before starting. The serialization list also protects those names if they become taskable later. Non-destructive tasks run concurrently without restriction.
+| | |
+| --- | --- |
+| Admission | at most 32 tasks running and 1,024 held (running and finished); past either, a slow call stays a request |
+| Terminal status | `completed` with the tool's result (an `isError` result is still `completed`); `failed` when the tool produced no result (a protocol error, or a panic); `cancelled` when the tool saw a `tasks/cancel` |
+| `tasks/cancel` | stops the operation at its next check, never mid-write; a task that finished first is `completed` |
+| Progress | the task's `statusMessage` (`"3 of 10"`), and `_meta["io.agentmuse/progress"] = {"progress", "total"}` on `tasks/get` |
+| `tasks/update` | accepted for any held task; no tool asks for input mid-task |
+| Lifetime | 4 hours from creation, after which rmcp fails a task still running; a finished task is kept 4 more hours. Tasks live with the connection: closing it stops them (5 seconds' grace, then abort) |
 
-**Task lifecycle:** `tasks/list`, `tasks/get`, `tasks/result`, `tasks/cancel`
+A request's cancellation token is cancelled by rmcp as it answers the request,
+and a task's answer is its handle, so each task's operation runs on the
+connection's own token instead.
 
-**Cancellation:** `tasks/cancel` first cancels the cooperative task token and then aborts the async future; active SQLite publication checks that token and rolls back. For direct calls, `notifications/cancelled` stops scans at mailbox/fetch-chunk boundaries and interrupts unsubscribe DNS, DKIM, and HTTP waits through a 25 ms cancellation poll. Cancellation during an HTTP send is inherently ambiguous because the endpoint may already have received the POST.
+Before a call is promoted, and for every call that never is, long operations
+report `notifications/progress`, and a direct call is cancelled with
+`notifications/cancelled`: scans stop at mailbox/fetch-chunk boundaries,
+unsubscribe DNS, DKIM and HTTP waits are interrupted through a 25 ms
+cancellation poll, and a mutation queued behind another on its account stops
+waiting. Cancellation during an HTTP send is inherently ambiguous because the
+endpoint may already have received the POST.
 
-Tasks are retained for 24 hours from creation, including completed, failed, and
-cancelled metadata. At most 128 live tasks/reservations are accepted per server
-process. `tasks/list` is newest-first in pages of 25 and uses an opaque,
-process-local cursor. `tasks/result` is repeatable until expiry; retrieving a
-result does not evict it. Expired active tasks are cancelled and removed.
+The SEP-1686 surface retired in 0.8.0 stays gone: no `capabilities.tasks`, no
+`execution.taskSupport`, no `tasks/list` or `tasks/result`, and a client's
+`task` parameter on `tools/call` is ignored.
 
 ## Tool Result Encoding
 
@@ -840,8 +975,9 @@ Each inventory entry carries `index`, the original `name` (omitted for
 nameless parts), the canonical `filename`, `contentType`, `size`, an optional
 `contentId`, and the part's `resourceUri`. Attachments follow one naming
 nomenclature everywhere: the canonical filename is
-`{uid}_{index}_{sanitized-name}` (`unnamed` for nameless parts) — exactly what
-`download_attachments` writes to disk. `/attachments/{index}` (zero-based part
+`{uid}_{index}_{sanitized-name}` (`unnamed` for nameless parts), shortened to
+240 bytes with its extension kept when the original name is longer than a
+filesystem allows — exactly what `download_attachments` writes to disk. `/attachments/{index}` (zero-based part
 index, stable within a UIDVALIDITY epoch) returns the part as an MCP resource
 `blob` served with the part's own content type; parts above 4 MiB fail with
 guidance to use the `download_attachments` tool instead.
@@ -888,4 +1024,3 @@ resources and displays them in the MCP Inspector.
 | `destructive` | Permanently deletes or modifies messages                       |
 | `idempotent`  | Safe to call multiple times with same arguments                |
 | `open_world`  | Makes external HTTP requests (e.g. one-click unsubscribe POST) |
-| `taskable`    | Supports `execution.taskSupport = "optional"` (SEP-1686)       |

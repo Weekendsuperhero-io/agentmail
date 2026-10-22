@@ -14,8 +14,6 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 
 struct McpClient {
-    /// Notifications seen while awaiting responses (see `request`).
-    notifications: Vec<Value>,
     reader: BufReader<ReadHalf<tokio::io::DuplexStream>>,
     writer: WriteHalf<tokio::io::DuplexStream>,
     next_id: i64,
@@ -24,32 +22,11 @@ struct McpClient {
 
 impl McpClient {
     async fn start() -> Self {
-        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
-        let config = Config::from_accounts(vec![(
-            "dummy".to_string(),
-            AccountConfig {
-                host: "imap.invalid".to_string(),
-                port: 993,
-                username: "dummy@example.invalid".to_string(),
-                email: None,
-                aliases: Vec::new(),
-                password: Some(Secret::new_raw("unused")),
-                tls: true,
-                max_connections: None,
-                auth: agentmail::AuthMethod::Password,
-            },
-        )]);
-        tokio::spawn(async move {
-            let _ = agentmail::mcp::serve_on(server_io, Agentmail::new(config)).await;
-        });
-        let (r, w) = tokio::io::split(client_io);
-        let mut client = Self {
-            notifications: Vec::new(),
-            reader: BufReader::new(r),
-            writer: w,
-            next_id: 0,
-            init_result: Value::Null,
-        };
+        Self::start_with(dummy_config()).await
+    }
+
+    async fn start_with(config: Config) -> Self {
+        let mut client = Self::connect(config).await;
         let resp = client
             .request(
                 "initialize",
@@ -63,6 +40,22 @@ impl McpClient {
         client.init_result = resp["result"].clone();
         client.notify("notifications/initialized", json!({})).await;
         client
+    }
+
+    /// A running server and nothing sent yet, for a test that chooses its
+    /// own first frame.
+    async fn connect(config: Config) -> Self {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            let _ = agentmail::mcp::serve_on(server_io, Agentmail::new(config)).await;
+        });
+        let (r, w) = tokio::io::split(client_io);
+        Self {
+            reader: BufReader::new(r),
+            writer: w,
+            next_id: 0,
+            init_result: Value::Null,
+        }
     }
 
     async fn notify(&mut self, method: &str, params: Value) {
@@ -93,57 +86,11 @@ impl McpClient {
                 if value.get("id").and_then(Value::as_i64) == Some(id) {
                     return value;
                 }
-                // BUFFER, don't drop. A fast task can publish its terminal
-                // status before the enqueue response is even written, so a
-                // test that only reads AFTER the response would miss the
-                // notification entirely and wrongly conclude the server never
-                // pushes.
-                if value.get("id").is_none() {
-                    self.notifications.push(value);
-                }
+                // Anything else (a notification) is skipped.
             }
         })
         .await
         .unwrap_or_else(|_| panic!("timeout waiting for `{method}` response"))
-    }
-}
-
-impl McpClient {
-    /// Read frames until a NOTIFICATION with `method` arrives, discarding
-    /// responses along the way.
-    ///
-    /// `request` deliberately SKIPS notifications, so a test written only with
-    /// it cannot tell a server that pushes from one that never does.
-    async fn wait_for_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
-        // Already buffered by an earlier `request`? A fast task's push can beat
-        // the very response that started it.
-        if let Some(pos) = self
-            .notifications
-            .iter()
-            .position(|v| v.get("method").and_then(Value::as_str) == Some(method))
-        {
-            return Some(self.notifications.remove(pos));
-        }
-        tokio::time::timeout(timeout, async {
-            loop {
-                let mut buf = String::new();
-                let n = self.reader.read_line(&mut buf).await.ok()?;
-                if n == 0 {
-                    return None;
-                }
-                let Ok(value) = serde_json::from_str::<Value>(&buf) else {
-                    continue;
-                };
-                if value.get("id").is_none()
-                    && value.get("method").and_then(Value::as_str) == Some(method)
-                {
-                    return Some(value);
-                }
-            }
-        })
-        .await
-        .ok()
-        .flatten()
     }
 }
 
@@ -257,27 +204,25 @@ async fn initialize_reports_capabilities_and_identity() {
     let caps = init["capabilities"]
         .as_object()
         .expect("capabilities object");
-    for cap in ["tools", "prompts", "resources", "completions", "tasks"] {
+    for cap in ["tools", "prompts", "resources", "completions"] {
         assert!(
             caps.contains_key(cap),
             "missing `{cap}` capability: {caps:?}"
         );
     }
-    for path in [
-        &["tasks", "list"][..],
-        &["tasks", "cancel"][..],
-        &["tasks", "requests", "tools", "call"][..],
-    ] {
-        let mut value = &init["capabilities"];
-        for segment in path {
-            value = &value[*segment];
-        }
-        assert!(
-            value.is_object(),
-            "task capability `{}` must be advertised: {caps:?}",
-            path.join(".")
-        );
-    }
+    // Tasks are the SEP-2663 extension, never the SEP-1686 (v1) slot retired
+    // in 0.8.0.
+    assert!(
+        !caps.contains_key("tasks"),
+        "the v1 `tasks` slot must not be advertised: {caps:?}"
+    );
+    assert!(
+        caps["extensions"]
+            .as_object()
+            .is_some_and(|extensions| extensions.contains_key("io.modelcontextprotocol/tasks")),
+        "the tasks extension is offered: {caps:?}"
+    );
+    assert_eq!(init["protocolVersion"], "2025-11-25");
 
     assert_eq!(
         init["serverInfo"]["name"].as_str(),
@@ -307,13 +252,13 @@ async fn initialize_reports_capabilities_and_identity() {
 }
 
 #[tokio::test]
-async fn tools_list_has_35_annotated_tools() {
+async fn tools_list_has_36_annotated_tools() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        35,
+        36,
         "tool count drifted — update docs and tests"
     );
 
@@ -356,7 +301,6 @@ async fn message_archive_tools_expose_evidence_fields_and_safety_contracts() {
     let tools = resp["result"]["tools"].as_array().expect("tools array");
 
     let source = find_tool(tools, "download_message_source");
-    assert_eq!(source["execution"]["taskSupport"], json!("optional"));
     assert_eq!(source["annotations"]["destructiveHint"], json!(false));
     let source_output = source["outputSchema"]["properties"]
         .as_object()
@@ -380,7 +324,6 @@ async fn message_archive_tools_expose_evidence_fields_and_safety_contracts() {
     }
 
     let thread = find_tool(tools, "download_thread");
-    assert_eq!(thread["execution"]["taskSupport"], json!("optional"));
     assert!(
         thread["description"]
             .as_str()
@@ -474,10 +417,211 @@ async fn list_accounts_schema_omits_connection_credentials() {
     }
 }
 
+/// An account whose IMAP login is NOT one of its addresses, so a test can tell
+/// "the addresses it sends as" from "everything it authenticates with".
+async fn client_with_sender_identity() -> McpClient {
+    let account = AccountConfig::new("imap.invalid", "login-name")
+        .with_email("Mark@Example.com")
+        .with_aliases(["sales@example.com"])
+        .with_display_name("Mark Blake");
+    McpClient::start_with(Config::from_accounts(vec![("work".to_string(), account)])).await
+}
+
+/// `list_accounts` answers "what can I send as": the display name and the
+/// addresses, primary first — and still never a login or a host.
 #[tokio::test]
-async fn task_result_is_repeatable_related_and_terminal_cancel_is_rejected() {
+async fn list_accounts_reports_the_addresses_an_account_sends_as() {
+    let mut client = client_with_sender_identity().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({"name": "list_accounts", "arguments": {}}),
+        )
+        .await;
+    let account = &resp["result"]["structuredContent"]["accounts"][0];
+
+    assert_eq!(account["displayName"], json!("Mark Blake"));
+    assert_eq!(
+        account["addresses"],
+        json!(["mark@example.com", "sales@example.com"])
+    );
+    let serialized = resp["result"].to_string();
+    assert!(
+        !serialized.contains("login-name") && !serialized.contains("imap.invalid"),
+        "no login or host in the result: {serialized}"
+    );
+
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let output = &find_tool(tools, "list_accounts")["outputSchema"];
+    let account = object_schema(&output["properties"]["accounts"]["items"])
+        .expect("account item object schema");
+    let required: Vec<&str> = account["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        required.contains(&"addresses"),
+        "addresses is always present: {account:#}"
+    );
+}
+
+/// Both draft tools take a `from` and report the sender they resolved; the
+/// address is checked against the account before any IMAP work.
+#[tokio::test]
+async fn draft_tools_take_a_sender_and_refuse_one_the_account_does_not_own() {
+    let mut client = client_with_sender_identity().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in ["create_draft", "update_draft"] {
+        let tool = find_tool(tools, name);
+        assert!(
+            tool["inputSchema"]["properties"]["from"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("list_accounts")),
+            "`{name}` takes a documented `from`: {tool:#}"
+        );
+        let required: Vec<&str> = tool["outputSchema"]["required"]
+            .as_array()
+            .map(|values| values.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            required.contains(&"from"),
+            "`{name}` always reports its sender"
+        );
+    }
+
+    for (name, arguments) in [
+        (
+            "create_draft",
+            json!({"account": "work", "to": ["you@example.net"], "from": "Mark <mark@elsewhere.example>"}),
+        ),
+        (
+            "update_draft",
+            json!({
+                "account": "work",
+                "mailbox": "Drafts",
+                "uid": 7,
+                "expectedUidValidity": 9,
+                "to": ["you@example.net"],
+                "from": "mark@elsewhere.example"
+            }),
+        ),
+    ] {
+        let resp = client
+            .request("tools/call", json!({"name": name, "arguments": arguments}))
+            .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp:#}");
+        let message = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            message.contains("mark@example.com, sales@example.com") && message.contains("alias"),
+            "`{name}` names the usable addresses: {message}"
+        );
+    }
+}
+
+/// Recipients take `Name <address>` exactly as `from` does, and every
+/// recipient field of both draft tools says so — an agent that only sees
+/// "email addresses" strips the names the user typed.
+#[tokio::test]
+async fn every_recipient_field_documents_the_named_form() {
     let mut client = McpClient::start().await;
-    let queued = client
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in ["create_draft", "update_draft"] {
+        let properties = &find_tool(tools, name)["inputSchema"]["properties"];
+        for field in ["to", "cc", "bcc", "replyTo"] {
+            let description = properties[field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                description.contains("Name <address>"),
+                "`{name}.{field}` must document the named form: {description:?}"
+            );
+        }
+    }
+}
+
+/// Adding `from` did not loosen the schema: a near-miss name is still refused
+/// with the field named, rather than silently ignored.
+#[tokio::test]
+async fn draft_tools_still_refuse_unknown_parameters() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "create_draft",
+                "arguments": {"account": "dummy", "to": ["a@example.com"], "sender": "x@example.com"}
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], json!(true), "{resp:#}");
+    assert!(
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|message| message.contains("sender")),
+        "the error names the unknown field: {resp:#}"
+    );
+}
+
+#[tokio::test]
+async fn list_identities_is_a_bounded_read_only_tool() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let tool = find_tool(tools, "list_identities");
+
+    assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
+    assert_eq!(tool["annotations"]["idempotentHint"], json!(true));
+    let sent = &tool["inputSchema"]["properties"]["sentMessages"];
+    assert_eq!(schema_minimum(sent), Some(1.0));
+    assert_eq!(schema_maximum(sent), Some(1000.0));
+    let output = &tool["outputSchema"]["properties"];
+    for field in ["sentMailbox", "scannedMessages", "identities"] {
+        assert!(output.get(field).is_some(), "output carries `{field}`");
+    }
+
+    let resp = client
+        .request(
+            "tools/call",
+            json!({"name": "list_identities", "arguments": {"account": "dummy", "sentMessages": 0}}),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "an out-of-range window fails before any IMAP work: {resp:#}"
+    );
+}
+
+/// No tool declares task support any more (0.8.0 retired the SEP-1686 task
+/// surface), so a client is never invited to task-augment a call.
+#[tokio::test]
+async fn no_tool_declares_task_support() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for tool in tools {
+        assert!(
+            tool.get("execution").is_none(),
+            "`{}` still declares `execution`: {tool:#}",
+            tool["name"]
+        );
+    }
+}
+
+/// The SEP-1686 `task` parameter asks for nothing any more: SEP-2663 leaves
+/// the decision to the server, and only for a client that declared the
+/// extension, which this one did not. So the call RUNS as a plain call (rmcp
+/// 3.x has no `task` field to read). The dummy account cannot connect, so the
+/// run shows as an `isError` RESULT.
+#[tokio::test]
+async fn a_task_augmented_call_runs_as_a_plain_call() {
+    let mut client = McpClient::start().await;
+    let resp = client
         .request(
             "tools/call",
             json!({
@@ -494,68 +638,196 @@ async fn task_result_is_repeatable_related_and_terminal_cancel_is_rejected() {
         )
         .await;
     assert!(
-        queued.get("error").is_none(),
-        "task enqueue failed: {queued:#}"
-    );
-    let task_id = queued["result"]["task"]["taskId"]
-        .as_str()
-        .expect("queued task id")
-        .to_string();
-
-    // tasks/result is the blocking result endpoint: the call must return the
-    // original tool result, never a transient "still running" error.
-    let first = client
-        .request("tasks/result", json!({"taskId": task_id}))
-        .await;
-    assert!(
-        first.get("error").is_none(),
-        "task result failed: {first:#}"
-    );
-    assert_eq!(first["result"]["isError"], json!(true));
-    assert_eq!(
-        first["result"]["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
-        json!(task_id)
-    );
-
-    let second = client
-        .request("tasks/result", json!({"taskId": task_id}))
-        .await;
-    assert_eq!(
-        second["result"], first["result"],
-        "retained task results must be repeatable"
-    );
-
-    let info = client
-        .request("tasks/get", json!({"taskId": task_id}))
-        .await;
-    assert_eq!(info["result"]["taskId"], json!(task_id));
-    assert_eq!(
-        info["result"]["status"],
-        json!("failed"),
-        "an isError tool result is a failed task: {info:#}"
-    );
-
-    let cancellation = client
-        .request("tasks/cancel", json!({"taskId": task_id}))
-        .await;
-    assert_eq!(
-        cancellation["error"]["code"],
-        json!(-32602),
-        "terminal task cancellation must be invalid params: {cancellation:#}"
-    );
-
-    let listed = client.request("tasks/list", json!({})).await;
-    let tasks = listed["result"]["tasks"]
-        .as_array()
-        .expect("task list array");
-    assert!(
-        tasks.iter().any(|task| task["taskId"] == task_id),
-        "retained task should be listed: {listed:#}"
+        resp.get("error").is_none() && resp["result"]["isError"] == json!(true),
+        "a task-augmented call must run as a plain call: {resp:#}"
     );
     assert!(
-        listed["result"].get("total").is_none(),
-        "tasks/list must not add a non-spec total field: {listed:#}"
+        resp["result"].get("task").is_none(),
+        "the answer is a CallToolResult, not a task handle: {resp:#}"
     );
+}
+
+/// One account that is never connected: only config-backed tools and
+/// validation paths run, so no network is touched.
+fn dummy_config() -> Config {
+    Config::from_accounts(vec![(
+        "dummy".to_string(),
+        AccountConfig {
+            host: "imap.invalid".to_string(),
+            port: 993,
+            username: "dummy@example.invalid".to_string(),
+            email: None,
+            aliases: Vec::new(),
+            display_name: None,
+            password: Some(Secret::new_raw("unused")),
+            tls: true,
+            max_connections: None,
+            auth: agentmail::AuthMethod::Password,
+        },
+    )])
+}
+
+/// The `_meta` a 2026-07-28 client puts on every request: its version,
+/// identity and capabilities, since that revision has no handshake to carry
+/// them.
+fn stateless_meta(version: &str, capabilities: &Value) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {"name": "agentmail-tests", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": capabilities,
+    })
+}
+
+/// The probe a 2026-07-28 client opens with: `server/discover` carrying its
+/// version, identity and capabilities in `_meta`.
+fn discover_probe(version: &str) -> Value {
+    json!({ "_meta": stateless_meta(version, &json!({})) })
+}
+
+/// An `initialize` asking for 2026-07-28 is answered in 2025-11-25: that
+/// revision has no handshake, so the newest one with one is the answer.
+#[tokio::test]
+async fn a_2026_07_28_client_is_negotiated_down_to_2025_11_25() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let resp = client
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": {"name": "agentmail-tests", "version": "0"}
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp:#}");
+}
+
+/// A 2026-07-28 probe opens that revision's lifecycle: `server/discover`
+/// answers with every revision this server implements (the list a `-32022`
+/// carries too), the tasks extension and this server's identity.
+/// Then a request carrying its own `_meta`, with no `initialize` anywhere,
+/// is served, in that revision's result shape.
+#[tokio::test]
+async fn server_discover_at_2026_07_28_opens_the_stateless_lifecycle() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let resp = client
+        .request("server/discover", discover_probe("2026-07-28"))
+        .await;
+    let result = &resp["result"];
+    assert_eq!(
+        result["supportedVersions"],
+        json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]),
+        "{resp:#}"
+    );
+    assert!(
+        result["capabilities"]["extensions"]
+            .as_object()
+            .is_some_and(|extensions| extensions.contains_key("io.modelcontextprotocol/tasks")),
+        "{resp:#}"
+    );
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "agentmail",
+        "{resp:#}"
+    );
+
+    let resp = client
+        .request(
+            "tools/list",
+            json!({ "_meta": stateless_meta("2026-07-28", &json!({})) }),
+        )
+        .await;
+    let result = &resp["result"];
+    assert!(
+        result["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "{resp:#}"
+    );
+    assert_eq!(result["resultType"], "complete", "{resp:#}");
+    assert_eq!(result["cacheScope"], "private", "{resp:#}");
+}
+
+/// A probe at a 2025 version is told the method does not exist, which is how
+/// a 2025-11-25 server answers it, and the handshake still works on the same
+/// connection: that is the fallback.
+#[tokio::test]
+async fn server_discover_at_a_2025_version_is_method_not_found() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let resp = client
+        .request("server/discover", discover_probe("2025-11-25"))
+        .await;
+    assert_eq!(resp["error"]["code"], -32601, "{resp:#}");
+
+    let resp = client
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "agentmail-tests", "version": "0"}
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp:#}");
+}
+
+/// A revision newer than 2026-07-28 is refused `-32022` with every version
+/// this server speaks, so a probing client can pick one.
+#[tokio::test]
+async fn an_unknown_revision_is_refused_with_the_supported_list() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let resp = client
+        .request("server/discover", discover_probe("2099-01-01"))
+        .await;
+    assert_eq!(resp["error"]["code"], -32022, "{resp:#}");
+    assert_eq!(
+        resp["error"]["data"]["supported"],
+        json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]),
+    );
+}
+
+/// `tasks/*` belongs to clients that declared the extension: a session that
+/// did not is refused `-32021`, naming the capability it lacks.
+#[tokio::test]
+async fn tasks_methods_require_the_declared_extension() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request("tasks/get", json!({ "taskId": "nope" }))
+        .await;
+    assert_eq!(resp["error"]["code"], -32021, "{resp:#}");
+    assert!(
+        resp["error"]["data"]
+            .to_string()
+            .contains("io.modelcontextprotocol/tasks"),
+        "{resp:#}"
+    );
+}
+
+/// A stateless 2026-07-28 client that declared the extension reaches
+/// `tasks/get`, and an id this server never issued is an invalid parameter.
+#[tokio::test]
+async fn an_unknown_task_is_an_invalid_parameter() {
+    let mut client = McpClient::connect(dummy_config()).await;
+    let tasks = json!({ "extensions": { "io.modelcontextprotocol/tasks": {} } });
+    let resp = client
+        .request(
+            "tasks/get",
+            json!({ "taskId": "nope", "_meta": stateless_meta("2026-07-28", &tasks) }),
+        )
+        .await;
+    assert_eq!(resp["error"]["code"], -32602, "{resp:#}");
 }
 
 #[tokio::test]
@@ -1067,6 +1339,37 @@ async fn tools_list_carries_the_live_accounts_in_the_account_enum() {
     );
 }
 
+/// Every server in a process dispatches through ONE shared tool router, and
+/// `tools/list` patches each server's accounts into copies of its schemas. A
+/// patch written into the shared definitions would leak one server's accounts
+/// into the next server's list.
+#[tokio::test]
+async fn servers_sharing_the_tool_router_each_advertise_only_their_own_accounts() {
+    let server = |name: &str| {
+        Config::from_accounts(vec![(
+            name.to_string(),
+            AccountConfig::new("imap.invalid", format!("{name}@example.invalid")),
+        )])
+    };
+    let mut clients = [
+        (McpClient::start_with(server("work")).await, "work"),
+        (McpClient::start_with(server("home")).await, "home"),
+    ];
+
+    // work, home, then work again: the second list of a server must not carry
+    // what the other server patched in between.
+    for index in [0, 1, 0] {
+        let (client, expected) = &mut clients[index];
+        let resp = client.request("tools/list", json!({})).await;
+        let tools = resp["result"]["tools"].as_array().expect("tools array");
+        assert_eq!(
+            find_tool(tools, "get_messages")["inputSchema"]["properties"]["account"]["enum"],
+            json!([*expected]),
+            "each server lists only its own accounts"
+        );
+    }
+}
+
 /// EVERY advertised template completes, including the mailbox index — which is
 /// listed FIRST and is the one an agent reaches for before it knows any UID.
 /// It was omitted from the completion whitelist, so the most reachable template
@@ -1230,7 +1533,6 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
             "legacy flat flag {legacy} must not survive the cleanup object"
         );
     }
-    assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
 
     let missing = client
         .request(
@@ -1640,7 +1942,6 @@ async fn domain_tools_expose_exact_hierarchy_and_action_contracts() {
                 .is_some_and(|description| description.contains("never includes")),
             "`{name}` must document exact-domain scope: {input:#}"
         );
-        assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
     }
     assert_eq!(
         find_tool(tools, "delete_by_domain")["annotations"]["destructiveHint"],
@@ -1686,7 +1987,6 @@ async fn top_subscription_move_maps_the_nested_sample_and_stays_non_destructive(
         "sample UIDVALIDITY must be non-zero"
     );
     assert_eq!(tool["annotations"]["destructiveHint"], json!(false));
-    assert_eq!(tool["execution"]["taskSupport"], json!("optional"));
 
     let output = tool["outputSchema"]["properties"]
         .as_object()
@@ -1744,13 +2044,14 @@ async fn reconciliation_tools_expose_durable_operation_state() {
     let reconcile = find_tool(tools, "reconcile_moves");
     assert_eq!(reconcile["annotations"]["destructiveHint"], json!(true));
     assert_eq!(reconcile["annotations"]["idempotentHint"], json!(true));
-    assert_eq!(reconcile["execution"]["taskSupport"], json!("optional"));
     for field in [
         "examined",
         "completed",
         "pending",
         "needsAttention",
         "failed",
+        "dismissed",
+        "errors",
         "operations",
     ] {
         assert!(
@@ -1758,6 +2059,68 @@ async fn reconciliation_tools_expose_durable_operation_state() {
             "reconcile_moves must expose `{field}`: {reconcile:#}"
         );
     }
+    let error = object_schema(&reconcile["outputSchema"]["properties"]["errors"]["items"])
+        .expect("reconcile error row");
+    for field in ["operationId", "error"] {
+        assert!(
+            error["properties"].get(field).is_some(),
+            "a reconcile error must name `{field}`: {error:#}"
+        );
+    }
+    let dismiss = &reconcile["inputSchema"]["properties"]["dismiss"];
+    assert_eq!(dismiss["type"], json!("boolean"), "{reconcile:#}");
+    let described = dismiss["description"].as_str().unwrap_or_default();
+    assert!(
+        described.contains("Requires operationId") && described.contains("deletes nothing"),
+        "dismiss must say what it needs and what it leaves alone: {described}"
+    );
+}
+
+/// An account-wide scan that loses its connection, or can't open a mailbox,
+/// reports what it did not cover — the sweeps always did, and `list_flags`
+/// and `find_attachments` now do too.
+#[tokio::test]
+async fn account_wide_scans_report_the_mailboxes_they_did_not_cover() {
+    let mut client = McpClient::start().await;
+    let resp = client.request("tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in [
+        "list_flags",
+        "find_attachments",
+        "delete_by_sender",
+        "move_subscription",
+    ] {
+        let properties = find_tool(tools, name)["outputSchema"]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("`{name}` output properties"));
+        for field in ["skipped", "skippedTotal", "skippedTruncated"] {
+            assert!(
+                properties.contains_key(field),
+                "`{name}` must expose coverage field `{field}`"
+            );
+        }
+    }
+}
+
+/// Dismissing closes one named move; closing every pending move at once is
+/// not offered, so `dismiss` without `operationId` fails before any work.
+#[tokio::test]
+async fn dismissing_a_move_requires_naming_it() {
+    let mut client = McpClient::start().await;
+    let resp = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "reconcile_moves",
+                "arguments": { "account": "dummy", "dismiss": true }
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "dismiss without operationId is invalid params: {resp:#}"
+    );
 }
 
 #[tokio::test]
@@ -2312,65 +2675,5 @@ async fn check_connection_unknown_account_is_an_iserror_result() {
     assert!(
         text.contains("Account not found"),
         "the error message reaches the caller: {result:#}"
-    );
-}
-
-/// A task-augmented call must PUSH `notifications/tasks/status` when it
-/// reaches a terminal state.
-///
-/// Task status is computed LAZILY here (`refresh_managed_task` runs on read),
-/// so before this the transition was observable only by polling `tasks/get` —
-/// a client that started a `delete_by_domain` over thousands of messages had
-/// no way to be told it finished.
-///
-/// Asserting on the notification specifically matters: every other task test
-/// in this file uses `request`, which skips notifications, so all of them
-/// passed against a server that never pushed at all.
-#[tokio::test]
-async fn task_terminal_transition_is_pushed_as_a_notification() {
-    let mut client = McpClient::start().await;
-    let queued = client
-        .request(
-            "tools/call",
-            json!({
-                "name": "unsubscribe_message",
-                "arguments": {
-                    "account": "dummy",
-                    "mailbox": "INBOX",
-                    "uid": 1,
-                    "expectedUidValidity": 1,
-                    "confirmOneClick": false
-                },
-                "task": {"ttl": 60_000}
-            }),
-        )
-        .await;
-    assert!(queued.get("error").is_none(), "enqueue failed: {queued:#}");
-    let task_id = queued["result"]["task"]["taskId"]
-        .as_str()
-        .expect("task id")
-        .to_string();
-
-    let note = client
-        .wait_for_notification("notifications/tasks/status", Duration::from_secs(10))
-        .await
-        .expect("server must PUSH tasks/status on the terminal transition");
-
-    assert_eq!(note["params"]["taskId"], task_id.as_str());
-    let pushed = note["params"]["status"].as_str().unwrap_or("");
-    assert!(
-        matches!(pushed, "completed" | "failed"),
-        "pushed status must be terminal, got {pushed:?}"
-    );
-
-    // The PUSHED status must agree with the POLLED one — they are produced by
-    // the same lazy refresh, and a disagreement would be worse than no push.
-    let polled = client
-        .request("tasks/get", json!({"taskId": task_id}))
-        .await;
-    assert_eq!(
-        polled["result"]["status"].as_str(),
-        Some(pushed),
-        "pushed status must match a subsequent tasks/get: {polled:#}"
     );
 }

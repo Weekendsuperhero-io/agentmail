@@ -1,17 +1,16 @@
 //!
 //!
-//! https://tools.ietf.org/html/rfc7162
+//! <https://tools.ietf.org/html/rfc7162>
 //!
 //! The IMAP QRESYNC Extensions
 //!
 
 use nom::{
-    bytes::streaming::tag_no_case, character::streaming::space1, combinator::opt, sequence::tuple,
-    IResult,
+    bytes::streaming::tag_no_case, character::streaming::space1, combinator::opt, IResult, Parser,
 };
 
-use crate::parser::core::sequence_set;
-use crate::types::*;
+use crate::core::sequence_set;
+use crate::Response;
 
 // The VANISHED response reports that the specified UIDs have been
 // permanently removed from the mailbox.  This response is similar to
@@ -20,12 +19,13 @@ use crate::types::*;
 // numbers.
 // [RFC7162 - VANISHED RESPONSE](https://tools.ietf.org/html/rfc7162#section-3.2.10)
 pub(crate) fn resp_vanished(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-    let (rest, (_, earlier, _, uids)) = tuple((
+    let (rest, (_, earlier, _, uids)) = (
         tag_no_case("VANISHED"),
-        opt(tuple((space1, tag_no_case("(EARLIER)")))),
+        opt((space1, tag_no_case("(EARLIER)"))),
         space1,
         sequence_set,
-    ))(i)?;
+    )
+        .parse(i)?;
     Ok((
         rest,
         Response::Vanished {

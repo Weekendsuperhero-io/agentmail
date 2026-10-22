@@ -9,7 +9,8 @@ use async_imap::extensions::compress::DeflateStream;
 use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls;
 use tracing::{debug, warn};
 
 use crate::AgentmailError;
@@ -97,6 +98,11 @@ pub(crate) mod test_support {
     use super::{ImapSession, ImapTransport};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    /// Ends a scripted reply when the server should send it and then close the
+    /// connection, so the client's next command fails to send — what a server
+    /// does when it drops a client right after answering it.
+    pub(crate) const THEN_HANG_UP: &str = "\u{0}then hang up";
+
     /// A running scripted server. Drop the session, then call
     /// [`ScriptedServer::commands`] to collect every line the client sent.
     pub(crate) struct ScriptedServer {
@@ -141,7 +147,11 @@ pub(crate) mod test_support {
                     respond(&tag, &command)
                 };
                 let Some(reply) = reply else { break };
-                if writer.write_all(reply.as_bytes()).await.is_err() {
+                let (reply, hang_up) = match reply.strip_suffix(THEN_HANG_UP) {
+                    Some(reply) => (reply.to_string(), true),
+                    None => (reply, false),
+                };
+                if writer.write_all(reply.as_bytes()).await.is_err() || hang_up {
                     break;
                 }
             }
@@ -286,6 +296,89 @@ where
         Ok::<_, async_imap::error::Error>(stream.collect::<Vec<_>>().await)
     })
     .await
+}
+
+/// The items of a `UID FETCH` that answer it: one per requested UID, in the
+/// order the server sent them.
+///
+/// Unsolicited FETCH responses — another client changing a message's flags
+/// while this command runs — share the command's response stream, and
+/// async-imap yields them as ordinary items. Taken at face value, one without
+/// a UID became "UID 0" and failed the whole page, one for a UID nobody asked
+/// for became a row of its own, and a FLAGS-only repeat of a requested message
+/// became a second, empty row for it. Kept: for each requested UID, its first
+/// item that carries a fetched section, else its first item. An item is never
+/// dropped for lacking a section alone — a requested message whose section came
+/// back `NIL` still answers, and callers that prune unanswered UIDs rely on it.
+pub(crate) fn answering_fetches(
+    fetched: Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>,
+    requested: &[u32],
+) -> Result<Vec<(u32, async_imap::types::Fetch)>> {
+    let carries_section = |fetch: &async_imap::types::Fetch| {
+        fetch.header().is_some() || fetch.body().is_some() || fetch.text().is_some()
+    };
+    let requested: hashbrown::HashSet<u32> = requested.iter().copied().collect();
+    let mut answers: Vec<(u32, async_imap::types::Fetch)> = Vec::with_capacity(requested.len());
+    let mut position: hashbrown::HashMap<u32, usize> = hashbrown::HashMap::new();
+    for item in fetched {
+        let fetch = item.map_err(AgentmailError::Imap)?;
+        let Some(uid) = fetch.uid.filter(|uid| requested.contains(uid)) else {
+            continue;
+        };
+        match position.get(&uid) {
+            Some(&index) => {
+                if !carries_section(&answers[index].1) && carries_section(&fetch) {
+                    answers[index].1 = fetch;
+                }
+            }
+            None => {
+                position.insert(uid, answers.len());
+                answers.push((uid, fetch));
+            }
+        }
+    }
+    Ok(answers)
+}
+
+/// [`answering_fetches`], trusted only from a live connection.
+///
+/// An answer that leaves out a requested UID means the message is gone — or
+/// that the stream closed, since async-imap ends a FETCH quietly at
+/// end-of-stream. Callers report "no longer exists" and prune caches on a
+/// missing UID, so a short answer counts only once a NOOP proves the
+/// connection alive; otherwise the lost connection is the error.
+async fn answered_fetches<T>(
+    session: &mut Session<T>,
+    fetched: Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>,
+    requested: &[u32],
+) -> Result<Vec<(u32, async_imap::types::Fetch)>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    let answers = answering_fetches(fetched, requested)?;
+    let distinct: hashbrown::HashSet<u32> = requested.iter().copied().collect();
+    if answers.len() < distinct.len() {
+        confirm_alive(session).await?;
+    }
+    Ok(answers)
+}
+
+/// The FETCH item answering `uid`, or `MessageNotFound` once a live
+/// connection has shown the message gone (see [`answered_fetches`]).
+async fn answer_for_uid<T>(
+    session: &mut Session<T>,
+    fetched: Vec<std::result::Result<async_imap::types::Fetch, async_imap::error::Error>>,
+    uid: u32,
+) -> Result<async_imap::types::Fetch>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    answered_fetches(session, fetched, &[uid])
+        .await?
+        .into_iter()
+        .next()
+        .map(|(_, fetch)| fetch)
+        .ok_or(AgentmailError::MessageNotFound(uid))
 }
 
 /// Select a mailbox with timeout. Use this instead of calling `session.select()` directly.
@@ -491,13 +584,13 @@ where
             Response::Done {
                 tag: done,
                 status,
-                information,
-                ..
+                outcome,
             } if done == &tag => {
                 return match status {
                     Status::Ok => Ok(enabled),
                     other => Err(AgentmailError::Other(format!(
-                        "ENABLE {extensions} rejected: {other:?} {information:?}"
+                        "ENABLE {extensions} rejected: {other:?} {:?}",
+                        outcome.information
                     ))),
                 };
             }
@@ -556,9 +649,24 @@ where
         if page < window {
             break;
         }
-        // Next page covers UIDs strictly below the lowest one just seen.
+        // Next page covers UIDs strictly below the lowest one just seen. The
+        // bound must SHRINK every page: a server that ignores the range answers
+        // each request with the same newest window, and without this check the
+        // walk would re-fetch it until someone cancelled.
         match lowest {
-            Some(low) if low > 1 => upper = Some(low - 1),
+            Some(low) if low > 1 => {
+                let next = low - 1;
+                if let Some(previous) = upper
+                    && next >= previous
+                {
+                    return Err(AgentmailError::Parse(format!(
+                        "UID Mode walk made no progress: the server answered UIDs 1:{previous} \
+                         with a page reaching down only to UID {low}; it may be ignoring the \
+                         requested range"
+                    )));
+                }
+                upper = Some(next);
+            }
             _ => break,
         }
     }
@@ -637,6 +745,32 @@ pub async fn connect(config: &AccountConfig, password: &str) -> Result<ImapSessi
     unreachable!("loop returns on the final attempt")
 }
 
+/// The TLS client configuration every IMAP connection shares: rustls on
+/// aws-lc-rs, TLS 1.2 and 1.3, and the OS's own certificate check
+/// (rustls-platform-verifier), so the trust a person or their MDM set up
+/// applies here as it does in their mail app. Built once per process. On
+/// macOS and Windows the verifier asks the OS on every handshake, so a trust
+/// change applies at once; on Linux it reads the system roots when built, so
+/// a root added later counts from the next start. Public so
+/// `examples/probe_xoauth2.rs` diagnoses the connection this crate makes.
+pub fn tls_client_config() -> Result<Arc<rustls::ClientConfig>> {
+    use rustls_platform_verifier::BuilderVerifierExt as _;
+
+    static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Ok(Arc::clone(config));
+    }
+    // The provider is named rather than taken from the process default, so
+    // agentmail works the same whether or not its host installed one.
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .and_then(|builder| builder.with_platform_verifier())
+        .map_err(|e| AgentmailError::Tls(std::io::Error::other(e)))?
+        .with_no_client_auth();
+    Ok(Arc::clone(CONFIG.get_or_init(|| Arc::new(config))))
+}
+
 /// A single TLS connect + login, no retry.
 async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSession> {
     if !config.tls {
@@ -644,13 +778,23 @@ async fn connect_once(config: &AccountConfig, password: &str) -> Result<ImapSess
             "tls=false is unsupported; refusing to send IMAP credentials without TLS".to_string(),
         ));
     }
+    let server_name =
+        rustls::pki_types::ServerName::try_from(config.host.clone()).map_err(|e| {
+            AgentmailError::Config(format!(
+                "IMAP host {:?} is not a name or address TLS can verify: {e}",
+                config.host
+            ))
+        })?;
+    let connector = tokio_rustls::TlsConnector::from(tls_client_config()?);
     let addr = format!("{}:{}", config.host, config.port);
     let tcp = imap_timeout(TcpStream::connect(&addr)).await?;
-
-    let connector = native_tls::TlsConnector::new()
-        .map_err(|e| AgentmailError::Other(format!("TLS connector error: {}", e)))?;
-    let connector = tokio_native_tls::TlsConnector::from(connector);
-    let tls = imap_timeout(connector.connect(&config.host, tcp)).await?;
+    let tls = imap_timeout(async {
+        connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(AgentmailError::Tls)
+    })
+    .await?;
 
     let transport = ImapTransport::Tls(Box::new(tls));
     let mut client = async_imap::Client::new(transport);
@@ -862,11 +1006,143 @@ async fn send_client_id(session: &mut ImapSession) {
 
 /// Validate a session is still alive with NOOP.
 pub async fn ping(session: &mut ImapSession) -> Result<()> {
-    match tokio::time::timeout(PING_TIMEOUT, session.noop()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(AgentmailError::Imap(e)),
+    match tokio::time::timeout(PING_TIMEOUT, noop_checked(session)).await {
+        Ok(result) => result,
         Err(_) => Err(AgentmailError::Other("IMAP ping timed out".into())),
     }
+}
+
+/// `NOOP` that only a tagged `OK` can pass.
+///
+/// async-imap's `noop()` cannot be a liveness probe: its `parse_noop` drains
+/// with `take_while(filter)`, so a stream that simply ENDS returns `Ok`, and so
+/// does a tagged `NO`. On macOS, security-framework maps a reset connection to a
+/// zero-byte read — the same end-of-stream — so after sleep or a server `BYE`
+/// every pooled session "passed" its ping and the next mutation failed on the
+/// dead socket (an APPEND then reported an ambiguous outcome). Written on
+/// `run_command` / `read_response` like [`enable`]: end-of-stream and an
+/// untagged `BYE` are a lost connection, and unsolicited `EXISTS`/`EXPUNGE`/
+/// `FETCH` updates in between are skipped.
+async fn noop_checked<T>(session: &mut Session<T>) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    use async_imap::imap_proto::{Response, Status};
+
+    let tag = session.run_command("NOOP").await?;
+    loop {
+        let Some(response) = session.read_response().await? else {
+            return Err(AgentmailError::Imap(
+                async_imap::error::Error::ConnectionLost,
+            ));
+        };
+        match response.parsed() {
+            Response::Data {
+                status: Status::Bye,
+                outcome,
+            } => {
+                debug!(
+                    target: "agentmail",
+                    information = ?outcome.information,
+                    "server said BYE in reply to NOOP"
+                );
+                return Err(AgentmailError::Imap(
+                    async_imap::error::Error::ConnectionLost,
+                ));
+            }
+            Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } if done == &tag => {
+                let detail = format!("NOOP: {:?}", outcome.information);
+                return match status {
+                    Status::Ok => Ok(()),
+                    Status::No => Err(AgentmailError::Imap(async_imap::error::Error::No(detail))),
+                    Status::Bad => Err(AgentmailError::Imap(async_imap::error::Error::Bad(detail))),
+                    other => Err(AgentmailError::Other(format!(
+                        "NOOP completed with unexpected status {other:?}: {detail}"
+                    ))),
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Prove the connection still answers before trusting what it just said.
+///
+/// async-imap ends SELECT, EXAMINE, SEARCH and FETCH quietly when the stream
+/// closes, so a dead connection reads as an empty mailbox, an empty search or
+/// a short fetch. A connection that ended can't answer a NOOP afterwards, so a
+/// passing [`noop_checked`] proves every earlier answer came from a live one.
+/// Account-wide scans call this after each mailbox, and count the mailbox only
+/// once it passes.
+pub(crate) async fn confirm_alive<T>(session: &mut Session<T>) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    imap_timeout(noop_checked(session)).await
+}
+
+/// `UID SEARCH` that only its own tagged `OK` can answer.
+///
+/// async-imap's `uid_search` drains with `take_while(filter)` like its NOOP
+/// (docs/patches/async-imap-surface-tagged-status.md), so a connection that
+/// ends and a tagged `NO` both come back as an empty `Ok` — "no such message".
+/// Wherever "not found" decides something irreversible (move reconciliation
+/// marks a move complete on it), the answer has to come from a live server:
+/// end-of-stream and an untagged `BYE` are a lost connection, `NO`/`BAD` are
+/// errors, and unsolicited updates in between are skipped.
+async fn uid_search_checked<T>(session: &mut Session<T>, query: &str) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    use async_imap::imap_proto::{MailboxDatum, Response, Status};
+
+    imap_timeout(async {
+        let tag = session.run_command(format!("UID SEARCH {query}")).await?;
+        let mut uids = Vec::new();
+        loop {
+            let Some(response) = session.read_response().await? else {
+                return Err(AgentmailError::Imap(
+                    async_imap::error::Error::ConnectionLost,
+                ));
+            };
+            match response.parsed() {
+                Response::MailboxData(MailboxDatum::Search(found)) => uids.extend_from_slice(found),
+                Response::Data {
+                    status: Status::Bye,
+                    ..
+                } => {
+                    return Err(AgentmailError::Imap(
+                        async_imap::error::Error::ConnectionLost,
+                    ));
+                }
+                Response::Done {
+                    tag: done,
+                    status,
+                    outcome,
+                } if done == &tag => {
+                    let detail = format!("UID SEARCH {query}: {:?}", outcome.information);
+                    return match status {
+                        Status::Ok => Ok(uids),
+                        Status::No => {
+                            Err(AgentmailError::Imap(async_imap::error::Error::No(detail)))
+                        }
+                        Status::Bad => {
+                            Err(AgentmailError::Imap(async_imap::error::Error::Bad(detail)))
+                        }
+                        other => Err(AgentmailError::Other(format!(
+                            "UID SEARCH completed with unexpected status {other:?}: {detail}"
+                        ))),
+                    };
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
 }
 
 /// Query server capabilities via IMAP CAPABILITY command.
@@ -1137,6 +1413,9 @@ pub(crate) async fn list_mailbox_layout(session: &mut ImapSession) -> Result<Vec
         Ok::<_, async_imap::error::Error>(stream.collect::<Vec<_>>().await)
     })
     .await?;
+    // LIST also ends quietly at end-of-stream, and a short list is cached by
+    // the mailbox catalog for every account-wide scan to plan from.
+    confirm_alive(session).await?;
 
     let mut result = Vec::with_capacity(names.len());
     for item in names {
@@ -1537,6 +1816,24 @@ pub async fn fetch_sender_dates_for_uids(
     Ok(results)
 }
 
+/// FROM + DATE rows for the `newest` most recent messages of `mailbox`, by
+/// UID — which ascends in arrival order, so the highest UIDs are the newest
+/// mail. EXAMINE, never SELECT, and `BODY.PEEK`: nothing is marked read.
+pub(crate) async fn recent_sender_rows(
+    session: &mut ImapSession,
+    mailbox: &str,
+    newest: usize,
+) -> Result<Vec<crate::scan_cache::SenderRow>> {
+    let opened = examine(session, mailbox).await?;
+    require_uid_validity(mailbox, opened.uid_validity)?;
+    if opened.exists == 0 || newest == 0 {
+        return Ok(Vec::new());
+    }
+    let uids = search_all_uids_checked(session, opened.exists, opened.uid_next).await?;
+    let tail = &uids[uids.len().saturating_sub(newest)..];
+    fetch_sender_dates_for_uids(session, tail, None, None).await
+}
+
 /// Fetch only FROM and DATE headers for all messages in a mailbox.
 /// Selects, searches all UIDs, and fetches them. Uses BODY.PEEK.
 pub async fn fetch_sender_dates(
@@ -1564,12 +1861,7 @@ pub async fn fetch_sender(session: &mut ImapSession, uid: u32) -> Result<(String
     let uid_str = uid.to_string();
     let fetched =
         timed_uid_fetch_collect(session, &uid_str, "BODY.PEEK[HEADER.FIELDS (FROM)]").await?;
-
-    let fetch = fetched
-        .into_iter()
-        .next()
-        .ok_or(AgentmailError::MessageNotFound(uid))?
-        .map_err(AgentmailError::Imap)?;
+    let fetch = answer_for_uid(session, fetched, uid).await?;
 
     let header_bytes = fetch.header().unwrap_or(&[]);
     let (email, name, _date, _msgid) = parser::parse_sender_date(header_bytes)?;
@@ -1811,12 +2103,7 @@ async fn fetch_rank_header_rows(
 
         let fetched = timed_uid_fetch_collect(session, &uid_set, items).await?;
 
-        for item in fetched {
-            let fetch = item.map_err(AgentmailError::Imap)?;
-            let uid = match fetch.uid {
-                Some(u) => u,
-                None => continue,
-            };
+        for (uid, fetch) in answered_fetches(session, fetched, chunk).await? {
             let header_bytes = fetch.header().unwrap_or(&[]);
             let header_str = String::from_utf8_lossy(header_bytes);
 
@@ -1890,9 +2177,7 @@ where
             "(UID BODY.PEEK[HEADER.FIELDS (List-Id)])",
         )
         .await?;
-        for item in fetched {
-            let fetch = item.map_err(AgentmailError::Imap)?;
-            let Some(uid) = fetch.uid else { continue };
+        for (uid, fetch) in answered_fetches(session, fetched, chunk).await? {
             let header_str = String::from_utf8_lossy(fetch.header().unwrap_or(&[]));
             results.push((uid, extract_header_value(&header_str, "List-Id")));
         }
@@ -1938,12 +2223,7 @@ pub async fn fetch_by_uids(
 
     // Extract owned data from the IMAP fetch results so we can parse off-thread
     let mut raw_items: RawFetchItems = Vec::with_capacity(fetched.len());
-    for item in fetched {
-        if item.is_err() {
-            debug!("FETCH item error");
-        }
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        let uid = fetch.uid.unwrap_or(0);
+    for (uid, fetch) in answered_fetches(session, fetched, uids).await? {
         let size = fetch.size;
         if include_content && size.is_none_or(|value| value as usize > MAX_TRANSIENT_MESSAGE_BYTES)
         {
@@ -2015,11 +2295,7 @@ pub async fn fetch_by_uids(
 pub async fn get_flags(session: &mut ImapSession, uid: u32) -> Result<Vec<String>> {
     let uid_str = uid.to_string();
     let fetched = timed_uid_fetch_collect(session, &uid_str, "(FLAGS)").await?;
-    let fetch = fetched
-        .into_iter()
-        .next()
-        .ok_or(AgentmailError::MessageNotFound(uid))?
-        .map_err(AgentmailError::Imap)?;
+    let fetch = answer_for_uid(session, fetched, uid).await?;
     Ok(fetch.flags().map(|f| flag_to_string(&f)).collect())
 }
 
@@ -2079,14 +2355,14 @@ pub async fn remove_flags(session: &mut ImapSession, uid: u32, flags: &[String])
 // ---------------------------------------------------------------------------
 
 /// Flush pending server-side state after a mutation (EXPUNGE, EXISTS, etc.).
-/// Issues NOOP which forces the server to send any queued untagged responses,
-/// ensuring the session view is up-to-date before release back to the pool.
+/// Issues a NOOP, which makes the server send any queued untagged responses,
+/// and passes only on its own tagged OK — async-imap's `noop()` would pass a
+/// closed stream, and its session would go back to the pool dead.
 pub async fn sync<T>(session: &mut Session<T>) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
-    imap_timeout(session.noop()).await?;
-    Ok(())
+    confirm_alive(session).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2374,8 +2650,10 @@ pub(crate) struct CopyUidMapping {
     pub(crate) pairs: Vec<(u32, u32)>,
 }
 
-fn expand_uid_members(members: &[async_imap::imap_proto::UidSetMember]) -> Result<Vec<u32>> {
-    use async_imap::imap_proto::UidSetMember;
+fn expand_uid_members(
+    members: &[async_imap::imap_proto::rfc4315::UidSetMember],
+) -> Result<Vec<u32>> {
+    use async_imap::imap_proto::rfc4315::UidSetMember;
 
     let mut expanded = Vec::new();
     for member in members {
@@ -2409,8 +2687,8 @@ fn expand_uid_members(members: &[async_imap::imap_proto::UidSetMember]) -> Resul
 
 fn copy_uid_mapping(
     uid_validity: u32,
-    source: &[async_imap::imap_proto::UidSetMember],
-    destination: &[async_imap::imap_proto::UidSetMember],
+    source: &[async_imap::imap_proto::rfc4315::UidSetMember],
+    destination: &[async_imap::imap_proto::rfc4315::UidSetMember],
 ) -> Result<CopyUidMapping> {
     let source = expand_uid_members(source)?;
     let destination = expand_uid_members(destination)?;
@@ -2442,7 +2720,7 @@ async fn checked_mutation_command<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
-    use async_imap::imap_proto::{Response, ResponseCode, Status};
+    use async_imap::imap_proto::{Outcome, Response, ResponseCode, Status};
 
     imap_timeout(async {
         let request_id = session.run_command(command).await?;
@@ -2455,16 +2733,18 @@ where
             match response.parsed() {
                 Response::Data {
                     status: Status::Ok,
-                    code: Some(ResponseCode::CopyUid(validity, source, destination)),
-                    ..
+                    outcome:
+                        Outcome {
+                            code: Some(ResponseCode::CopyUid(validity, source, destination)),
+                            ..
+                        },
                 } => {
                     copy_uid = Some(copy_uid_mapping(*validity, source, destination)?);
                 }
                 Response::Done {
                     tag,
                     status,
-                    code,
-                    information,
+                    outcome: Outcome { code, information },
                 } if tag == &request_id => {
                     if let Some(ResponseCode::CopyUid(validity, source, destination)) = code {
                         copy_uid = Some(copy_uid_mapping(*validity, source, destination)?);
@@ -2699,6 +2979,14 @@ where
                 session_usable: true,
             });
         }
+        // `prepare` resumes only an active operation, and a dismissed one is
+        // not; answering anyway beats a panic if that ever changes.
+        MoveJournalState::Dismissed => {
+            return Err(AgentmailError::Other(format!(
+                "move operation '{}' was dismissed",
+                operation.operation_id
+            )));
+        }
     }
 
     let operation = context
@@ -2772,12 +3060,184 @@ where
     }
 }
 
+/// What opening a mailbox told move reconciliation.
+enum Opened {
+    /// Open, under the epoch the journal recorded.
+    Open,
+    /// A live server's answer that the journal's UIDs no longer name anything
+    /// in this mailbox. The reason becomes the operation's detail.
+    Gone(String),
+}
+
+/// Open `mailbox` for reconciliation and decide what a failure means.
+///
+/// Only a live server's answer may move the journal: a new UIDVALIDITY, a
+/// `NO [NONEXISTENT]` (RFC 5530), or an open that carried no UIDVALIDITY on a
+/// connection a NOOP then proves alive. async-imap returns `Ok` from SELECT
+/// and EXAMINE at end-of-stream, so a dead connection reaches the epoch check
+/// as "no UIDVALIDITY"; the NOOP tells the two apart. Anything else — a lost
+/// connection, a timeout, a refusal that says nothing about the mailbox — is
+/// returned as the error it is, and the operation keeps its state.
+async fn open_for_reconcile<T>(
+    session: &mut Session<T>,
+    mailbox: &str,
+    expected_uid_validity: u32,
+    read_only: bool,
+) -> Result<Opened>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    let opened = if read_only {
+        examine_with_expected_uid_validity(session, mailbox, expected_uid_validity).await
+    } else {
+        select_with_expected_uid_validity(session, mailbox, expected_uid_validity).await
+    };
+    match opened {
+        Ok(_) => Ok(Opened::Open),
+        Err(AgentmailError::UidValidityChanged { actual, .. }) => Ok(Opened::Gone(format!(
+            "'{mailbox}' has a new UIDVALIDITY ({}, was {expected_uid_validity}), so the journal's UIDs no longer name its messages",
+            actual.map_or_else(|| "none".to_string(), |actual| actual.to_string())
+        ))),
+        Err(AgentmailError::UidValidityUnavailable { .. }) => {
+            imap_timeout(noop_checked(session)).await?;
+            Ok(Opened::Gone(format!(
+                "'{mailbox}' opened without a UIDVALIDITY, so the journal's UIDs cannot be checked against it"
+            )))
+        }
+        Err(AgentmailError::Imap(async_imap::error::Error::No(text)))
+            if text.to_ascii_uppercase().contains("[NONEXISTENT]") =>
+        {
+            Ok(Opened::Gone(format!("'{mailbox}' no longer exists")))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `uid` is in the open mailbox, as only a live server can say.
+///
+/// On a Limited Mode session (Yahoo/AOL outside UID Mode) a UID below the
+/// visible window searches as absent, so there "not found" proves nothing: it
+/// is returned as an error, leaving the operation for a session that sees the
+/// whole mailbox.
+async fn uid_present<T>(
+    session: &mut Session<T>,
+    mailbox: &str,
+    uid: u32,
+    whole_mailbox_visible: bool,
+) -> Result<bool>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    if uid_search_checked(session, &format!("UID {uid}"))
+        .await?
+        .contains(&uid)
+    {
+        return Ok(true);
+    }
+    if !whole_mailbox_visible {
+        return Err(AgentmailError::Other(format!(
+            "cannot confirm UID {uid} is gone from '{mailbox}': a Limited Mode session does not see messages below its window"
+        )));
+    }
+    Ok(false)
+}
+
+/// Why the copy a move made can't be vouched for, or `None` once it is seen.
+///
+/// A pending move can wait days for reconciliation, and meanwhile any client
+/// can delete or move the copy — including a person who saw the message in
+/// both mailboxes and removed the "duplicate". Deleting the source then would
+/// lose the message, so reconciliation deletes a source only right after it
+/// has seen the copy. Without a COPYUID (a `UIDNOTSTICKY` destination) there
+/// is no copy to look for, and the COPY's own `OK` is all the evidence there
+/// is.
+async fn missing_copy<T>(
+    session: &mut Session<T>,
+    operation: &crate::mutation_journal::MoveOperation,
+    whole_mailbox_visible: bool,
+) -> Result<Option<String>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+{
+    let Some(copied_uid) = operation.copied_uid else {
+        return Ok(None);
+    };
+    // A parked move may have been through cleanup too (a refused EXPUNGE
+    // after its STORE landed); the journal no longer says which.
+    let kept = if matches!(
+        operation.state,
+        crate::mutation_journal::MoveJournalState::DeleteInFlight
+            | crate::mutation_journal::MoveJournalState::NeedsAttention
+    ) {
+        "the source was kept, though an interrupted cleanup may have flagged it \\Deleted"
+    } else {
+        "the source was kept"
+    };
+    let epoch = operation
+        .copied_uid_validity
+        .unwrap_or(operation.destination_uid_validity);
+    if let Opened::Gone(reason) =
+        open_for_reconcile(session, &operation.destination, epoch, true).await?
+    {
+        return Ok(Some(format!("destination {reason}; {kept}")));
+    }
+    if uid_present(
+        session,
+        &operation.destination,
+        copied_uid,
+        whole_mailbox_visible,
+    )
+    .await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "the copy (UID {copied_uid}) is no longer in '{}'; {kept}",
+        operation.destination
+    )))
+}
+
+/// Park `operation` for a person, from the state it was examined in.
+async fn mark_needs_attention(
+    context: JournalMoveContext<'_>,
+    operation: crate::mutation_journal::MoveOperation,
+    reason: &str,
+) -> Result<MoveItemOutcome> {
+    context
+        .journal
+        .transition(
+            &operation.operation_id,
+            &[operation.state],
+            crate::mutation_journal::MoveJournalState::NeedsAttention,
+            Some(reason),
+        )
+        .await?;
+    Ok(MoveItemOutcome {
+        status: crate::types::MoveStatus::NeedsAttention,
+        operation_id: Some(operation.operation_id),
+        session_usable: true,
+    })
+}
+
 /// Resume one durable COPY-based MOVE without ever issuing a second COPY
-/// unless destination UIDNEXT proves that the first command changed nothing.
+/// unless destination UIDNEXT proves that the first command changed nothing,
+/// and without deleting a source whose copy it has not just seen.
+///
+/// Only a live server's evidence moves the journal. An attempt that learns
+/// nothing — the connection dropped, a command timed out, the server refused
+/// for a reason that says nothing about the move — returns `Err` and leaves
+/// the operation exactly as it was. A move that `NeedsAttention` is examined
+/// again from the last thing the journal knows for certain, so one a
+/// transient failure parked there finishes once the evidence allows; one that
+/// still can't finish stays parked until it is dismissed.
+///
+/// `whole_mailbox_visible` is false on a Limited Mode session (Yahoo/AOL
+/// outside UID Mode), where "not found" proves nothing.
 pub(crate) async fn reconcile_journaled_move<T>(
     session: &mut Session<T>,
     context: JournalMoveContext<'_>,
     operation: crate::mutation_journal::MoveOperation,
+    whole_mailbox_visible: bool,
 ) -> Result<MoveItemOutcome>
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
@@ -2785,7 +3245,10 @@ where
     use crate::mutation_journal::MoveJournalState;
     use crate::types::MoveStatus;
 
-    match operation.state {
+    // Where the move resumes. A COPYUID proves the copy was made; without
+    // one, whether it was is exactly what CopyInFlight asks of the
+    // destination's UIDNEXT.
+    let resume = match operation.state {
         MoveJournalState::Complete => {
             return Ok(MoveItemOutcome {
                 status: MoveStatus::Moved,
@@ -2800,46 +3263,67 @@ where
                 session_usable: true,
             });
         }
-        MoveJournalState::NeedsAttention => {
-            return Ok(MoveItemOutcome {
-                status: MoveStatus::NeedsAttention,
-                operation_id: Some(operation.operation_id),
-                session_usable: true,
-            });
+        MoveJournalState::Dismissed => {
+            return Err(AgentmailError::Other(format!(
+                "move operation '{}' was dismissed; there is nothing to reconcile",
+                operation.operation_id
+            )));
         }
-        _ => {}
+        MoveJournalState::NeedsAttention if operation.copied_uid.is_some() => {
+            MoveJournalState::Copied
+        }
+        MoveJournalState::NeedsAttention => MoveJournalState::CopyInFlight,
+        state => state,
+    };
+
+    if matches!(
+        resume,
+        MoveJournalState::Copied | MoveJournalState::DeleteInFlight
+    ) && let Some(reason) = missing_copy(session, &operation, whole_mailbox_visible).await?
+    {
+        return mark_needs_attention(context, operation, &reason).await;
     }
 
-    if let Err(error) = select_with_expected_uid_validity(
+    let source_exists = match open_for_reconcile(
         session,
         &operation.source_mailbox,
         operation.source_uid_validity,
+        false,
     )
-    .await
+    .await?
     {
+        Opened::Gone(reason) => {
+            return mark_needs_attention(context, operation, &format!("source {reason}")).await;
+        }
+        Opened::Open => {
+            uid_present(
+                session,
+                &operation.source_mailbox,
+                operation.source_uid,
+                whole_mailbox_visible,
+            )
+            .await?
+        }
+    };
+
+    // The evidence is in; a move that needed attention resumes from here.
+    let operation = if operation.state == MoveJournalState::NeedsAttention {
+        let detail = format!(
+            "re-examined after: {}",
+            operation.detail.as_deref().unwrap_or("needing attention")
+        );
         context
             .journal
             .transition(
                 &operation.operation_id,
-                &[
-                    MoveJournalState::Prepared,
-                    MoveJournalState::CopyInFlight,
-                    MoveJournalState::Copied,
-                    MoveJournalState::DeleteInFlight,
-                ],
-                MoveJournalState::NeedsAttention,
-                Some(&format!("source mailbox epoch changed: {error}")),
+                &[MoveJournalState::NeedsAttention],
+                resume,
+                Some(&detail),
             )
-            .await?;
-        return Ok(MoveItemOutcome {
-            status: MoveStatus::NeedsAttention,
-            operation_id: Some(operation.operation_id),
-            session_usable: true,
-        });
-    }
-    let source_exists = search_uids(session, &format!("UID {}", operation.source_uid))
-        .await?
-        .contains(&operation.source_uid);
+            .await?
+    } else {
+        operation
+    };
 
     match operation.state {
         MoveJournalState::Copied | MoveJournalState::DeleteInFlight => {
@@ -2968,7 +3452,10 @@ where
         }
         MoveJournalState::Complete
         | MoveJournalState::CopyFailed
-        | MoveJournalState::NeedsAttention => unreachable!("terminal states returned above"),
+        | MoveJournalState::NeedsAttention
+        | MoveJournalState::Dismissed => {
+            unreachable!("terminal states returned above and NeedsAttention resumed")
+        }
     }
 }
 
@@ -3102,7 +3589,7 @@ pub async fn append_draft(
 
 fn append_uid_identity(
     uid_validity: u32,
-    members: &[async_imap::imap_proto::UidSetMember],
+    members: &[async_imap::imap_proto::rfc4315::UidSetMember],
 ) -> Result<Option<(u32, u32)>> {
     let uids = expand_uid_members(members)?;
     match uids.as_slice() {
@@ -3138,7 +3625,7 @@ pub async fn replace_draft(
     expected_uid_validity: u32,
     rfc822_message: &[u8],
 ) -> Result<Option<(u32, u32)>> {
-    use async_imap::imap_proto::{Response, ResponseCode, Status};
+    use async_imap::imap_proto::{Outcome, Response, ResponseCode, Status};
 
     select_with_expected_uid_validity(session, drafts_mailbox, expected_uid_validity).await?;
     let mailbox = quote_imap_string(drafts_mailbox)?;
@@ -3153,12 +3640,11 @@ pub async fn replace_draft(
             .await?
             .ok_or(AgentmailError::NotConnected)?;
         match response.parsed() {
-            Response::Continue { .. } => break,
+            Response::Continue(_) => break,
             Response::Done {
                 tag: done,
                 status,
-                information,
-                ..
+                outcome: Outcome { information, .. },
             } if done == &tag => {
                 return Err(match status {
                     Status::No => AgentmailError::Imap(async_imap::error::Error::No(format!(
@@ -3188,14 +3674,16 @@ pub async fn replace_draft(
         match response.parsed() {
             Response::Data {
                 status: Status::Ok,
-                code: Some(ResponseCode::AppendUid(uid_validity, members)),
-                ..
+                outcome:
+                    Outcome {
+                        code: Some(ResponseCode::AppendUid(uid_validity, members)),
+                        ..
+                    },
             } => identity = append_uid_identity(*uid_validity, members)?,
             Response::Done {
                 tag: done,
                 status,
-                code,
-                information,
+                outcome: Outcome { code, information },
             } if done == &tag => {
                 if let Some(ResponseCode::AppendUid(uid_validity, members)) = code {
                     identity = append_uid_identity(*uid_validity, members)?;
@@ -3272,15 +3760,11 @@ where
     examine_with_expected_uid_validity(session, mailbox, expected_uid_validity).await?;
     let uid_str = uid.to_string();
     let metadata = timed_uid_fetch_collect(session, &uid_str, "(UID RFC822.SIZE)").await?;
-    let mut size = None;
-    for item in metadata {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            size = fetch.size.map(|value| value as usize);
-            break;
-        }
-    }
-    let size = size.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let size = answer_for_uid(session, metadata, uid)
+        .await?
+        .size
+        .map(|value| value as usize)
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
     if size > max_bytes {
         return Err(AgentmailError::Other(format!(
             "message UID {uid} is {size} bytes; this resource is limited to {max_bytes} bytes"
@@ -3289,16 +3773,11 @@ where
 
     let fetch_items = format!("(UID BODY.PEEK[]<0.{}>)", max_bytes.saturating_add(1));
     let fetched = timed_uid_fetch_collect(session, &uid_str, &fetch_items).await?;
-
-    let mut body = None;
-    for item in fetched {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            body = fetch.body().map(<[u8]>::to_vec);
-            break;
-        }
-    }
-    let body = body.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let body = answer_for_uid(session, fetched, uid)
+        .await?
+        .body()
+        .map(<[u8]>::to_vec)
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
     if body.len() > max_bytes || body.len() != size {
         return Err(AgentmailError::Other(format!(
             "message UID {uid} source was truncated or exceeded the {max_bytes} byte resource limit"
@@ -3321,15 +3800,12 @@ where
     examine_with_expected_uid_validity(session, mailbox, expected_uid_validity).await?;
     let fetch_items = format!("(UID BODY.PEEK[HEADER]<0.{}>)", max_bytes.saturating_add(1));
     let fetched = timed_uid_fetch_collect(session, &uid.to_string(), &fetch_items).await?;
-    let mut headers = None;
-    for item in fetched {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            headers = fetch.header().or_else(|| fetch.body()).map(<[u8]>::to_vec);
-            break;
-        }
-    }
-    let headers = headers.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let fetch = answer_for_uid(session, fetched, uid).await?;
+    let headers = fetch
+        .header()
+        .or_else(|| fetch.body())
+        .map(<[u8]>::to_vec)
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
     if headers.len() > max_bytes {
         return Err(AgentmailError::Other(format!(
             "message UID {uid} headers exceed the {max_bytes} byte resource limit"
@@ -3391,15 +3867,8 @@ where
     let uid_set = uid.to_string();
     check_cancel(cancel)?;
     let metadata = timed_uid_fetch_collect(session, &uid_set, "(UID RFC822.SIZE)").await?;
-    let mut expected_size = None;
-    for item in metadata {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            expected_size = Some(validate_unsubscribe_message_size(uid, fetch.size)?);
-            break;
-        }
-    }
-    let expected_size = expected_size.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let expected_size =
+        validate_unsubscribe_message_size(uid, answer_for_uid(session, metadata, uid).await?.size)?;
 
     check_cancel(cancel)?;
     // Request at most limit+1 octets. If a server understates RFC822.SIZE, the
@@ -3407,15 +3876,11 @@ where
     // this matters for DKIM signatures that use an `l=` body-length tag.
     let body_items = format!("(UID BODY.PEEK[]<0.{}>)", MAX_UNSUBSCRIBE_MESSAGE_BYTES + 1);
     let fetched = timed_uid_fetch_collect(session, &uid_set, &body_items).await?;
-    let mut raw_message = None;
-    for item in fetched {
-        let fetch = item.map_err(AgentmailError::Imap)?;
-        if fetch.uid == Some(uid) {
-            raw_message = fetch.body().map(<[u8]>::to_vec);
-            break;
-        }
-    }
-    let raw_message = raw_message.ok_or(AgentmailError::MessageNotFound(uid))?;
+    let raw_message = answer_for_uid(session, fetched, uid)
+        .await?
+        .body()
+        .map(<[u8]>::to_vec)
+        .ok_or(AgentmailError::MessageNotFound(uid))?;
     // Yahoo/AOL's RFC822.SIZE is unreliable metadata — observed deltas run
     // in BOTH directions (line-ending/charset accounting at ingestion), so a
     // mismatch is not evidence of truncation. The only case where a clipped
@@ -3463,12 +3928,7 @@ where
         "BODY.PEEK[HEADER.FIELDS (List-Unsubscribe List-Unsubscribe-Post List-Id)]",
     )
     .await?;
-
-    let fetch = fetched
-        .into_iter()
-        .next()
-        .ok_or(AgentmailError::MessageNotFound(uid))?
-        .map_err(AgentmailError::Imap)?;
+    let fetch = answer_for_uid(session, fetched, uid).await?;
 
     let header_bytes = fetch.header().unwrap_or(&[]);
     let header_str = String::from_utf8_lossy(header_bytes);
@@ -3789,6 +4249,37 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
     use super::*;
+
+    /// The OS verifier can fail to start (no system roots on a bare Linux
+    /// image); this is where that shows, not at an account's first connect.
+    #[test]
+    fn the_tls_client_config_builds_with_the_platform_verifier() {
+        tls_client_config().expect("the TLS client configuration builds");
+    }
+
+    /// A real handshake, the certificate checked by the OS, against a public
+    /// IMAP server: what no scripted session can show.
+    #[tokio::test]
+    #[ignore = "network: completes a TLS handshake with imap.gmail.com:993"]
+    async fn a_tls_handshake_with_a_public_imap_server_is_verified_by_the_os() {
+        let connector = tokio_rustls::TlsConnector::from(tls_client_config().unwrap());
+        let tcp = TcpStream::connect(("imap.gmail.com", 993)).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("imap.gmail.com").unwrap();
+        let mut tls = connector
+            .connect(name, tcp)
+            .await
+            .expect("verified handshake");
+        // TLS 1.3: Secure Transport, native-tls's engine on macOS, never
+        // offered it.
+        let version = tls.get_ref().1.protocol_version();
+        assert_eq!(version, Some(rustls::ProtocolVersion::TLSv1_3));
+        let mut greeting = String::new();
+        BufReader::new(&mut tls)
+            .read_line(&mut greeting)
+            .await
+            .unwrap();
+        assert!(greeting.starts_with("* OK"), "greeting {greeting:?}");
+    }
 
     async fn scripted_unsubscribe_session(
         uid_validity: Option<u32>,
@@ -4781,6 +5272,78 @@ mod tests {
         );
     }
 
+    /// Another client changing flags mid-fetch makes the server interleave
+    /// unsolicited FETCH responses into our UID FETCH: one without a UID, one
+    /// for a UID nobody asked for, and a FLAGS-only repeat of the requested
+    /// message. Only the requested message, with its fetched header, may come
+    /// back.
+    #[tokio::test]
+    async fn unsolicited_fetch_responses_do_not_become_messages() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command.contains("UID FETCH").then(|| {
+                let header = "From: Ann <ann@example.com>\r\nSubject: Hello\r\n\r\n";
+                // A FLAGS-only repeat on BOTH sides of the real answer: the
+                // fetched section must win whichever arrives first.
+                format!(
+                    "* 3 FETCH (FLAGS (\\Seen))\r\n\
+                     * 1 FETCH (UID 7 FLAGS (\\Answered))\r\n\
+                     * 1 FETCH (UID 7 FLAGS () INTERNALDATE \"06-Oct-2026 10:00:00 +0000\" \
+                     RFC822.SIZE 120 BODY[HEADER] {{{}}}\r\n{header})\r\n\
+                     * 4 FETCH (UID 99 FLAGS (\\Flagged))\r\n\
+                     * 1 FETCH (UID 7 FLAGS (\\Seen))\r\n\
+                     {tag} OK UID FETCH completed\r\n",
+                    header.len()
+                )
+            })
+        })
+        .await;
+
+        let messages = fetch_by_uids(&mut session, &[7], "INBOX", "work", false, false)
+            .await
+            .expect("unsolicited updates must not fail the page");
+
+        let rows: Vec<(u32, &str)> = messages
+            .iter()
+            .map(|message| (message.uid, message.subject.as_str()))
+            .collect();
+        assert_eq!(rows, [(7, "Hello")]);
+        drop(session);
+        server.commands().await;
+    }
+
+    /// A server that ignores the UID range answers every page with the same
+    /// newest window. The walk must refuse that instead of re-fetching it until
+    /// someone cancels — the scan would otherwise never finish.
+    #[tokio::test]
+    async fn walk_all_uids_uidmode_refuses_a_server_that_ignores_the_range() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command.contains("UID FETCH").then(|| {
+                format!(
+                    "* 10 UIDFETCH (UID 10)\r\n* 9 UIDFETCH (UID 9)\r\n\
+                     {tag} OK UID FETCH completed\r\n"
+                )
+            })
+        })
+        .await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            walk_all_uids_uidmode(&mut session, 2, None, None),
+        )
+        .await
+        .expect("the walk must end, not loop on a repeated page");
+
+        let error = outcome.expect_err("a page that does not shrink is refused");
+        assert!(error.to_string().contains("no progress"), "{error}");
+        drop(session);
+        let commands = server.commands().await;
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("UID FETCH")).count(),
+            2,
+            "one repeat is enough to know: {commands:?}"
+        );
+    }
+
     #[tokio::test]
     async fn uidfetch_response_is_parsed_with_synthesized_uid() {
         let (mut session, server) = scripted_uidfetch_session().await;
@@ -4802,13 +5365,769 @@ mod tests {
         server.await.expect("scripted server should finish");
     }
 
+    /// `list_identities` reads only the newest Sent mail: EXAMINE (never
+    /// SELECT), one SEARCH, then a `BODY.PEEK` fetch of the highest UIDs.
+    #[tokio::test]
+    async fn recent_sender_rows_fetch_only_the_newest_uids_without_marking_them_read() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            if command.contains("EXAMINE") {
+                Some(test_support::examine_reply(tag, 9, 31, 4))
+            } else if command.contains("UID SEARCH") {
+                Some(format!("* SEARCH 3 10 20 30\r\n{tag} OK SEARCH completed\r\n"))
+            } else if command.contains("UID FETCH") {
+                let fetch = |seq: u32, uid: u32, from: &str| {
+                    let headers = format!(
+                        "From: {from}\r\nDate: Tue, 01 Sep 2026 12:00:00 +0000\r\n\r\n"
+                    );
+                    format!(
+                        "* {seq} FETCH (UID {uid} BODY[HEADER.FIELDS (FROM DATE MESSAGE-ID)] {{{}}}\r\n{headers})\r\n",
+                        headers.len()
+                    )
+                };
+                Some(format!(
+                    "{}{}{tag} OK FETCH completed\r\n",
+                    fetch(3, 20, "\"Blake, Mark\" <Mark@Example.com>"),
+                    fetch(4, 30, "sales@example.com"),
+                ))
+            } else {
+                None
+            }
+        })
+        .await;
+
+        let rows = recent_sender_rows(&mut session, "Sent", 2)
+            .await
+            .expect("rows for the newest two");
+
+        let summary: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.uid, row.email.as_str(), row.display_name.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (20, "mark@example.com", "Blake, Mark"),
+                (30, "sales@example.com", "")
+            ]
+        );
+        drop(session);
+        let commands = server.commands().await;
+        let fetch = commands
+            .iter()
+            .find(|command| command.contains("UID FETCH"))
+            .expect("a fetch was sent");
+        assert!(fetch.contains("UID FETCH 20,30 "), "{fetch}");
+        assert!(fetch.contains("BODY.PEEK["), "{fetch}");
+        assert!(
+            !commands.iter().any(|command| command.contains(" SELECT ")),
+            "{commands:?}"
+        );
+    }
+
+    // ----- Move reconciliation: what a failed attempt may and may not decide -----
+
+    /// A journal in a temp directory holding one move of INBOX UID 42 (epoch
+    /// 7) to Archive (epoch 9, UIDNEXT 100), advanced to `state` the way the
+    /// move code advances it. `copied` records a COPYUID naming Archive UID 100.
+    async fn journaled_move(
+        state: crate::mutation_journal::MoveJournalState,
+        copied: bool,
+    ) -> (
+        crate::mutation_journal::MutationJournal,
+        crate::mutation_journal::MoveOperation,
+    ) {
+        use crate::mutation_journal::{MoveJournalState, MutationJournal, PrepareMove};
+        let journal = MutationJournal::at_path(
+            std::env::temp_dir()
+                .join(format!("agentmail-reconcile-{}", uuid::Uuid::new_v4()))
+                .join(MutationJournal::FILE_NAME),
+        );
+        let mut operation = journal
+            .prepare(PrepareMove {
+                account_key: "acct",
+                source_mailbox: "INBOX",
+                source_uid_validity: 7,
+                source_uid: 42,
+                destination: "Archive",
+                destination_uid_validity: 9,
+                destination_uid_next: 100,
+            })
+            .await
+            .expect("prepare");
+        let id = operation.operation_id.clone();
+        if state != MoveJournalState::Prepared {
+            operation = journal
+                .transition(
+                    &id,
+                    &[MoveJournalState::Prepared],
+                    MoveJournalState::CopyInFlight,
+                    None,
+                )
+                .await
+                .expect("copy in flight");
+        }
+        if copied {
+            operation = journal
+                .record_copied(&id, Some(9), Some(100))
+                .await
+                .expect("copied");
+        }
+        if state == MoveJournalState::DeleteInFlight {
+            operation = journal
+                .transition(
+                    &id,
+                    &[MoveJournalState::Copied],
+                    MoveJournalState::DeleteInFlight,
+                    None,
+                )
+                .await
+                .expect("delete in flight");
+        }
+        if state == MoveJournalState::NeedsAttention {
+            operation = journal
+                .transition(
+                    &id,
+                    &[operation.state],
+                    MoveJournalState::NeedsAttention,
+                    Some("source mailbox epoch changed: connection lost"),
+                )
+                .await
+                .expect("needs attention");
+        }
+        assert_eq!(operation.state, state);
+        (journal, operation)
+    }
+
+    /// A scripted server for reconciliation. INBOX (UIDVALIDITY 7) holds
+    /// `inbox` and Archive (UIDVALIDITY 9, UIDNEXT 200) holds `archive`;
+    /// `UID SEARCH UID n` answers from whichever was opened last, and STATUS,
+    /// STORE, EXPUNGE and NOOP succeed. The first override whose marker a
+    /// command contains answers it instead: `None` hangs up, and `{tag}` in a
+    /// reply is the command's tag.
+    fn mail_world(
+        inbox: &'static [u32],
+        archive: &'static [u32],
+        overrides: &'static [(&'static str, Option<&'static str>)],
+    ) -> impl Fn(&str, &str) -> Option<String> + Send + 'static {
+        let opened = std::sync::Mutex::new(String::new());
+        move |tag, command| {
+            if let Some((_, reply)) = overrides
+                .iter()
+                .find(|(marker, _)| command.contains(marker))
+            {
+                return reply.map(|reply| reply.replace("{tag}", tag));
+            }
+            let words: Vec<&str> = command.split_whitespace().collect();
+            match (words.get(1).copied(), words.get(2).copied()) {
+                (Some(verb @ ("SELECT" | "EXAMINE")), Some(mailbox)) => {
+                    let mailbox = mailbox.trim_matches('"');
+                    let validity = if mailbox == "INBOX" { 7 } else { 9 };
+                    *opened.lock().expect("world lock") = mailbox.to_string();
+                    Some(format!(
+                        "* 3 EXISTS\r\n* OK [UIDVALIDITY {validity}] UIDs valid\r\n\
+                         * OK [UIDNEXT 200] Predicted next UID\r\n{tag} OK {verb} completed\r\n"
+                    ))
+                }
+                (Some("STATUS"), Some(mailbox)) => Some(test_support::status_reply(
+                    tag,
+                    mailbox.trim_matches('"'),
+                    9,
+                    200,
+                    3,
+                )),
+                (Some("UID"), Some("SEARCH")) => {
+                    let uid: u32 = words.last()?.parse().ok()?;
+                    let held = if opened.lock().expect("world lock").as_str() == "INBOX" {
+                        inbox
+                    } else {
+                        archive
+                    };
+                    let hit = if held.contains(&uid) {
+                        format!(" {uid}")
+                    } else {
+                        String::new()
+                    };
+                    Some(format!("* SEARCH{hit}\r\n{tag} OK SEARCH completed\r\n"))
+                }
+                (Some("UID"), Some("STORE")) => Some(format!("{tag} OK STORE completed\r\n")),
+                (Some("UID"), Some("EXPUNGE")) => {
+                    Some(format!("* 1 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n"))
+                }
+                (Some("NOOP"), _) => Some(format!("{tag} OK NOOP completed\r\n")),
+                _ => None,
+            }
+        }
+    }
+
+    /// Reconcile the move [`journaled_move`] builds against `server`, and
+    /// return what reconciliation answered, the operation as the journal now
+    /// holds it, and every command the server saw.
+    async fn reconcile_against(
+        server: impl Fn(&str, &str) -> Option<String> + Send + 'static,
+        state: crate::mutation_journal::MoveJournalState,
+        copied: bool,
+        whole_mailbox_visible: bool,
+    ) -> (
+        Result<MoveItemOutcome>,
+        crate::mutation_journal::MoveOperation,
+        Vec<String>,
+    ) {
+        let (journal, operation) = journaled_move(state, copied).await;
+        let (mut session, server) = test_support::scripted_session(server).await;
+        let outcome = reconcile_journaled_move(
+            &mut session,
+            JournalMoveContext {
+                journal: &journal,
+                account_key: "acct",
+                source_mailbox: "INBOX",
+                source_uid_validity: 7,
+            },
+            operation.clone(),
+            whole_mailbox_visible,
+        )
+        .await;
+        drop(session);
+        let commands = server.commands().await;
+        let after = journal
+            .get(&operation.operation_id)
+            .await
+            .expect("journal readable")
+            .expect("operation kept");
+        (outcome, after, commands)
+    }
+
+    fn sent(commands: &[String], fragment: &str) -> bool {
+        commands.iter().any(|command| command.contains(fragment))
+    }
+
+    /// A connection that drops while the source mailbox is being opened says
+    /// nothing about the move. Recording it as `NeedsAttention` stranded the
+    /// move for good, and with it any rename or delete of both mailboxes.
+    #[tokio::test]
+    async fn a_connection_lost_while_selecting_leaves_the_move_as_it_was() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, _) = reconcile_against(
+            mail_world(&[42], &[100], &[(" SELECT ", None)]),
+            MoveJournalState::Copied,
+            true,
+            true,
+        )
+        .await;
+
+        let error = outcome.expect_err("a lost connection decides nothing");
+        assert!(error.is_connection_error(), "{error:?}");
+        assert_eq!(after.state, MoveJournalState::Copied);
+    }
+
+    /// The source opened, then the connection went before the search that
+    /// decides whether the source is still there. An empty answer from a dead
+    /// connection is not "gone": marking the move complete there left the
+    /// source behind with the journal's claim released.
+    #[tokio::test]
+    async fn a_connection_lost_after_selecting_does_not_complete_the_move() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, _) = reconcile_against(
+            mail_world(&[42], &[100], &[("UID SEARCH UID 42", None)]),
+            MoveJournalState::Copied,
+            true,
+            true,
+        )
+        .await;
+
+        let error = outcome.expect_err("a lost connection decides nothing");
+        assert!(error.is_connection_error(), "{error:?}");
+        assert_eq!(after.state, MoveJournalState::Copied);
+    }
+
+    #[tokio::test]
+    async fn a_bye_in_place_of_the_search_answer_does_not_complete_the_move() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, _) = reconcile_against(
+            mail_world(
+                &[42],
+                &[100],
+                &[("UID SEARCH UID 42", Some("* BYE Server shutting down\r\n"))],
+            ),
+            MoveJournalState::Copied,
+            true,
+            true,
+        )
+        .await;
+
+        let error = outcome.expect_err("a server saying BYE answered nothing");
+        assert!(error.is_connection_error(), "{error:?}");
+        assert_eq!(after.state, MoveJournalState::Copied);
+    }
+
+    /// A refusal that says nothing about the mailbox (here `[UNAVAILABLE]`)
+    /// is not evidence either: the move waits for the next attempt.
+    #[tokio::test]
+    async fn a_select_refused_for_another_reason_leaves_the_move_as_it_was() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, _) = reconcile_against(
+            mail_world(
+                &[42],
+                &[100],
+                &[(
+                    " SELECT ",
+                    Some("{tag} NO [UNAVAILABLE] Try again later\r\n"),
+                )],
+            ),
+            MoveJournalState::Copied,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(after.state, MoveJournalState::Copied);
+    }
+
+    #[tokio::test]
+    async fn a_source_with_a_new_uidvalidity_needs_attention() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, commands) = reconcile_against(
+            mail_world(
+                &[42],
+                &[100],
+                &[(
+                    " SELECT ",
+                    Some(
+                        "* OK [UIDVALIDITY 8] UIDs valid\r\n{tag} OK [READ-WRITE] SELECT completed\r\n",
+                    ),
+                )],
+            ),
+            MoveJournalState::Copied,
+            true,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("a live server answered").status,
+            crate::types::MoveStatus::NeedsAttention
+        );
+        assert_eq!(after.state, MoveJournalState::NeedsAttention);
+        assert!(
+            after
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("new UIDVALIDITY (8, was 7)"),
+            "{after:?}"
+        );
+        assert!(!sent(&commands, "STORE"), "{commands:?}");
+    }
+
+    #[tokio::test]
+    async fn a_source_mailbox_that_no_longer_exists_needs_attention() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, _) = reconcile_against(
+            mail_world(
+                &[42],
+                &[100],
+                &[(
+                    " SELECT ",
+                    Some("{tag} NO [NONEXISTENT] Unknown Mailbox: INBOX\r\n"),
+                )],
+            ),
+            MoveJournalState::Copied,
+            true,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("a live server answered").status,
+            crate::types::MoveStatus::NeedsAttention
+        );
+        assert_eq!(after.state, MoveJournalState::NeedsAttention);
+        assert!(
+            after
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("no longer exists"),
+            "{after:?}"
+        );
+    }
+
+    /// A SELECT without UIDVALIDITY is only the server's answer when the
+    /// connection is proven alive afterwards; here the NOOP succeeds.
+    #[tokio::test]
+    async fn a_live_source_without_uidvalidity_needs_attention() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, commands) = reconcile_against(
+            mail_world(
+                &[42],
+                &[100],
+                &[(
+                    " SELECT ",
+                    Some("* 3 EXISTS\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"),
+                )],
+            ),
+            MoveJournalState::Copied,
+            true,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("a live server answered").status,
+            crate::types::MoveStatus::NeedsAttention
+        );
+        assert_eq!(after.state, MoveJournalState::NeedsAttention);
+        assert!(sent(&commands, " NOOP"), "{commands:?}");
+    }
+
+    #[tokio::test]
+    async fn a_source_gone_from_a_whole_mailbox_completes_the_move() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, commands) = reconcile_against(
+            mail_world(&[], &[100], &[]),
+            MoveJournalState::DeleteInFlight,
+            true,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("reconciled").status,
+            crate::types::MoveStatus::Moved
+        );
+        assert_eq!(after.state, MoveJournalState::Complete);
+        assert!(!sent(&commands, "EXPUNGE"), "{commands:?}");
+    }
+
+    /// A Limited Mode session can't see below its window, so a source it
+    /// doesn't find may still be there.
+    #[tokio::test]
+    async fn a_limited_mode_session_cannot_prove_the_source_gone() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, _) = reconcile_against(
+            mail_world(&[], &[100], &[]),
+            MoveJournalState::Copied,
+            true,
+            false,
+        )
+        .await;
+
+        let error = outcome.expect_err("absence proves nothing in Limited Mode");
+        assert!(error.to_string().contains("Limited Mode"), "{error}");
+        assert_eq!(after.state, MoveJournalState::Copied);
+    }
+
+    /// The copy was deleted after the COPY — say by a person who saw the
+    /// message in both mailboxes. Deleting the source now would lose it.
+    #[tokio::test]
+    async fn a_copy_gone_from_the_destination_keeps_the_source() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, commands) = reconcile_against(
+            mail_world(&[42], &[], &[]),
+            MoveJournalState::Copied,
+            true,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("a live server answered").status,
+            crate::types::MoveStatus::NeedsAttention
+        );
+        assert_eq!(after.state, MoveJournalState::NeedsAttention);
+        assert!(
+            after
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("the source was kept"),
+            "{after:?}"
+        );
+        assert!(!sent(&commands, " SELECT "), "{commands:?}");
+        assert!(!sent(&commands, "STORE"), "{commands:?}");
+        assert!(!sent(&commands, "EXPUNGE"), "{commands:?}");
+    }
+
+    /// A move left `NeedsAttention` (here by a transient failure, before this
+    /// was classified) is examined again, and finishes once the evidence
+    /// allows: the copy is there, so is the source, and cleanup succeeds.
+    #[tokio::test]
+    async fn a_move_needing_attention_is_re_examined_and_finished() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, commands) = reconcile_against(
+            mail_world(&[42], &[100], &[]),
+            MoveJournalState::NeedsAttention,
+            true,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("re-examined").status,
+            crate::types::MoveStatus::Moved
+        );
+        assert_eq!(after.state, MoveJournalState::Complete);
+        assert!(sent(&commands, "UID STORE 42 "), "{commands:?}");
+        assert!(sent(&commands, "UID EXPUNGE 42"), "{commands:?}");
+    }
+
+    /// Without a COPYUID nothing proves the copy was or wasn't made, so a
+    /// re-examined move asks the destination's UIDNEXT, as an ambiguous COPY
+    /// does. It moved on (other mail arrived), so the COPY is not sent again.
+    #[tokio::test]
+    async fn re_examining_without_a_copyuid_never_copies_twice() {
+        use crate::mutation_journal::MoveJournalState;
+        let (outcome, after, commands) = reconcile_against(
+            mail_world(&[42], &[], &[]),
+            MoveJournalState::NeedsAttention,
+            false,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("a live server answered").status,
+            crate::types::MoveStatus::NeedsAttention
+        );
+        assert_eq!(after.state, MoveJournalState::NeedsAttention);
+        assert!(
+            after
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("UIDNEXT advanced"),
+            "{after:?}"
+        );
+        assert!(!sent(&commands, "COPY"), "{commands:?}");
+        assert!(!sent(&commands, "STORE"), "{commands:?}");
+    }
+
+    #[tokio::test]
+    async fn checked_search_returns_the_uids_and_skips_unsolicited_updates() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command
+                .contains("UID SEARCH")
+                .then(|| format!("* SEARCH 4 9\r\n* 4 EXISTS\r\n{tag} OK SEARCH completed\r\n"))
+        })
+        .await;
+
+        assert_eq!(
+            uid_search_checked(&mut session, "UID 1:9")
+                .await
+                .expect("searched"),
+            vec![4, 9]
+        );
+        drop(session);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn checked_search_reports_a_refusal() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command
+                .contains("UID SEARCH")
+                .then(|| format!("{tag} NO [LIMIT] Too many messages\r\n"))
+        })
+        .await;
+
+        let error = uid_search_checked(&mut session, "ALL")
+            .await
+            .expect_err("a refusal is not an empty result");
+        assert!(
+            matches!(error, AgentmailError::Imap(async_imap::error::Error::No(_))),
+            "{error:?}"
+        );
+        drop(session);
+        server.commands().await;
+    }
+
+    /// The bug [`uid_search_checked`] exists for, pinned against the library:
+    /// a search whose connection ends before any reply finds "nothing". If
+    /// this starts failing, async-imap surfaces end-of-stream on SEARCH.
+    #[tokio::test]
+    async fn async_imaps_own_search_reports_a_closed_stream_as_no_match() {
+        let (mut session, server) = test_support::scripted_session(|_, _| None).await;
+
+        assert!(
+            session
+                .uid_search("UID 42")
+                .await
+                .is_ok_and(|found| found.is_empty()),
+            "async-imap 0.12 still reads end-of-stream as an empty SEARCH"
+        );
+        drop(session);
+        server.commands().await;
+    }
+
+    /// A connection that closes partway through LIST hands back a short list,
+    /// which the mailbox catalog caches and every account-wide scan then
+    /// plans from — skipping the mailboxes it never heard about.
+    #[tokio::test]
+    async fn a_list_cut_short_by_a_closed_connection_is_an_error() {
+        let (mut session, server) = test_support::scripted_session(|_, command| {
+            command.contains(" LIST ").then(|| {
+                format!(
+                    "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n{}",
+                    test_support::THEN_HANG_UP
+                )
+            })
+        })
+        .await;
+
+        let error = list_mailbox_layout(&mut session)
+            .await
+            .expect_err("a list without its tagged OK is not the account's mailboxes");
+
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(session);
+        server.commands().await;
+    }
+
+    /// A FETCH on a closed stream returns no row. Read as "the message no
+    /// longer exists", it made callers prune the ranking cache of a message
+    /// that is still there.
+    #[tokio::test]
+    async fn a_closed_connection_is_not_a_missing_message() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command
+                .contains("EXAMINE")
+                .then(|| test_support::examine_reply(tag, 9, 100, 3))
+        })
+        .await;
+
+        let error = get_message_headers_bounded(&mut session, "INBOX", 7, 9, 4096)
+            .await
+            .expect_err("no answer came");
+
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(session);
+        server.commands().await;
+    }
+
+    /// The other side of the same rule: a live server that answers without
+    /// the UID still means the message is gone.
+    #[tokio::test]
+    async fn a_live_server_without_the_row_reports_the_message_missing() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            if command.contains("EXAMINE") {
+                Some(test_support::examine_reply(tag, 9, 100, 3))
+            } else if command.contains("UID FETCH") {
+                Some(format!("{tag} OK FETCH completed\r\n"))
+            } else if command.contains(" NOOP") {
+                Some(format!("{tag} OK NOOP completed\r\n"))
+            } else {
+                None
+            }
+        })
+        .await;
+
+        let error = get_message_headers_bounded(&mut session, "INBOX", 7, 9, 4096)
+            .await
+            .expect_err("the server has no UID 7");
+
+        assert!(
+            matches!(error, AgentmailError::MessageNotFound(7)),
+            "{error:?}"
+        );
+        drop(session);
+        server.commands().await;
+    }
+
+    /// The bug [`noop_checked`] exists for, pinned against the library: a NOOP
+    /// whose connection ends before any reply is reported as success. If this
+    /// starts failing, async-imap fixed `parse_noop` and the hand-written NOOP
+    /// could go back to `session.noop()`.
+    #[tokio::test]
+    async fn async_imaps_own_noop_reports_a_closed_stream_as_alive() {
+        let (mut session, server) = test_support::scripted_session(|_, _| None).await;
+
+        assert!(
+            session.noop().await.is_ok(),
+            "async-imap 0.12 still treats end-of-stream as a completed NOOP"
+        );
+        drop(session);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn ping_fails_when_the_connection_ends_before_the_tagged_reply() {
+        let (mut session, server) = test_support::scripted_session(|_, _| None).await;
+
+        let error = ping(&mut session)
+            .await
+            .expect_err("end-of-stream is a dead session, not a live one");
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(session);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn ping_fails_on_an_untagged_bye_without_waiting_for_the_tag() {
+        let (mut session, server) = test_support::scripted_session(|_, command| {
+            command
+                .contains(" NOOP")
+                .then(|| "* BYE Autologout; idle for too long\r\n".to_string())
+        })
+        .await;
+
+        let error = ping(&mut session)
+            .await
+            .expect_err("a server that said BYE is closing the session");
+        assert!(error.is_connection_error(), "{error:?}");
+        drop(session);
+        server.commands().await;
+    }
+
+    #[tokio::test]
+    async fn ping_passes_only_on_its_own_tagged_ok_skipping_unsolicited_updates() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command.contains(" NOOP").then(|| {
+                format!(
+                    "* 4 EXISTS\r\n* 2 EXPUNGE\r\n* 1 FETCH (FLAGS (\\Seen))\r\n\
+                     {tag} OK NOOP completed\r\n"
+                )
+            })
+        })
+        .await;
+
+        ping(&mut session)
+            .await
+            .expect("a tagged OK after unsolicited updates is a live session");
+        drop(session);
+        let commands = server.commands().await;
+        assert!(
+            commands.iter().any(|c| c.ends_with("NOOP\r\n")),
+            "{commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_fails_on_a_tagged_no() {
+        let (mut session, server) = test_support::scripted_session(|tag, command| {
+            command
+                .contains(" NOOP")
+                .then(|| format!("{tag} NO [UNAVAILABLE] backend down\r\n"))
+        })
+        .await;
+
+        let error = ping(&mut session)
+            .await
+            .expect_err("a refused NOOP is not a healthy session");
+        assert!(
+            matches!(error, AgentmailError::Imap(async_imap::error::Error::No(_))),
+            "{error:?}"
+        );
+        drop(session);
+        server.commands().await;
+    }
+
     /// The exact shape AOL returns for a UID-only walk page:
     /// `* <uid> UIDFETCH (UID <uid>)` with the UID present inside too.
     #[test]
     fn uidonly_uidfetch_line_parses_via_the_patched_imap_proto() {
         use async_imap::imap_proto::{self, Response};
         let line = b"* 434894 UIDFETCH (UID 434894)\r\n";
-        let (rest, response) = imap_proto::parser::parse_response(line)
+        let (rest, response) = imap_proto::Response::parse(line)
             .expect("patched imap-proto must parse a UID-only UIDFETCH line");
         assert!(rest.is_empty(), "the whole line is consumed: {rest:?}");
         match response {
@@ -4838,7 +6157,7 @@ mod tests {
             "* 434894 UIDFETCH (UID 434894 BODY[HEADER.FIELDS (List-Id From)] {{{}}}\r\n{headers})\r\n",
             headers.len()
         );
-        let (rest, response) = imap_proto::parser::parse_response(line.as_bytes())
+        let (rest, response) = imap_proto::Response::parse(line.as_bytes())
             .expect("patched imap-proto must parse a UIDFETCH with a body-section literal");
         assert!(rest.is_empty(), "the whole line is consumed: {rest:?}");
         match response {
@@ -5256,7 +6575,7 @@ mod tests {
 
     #[test]
     fn copyuid_ranges_expand_in_protocol_order_and_reject_mismatch() {
-        use async_imap::imap_proto::UidSetMember;
+        use async_imap::imap_proto::rfc4315::UidSetMember;
 
         let mapping = copy_uid_mapping(
             9,

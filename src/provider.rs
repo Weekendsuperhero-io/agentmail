@@ -74,6 +74,7 @@ impl MailProvider {
             username: username.to_string(),
             email: None,
             aliases: Vec::new(),
+            display_name: None,
             password,
             tls: true,
             max_connections: None,

@@ -38,12 +38,20 @@ pub struct AccountConfig {
     pub port: u16,
     pub username: String,
     /// Primary mailbox address when the IMAP login is not itself an email
-    /// address. Used for own-address filtering, never for authentication.
+    /// address. A draft's default `From`, and an own address for filtering;
+    /// never used for authentication.
     #[serde(default)]
     pub email: Option<String>,
-    /// Additional mailbox identities used for own-address filtering.
+    /// Additional addresses this account sends as. Each is an identity a draft
+    /// may be `From` (see [`Self::identities`]) and an own address for
+    /// filtering.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// The sender's name on drafts: `display_name = "Mark Blake"` makes a
+    /// draft `From: Mark Blake <you@example.com>`. Unset, `From` is the bare
+    /// address.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Password secret: `password.raw = "..."`, `password.cmd = "..."`,
     /// or `password.keyring = "..."`. Legacy `password = "..."` is also
     /// accepted. Under `auth = "xoauth2"` this yields the OAuth access token.
@@ -74,6 +82,7 @@ impl AccountConfig {
             username,
             email: None,
             aliases: Vec::new(),
+            display_name: None,
             password,
             tls: true,
             max_connections: None,
@@ -105,13 +114,19 @@ impl AccountConfig {
         self
     }
 
-    /// Set additional mailbox identities used for own-address filtering.
+    /// Set the additional addresses this account sends as.
     pub fn with_aliases<I, S>(mut self, aliases: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         self.aliases = aliases.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the sender's name shown on drafts (`Name <address>`).
+    pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
         self
     }
 
@@ -127,9 +142,34 @@ impl AccountConfig {
             .or_else(|| canonicalize_email(&self.username))
     }
 
+    /// The addresses this account sends as, canonical and deduplicated: the
+    /// primary ([`Self::canonical_email`]) first, then the aliases.
+    ///
+    /// This is the set a draft's `From` must come from and the set
+    /// `list_accounts` advertises. It is narrower than
+    /// [`Self::canonical_addresses`] on purpose: an email-shaped login that
+    /// differs from a configured `email` is a credential, not an address the
+    /// user chose to send as, so it is never offered — list it in `aliases` to
+    /// make it one.
+    pub fn identities(&self) -> Vec<String> {
+        let mut identities = Vec::with_capacity(self.aliases.len().saturating_add(1));
+        if let Some(primary) = self.canonical_email() {
+            identities.push(primary);
+        }
+        for alias in &self.aliases {
+            if let Some(alias) = canonicalize_email(alias)
+                && !identities.contains(&alias)
+            {
+                identities.push(alias);
+            }
+        }
+        identities
+    }
+
     /// Return every configured mailbox identity in canonical, deduplicated
     /// form. The primary identity is first, followed by an email-shaped login
-    /// (when distinct) and then aliases.
+    /// (when distinct) and then aliases. A superset of [`Self::identities`],
+    /// used only to recognize the account's own mail, never to send as.
     pub fn canonical_addresses(&self) -> Vec<String> {
         let mut addresses = Vec::with_capacity(self.aliases.len().saturating_add(2));
         if let Some(primary) = self.canonical_email() {
@@ -161,14 +201,18 @@ impl AccountConfig {
             let trimmed = alias.trim();
             *alias = canonicalize_email(trimmed).unwrap_or_else(|| trimmed.to_string());
         }
+        // An alias equal to a distinct login is KEPT: listing it is how the
+        // login address becomes one this account may send as.
         let primary = self.canonical_email();
-        let login = canonicalize_email(&self.username);
         let mut seen = hashbrown::HashSet::with_capacity(self.aliases.len());
-        self.aliases.retain(|alias| {
-            primary.as_ref() != Some(alias)
-                && login.as_ref() != Some(alias)
-                && seen.insert(alias.clone())
-        });
+        self.aliases
+            .retain(|alias| primary.as_ref() != Some(alias) && seen.insert(alias.clone()));
+        self.display_name = self
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
     }
 
     fn validate(&self, account_name: &str) -> crate::Result<()> {
@@ -210,6 +254,12 @@ impl AccountConfig {
                 "aliases must contain only valid bare email addresses",
             ));
         }
+        if let Some(problem) = self.display_name.as_deref().and_then(display_name_problem) {
+            return Err(config_error(
+                account_name,
+                &format!("display_name {problem}"),
+            ));
+        }
         if self.port == 0 {
             return Err(config_error(
                 account_name,
@@ -236,6 +286,41 @@ impl AccountConfig {
 
 fn config_error(account_name: &str, message: &str) -> crate::AgentmailError {
     crate::AgentmailError::Config(format!("account '{account_name}': {message}"))
+}
+
+/// Longest accepted sender display name, in characters.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 256;
+
+/// Check a sender display name — the `Mark Blake` of `Mark Blake <addr>` —
+/// before it reaches a `From` header.
+///
+/// Control characters are refused: CR or LF would end the header early (and
+/// make lettre's `Mailbox` formatting fail outright), and no other control
+/// character belongs in a name a person reads. Quotes, commas, `@` and
+/// non-ASCII letters are all fine; they are quoted or RFC 2047-encoded when
+/// the header is written. Exported so an embedding app validates its settings
+/// with the same rule the server applies.
+pub fn validate_display_name(name: &str) -> crate::Result<()> {
+    match display_name_problem(name) {
+        Some(problem) => Err(crate::AgentmailError::Config(format!(
+            "display_name {problem}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// What is wrong with a sender name, phrased to follow the name of whatever
+/// field held it ("display_name must …"); `None` when it is usable.
+pub(crate) fn display_name_problem(name: &str) -> Option<String> {
+    if name.chars().any(char::is_control) {
+        Some("must not contain control characters (line breaks included)".to_string())
+    } else if name.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        Some(format!(
+            "must be at most {MAX_DISPLAY_NAME_CHARS} characters"
+        ))
+    } else {
+        None
+    }
 }
 
 fn normalize_host(host: &str) -> String {
@@ -430,7 +515,10 @@ impl Config {
         }
     }
 
-    /// Default config path: `$AGENTMAIL_CONFIG` or `~/.config/agentmail/config.toml`.
+    /// Default config path: `$AGENTMAIL_CONFIG`, else `agentmail/config.toml`
+    /// under the platform config directory — `~/Library/Application Support`
+    /// on macOS (where `~/.config` is NOT read), `$XDG_CONFIG_HOME` or
+    /// `~/.config` on Linux, `%APPDATA%` on Windows.
     pub fn default_path() -> PathBuf {
         if let Ok(p) = std::env::var("AGENTMAIL_CONFIG") {
             return PathBuf::from(p);
@@ -596,6 +684,98 @@ mod tests {
                 .to_string();
             assert!(error.contains(expected), "unexpected error: {error}");
         }
+    }
+
+    #[test]
+    fn display_name_is_trimmed_and_a_blank_one_is_unset() {
+        let mut config: Config = ::toml::from_str(
+            r#"
+                [accounts.work]
+                host = "imap.example.com"
+                username = "me@example.com"
+                display_name = "  Mark Blake  "
+
+                [accounts.blank]
+                host = "imap.example.com"
+                username = "other@example.com"
+                display_name = "   "
+            "#,
+        )
+        .expect("valid TOML");
+
+        config.normalize_and_validate().expect("valid config");
+
+        assert_eq!(
+            config.accounts["work"].display_name.as_deref(),
+            Some("Mark Blake")
+        );
+        assert_eq!(config.accounts["blank"].display_name, None);
+    }
+
+    #[test]
+    fn a_display_name_with_a_control_character_is_rejected() {
+        // TOML escapes, so the parsed value carries the raw control character.
+        for name in [r"Mark\r\nBcc: x@evil.example", r"Mark\u0007"] {
+            let input = format!(
+                "[accounts.bad]\nhost = \"imap.example.com\"\nusername = \"me@example.com\"\ndisplay_name = \"{name}\"\n"
+            );
+            let mut config: Config = ::toml::from_str(&input).expect("valid TOML shape");
+            let error = config
+                .normalize_and_validate()
+                .expect_err("a control character must be rejected")
+                .to_string();
+            assert!(error.contains("control characters"), "{error}");
+        }
+        assert!(validate_display_name("Blake, Mark \"Shark\" Jos\u{e9}").is_ok());
+        assert!(validate_display_name(&"x".repeat(MAX_DISPLAY_NAME_CHARS)).is_ok());
+        assert!(validate_display_name(&"x".repeat(MAX_DISPLAY_NAME_CHARS + 1)).is_err());
+    }
+
+    /// The sendable set is the primary and the aliases. A login that differs
+    /// from the configured `email` stays a filter-only own address unless the
+    /// user lists it as an alias.
+    #[test]
+    fn identities_are_the_primary_then_aliases_never_a_distinct_login() {
+        let mut config: Config = ::toml::from_str(
+            r#"
+                [accounts.corp]
+                host = "imap.example.com"
+                username = "login@example.com"
+                email = "Mark@Example.com"
+                aliases = ["sales@example.com"]
+
+                [accounts.listed]
+                host = "imap.example.com"
+                username = "login@example.com"
+                email = "mark@example.com"
+                aliases = ["LOGIN@example.com"]
+
+                [accounts.gmail]
+                host = "imap.gmail.com"
+                username = "Me@Gmail.com"
+
+                [accounts.icloud]
+                host = "imap.mail.me.com"
+                username = "johnappleseed"
+            "#,
+        )
+        .expect("valid TOML");
+        config.normalize_and_validate().expect("valid config");
+
+        let corp = &config.accounts["corp"];
+        assert_eq!(corp.identities(), ["mark@example.com", "sales@example.com"]);
+        assert!(
+            corp.canonical_addresses()
+                .contains(&"login@example.com".to_string()),
+            "the login still counts as the account's own mail"
+        );
+        assert_eq!(
+            config.accounts["listed"].identities(),
+            ["mark@example.com", "login@example.com"],
+            "listing the login as an alias makes it sendable"
+        );
+        assert_eq!(config.accounts["gmail"].identities(), ["me@gmail.com"]);
+        assert!(config.accounts["icloud"].identities().is_empty());
     }
 
     #[test]
