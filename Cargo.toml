@@ -9,7 +9,7 @@ imap-proto = { path = "vendor/imap-proto" }
 
 [package]
 name = "agentmail"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
 rust-version = "1.99.1"
 description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
