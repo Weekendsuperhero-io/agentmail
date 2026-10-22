@@ -366,8 +366,8 @@ mod tests {
         let now = SystemTime::now();
         let generation = catalog.generation("work");
         catalog.store_if_generation("work", generation, vec![entry("INBOX")], now);
-
-        let result = catalog.get_at("work", now + MAILBOX_CATALOG_TTL - Duration::from_nanos(1));
+        //Windows stores time in microseconds so no nano
+        let result = catalog.get_at("work", now + MAILBOX_CATALOG_TTL - Duration::from_micros(1));
 
         assert_eq!(result.as_deref().map(|entries| entries.len()), Some(1));
     }
