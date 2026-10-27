@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-10-14T00:00
+updated: 2026-10-27T00:00
 ---
 # agentmail
 
@@ -565,7 +565,8 @@ extension (SEP-2663) a slow call becomes a task it polls; see
   client IP, HELO, and envelope-sender inputs that are not present in an RFC822
   archive.
 - Embedded AgentMail accepts the workspace root only as trusted request
-  metadata from Agent Muse (`io.agentmuse/workspaceRoot`) on every call.
+  metadata from HERO (`com.makeyourhero/workspaceRoot`; versions before HERO
+  send `io.agentmuse/workspaceRoot`, still accepted) on every call.
   Missing or invalid metadata fails closed. Standalone
   `agentmail serve` instead uses `AGENTMAIL_FILE_ROOT` (falling back to
   `~/.agentmail/files`). Caller-supplied output directories are confined below

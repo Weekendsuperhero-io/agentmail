@@ -12,7 +12,7 @@ No Mail.app dependency. Pure IMAP over TLS. Works on macOS, Linux, and Windows.
 
 ```mermaid
 graph TB
-    subgraph "Agent App (Tauri)"
+    subgraph "HERO (Tauri)"
         UI[Settings UI]
         DB[(SQLite<br/>mail_accounts)]
         KR[OS Keyring<br/>passwords]
@@ -57,10 +57,10 @@ graph LR
         MK1 -->|config.toml| FS[platform config dir/agentmail/]
     end
 
-    subgraph "In-Process (Agent App)"
+    subgraph "In-Process (HERO)"
         GW2[Bridge] <-->|DuplexStream| MCP2[AgentMailServer]
         MCP2 --> MK2[Agentmail]
-        MK2 -->|Config::from_accounts| DB2[Agent DB]
+        MK2 -->|Config::from_accounts| DB2[HERO agents.db]
     end
 ```
 
@@ -69,7 +69,7 @@ graph LR
 | Binary          | `agentmail serve`                 | None (library)                                  |
 | Transport       | stdio                             | DuplexStream                                    |
 | Account config  | `<config dir>/agentmail/config.toml`¹ | Passed at spawn via `serve_on()`            |
-| Password source | keyring (agentmail service)       | keyring (agent service)                         |
+| Password source | keyring (agentmail service)       | keyring (the app's bundle identifier)           |
 | Entry point     | `main.rs`                         | `agentmail_mcp::serve_on(transport, agentmail)` |
 
 ¹ `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` (`~/.config`) on
@@ -158,7 +158,7 @@ flowchart TD
     Default -->|not found| Error[Error: no password]
 ```
 
-When running in-process, the agent app calls `init_keyring_with_service("agent")` so passwords are stored under the agent's keyring service, not "agentmail". The signed agent app avoids macOS Keychain popups.
+When running in-process, HERO calls `agentmail::init_service_name(&app_identifier)` at startup with its runtime bundle identifier (`Agent.weekendsuperhero.io`, `Agent.weekendsuperhero.io.beta` or `Agent.weekendsuperhero.io.dev`), so passwords are stored under that keyring service, one per channel, not "agentmail". The signed app avoids macOS Keychain popups.
 
 Credential commands run with stdin closed, a 15-second deadline, and 64 KiB
 bounds on each output stream. Non-zero exit, invalid UTF-8, empty output,

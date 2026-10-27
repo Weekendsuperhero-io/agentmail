@@ -34,7 +34,8 @@
 //! the request's token, as it always did. After, that request has been
 //! answered, so progress becomes the task's status message, and `tasks/get`
 //! carries the numbers under [`PROGRESS_META_KEY`] for a host that relays them
-//! as progress of its own.
+//! as progress of its own, and under [`LEGACY_PROGRESS_META_KEY`] for a host
+//! from before HERO.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -89,7 +90,11 @@ pub(super) const TASK_TOOLS: &[&str] = &[
 /// The `_meta` key under which `tasks/get` reports a running task's latest
 /// progress, as `{"progress": n, "total": m}`. The request's own progress
 /// token died with the request, so this is how a host keeps relaying it.
-pub(super) const PROGRESS_META_KEY: &str = "io.agentmuse/progress";
+pub(super) const PROGRESS_META_KEY: &str = "com.makeyourhero/progress";
+/// [`PROGRESS_META_KEY`] as hosts before HERO spell it. `tasks/get` writes
+/// both keys with the same value: a bridge released before HERO reads only
+/// this one, and a standalone AgentMail can sit behind such a bridge.
+pub(super) const LEGACY_PROGRESS_META_KEY: &str = "io.agentmuse/progress";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TaskConfig {
@@ -375,15 +380,16 @@ impl TaskRuntime {
             && tracked.len() < self.config.max_tracked
     }
 
-    /// `tasks/get`, with the latest progress under [`PROGRESS_META_KEY`].
+    /// `tasks/get`, with the latest progress under [`PROGRESS_META_KEY`] and,
+    /// for a host from before HERO, [`LEGACY_PROGRESS_META_KEY`].
     pub(super) fn get(&self, task_id: &str) -> Result<GetTaskResult, McpError> {
         let mut result = GetTaskResult::new(self.manager.get_task(task_id)?);
         if let Some((progress, total)) = self.progress.get(task_id) {
+            let value = serde_json::json!({ "progress": progress, "total": total });
             let mut meta = MetaObject::default();
-            meta.0.insert(
-                PROGRESS_META_KEY.to_string(),
-                serde_json::json!({ "progress": progress, "total": total }),
-            );
+            for key in [PROGRESS_META_KEY, LEGACY_PROGRESS_META_KEY] {
+                meta.0.insert(key.to_string(), value.clone());
+            }
             result.meta = Some(meta);
         }
         Ok(result)
@@ -741,7 +747,9 @@ mod tests {
     }
 
     /// Progress after promotion lands on the task: its status message and the
-    /// numbers `tasks/get` reports under `io.agentmuse/progress`.
+    /// numbers `tasks/get` reports under `com.makeyourhero/progress`, and the
+    /// same numbers under `io.agentmuse/progress`, the only key a bridge from
+    /// before HERO reads.
     #[tokio::test]
     async fn progress_after_promotion_is_the_tasks_status() {
         let runtime = TaskRuntime::new(quick());
@@ -765,9 +773,15 @@ mod tests {
         let running = runtime.get(&task_id).unwrap();
         assert_eq!(running.task.task.status_message.as_deref(), Some("3 of 10"));
         let meta = running.meta.expect("progress meta");
+        let progress = meta.0.get(PROGRESS_META_KEY);
         assert_eq!(
-            meta.0.get(PROGRESS_META_KEY),
+            progress,
             Some(&serde_json::json!({ "progress": 3, "total": 10 }))
+        );
+        assert_eq!(
+            meta.0.get(LEGACY_PROGRESS_META_KEY),
+            progress,
+            "the pre-HERO key carries the same numbers"
         );
     }
 

@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-10-14T00:00
+updated: 2026-10-27T00:00
 ---
 # Agentmail MCP — Tool & Prompt Reference
 
@@ -757,12 +757,16 @@ JSON manifest. It does not discover or infer thread membership. All UIDs must
 belong to the same mailbox and UIDVALIDITY epoch; existing source or manifest
 filenames cause a no-overwrite failure.
 
-For embedded AgentMail, Agent Muse injects the trusted absolute workspace root
-as request metadata (`io.agentmuse/workspaceRoot`) on every call. Only the
+For embedded AgentMail, HERO injects the trusted absolute workspace root
+as request metadata (`com.makeyourhero/workspaceRoot`; versions before HERO
+send `io.agentmuse/workspaceRoot`, still accepted) on every call. Only the
 in-process backend named `agentmail` receives
 it; a missing or invalid root fails closed, and other backends never receive
-the value. Standalone `agentmail serve` uses `AGENTMAIL_FILE_ROOT` or its
-`~/.agentmail/files` default instead.
+the value. The Project's other bound directories ride beside the root as
+`additionalWorkspaceRoots` under the same prefix, and a request that carries
+the `com.makeyourhero/` root is read under that prefix alone. Standalone
+`agentmail serve` uses `AGENTMAIL_FILE_ROOT` or its `~/.agentmail/files`
+default instead.
 
 **export_thread_record**
 
@@ -909,7 +913,7 @@ Task-eligible tools: `search_messages`, `list_flags`, `find_attachments`,
 | Admission | at most 32 tasks running and 1,024 held (running and finished); past either, a slow call stays a request |
 | Terminal status | `completed` with the tool's result (an `isError` result is still `completed`); `failed` when the tool produced no result (a protocol error, or a panic); `cancelled` when the tool saw a `tasks/cancel` |
 | `tasks/cancel` | stops the operation at its next check, never mid-write; a task that finished first is `completed` |
-| Progress | the task's `statusMessage` (`"3 of 10"`), and `_meta["io.agentmuse/progress"] = {"progress", "total"}` on `tasks/get` |
+| Progress | the task's `statusMessage` (`"3 of 10"`), and `_meta["com.makeyourhero/progress"] = {"progress", "total"}` on `tasks/get`, with the same value under `_meta["io.agentmuse/progress"]` for older hosts |
 | `tasks/update` | accepted for any held task; no tool asks for input mid-task |
 | Lifetime | 4 hours from creation, after which rmcp fails a task still running; a finished task is kept 4 more hours. Tasks live with the connection: closing it stops them (5 seconds' grace, then abort) |
 
@@ -996,7 +1000,7 @@ that should not traverse model context, use `download_message_source` or
 Account roots, mailbox catalogs, and message representations carry MCP
 resource annotations. Catalog/body/info resources target the assistant at
 priorities appropriate to discovery, headers/source are lower-priority exact
-evidence views, and attachment blobs target both user and assistant. Agent Muse
+evidence views, and attachment blobs target both user and assistant. HERO
 preserves `audience`, `priority`, and `lastModified` when mapping backend
 resources and displays them in the MCP Inspector.
 
