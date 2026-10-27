@@ -186,6 +186,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A draft's line breaks reach the reader.** The HTML half rendered a
+  single newline the way CommonMark does, as a space, so a signature written
+  one line under another (`Best,` / a name / a company) arrived on one line
+  in every client that shows the HTML, while the plain half kept its lines.
+  A single newline is now a line break (`<br />`) there too. A blank line
+  still starts a new paragraph.
 - **The deploy doctor finds the running app again.** `scripts/doctor.sh`
   looked for `Agent.app`, which matched macOS's own `WiFiAgent.app` and the
   like, but the app has shipped as `Agent Muse.app` (`agent-muse`) since the

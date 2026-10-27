@@ -638,7 +638,9 @@ Draft bodies are written in **Markdown** and sent as `multipart/alternative`
 (RFC 2046 §5.1.4): the text exactly as written as `text/plain`, then an HTML
 rendering of the same source, least-preferred part first so every client picks
 the richest form it can display. `**bold**`, lists, links, tables and
-strikethrough arrive formatted instead of as literal syntax.
+strikethrough arrive formatted instead of as literal syntax. A single newline
+is a line break in the HTML too, so a signature or an address keeps its lines.
+A blank line starts a new paragraph.
 
 Raw HTML inside a body is **escaped, never rendered** — a draft body is
 author-supplied text, and treating `<...>` in it as markup would let a tool call

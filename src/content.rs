@@ -72,6 +72,13 @@ fn is_safe_url(dest: &str) -> bool {
 /// Render a Markdown draft body into the `text/html` half of a
 /// `multipart/alternative` message.
 ///
+/// **A line break stays a line break.** CommonMark joins the lines of a
+/// paragraph: a single newline is a soft break, which HTML shows as a space.
+/// So a signature written one line under another (`Best,` / `Claude` / a
+/// company) reached the reader as one line, while the plain half kept its
+/// lines. Every soft break renders as a hard one (`<br />`), the way GitHub
+/// renders a comment. A blank line still starts a new paragraph.
+///
 /// Two things are refused, and they are different problems:
 ///
 /// **Raw HTML is ESCAPED, never emitted.** A draft body is agent-authored text,
@@ -109,6 +116,7 @@ pub fn markdown_to_email_html(markdown: &str) -> String {
     let mut in_unsafe_link = false;
     let mut in_unsafe_image = false;
     let events = Parser::new_ext(markdown, options).filter_map(move |event| match event {
+        Event::SoftBreak => Some(Event::HardBreak),
         Event::Html(raw) | Event::InlineHtml(raw) => Some(Event::Text(raw)),
         Event::Start(Tag::Link { ref dest_url, .. }) if !is_safe_url(dest_url) => {
             in_unsafe_link = true;
@@ -374,6 +382,27 @@ mod tests {
             "<a href=\"https://autolink.example\">",
         ] {
             assert!(html.contains(expected), "missing {expected} in {html}");
+        }
+    }
+
+    /// A signature keeps its lines: a single newline is a line break in the
+    /// HTML half, as it is in the plain half, inside a quote and a list item
+    /// too, and a blank line still starts a paragraph.
+    #[test]
+    fn a_single_newline_is_a_line_break() {
+        let html = markdown_to_email_html(
+            "Thanks for the update.\n\n\
+             Best,\nClaude\nHERO\n\n\
+             > first line\n> second line\n\n\
+             - one item\n  over two lines\n",
+        );
+        for expected in [
+            "<p>Thanks for the update.</p>",
+            "<p>Best,<br />\nClaude<br />\nHERO</p>",
+            "first line<br />\nsecond line",
+            "one item<br />\nover two lines",
+        ] {
+            assert!(html.contains(expected), "missing {expected:?} in {html}");
         }
     }
 }
