@@ -66,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **rmcp 3.8.0**, version 0.9.3 — exact-pinned to the HERO workspace's rmcp,
+  so the app still links one copy. rmcp 3.8.0 reports a 429 or 5xx as
+  `StreamableHttpError::HttpStatus` (with any `Retry-After`) and stops an SSE
+  stream from reconnecting after a permanent GET error; the server side is
+  unchanged.
 - **HERO's `_meta` keys, version 0.9.3** — the embedded server accepts the
   session workspace as `com.makeyourhero/workspaceRoot` and
   `com.makeyourhero/additionalWorkspaceRoots` beside the `io.agentmuse/*`

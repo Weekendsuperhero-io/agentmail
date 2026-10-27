@@ -58,7 +58,7 @@ reqwest = { version = "0.13", features = ["json"] }
 # Exact-pinned to the HERO workspace's rmcp, so the app links
 # one copy. The protocol does not move with the SDK: the server speaks up to
 # `mcp::MAX_PROTOCOL_VERSION` (2026-07-28), named in the source.
-rmcp = { version = "=3.7.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.8.0", features = ["server", "macros", "transport-io"] }
 # Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native
 # sqlite — libsqlite3-sys has `links = "sqlite3"`, so exactly one version may
