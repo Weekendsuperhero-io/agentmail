@@ -2429,7 +2429,7 @@ mod tests {
         );
     }
 
-    /// An embedder (the Agent Muse settings screen) reads `list_identities`'
+    /// An embedder (HERO's Mail Accounts settings) reads `list_identities`'
     /// structured result back into the library's `ListIdentitiesResponse`.
     /// The wire output is a separate struct, so pin that the two agree.
     #[test]

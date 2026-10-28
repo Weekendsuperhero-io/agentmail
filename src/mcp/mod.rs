@@ -38,7 +38,14 @@ const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 const PREWARM_CONCURRENCY: usize = 3;
 const PREWARM_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The session's PRIMARY workspace root, as a JSON string.
-pub const WORKSPACE_ROOT_META_KEY: &str = "io.agentmuse/workspaceRoot";
+///
+/// Hosts from before the HERO rename send [`LEGACY_WORKSPACE_ROOT_META_KEY`]
+/// instead. A request that carries this key is read under this spelling
+/// alone, its extra roots included, even when it carries the older one too.
+pub const WORKSPACE_ROOT_META_KEY: &str = "com.makeyourhero/workspaceRoot";
+/// [`WORKSPACE_ROOT_META_KEY`] as hosts before HERO spell it. Read only when
+/// the request does not carry the HERO key.
+pub const LEGACY_WORKSPACE_ROOT_META_KEY: &str = "io.agentmuse/workspaceRoot";
 /// The Project's OTHER bound directories, as a JSON array of strings.
 ///
 /// A separate key rather than widening [`WORKSPACE_ROOT_META_KEY`] to
@@ -46,7 +53,10 @@ pub const WORKSPACE_ROOT_META_KEY: &str = "io.agentmuse/workspaceRoot";
 /// paths join it, an omitted `outputDir` lands in it), so it keeps a field
 /// whose type says there is exactly one. Absent or empty means what it always
 /// meant — one root — so an older app, or the standalone server, is unchanged.
-pub const ADDITIONAL_ROOTS_META_KEY: &str = "io.agentmuse/additionalWorkspaceRoots";
+pub const ADDITIONAL_ROOTS_META_KEY: &str = "com.makeyourhero/additionalWorkspaceRoots";
+/// [`ADDITIONAL_ROOTS_META_KEY`] as hosts before HERO spell it, read only
+/// beside [`LEGACY_WORKSPACE_ROOT_META_KEY`].
+pub const LEGACY_ADDITIONAL_ROOTS_META_KEY: &str = "io.agentmuse/additionalWorkspaceRoots";
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -314,8 +324,22 @@ impl AgentMailServer {
         if let Some(policy) = &self.file_access {
             return Ok(policy.clone());
         }
+        // The primary root picks the spelling, and the extra roots are read
+        // under the same one: the host sends the two as a pair, so a primary
+        // never takes its extras from the other spelling. The HERO key decides
+        // by being in `_meta` at all, so a HERO root that is empty, not a
+        // string or relative fails closed below instead of falling back to the
+        // older spelling's root.
+        let (root_key, additional_key) = if meta.contains_key(WORKSPACE_ROOT_META_KEY) {
+            (WORKSPACE_ROOT_META_KEY, ADDITIONAL_ROOTS_META_KEY)
+        } else {
+            (
+                LEGACY_WORKSPACE_ROOT_META_KEY,
+                LEGACY_ADDITIONAL_ROOTS_META_KEY,
+            )
+        };
         let root = meta
-            .get(WORKSPACE_ROOT_META_KEY)
+            .get(root_key)
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|root| !root.is_empty())
@@ -337,7 +361,7 @@ impl AgentMailServer {
         // dropped rather than failing the call, because the primary root
         // alone is still a working session.
         let additional: Vec<std::path::PathBuf> = meta
-            .get(ADDITIONAL_ROOTS_META_KEY)
+            .get(additional_key)
             .and_then(serde_json::Value::as_array)
             .map(|entries| {
                 entries
@@ -1318,6 +1342,240 @@ mod tests {
         assert!(cancel());
         let err = crate::imap_client::check_cancel(Some(&cancel)).unwrap_err();
         assert_eq!(err.to_string(), "cancelled by client");
+    }
+}
+
+/// The session workspace the embedded server reads from `_meta`, under the
+/// HERO spelling of its keys and the one before it.
+#[cfg(test)]
+mod workspace_root_tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    /// The embedded server: no ambient sandbox, only what `_meta` carries.
+    fn embedded() -> AgentMailServer {
+        AgentMailServer::new_embedded(crate::Agentmail::builder(crate::Config::empty()).build())
+    }
+
+    /// A fresh directory for one test's roots, removed when the test ends,
+    /// passed or failed. Canonical, so a root made in it compares equal to the
+    /// root the sandbox resolves.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "agentmail-workspace-meta-{test}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).expect("create the scratch directory");
+            Self(
+                dir.canonicalize()
+                    .expect("canonicalize the scratch directory"),
+            )
+        }
+
+        /// A root that exists, since the sandbox canonicalizes its roots.
+        fn root(&self, name: &str) -> PathBuf {
+            let dir = self.0.join(name);
+            std::fs::create_dir_all(&dir).expect("create a workspace root");
+            dir
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Request `_meta` carrying exactly these keys.
+    fn meta_with(entries: &[(&str, serde_json::Value)]) -> RequestMetaObject {
+        let mut meta = RequestMetaObject::new();
+        for (key, value) in entries {
+            meta.insert((*key).to_string(), value.clone());
+        }
+        meta
+    }
+
+    /// Whether the sandbox lets a file operation write into `dir`.
+    fn grants(policy: &file_access::FileAccessPolicy, dir: &Path) -> bool {
+        policy
+            .confine_dir(Some(dir.to_str().expect("a UTF-8 temp path")))
+            .is_ok()
+    }
+
+    /// HERO sends the session's workspace under `com.makeyourhero/*`: the
+    /// primary root is where a file operation lands by default, and the extra
+    /// roots are granted beside it.
+    #[test]
+    fn the_hero_keys_sandbox_the_session() {
+        let scratch = Scratch::new("hero");
+        let primary = scratch.root("primary");
+        let extra = scratch.root("extra");
+
+        let policy = embedded()
+            .file_access_for_request(&meta_with(&[
+                (WORKSPACE_ROOT_META_KEY, json!(primary)),
+                (ADDITIONAL_ROOTS_META_KEY, json!([extra])),
+            ]))
+            .expect("the HERO keys open the sandbox");
+        assert_eq!(policy.confine_dir(None).expect("default dir"), primary);
+        assert!(grants(&policy, &extra), "the HERO extra root is granted");
+    }
+
+    /// A host from before HERO sends only `io.agentmuse/*`, and its session
+    /// is sandboxed exactly as before.
+    #[test]
+    fn the_pre_hero_keys_still_sandbox_the_session() {
+        let scratch = Scratch::new("legacy");
+        let primary = scratch.root("primary");
+        let extra = scratch.root("extra");
+
+        let policy = embedded()
+            .file_access_for_request(&meta_with(&[
+                (LEGACY_WORKSPACE_ROOT_META_KEY, json!(primary)),
+                (LEGACY_ADDITIONAL_ROOTS_META_KEY, json!([extra])),
+            ]))
+            .expect("the pre-HERO keys open the sandbox");
+        assert_eq!(policy.confine_dir(None).expect("default dir"), primary);
+        assert!(
+            grants(&policy, &extra),
+            "the pre-HERO extra root is granted"
+        );
+    }
+
+    /// With both spellings in `_meta`, the HERO pair wins whole: its primary
+    /// and its extras. Each spelling names its own directories here, so the
+    /// older pair's roots being refused is what proves which pair was read.
+    #[test]
+    fn with_both_spellings_the_hero_pair_wins() {
+        let scratch = Scratch::new("both");
+        let hero = scratch.root("hero");
+        let hero_extra = scratch.root("hero-extra");
+        let legacy = scratch.root("legacy");
+        let legacy_extra = scratch.root("legacy-extra");
+
+        let policy = embedded()
+            .file_access_for_request(&meta_with(&[
+                (WORKSPACE_ROOT_META_KEY, json!(hero)),
+                (ADDITIONAL_ROOTS_META_KEY, json!([hero_extra])),
+                (LEGACY_WORKSPACE_ROOT_META_KEY, json!(legacy)),
+                (LEGACY_ADDITIONAL_ROOTS_META_KEY, json!([legacy_extra])),
+            ]))
+            .expect("both spellings open the sandbox");
+        assert_eq!(
+            policy.confine_dir(None).expect("default dir"),
+            hero,
+            "the HERO primary is the default"
+        );
+        assert!(
+            grants(&policy, &hero_extra),
+            "the HERO extra root is granted"
+        );
+        assert!(!grants(&policy, &legacy), "the older primary is not a root");
+        assert!(
+            !grants(&policy, &legacy_extra),
+            "the older extras are not read beside the HERO primary"
+        );
+    }
+
+    /// The host sends a primary and its extras as a pair, so a primary never
+    /// takes extras from the other spelling, in either direction.
+    #[test]
+    fn a_primary_never_takes_extra_roots_from_the_other_spelling() {
+        let scratch = Scratch::new("mixed");
+        let primary = scratch.root("primary");
+        let extra = scratch.root("extra");
+        let server = embedded();
+
+        for (root_key, other_extras_key) in [
+            (WORKSPACE_ROOT_META_KEY, LEGACY_ADDITIONAL_ROOTS_META_KEY),
+            (LEGACY_WORKSPACE_ROOT_META_KEY, ADDITIONAL_ROOTS_META_KEY),
+        ] {
+            let policy = server
+                .file_access_for_request(&meta_with(&[
+                    (root_key, json!(primary)),
+                    (other_extras_key, json!([extra])),
+                ]))
+                .expect("the primary alone opens the sandbox");
+            assert_eq!(policy.confine_dir(None).expect("default dir"), primary);
+            assert!(
+                !grants(&policy, &extra),
+                "`{root_key}` took extra roots from `{other_extras_key}`"
+            );
+        }
+    }
+
+    /// With neither key naming a non-empty absolute root, a file operation
+    /// refuses as it always has: the embedded server has no ambient sandbox
+    /// to fall back on, and extra roots without a primary are no workspace.
+    #[test]
+    fn with_neither_root_a_file_operation_refuses() {
+        let server = embedded();
+        let refusal = |meta: &RequestMetaObject| {
+            server
+                .file_access_for_request(meta)
+                .expect_err("no workspace root, no sandbox")
+                .message
+                .into_owned()
+        };
+
+        for meta in [
+            RequestMetaObject::new(),
+            meta_with(&[
+                (ADDITIONAL_ROOTS_META_KEY, json!(["/hero/extra"])),
+                (LEGACY_ADDITIONAL_ROOTS_META_KEY, json!(["/legacy/extra"])),
+            ]),
+            meta_with(&[(LEGACY_WORKSPACE_ROOT_META_KEY, json!("  "))]),
+        ] {
+            let message = refusal(&meta);
+            assert!(
+                message.contains("requires an active session workspace"),
+                "{message}"
+            );
+        }
+        let message = refusal(&meta_with(&[(
+            LEGACY_WORKSPACE_ROOT_META_KEY,
+            json!("relative/dir"),
+        )]));
+        assert!(message.contains("must be an absolute path"), "{message}");
+    }
+
+    /// A HERO root that names no usable workspace refuses rather than falling
+    /// back to the older spelling's root. The HERO key decides by being in
+    /// `_meta`, whatever its value: a host that sends both spellings sends
+    /// one root under both, so a disagreement is a host bug, which a refusal
+    /// reports and a fallback would hide.
+    #[test]
+    fn a_hero_root_that_names_no_workspace_does_not_fall_back() {
+        let scratch = Scratch::new("no-fallback");
+        let legacy = scratch.root("legacy");
+        let server = embedded();
+        server
+            .file_access_for_request(&meta_with(&[(
+                LEGACY_WORKSPACE_ROOT_META_KEY,
+                json!(legacy),
+            )]))
+            .expect("the older root alone is a workspace");
+
+        for (hero_root, refusal) in [
+            (json!(""), "requires an active session workspace"),
+            (
+                serde_json::Value::Null,
+                "requires an active session workspace",
+            ),
+            (json!("relative/dir"), "must be an absolute path"),
+        ] {
+            let error = server
+                .file_access_for_request(&meta_with(&[
+                    (WORKSPACE_ROOT_META_KEY, hero_root.clone()),
+                    (LEGACY_WORKSPACE_ROOT_META_KEY, json!(legacy)),
+                ]))
+                .expect_err("a HERO root in `_meta` decides the spelling");
+            assert!(error.message.contains(refusal), "{hero_root}: {error:?}");
+        }
     }
 }
 

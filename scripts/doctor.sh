@@ -71,12 +71,20 @@ else
 fi
 
 # 5. Running app process vs artifacts.
-APP_PROC=$(pgrep -fl 'Agent\.app|target/(debug|release)/agent$|Agent\.weekendsuperhero' 2>/dev/null | grep -iv 'grep' | head -3)
+# The bundle and binary names HERO ships under, the names the app shipped
+# under before them, and the dev binary under its old and new name. An
+# updated install keeps its old bundle folder (`Agent Beta.app`), so the
+# binary name is what finds it. `-a` keeps pgrep's own ancestors: run from an
+# agent session in the app, the app is one of them. The bundle identifier is
+# no pattern: it appears only in the app-data paths of the agents, runtimes
+# and MCP servers the app spawns, never in the app's command line, and those
+# filled the three lines shown.
+APP_PROC=$(pgrep -afl 'HERO( Beta| Dev)?\.app/|/makeyourhero(-beta|-dev)?$|Agent Muse( Beta| Dev)?\.app/|/agent-muse(-beta|-dev)?$|target/(debug|release)/(agent|app)$' 2>/dev/null | grep -iv 'grep' | head -3)
 if [ -n "$APP_PROC" ]; then
   info "running app processes (verify each was started AFTER the rebuild):"
   echo "$APP_PROC" | while read -r line; do info "  $line"; done
 else
-  info "no running app process matched 'Agent' — launch after rebuilding"
+  info "no running HERO (or Agent Muse) process matched — launch after rebuilding"
 fi
 
 echo ""

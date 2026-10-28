@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-10-14T00:00
+updated: 2026-10-27T00:00
 ---
 # Changelog
 
@@ -66,6 +66,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **rmcp 3.8.0**, version 0.9.3 — exact-pinned to the HERO workspace's rmcp,
+  so the app still links one copy. rmcp 3.8.0 reports a 429 or 5xx as
+  `StreamableHttpError::HttpStatus` (with any `Retry-After`) and stops an SSE
+  stream from reconnecting after a permanent GET error; the server side is
+  unchanged.
+- **HERO's `_meta` keys, version 0.9.3** — the embedded server accepts the
+  session workspace as `com.makeyourhero/workspaceRoot` and
+  `com.makeyourhero/additionalWorkspaceRoots` beside the `io.agentmuse/*`
+  spellings older hosts send. The primary root picks the spelling and the
+  extra roots are read under the same one: a request that carries the HERO
+  root is read under that spelling alone, so a blank or relative HERO root
+  fails closed rather than falling back, and a request with neither root
+  refuses as before. `tasks/get` reports a running task's progress under
+  `com.makeyourhero/progress` and, with the same value, under
+  `io.agentmuse/progress`, the key bridges released before HERO read.
+  `mcp::WORKSPACE_ROOT_META_KEY` and `mcp::ADDITIONAL_ROOTS_META_KEY` now
+  hold the HERO keys; `mcp::LEGACY_WORKSPACE_ROOT_META_KEY` and
+  `mcp::LEGACY_ADDITIONAL_ROOTS_META_KEY` hold the older ones.
 - **MCP 2026-07-28 alongside 2025-11-25, version 0.9.0** — a 2026-07-28
   client runs that revision's stateless lifecycle: `server/discover` answers
   with every revision this server implements (the same list a `-32022`
@@ -168,6 +186,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A draft's line breaks reach the reader.** The HTML half rendered a
+  single newline the way CommonMark does, as a space, so a signature written
+  one line under another (`Best,` / a name / a company) arrived on one line
+  in every client that shows the HTML, while the plain half kept its lines.
+  A single newline is now a line break (`<br />`) there too. A blank line
+  still starts a new paragraph.
+- **The deploy doctor finds the running app again.** `scripts/doctor.sh`
+  looked for `Agent.app`, which matched macOS's own `WiFiAgent.app` and the
+  like, but the app has shipped as `Agent Muse.app` (`agent-muse`) since the
+  Agent Muse rename, so it never found an installed copy. It now matches
+  HERO's bundle and binary names, the Agent Muse ones, and the dev binary as
+  `target/*/agent` or `target/*/app`. It lists the app when run from one of
+  the app's own agent sessions, which pgrep used to leave out as its
+  ancestor, and no longer matches the bundle identifier, which only the
+  app-data paths of the agents and MCP servers the app spawns carry.
 - **Dead pooled sessions passed their liveness check.** async-imap's `NOOP`
   treats end-of-stream as success, and on macOS a reset connection reads as
   end-of-stream, so after sleep or a server `BYE` the pool handed out dead

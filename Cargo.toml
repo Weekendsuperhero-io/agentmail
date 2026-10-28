@@ -9,7 +9,7 @@ imap-proto = { path = "vendor/imap-proto" }
 
 [package]
 name = "agentmail"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2024"
 rust-version = "1.99.1"
 description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
@@ -47,7 +47,7 @@ hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 idna = "1"
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
 mail-parser = "0.11"
-# aws-lc-rs, not ring: Agent Muse links this crate and ships one rustls crypto
+# aws-lc-rs, not ring: HERO links this crate and ships one rustls crypto
 # provider. The feature also picks hickory's TLS and DNSSEC backends.
 mail-auth = { version = "0.13.3", default-features = false, features = ["aws-lc-rs"] }
 parking_lot = "0.12"
@@ -55,10 +55,10 @@ percent-encoding = "2"
 printpdf = { version = "0.12", default-features = false }
 psl = "2"
 reqwest = { version = "0.13", features = ["json"] }
-# Exact-pinned to the embedding Agent Muse workspace's rmcp, so the app links
+# Exact-pinned to the HERO workspace's rmcp, so the app links
 # one copy. The protocol does not move with the SDK: the server speaks up to
 # `mcp::MAX_PROTOCOL_VERSION` (2026-07-28), named in the source.
-rmcp = { version = "=3.7.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.8.0", features = ["server", "macros", "transport-io"] }
 # Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native
 # sqlite — libsqlite3-sys has `links = "sqlite3"`, so exactly one version may
@@ -71,7 +71,7 @@ serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-# IMAP's TLS. rustls on aws-lc-rs, the one crypto provider Agent Muse ships
+# IMAP's TLS. rustls on aws-lc-rs, the one crypto provider HERO ships
 # (`tokio_rustls::rustls` is the rustls this uses, so the two can't drift),
 # with the certificate check handed to the OS by rustls-platform-verifier,
 # so the roots a person or their MDM installed still count. native-tls ran

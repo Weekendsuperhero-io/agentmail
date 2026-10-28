@@ -609,6 +609,22 @@ update_draft}`; `create_draft` and the CLI take the default. Pinned by
 `plain_text_only_emits_a_single_unrendered_part`, and
 `attachments_nest_the_alternative_inside_mixed`.
 
+### Addendum: a single newline is a line break (0.9.3, 2026-10-27)
+
+CommonMark joins the lines of a paragraph: a single newline is a soft break,
+which `push_html` writes as a newline and HTML shows as a space. So the two
+halves did not say the same thing. A signature written one line under another
+(`Best,` / a name / a company) kept its lines in the plain half and reached
+every reader of the HTML on one line. That is what the HTML half is for most
+clients.
+
+`markdown_to_email_html` now renders every soft break as a hard break
+(`<br />`), the way GitHub renders a comment. A blank line still starts a new
+paragraph. That includes prose an author wrapped by hand: its HTML now breaks
+where the plain half does. That is the plain half's own layout, and the rule
+this decision already states for smart punctuation: the two halves of an
+alternative say the same thing. Pinned by `a_single_newline_is_a_line_break`.
+
 ## 0.5.0 — The Draft Ceiling Is The Server's, Not Only Ours
 
 ### Decision

@@ -29,7 +29,7 @@ const KEYRING_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Initialize the keyring service name.
 ///
-/// When embedded in the Agent app, this is set to the app's bundle identifier.
+/// When embedded in HERO, this is set to the app's bundle identifier.
 /// When running standalone, this defaults to `"agentmail"`.
 pub fn init_service_name(name: &str) {
     SERVICE_NAME.set(name.to_string()).ok();
