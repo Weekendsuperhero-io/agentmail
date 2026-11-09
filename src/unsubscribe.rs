@@ -26,6 +26,9 @@ pub(crate) struct ListHeaders {
     pub list_unsubscribe: Option<String>,
     pub list_unsubscribe_post: Option<String>,
     pub list_id: Option<String>,
+    /// RFC 2369 `List-Help`, carried for display only: nothing acts on it,
+    /// so it keeps no count.
+    pub list_help: Option<String>,
     list_unsubscribe_count: usize,
     list_unsubscribe_post_count: usize,
     list_id_count: usize,
@@ -82,9 +85,16 @@ struct PinnedEndpoint {
     addresses: Vec<SocketAddr>,
 }
 
-/// Extract the three list fields from the RFC 5322 header block, unfolding
-/// continuation lines. Counts are retained so action-time parsing can reject
-/// ambiguous duplicate headers rather than trusting the first one.
+/// Extract the list fields from the RFC 5322 header block, unfolding
+/// continuation lines: each value is the header's raw text, trimmed, with
+/// each fold joined by one space, and the FIRST occurrence wins. Counts are
+/// retained so action-time parsing can reject ambiguous duplicate headers
+/// rather than trusting the first one.
+///
+/// This is also how `parser::parse_rfc822` fills `MessageInfo`'s list
+/// fields, so what a message shows and what unsubscribing acts on are read
+/// the same way. It reads the bytes itself rather than through mail-parser,
+/// which parses the RFC 2369 headers and `List-Id` as ADDRESSES.
 pub(crate) fn parse_list_headers(raw_message: &[u8]) -> ListHeaders {
     let header_text = String::from_utf8_lossy(rfc5322_header_block(raw_message));
     let mut fields: Vec<(String, String)> = Vec::new();
@@ -116,7 +126,10 @@ pub(crate) fn parse_list_headers(raw_message: &[u8]) -> ListHeaders {
             fields.push(field);
         }
         if let Some((name, value)) = line.split_once(':') {
-            current = Some((name.to_ascii_lowercase(), value.trim().to_string()));
+            current = Some((
+                name.trim_end().to_ascii_lowercase(),
+                value.trim().to_string(),
+            ));
         }
     }
     if let Some(field) = current {
@@ -137,6 +150,9 @@ pub(crate) fn parse_list_headers(raw_message: &[u8]) -> ListHeaders {
             "list-id" => {
                 result.list_id_count += 1;
                 result.list_id.get_or_insert(value);
+            }
+            "list-help" => {
+                result.list_help.get_or_insert(value);
             }
             _ => {}
         }

@@ -39,22 +39,21 @@ pub fn parse_rfc822(
         .date()
         .and_then(|d| chrono::DateTime::from_timestamp(d.to_timestamp(), 0));
 
-    let list_unsubscribe = parsed
-        .header("List-Unsubscribe")
-        .and_then(header_to_string)
-        .filter(|s| !s.is_empty());
-    let list_unsubscribe_post = parsed
-        .header("List-Unsubscribe-Post")
-        .and_then(header_to_string)
-        .filter(|s| !s.is_empty());
-    let list_id = parsed
-        .header("List-Id")
-        .and_then(header_to_string)
-        .filter(|s| !s.is_empty());
-    let list_help = parsed
-        .header("List-Help")
-        .and_then(header_to_string)
-        .filter(|s| !s.is_empty());
+    // The list headers are read raw, as the unsubscribe flow reads them:
+    // mail-parser parses the RFC 2369 headers and `List-Id` as addresses,
+    // which no string field could carry (they were always `None`).
+    let crate::unsubscribe::ListHeaders {
+        list_unsubscribe,
+        list_unsubscribe_post,
+        list_id,
+        list_help,
+        ..
+    } = crate::unsubscribe::parse_list_headers(raw);
+    let non_empty = |value: Option<String>| value.filter(|s| !s.is_empty());
+    let list_unsubscribe = non_empty(list_unsubscribe);
+    let list_unsubscribe_post = non_empty(list_unsubscribe_post);
+    let list_id = non_empty(list_id);
+    let list_help = non_empty(list_help);
 
     // Envelope / threading
     let message_id = parsed.message_id().map(|s| s.to_string());
@@ -234,20 +233,6 @@ fn extract_header_value_text_list(hv: &mail_parser::HeaderValue<'_>) -> Vec<Stri
         mail_parser::HeaderValue::Text(s) => vec![s.to_string()],
         mail_parser::HeaderValue::TextList(list) => list.iter().map(|s| s.to_string()).collect(),
         _ => Vec::new(),
-    }
-}
-
-/// Convert a HeaderValue to a plain string.
-fn header_to_string(hv: &mail_parser::HeaderValue<'_>) -> Option<String> {
-    match hv {
-        mail_parser::HeaderValue::Text(s) => Some(s.to_string()),
-        mail_parser::HeaderValue::TextList(list) => Some(
-            list.iter()
-                .map(|s| s.as_ref())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        _ => None,
     }
 }
 
@@ -700,6 +685,111 @@ mod tests {
             ("mark@example.com", "Blake, Mark"),
             "a From inside a group is still the sender"
         );
+    }
+
+    fn parse_headers(headers: &str) -> MessageInfo {
+        let raw = format!("From: News <news@example.com>\r\nSubject: s\r\n{headers}\r\nbody\r\n");
+        parse_rfc822(
+            raw.as_bytes(),
+            1,
+            Vec::new(),
+            None,
+            "INBOX",
+            "work",
+            false,
+            false,
+        )
+        .expect("parse")
+    }
+
+    /// mail-parser parses `List-Unsubscribe`, `List-Id` and `List-Help` as
+    /// addresses; each field is the header's raw text instead, trimmed and
+    /// unfolded, the same text the unsubscribe flow reads.
+    #[test]
+    fn list_headers_carry_their_raw_text() {
+        let message = parse_headers(concat!(
+            "List-Unsubscribe: <mailto:unsub@lists.example.com?subject=unsubscribe>,\r\n",
+            "\t<https://lists.example.com/u/abc123>\r\n",
+            "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
+            "List-Id: \"Weekly News\" <weekly.lists.example.com>\r\n",
+            "List-Help: <mailto:help@lists.example.com?subject=help>\r\n",
+        ));
+        assert_eq!(
+            message.list_unsubscribe.as_deref(),
+            Some(
+                "<mailto:unsub@lists.example.com?subject=unsubscribe>, \
+                 <https://lists.example.com/u/abc123>"
+            ),
+            "a folded header with two URIs is one line, both URIs kept"
+        );
+        assert_eq!(
+            message.list_unsubscribe_post.as_deref(),
+            Some("List-Unsubscribe=One-Click")
+        );
+        assert_eq!(
+            message.list_id.as_deref(),
+            Some("\"Weekly News\" <weekly.lists.example.com>"),
+            "the display name is kept, as written"
+        );
+        assert_eq!(
+            message.list_help.as_deref(),
+            Some("<mailto:help@lists.example.com?subject=help>")
+        );
+
+        // An unquoted display name, and a bare id with no name.
+        let message = parse_headers("List-Id: Weekly News <weekly.lists.example.com>\r\n");
+        assert_eq!(
+            message.list_id.as_deref(),
+            Some("Weekly News <weekly.lists.example.com>")
+        );
+        let message = parse_headers("List-Id: <weekly.lists.example.com>\r\n");
+        assert_eq!(
+            message.list_id.as_deref(),
+            Some("<weekly.lists.example.com>")
+        );
+    }
+
+    #[test]
+    fn missing_or_blank_list_headers_are_none() {
+        let message = parse_headers("");
+        assert_eq!(message.list_unsubscribe, None);
+        assert_eq!(message.list_unsubscribe_post, None);
+        assert_eq!(message.list_id, None);
+        assert_eq!(message.list_help, None);
+
+        let message = parse_headers("List-Id:   \r\nList-Help:\r\n");
+        assert_eq!(message.list_id, None, "a blank header is no value");
+        assert_eq!(message.list_help, None);
+    }
+
+    #[test]
+    fn list_headers_come_only_from_the_top_level_header_block() {
+        // A List-* line in the body or in a forwarded message/rfc822 part is
+        // not this message's: the read stops at the first blank line.
+        let raw = "From: a@example.com\r\nSubject: fwd\r\n\
+                   Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+                   List-Id: <body.example>\r\n\
+                   --b\r\nContent-Type: message/rfc822\r\n\r\n\
+                   List-Id: <inner.example>\r\n\
+                   List-Unsubscribe: <mailto:inner@example.com>\r\n\
+                   Subject: inner\r\n\r\nhi\r\n--b--\r\n";
+        let message = parse_rfc822(
+            raw.as_bytes(),
+            1,
+            Vec::new(),
+            None,
+            "INBOX",
+            "work",
+            false,
+            false,
+        )
+        .expect("parse");
+        assert_eq!(message.list_id, None);
+        assert_eq!(message.list_unsubscribe, None);
+
+        // Obsolete syntax (RFC 5322 §4.5): whitespace before the colon.
+        let message = parse_headers("List-Id : <obs.example>\r\n");
+        assert_eq!(message.list_id.as_deref(), Some("<obs.example>"));
     }
 
     /// Empty (whitespace-only) header values are skipped — no key is created,
