@@ -68,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **parking_lot 0.13** (from 0.12), version 0.9.5 — no code change: the
   crate uses only `Mutex`, whose API is unchanged.
+- **toml 1.2 and pulldown-cmark 0.13.6** (requirement floors raised from 1.1
+  and 0.13.4), version 0.9.5. Both are semver-compatible, with no code change.
 - **rmcp 3.9.0**, version 0.9.5 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. The bump clears RUSTSEC-2026-0462 for the
   app: rmcp's streamable-HTTP client now bounds a non-streaming response body
