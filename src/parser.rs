@@ -524,7 +524,7 @@ mod tests {
         "Subject:\r\n",
         "In-Reply-To: <parent@example.com>\r\n",
         "References: <root@example.com> <parent@example.com>\r\n",
-        "X-Mailer: Probe 1.0\r\n",
+        "X-mailer: Probe 1.0\r\n",
         "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
         "MIME-Version: 1.0\r\n",
         "Content-Type: multipart/mixed; boundary=\"outer\"\r\n",
@@ -685,8 +685,10 @@ mod tests {
             ),
             "raw, not re-rendered"
         );
+        // Keyed as written: mail-parser 1.0 re-keys a header it knows to
+        // its standard spelling, so the 1.0 port flips this knowingly.
         assert_eq!(
-            message.headers.get("X-Mailer").map(Vec::as_slice),
+            message.headers.get("X-mailer").map(Vec::as_slice),
             Some(["Probe 1.0".to_string()].as_slice())
         );
 
