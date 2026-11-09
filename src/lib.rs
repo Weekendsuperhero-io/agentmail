@@ -7090,10 +7090,10 @@ mod tests {
         let parsed = mail_parser::MessageParser::default()
             .parse(&raw)
             .expect("parse draft");
-        let to: Vec<_> = parsed.to().expect("To").iter().collect();
+        let to: Vec<_> = parsed.to().expect("To").mailboxes().collect();
         assert_eq!(to.len(), 3, "no recipient split at a comma");
-        assert_eq!(to[0].name.as_deref(), Some("Blake, Mark"));
-        assert_eq!(parsed.cc().expect("Cc").iter().count(), 1);
+        assert_eq!(to[0].name(), Some("Blake, Mark"));
+        assert_eq!(parsed.cc().expect("Cc").mailboxes().count(), 1);
     }
 
     #[test]

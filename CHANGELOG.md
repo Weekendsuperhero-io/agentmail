@@ -66,6 +66,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **mail-parser 1.0, mail-auth 0.15, parking_lot 0.13**, version 0.9.5 —
+  mail-auth 0.14+ requires mail-parser 1.0, so the two move together. What a
+  client sees is unchanged: inline images, audio and video shown in the body
+  (a photo between two text parts, as iPhone Mail sends it) are still listed
+  and saved as attachments, though mail-parser 1.0 follows RFC 8621 and leaves
+  them out of its own `attachments()`; a text attachment is still saved as
+  UTF-8 text, converted from its charset; group addresses are still flattened.
+  Parsing gains 1.0's fixes (a MIME boundary in mid-line no longer truncates a
+  part, RFC 2231 parameters join before decoding), and DKIM's relaxed body
+  canonicalization ignores trailing whitespace-only lines (mail-auth #62).
+  One visible difference: in `include_headers` a field mail-parser 1.0 newly
+  knows (`X-Mailer`, `User-Agent`, `Precedence` and 109 more) is keyed by its
+  canonical spelling rather than as written.
 - **rmcp 3.9.0**, version 0.9.5 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. The bump clears RUSTSEC-2026-0462 for the
   app: rmcp's streamable-HTTP client now bounds a non-streaming response body

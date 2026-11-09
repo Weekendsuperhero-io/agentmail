@@ -29,7 +29,7 @@ pub(crate) async fn verify_dkim(
             checked_at,
         });
     };
-    if message.dkim_headers.is_empty() {
+    if message.dkim_signatures().is_empty() {
         return Ok(DkimVerification {
             result: "none".to_string(),
             domain: None,
