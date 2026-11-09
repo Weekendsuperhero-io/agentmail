@@ -209,6 +209,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A message's `List-Unsubscribe`, `List-Id` and `List-Help` were always
+  missing.** mail-parser parses those headers as addresses, and
+  `MessageInfo` kept only text values, so the three fields were `None` on
+  every message. Each is now the header's own text, trimmed and unfolded
+  (one space per fold), first occurrence, read the way the unsubscribe flow
+  reads it (`List-Unsubscribe-Post` too, which was not affected): a folded
+  `List-Unsubscribe` is `<mailto:…>, <https://…>`, and `List-Id` keeps its
+  display name, `Weekly News <weekly.lists.example.com>`. No schema
+  changes; what now appears: the `email://…/info` resource carries the
+  documented `listId`, which it had always omitted, and the library's
+  `MessageInfo` (`get_messages_by_uid`, `search_messages`, and the CLI's
+  `get-messages-by-uid` JSON) fills `listUnsubscribe`, `listId` and
+  `listHelp`. The MCP tools' message rows never carried these fields, and
+  unsubscribing, mailing-list ranking and List-Id cleanup read the headers
+  themselves, so none of them change.
 - **A draft's line breaks reach the reader.** The HTML half rendered a
   single newline the way CommonMark does, as a space, so a signature written
   one line under another (`Best,` / a name / a company) arrived on one line

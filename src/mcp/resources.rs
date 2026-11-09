@@ -1260,6 +1260,34 @@ mod tests {
         );
     }
 
+    /// `/info`'s `listId` is the message's own `List-Id`, as written.
+    #[test]
+    fn info_document_carries_the_list_id() {
+        let parsed = EmailResourceUri {
+            account: "work".to_string(),
+            mailbox: "INBOX".to_string(),
+            uid_validity: 9001,
+            uid: 7,
+            kind: EmailResourceKind::Info,
+        };
+        let message = crate::parser::parse_rfc822(
+            b"From: News <news@example.com>\r\n\
+              List-Id: Weekly News <weekly.lists.example.com>\r\n\
+              Subject: s\r\n\r\nbody\r\n",
+            7,
+            Vec::new(),
+            None,
+            "INBOX",
+            "work",
+            false,
+            false,
+        )
+        .expect("parse");
+        let info: serde_json::Value =
+            serde_json::from_str(&render_message_info(&parsed, &message)).expect("JSON");
+        assert_eq!(info["listId"], "Weekly News <weekly.lists.example.com>");
+    }
+
     #[test]
     fn header_uri_round_trips() {
         let uri = format_email_uri_for_kind("dummy", "INBOX", 7, 9, EmailResourceKind::Headers);
