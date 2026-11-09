@@ -108,9 +108,15 @@ pub(crate) fn format_mailbox(mailbox: &Mailbox) -> String {
 pub(crate) fn extract_from_mailbox(rfc822: &[u8]) -> Option<Mailbox> {
     let parsed = mail_parser::MessageParser::default().parse(rfc822)?;
     let from = parsed.from()?.first()?;
-    let email = from.address()?.trim().parse::<lettre::Address>().ok()?;
+    let email = from
+        .address
+        .as_deref()?
+        .trim()
+        .parse::<lettre::Address>()
+        .ok()?;
     let name = from
-        .name()
+        .name
+        .as_deref()
         .map(|name| name.chars().filter(|c| !c.is_control()).collect::<String>())
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty());
@@ -398,8 +404,7 @@ fn insert_headers(mut rfc822: Vec<u8>, headers: &[String]) -> crate::Result<Vec<
 pub(crate) fn extract_apple_uuid(rfc822: &[u8]) -> Option<uuid::Uuid> {
     let parsed = mail_parser::MessageParser::default().parse(rfc822)?;
     let value = parsed
-        .headers()
-        .value("X-Universally-Unique-Identifier")?
+        .header("X-Universally-Unique-Identifier")?
         .as_text()?
         .trim();
     uuid::Uuid::parse_str(value.trim_matches(['<', '>'])).ok()
@@ -409,7 +414,7 @@ pub(crate) fn extract_apple_uuid(rfc822: &[u8]) -> Option<uuid::Uuid> {
 mod tests {
     use super::*;
     use crate::types::DraftAttachment;
-    use mail_parser::MessageParser;
+    use mail_parser::{MessageParser, MimeHeaders};
 
     fn parse(raw: &[u8]) -> mail_parser::Message<'_> {
         MessageParser::default()
@@ -999,10 +1004,10 @@ mod tests {
         .expect("composes");
 
         let parsed = parse(&raw);
-        let senders: Vec<_> = parsed.from().expect("a From header").mailboxes().collect();
+        let senders: Vec<_> = parsed.from().expect("a From header").iter().collect();
         assert_eq!(senders.len(), 1, "one sender, not split at the comma");
-        assert_eq!(senders[0].name(), Some(name));
-        assert_eq!(senders[0].address(), Some("mark@example.com"));
+        assert_eq!(senders[0].name.as_deref(), Some(name));
+        assert_eq!(senders[0].address.as_deref(), Some("mark@example.com"));
         assert_eq!(
             extract_from_mailbox(&raw).map(|mailbox| format_mailbox(&mailbox)),
             Some("\"Blake, Mark \\\"Shark\\\" José\" <mark@example.com>".to_string()),
@@ -1036,14 +1041,14 @@ mod tests {
         )
         .expect("named recipients compose");
         let parsed = parse(&raw);
-        let mailboxes = |header: Option<mail_parser::AddressList<'_>>| -> Vec<(String, String)> {
+        let mailboxes = |header: Option<&mail_parser::Address<'_>>| -> Vec<(String, String)> {
             header
                 .expect("header present")
-                .mailboxes()
+                .iter()
                 .map(|addr| {
                     (
-                        addr.name().unwrap_or("").to_string(),
-                        addr.address().unwrap_or("").to_string(),
+                        addr.name.as_deref().unwrap_or("").to_string(),
+                        addr.address.as_deref().unwrap_or("").to_string(),
                     )
                 })
                 .collect()

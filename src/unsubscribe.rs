@@ -280,7 +280,7 @@ async fn verify_rfc8058_dkim(
             "The complete message could not be parsed for DKIM verification.".to_string(),
         ));
     };
-    if message.dkim_signatures().is_empty() {
+    if message.dkim_headers.is_empty() {
         return Ok(Err(
             "No verifiable DKIM signature was present; RFC 8058 one-click was not attempted."
                 .to_string(),
@@ -772,21 +772,22 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use mail_auth::crypto::Ed25519Key;
-    use mail_auth::dkim::{DkimSigner, DomainKey};
-    use mail_auth::dns::TxtRecordParser;
-    use mail_auth::headers::HeaderWriter;
-    use mail_auth::{DnsCache, NoCache, Parameters, ResolverCache, TxtRecord};
+    use mail_auth::common::crypto::Ed25519Key;
+    use mail_auth::common::headers::HeaderWriter;
+    use mail_auth::common::parse::TxtRecordParser;
+    use mail_auth::common::verify::DomainKey;
+    use mail_auth::dkim::DkimSigner;
+    use mail_auth::{Parameters, ResolverCache, Txt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
 
     #[derive(Clone)]
-    struct StaticTxtCache(TxtRecord);
+    struct StaticTxtCache(Txt);
 
-    impl ResolverCache<Box<str>, TxtRecord> for StaticTxtCache {
-        fn get<Q>(&self, _name: &Q) -> Option<TxtRecord>
+    impl ResolverCache<Box<str>, Txt> for StaticTxtCache {
+        fn get<Q>(&self, _name: &Q) -> Option<Txt>
         where
             Box<str>: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
@@ -794,7 +795,7 @@ mod tests {
             Some(self.0.clone())
         }
 
-        fn remove<Q>(&self, _name: &Q) -> Option<TxtRecord>
+        fn remove<Q>(&self, _name: &Q) -> Option<Txt>
         where
             Box<str>: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
@@ -802,32 +803,7 @@ mod tests {
             None
         }
 
-        fn insert(&self, _key: Box<str>, _value: TxtRecord, _valid_until: std::time::Instant) {}
-    }
-
-    /// Every TXT lookup answers the one record; nothing else is cached.
-    impl DnsCache for StaticTxtCache {
-        type Txt = Self;
-        type Mx = NoCache;
-        type Ipv4 = NoCache;
-        type Ipv6 = NoCache;
-        type Ptr = NoCache;
-
-        fn txt(&self) -> Option<&Self::Txt> {
-            Some(self)
-        }
-        fn mx(&self) -> Option<&Self::Mx> {
-            None
-        }
-        fn ipv4(&self) -> Option<&Self::Ipv4> {
-            None
-        }
-        fn ipv6(&self) -> Option<&Self::Ipv6> {
-            None
-        }
-        fn ptr(&self) -> Option<&Self::Ptr> {
-            None
-        }
+        fn insert(&self, _key: Box<str>, _value: Txt, _valid_until: std::time::Instant) {}
     }
 
     #[test]
@@ -1009,7 +985,7 @@ mod tests {
             .unwrap();
         let signed = format!("{}{raw}", signature.to_header());
         let message = AuthenticatedMessage::parse(signed.as_bytes()).unwrap();
-        let cache = StaticTxtCache(TxtRecord::DomainKey(Arc::new(
+        let cache = StaticTxtCache(Txt::DomainKey(Arc::new(
             DomainKey::parse(PUBLIC_RECORD).unwrap(),
         )));
         let authenticator = MessageAuthenticator::new(
@@ -1018,7 +994,7 @@ mod tests {
         )
         .unwrap();
         let outputs = authenticator
-            .verify_dkim(Parameters::new(&message).with_cache(&cache))
+            .verify_dkim(Parameters::new(&message).with_txt_cache(&cache))
             .await;
 
         assert!(

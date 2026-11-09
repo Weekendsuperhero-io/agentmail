@@ -3,7 +3,7 @@
 //! The `.eml` files remain the lossless evidence. The PDF is a readable index
 //! and chronology whose hash table points back to those exact source bytes.
 
-use mail_parser::MessageParser;
+use mail_parser::{MessageParser, MimeHeaders as _};
 use printpdf::{
     Color, Mm, Op, ParsedFont, PdfDocument, PdfFontHandle, PdfPage, PdfParseOptions,
     PdfSaveOptions, Point, Pt, Rgb, TextItem,
@@ -117,8 +117,27 @@ pub(crate) fn analyze_message(
         &body,
         body_char_limit.clamp(1, BODY_PRESENTATION_CHAR_LIMIT),
     );
-    let attachments = crate::parser::attachment_parts(&parsed)
-        .map(|part| crate::parser::attachment_info(&part))
+    let attachments = parsed
+        .attachments()
+        .map(|part| {
+            let content_type = part
+                .content_type()
+                .map(|content_type| {
+                    let mut value = content_type.c_type.to_string();
+                    if let Some(subtype) = &content_type.c_subtype {
+                        value.push('/');
+                        value.push_str(subtype);
+                    }
+                    value
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            AttachmentInfo {
+                name: part.attachment_name().map(str::to_string),
+                content_type,
+                size: part.contents().len(),
+                content_id: part.content_id().map(str::to_string),
+            }
+        })
         .collect();
     Ok(RecordPresentationMessage {
         body,

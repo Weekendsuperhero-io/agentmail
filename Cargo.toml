@@ -46,10 +46,10 @@ futures = "0.3"
 hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 idna = "1"
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
-mail-parser = "1.0.1"
+mail-parser = "0.11"
 # aws-lc-rs, not ring: HERO links this crate and ships one rustls crypto
 # provider. The feature also picks hickory's TLS and DNSSEC backends.
-mail-auth = { version = "0.15.1", default-features = false, features = ["aws-lc-rs"] }
+mail-auth = { version = "0.13.3", default-features = false, features = ["aws-lc-rs"] }
 parking_lot = "0.13"
 percent-encoding = "2"
 printpdf = { version = "0.12", default-features = false }
@@ -112,6 +112,6 @@ unnested_or_patterns = "warn"
 
 [dev-dependencies]
 proptest = "1"
-mail-parser = "1.0.1"
+mail-parser = "0.11"
 # oauth_token example only (loopback PKCE flow to mint an access token).
 rand = "0.10"

@@ -1,6 +1,6 @@
 use hashbrown::HashMap;
 
-use mail_parser::{MessageParser, PartRole};
+use mail_parser::{MessageParser, MimeHeaders};
 
 use crate::content;
 use crate::types::{AttachmentInfo, MessageInfo};
@@ -29,46 +29,37 @@ pub fn parse_rfc822(
     })?;
 
     let subject = parsed.subject().unwrap_or("").to_string();
-    let sender = format_address(parsed.from().as_ref());
-    let reply_to = format_address_list(parsed.reply_to().as_ref());
-    let to = format_address_list(parsed.to().as_ref());
-    let cc = format_address_list(parsed.cc().as_ref());
-    let bcc = format_address_list(parsed.bcc().as_ref());
+    let sender = format_address(parsed.from());
+    let reply_to = format_address_list(parsed.reply_to());
+    let to = format_address_list(parsed.to());
+    let cc = format_address_list(parsed.cc());
+    let bcc = format_address_list(parsed.bcc());
 
     let date = parsed
         .date()
         .and_then(|d| chrono::DateTime::from_timestamp(d.to_timestamp(), 0));
 
     let list_unsubscribe = parsed
-        .headers()
-        .value("List-Unsubscribe")
-        .and_then(|value| header_to_string(&value))
+        .header("List-Unsubscribe")
+        .and_then(header_to_string)
         .filter(|s| !s.is_empty());
     let list_unsubscribe_post = parsed
-        .headers()
-        .value("List-Unsubscribe-Post")
-        .and_then(|value| header_to_string(&value))
+        .header("List-Unsubscribe-Post")
+        .and_then(header_to_string)
         .filter(|s| !s.is_empty());
     let list_id = parsed
-        .headers()
-        .value("List-Id")
-        .and_then(|value| header_to_string(&value))
+        .header("List-Id")
+        .and_then(header_to_string)
         .filter(|s| !s.is_empty());
     let list_help = parsed
-        .headers()
-        .value("List-Help")
-        .and_then(|value| header_to_string(&value))
+        .header("List-Help")
+        .and_then(header_to_string)
         .filter(|s| !s.is_empty());
 
     // Envelope / threading
     let message_id = parsed.message_id().map(|s| s.to_string());
-    let in_reply_to = parsed
-        .in_reply_to()
-        .and_then(|ids| ids.first().map(str::to_string));
-    let references = parsed
-        .references()
-        .map(|ids| ids.iter().map(str::to_string).collect())
-        .unwrap_or_default();
+    let in_reply_to = extract_header_value_text(parsed.in_reply_to());
+    let references = extract_header_value_text_list(parsed.references());
 
     // MIME structure
     let mime_type = extract_mime_type(&parsed);
@@ -138,7 +129,7 @@ pub fn parse_sender_date(raw: &[u8]) -> crate::Result<SenderHeaders> {
         crate::AgentmailError::Parse("Failed to parse partial headers".to_string())
     })?;
 
-    let (email, name) = extract_from_parts(parsed.from().as_ref());
+    let (email, name) = extract_from_parts(parsed.from());
 
     let date = parsed
         .date()
@@ -153,13 +144,24 @@ pub fn parse_sender_date(raw: &[u8]) -> crate::Result<SenderHeaders> {
 }
 
 /// Extract (email, display_name) from a From address. Email is lowercased for grouping.
-fn extract_from_parts(addr: Option<&mail_parser::AddressList<'_>>) -> (String, String) {
-    match addr.and_then(mail_parser::AddressList::first) {
-        Some(a) => (
-            canonical_sender_address(a.address().unwrap_or("")),
-            a.name().unwrap_or("").to_string(),
-        ),
-        None => (String::new(), String::new()),
+fn extract_from_parts(addr: Option<&mail_parser::Address<'_>>) -> (String, String) {
+    match addr {
+        Some(mail_parser::Address::List(list)) if !list.is_empty() => {
+            let a = &list[0];
+            let email = canonical_sender_address(a.address.as_deref().unwrap_or(""));
+            let name = a.name.as_deref().unwrap_or("").to_string();
+            (email, name)
+        }
+        Some(mail_parser::Address::Group(groups)) if !groups.is_empty() => {
+            if let Some(a) = groups[0].addresses.first() {
+                let email = canonical_sender_address(a.address.as_deref().unwrap_or(""));
+                let name = a.name.as_deref().unwrap_or("").to_string();
+                (email, name)
+            } else {
+                (String::new(), String::new())
+            }
+        }
+        _ => (String::new(), String::new()),
     }
 }
 
@@ -206,28 +208,45 @@ fn extract_content(
 /// Build a HashMap of all headers using raw original values from the message.
 fn build_headers_map(parsed: &mail_parser::Message<'_>) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for header in parsed.headers() {
-        let trimmed = String::from_utf8_lossy(header.raw_value())
-            .trim()
-            .to_string();
+    for (name, value) in parsed.headers_raw() {
+        let trimmed = value.trim().to_string();
         if !trimmed.is_empty() {
-            // A known field under its canonical spelling, any other as written.
-            let name = header.name();
             // entry_ref: `name` is a borrowed `&str` — allocate the owned key
             // only when a header first appears. See PERF-entry-ref.md.
-            map.entry_ref(name.as_str()).or_default().push(trimmed);
+            map.entry_ref(name).or_default().push(trimmed);
         }
     }
     map
+}
+
+/// Extract a single string from a HeaderValue (Text or first of TextList).
+fn extract_header_value_text(hv: &mail_parser::HeaderValue<'_>) -> Option<String> {
+    match hv {
+        mail_parser::HeaderValue::Text(s) => Some(s.to_string()),
+        mail_parser::HeaderValue::TextList(list) => list.first().map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+/// Extract a list of strings from a HeaderValue (TextList or single Text).
+fn extract_header_value_text_list(hv: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+    match hv {
+        mail_parser::HeaderValue::Text(s) => vec![s.to_string()],
+        mail_parser::HeaderValue::TextList(list) => list.iter().map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Convert a HeaderValue to a plain string.
 fn header_to_string(hv: &mail_parser::HeaderValue<'_>) -> Option<String> {
     match hv {
         mail_parser::HeaderValue::Text(s) => Some(s.to_string()),
-        mail_parser::HeaderValue::TextList(list) => {
-            Some(list.iter().collect::<Vec<_>>().join(", "))
-        }
+        mail_parser::HeaderValue::TextList(list) => Some(
+            list.iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         _ => None,
     }
 }
@@ -238,59 +257,40 @@ fn header_to_string(hv: &mail_parser::HeaderValue<'_>) -> Option<String> {
 
 /// Extract the top-level MIME Content-Type (e.g., "multipart/mixed" or "text/plain").
 fn extract_mime_type(parsed: &mail_parser::Message<'_>) -> Option<String> {
-    parsed.content_type().map(|ct| mime_type_string(&ct))
-}
-
-/// `type/subtype`, or the bare type when there is no subtype.
-pub(crate) fn mime_type_string(ct: &mail_parser::ContentType<'_>) -> String {
-    match ct.subtype() {
-        Some(sub) => format!("{}/{sub}", ct.ctype()),
-        None => ct.ctype().to_string(),
-    }
-}
-
-/// The parts offered as attachments: RFC 8621 `attachments` plus the inline
-/// image, audio and video parts shown in both bodies. mail-parser 1.0 follows
-/// RFC 8621 and leaves those out (a photo between two text parts, as iPhone
-/// Mail sends it), which 0.11 listed; they stay listed and downloadable.
-/// Document order.
-pub(crate) fn attachment_parts<'m>(
-    parsed: &'m mail_parser::Message<'_>,
-) -> impl Iterator<Item = mail_parser::MessagePart<'m>> {
-    parsed
-        .root()
-        .parts()
-        .filter(|part| part.is_attachment() || part.role() == PartRole::MediaBody)
-}
-
-/// The bytes of an attachment: a text part as UTF-8 text, converted from its
-/// charset as 0.11 did, any other part transfer-decoded.
-pub(crate) fn attachment_bytes(part: &mail_parser::MessagePart<'_>) -> Vec<u8> {
-    match part.text() {
-        Some(text) => text.into_owned().into_bytes(),
-        None => part.decoded().into_owned(),
-    }
-}
-
-/// Metadata for one attachment part.
-pub(crate) fn attachment_info(part: &mail_parser::MessagePart<'_>) -> AttachmentInfo {
-    AttachmentInfo {
-        name: part.attachment_name().map(str::to_string),
-        content_type: part.content_type().map_or_else(
-            || "application/octet-stream".to_string(),
-            |ct| mime_type_string(&ct),
-        ),
-        size: part
-            .text()
-            .map_or_else(|| part.decoded_len(), |text| text.len()),
-        content_id: part.content_id().map(str::to_string),
-    }
+    parsed.content_type().map(|ct| {
+        let mut s = ct.c_type.to_string();
+        if let Some(ref sub) = ct.c_subtype {
+            s.push('/');
+            s.push_str(sub);
+        }
+        s
+    })
 }
 
 /// Extract attachment metadata from the parsed message.
 fn extract_attachments(parsed: &mail_parser::Message<'_>) -> Vec<AttachmentInfo> {
-    attachment_parts(parsed)
-        .map(|part| attachment_info(&part))
+    parsed
+        .attachments()
+        .map(|part| {
+            let content_type = part
+                .content_type()
+                .map(|ct| {
+                    let mut s = ct.c_type.to_string();
+                    if let Some(ref sub) = ct.c_subtype {
+                        s.push('/');
+                        s.push_str(sub);
+                    }
+                    s
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+
+            AttachmentInfo {
+                name: part.attachment_name().map(|s| s.to_string()),
+                content_type,
+                size: part.contents().len(),
+                content_id: part.content_id().map(|s| s.to_string()),
+            }
+        })
         .collect()
 }
 
@@ -304,18 +304,28 @@ pub fn extract_attachment_data(
         crate::AgentmailError::Parse(format!("Failed to parse RFC822 message UID {}", uid))
     })?;
 
-    let results = attachment_parts(&parsed)
-        .map(|part| {
-            let name = part
-                .attachment_name()
-                .map_or_else(|| "unnamed".to_string(), str::to_string);
-            let content_type = part.content_type().map_or_else(
-                || "application/octet-stream".to_string(),
-                |ct| mime_type_string(&ct),
-            );
-            (name, content_type, attachment_bytes(&part))
-        })
-        .collect();
+    let mut results = Vec::new();
+    for part in parsed.attachments() {
+        let name = part
+            .attachment_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unnamed".to_string());
+
+        let content_type = part
+            .content_type()
+            .map(|ct| {
+                let mut s = ct.c_type.to_string();
+                if let Some(ref sub) = ct.c_subtype {
+                    s.push('/');
+                    s.push_str(sub);
+                }
+                s
+            })
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        let bytes = part.contents().to_vec();
+        results.push((name, content_type, bytes));
+    }
 
     Ok(results)
 }
@@ -324,22 +334,39 @@ pub fn extract_attachment_data(
 // Address helpers
 // ---------------------------------------------------------------------------
 
-/// Format the first mailbox of an address field (groups flattened) as a
-/// single "Name <email>" string.
-fn format_address(addr: Option<&mail_parser::AddressList<'_>>) -> String {
-    addr.and_then(mail_parser::AddressList::first)
-        .map(|a| format_single_addr(&a))
-        .unwrap_or_default()
+/// Format a mail-parser Address into a single "Name <email>" string (first address).
+fn format_address(addr: Option<&mail_parser::Address<'_>>) -> String {
+    match addr {
+        Some(mail_parser::Address::List(list)) if !list.is_empty() => format_single_addr(&list[0]),
+        Some(mail_parser::Address::Group(groups)) if !groups.is_empty() => {
+            if let Some(a) = groups[0].addresses.first() {
+                format_single_addr(a)
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
 }
 
-/// Every mailbox of an address field (groups flattened), formatted.
-fn format_address_list(addr: Option<&mail_parser::AddressList<'_>>) -> Vec<String> {
-    addr.map(|list| list.mailboxes().map(|a| format_single_addr(&a)).collect())
-        .unwrap_or_default()
+/// Format a mail-parser Address into a list of address strings.
+fn format_address_list(addr: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+    match addr {
+        Some(mail_parser::Address::List(list)) => list.iter().map(format_single_addr).collect(),
+        Some(mail_parser::Address::Group(groups)) => groups
+            .iter()
+            .flat_map(|g| g.addresses.iter())
+            .map(format_single_addr)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
-fn format_single_addr(a: &mail_parser::Mailbox<'_>) -> String {
-    format_name_addr(a.name().unwrap_or(""), a.address().unwrap_or(""))
+fn format_single_addr(a: &mail_parser::Addr<'_>) -> String {
+    format_name_addr(
+        a.name.as_deref().unwrap_or(""),
+        a.address.as_deref().unwrap_or(""),
+    )
 }
 
 /// `Name <email>`, or the bare `email` when there is no name — written so it
@@ -497,7 +524,7 @@ mod tests {
         "Subject:\r\n",
         "In-Reply-To: <parent@example.com>\r\n",
         "References: <root@example.com> <parent@example.com>\r\n",
-        "X-mailer: Probe 1.0\r\n",
+        "X-Mailer: Probe 1.0\r\n",
         "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
         "MIME-Version: 1.0\r\n",
         "Content-Type: multipart/mixed; boundary=\"outer\"\r\n",
@@ -546,13 +573,13 @@ mod tests {
         "--outer--\r\n",
     );
 
-    /// Every attachment 0.11 listed is still listed, in document order, with
-    /// the bytes and sizes 0.11 gave (checked against 0.11 side by side when
-    /// moving to 1.0). The inline photo is the one RFC 8621 — and so 1.0's
+    /// Every attachment is listed, in document order, with its bytes and
+    /// size. The inline photo is the one RFC 8621 — and so mail-parser 1.0's
     /// own `attachments()` — leaves out; without it a photo sent from an
-    /// iPhone could not be listed or saved.
+    /// iPhone could not be listed or saved. A text attachment is UTF-8,
+    /// converted from its charset.
     #[test]
-    fn attachments_keep_inline_media_and_their_0_11_bytes() {
+    fn attachments_keep_inline_media_and_text_as_utf8() {
         let message = parse_rfc822(
             MIXED.as_bytes(),
             1,
@@ -608,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn header_fields_read_as_they_did_under_0_11() {
+    fn header_fields_flatten_groups_and_keep_blank_subjects() {
         let message = parse_rfc822(
             MIXED.as_bytes(),
             1,
@@ -658,10 +685,9 @@ mod tests {
             ),
             "raw, not re-rendered"
         );
-        assert!(
-            message.headers.contains_key("X-Mailer"),
-            "a field mail-parser knows keeps its canonical spelling: {:?}",
-            message.headers.keys().collect::<Vec<_>>()
+        assert_eq!(
+            message.headers.get("X-Mailer").map(Vec::as_slice),
+            Some(["Probe 1.0".to_string()].as_slice())
         );
 
         let (email, name, _, _) =

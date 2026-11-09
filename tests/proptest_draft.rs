@@ -5,7 +5,7 @@
 
 use agentmail::draft::compose_draft;
 use agentmail::types::DraftAttachment;
-use mail_parser::MessageParser;
+use mail_parser::{MessageParser, MimeHeaders};
 use proptest::prelude::*;
 
 /// Generates a "reasonable" email address that lettre should accept.
@@ -208,9 +208,9 @@ proptest! {
             let found = msg.attachments().find(|p| p.attachment_name() == Some(&filename));
 
             if let Some(part) = found {
-                let on_disk = part.decoded();
+                let on_disk = part.contents();
                 prop_assert_eq!(
-                    &on_disk[..],
+                    on_disk,
                     &data[..],
                     "attachment bytes did not survive the roundtrip for {:?}",
                     filename
