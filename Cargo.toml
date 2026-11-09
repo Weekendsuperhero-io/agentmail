@@ -9,7 +9,7 @@ imap-proto = { path = "vendor/imap-proto" }
 
 [package]
 name = "agentmail"
-version = "0.9.4"
+version = "0.9.5"
 edition = "2024"
 rust-version = "1.99.1"
 description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
@@ -50,7 +50,7 @@ mail-parser = "0.11"
 # aws-lc-rs, not ring: HERO links this crate and ships one rustls crypto
 # provider. The feature also picks hickory's TLS and DNSSEC backends.
 mail-auth = { version = "0.13.3", default-features = false, features = ["aws-lc-rs"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 percent-encoding = "2"
 printpdf = { version = "0.12", default-features = false }
 psl = "2"
@@ -58,7 +58,7 @@ reqwest = { version = "0.13", features = ["json"] }
 # Exact-pinned to the HERO workspace's rmcp, so the app links
 # one copy. The protocol does not move with the SDK: the server speaks up to
 # `mcp::MAX_PROTOCOL_VERSION` (2026-07-28), named in the source.
-rmcp = { version = "=3.8.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.9.0", features = ["server", "macros", "transport-io"] }
 # Held at 0.39 (libsqlite3-sys ^0.37) so embedding workspaces that also carry
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native
 # sqlite — libsqlite3-sys has `links = "sqlite3"`, so exactly one version may
@@ -79,11 +79,11 @@ tokio = { version = "1", features = ["full"] }
 rustls-platform-verifier = "0.7"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
 tokio-util = "0.7"
-toml = "1.1"
+toml = "1.2"
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0", features = ["keychain", "protected"] }

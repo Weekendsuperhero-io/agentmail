@@ -514,6 +514,194 @@ mod tests {
         assert!(without.reply_to.is_empty());
     }
 
+    /// A message shaped the way mail-parser 1.0 reads differently from 0.11:
+    /// a photo shown inline between two text parts (iPhone Mail), a latin-1
+    /// text attachment, a `cid:` image in `multipart/related`, a forwarded
+    /// message, a group in To, a blank Subject and single-id In-Reply-To.
+    const MIXED: &str = concat!(
+        "From: Ann <ann@example.com>\r\n",
+        "To: Team: Bob <bob@example.com>, carol@example.com;, Dan <dan@example.com>\r\n",
+        "Subject:\r\n",
+        "In-Reply-To: <parent@example.com>\r\n",
+        "References: <root@example.com> <parent@example.com>\r\n",
+        "X-mailer: Probe 1.0\r\n",
+        "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/mixed; boundary=\"outer\"\r\n",
+        "\r\n",
+        "--outer\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "\r\n",
+        "Look at this:\r\n",
+        "--outer\r\n",
+        "Content-Type: image/png; name=\"photo.png\"\r\n",
+        "Content-Disposition: inline; filename=\"photo.png\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "iVBORw0KGgo=\r\n",
+        "--outer\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "\r\n",
+        "Nice, right?\r\n",
+        "--outer\r\n",
+        "Content-Type: text/plain; charset=iso-8859-1; name=\"notes.txt\"\r\n",
+        "Content-Disposition: attachment; filename=\"notes.txt\"\r\n",
+        "Content-Transfer-Encoding: quoted-printable\r\n",
+        "\r\n",
+        "caf=E9\r\n",
+        "--outer\r\n",
+        "Content-Type: multipart/related; boundary=\"rel\"\r\n",
+        "\r\n",
+        "--rel\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "\r\n",
+        "<p>Logo: <img src=\"cid:logo@x\"></p>\r\n",
+        "--rel\r\n",
+        "Content-Type: image/gif\r\n",
+        "Content-ID: <logo@x>\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "R0lGODlhAQABAAAAACw=\r\n",
+        "--rel--\r\n",
+        "--outer\r\n",
+        "Content-Type: message/rfc822\r\n",
+        "\r\n",
+        "From: inner@example.com\r\n",
+        "Subject: inner\r\n",
+        "\r\n",
+        "inner body\r\n",
+        "--outer--\r\n",
+    );
+
+    /// Every attachment is listed, in document order, with its bytes and
+    /// size. The inline photo is the one RFC 8621 — and so mail-parser 1.0's
+    /// own `attachments()` — leaves out; without it a photo sent from an
+    /// iPhone could not be listed or saved. A text attachment is UTF-8,
+    /// converted from its charset.
+    #[test]
+    fn attachments_keep_inline_media_and_text_as_utf8() {
+        let message = parse_rfc822(
+            MIXED.as_bytes(),
+            1,
+            Vec::new(),
+            None,
+            "INBOX",
+            "work",
+            true,
+            false,
+        )
+        .expect("parse");
+        let listed: Vec<_> = message
+            .attachments
+            .iter()
+            .map(|a| {
+                (
+                    a.name.as_deref(),
+                    a.content_type.as_str(),
+                    a.size,
+                    a.content_id.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (Some("photo.png"), "image/png", 8, None),
+                (Some("notes.txt"), "text/plain", 5, None),
+                (None, "image/gif", 14, Some("logo@x")),
+                (None, "message/rfc822", 53, None),
+            ]
+        );
+
+        let data = extract_attachment_data(MIXED.as_bytes(), 1).expect("attachments");
+        let names: Vec<_> = data.iter().map(|(name, _, _)| name.as_str()).collect();
+        assert_eq!(names, ["photo.png", "notes.txt", "unnamed", "unnamed"]);
+        assert_eq!(data[0].2, b"\x89PNG\r\n\x1a\n", "base64 decoded");
+        assert_eq!(
+            data[1].2,
+            "café".as_bytes(),
+            "a text attachment arrives as UTF-8, converted from latin-1"
+        );
+        assert!(data[2].2.starts_with(b"GIF89a"));
+        assert!(
+            data[3]
+                .2
+                .starts_with(b"From: inner@example.com\r\nSubject: inner\r\n"),
+            "a forwarded message is its source"
+        );
+        for ((_, _, bytes), info) in data.iter().zip(&message.attachments) {
+            assert_eq!(bytes.len(), info.size, "{:?}", info.name);
+        }
+    }
+
+    #[test]
+    fn header_fields_flatten_groups_and_keep_blank_subjects() {
+        let message = parse_rfc822(
+            MIXED.as_bytes(),
+            1,
+            Vec::new(),
+            None,
+            "INBOX",
+            "work",
+            true,
+            true,
+        )
+        .expect("parse");
+        assert_eq!(message.subject, "", "a blank Subject is empty");
+        assert_eq!(parse_subject(MIXED.as_bytes()), None);
+        assert_eq!(message.sender, "Ann <ann@example.com>");
+        assert_eq!(
+            message.to,
+            [
+                "Bob <bob@example.com>",
+                "carol@example.com",
+                "Dan <dan@example.com>"
+            ],
+            "a group's members and the mailboxes after it, flattened"
+        );
+        assert_eq!(message.in_reply_to.as_deref(), Some("parent@example.com"));
+        assert_eq!(
+            message.references,
+            ["root@example.com", "parent@example.com"]
+        );
+        assert_eq!(
+            message.list_unsubscribe_post.as_deref(),
+            Some("List-Unsubscribe=One-Click")
+        );
+        assert_eq!(message.mime_type.as_deref(), Some("multipart/mixed"));
+        assert_eq!(
+            message.content_format.as_deref(),
+            Some("markdown"),
+            "the HTML body is preferred"
+        );
+        assert_eq!(
+            message.headers.get("To").map(Vec::as_slice),
+            Some(
+                [
+                    "Team: Bob <bob@example.com>, carol@example.com;, Dan <dan@example.com>"
+                        .to_string()
+                ]
+                .as_slice()
+            ),
+            "raw, not re-rendered"
+        );
+        // Keyed as written: mail-parser 1.0 re-keys a header it knows to
+        // its standard spelling, so the 1.0 port flips this knowingly.
+        assert_eq!(
+            message.headers.get("X-mailer").map(Vec::as_slice),
+            Some(["Probe 1.0".to_string()].as_slice())
+        );
+
+        let (email, name, _, _) =
+            parse_sender_date(b"From: Team: \"Blake, Mark\" <Mark@Example.com>;\r\n\r\n")
+                .expect("headers");
+        assert_eq!(
+            (email.as_str(), name.as_str()),
+            ("mark@example.com", "Blake, Mark"),
+            "a From inside a group is still the sender"
+        );
+    }
+
     /// Empty (whitespace-only) header values are skipped — no key is created,
     /// so no owned key is allocated for them.
     #[test]
