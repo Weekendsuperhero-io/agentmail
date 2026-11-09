@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-10-27T00:00
+updated: 2026-11-09T00:00
 ---
 # Changelog
 
@@ -66,6 +66,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **rmcp 3.9.0**, version 0.9.5 — exact-pinned to the HERO workspace's rmcp,
+  so the app still links one copy. The bump clears RUSTSEC-2026-0462 for the
+  app: rmcp's streamable-HTTP client now bounds a non-streaming response body
+  (16 MiB for JSON, 64 KiB for an error) and refuses a larger one with
+  `StreamableHttpError::ResponseBodyTooLarge`. This crate does not build
+  rmcp's HTTP client, so it was never exposed. `skills/*` and
+  `resources/directory/read` answer `-32601` unless a server declares the
+  skills extension, which this one does not.
+- **Output schemas list what the server always writes** (rmcp 3.9.0,
+  rust-sdk#1378) — `schema_for_output` now describes what `Serialize`
+  produces rather than what `Deserialize` accepts, so a field the server
+  always writes is listed in `required`. Four of the 36 declared output
+  schemas change, and only there: `list_identities` requires `sentMailbox`
+  (a string, or `null` when the account has no Sent mailbox),
+  `preview_thread_record` requires `warnings` and each message's
+  `references`, and `export_thread_record` requires `limitations` (each an
+  array, empty when there is nothing to say). The output itself is unchanged:
+  every one of these fields was already written on every call, so the schema
+  now states what a client always received.
 - **rmcp 3.8.0**, version 0.9.3 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. rmcp 3.8.0 reports a 429 or 5xx as
   `StreamableHttpError::HttpStatus` (with any `Retry-After`) and stops an SSE
