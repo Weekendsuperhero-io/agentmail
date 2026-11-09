@@ -126,7 +126,10 @@ pub(crate) fn parse_list_headers(raw_message: &[u8]) -> ListHeaders {
             fields.push(field);
         }
         if let Some((name, value)) = line.split_once(':') {
-            current = Some((name.to_ascii_lowercase(), value.trim().to_string()));
+            current = Some((
+                name.trim_end().to_ascii_lowercase(),
+                value.trim().to_string(),
+            ));
         }
     }
     if let Some(field) = current {

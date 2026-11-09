@@ -223,7 +223,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get-messages-by-uid` JSON) fills `listUnsubscribe`, `listId` and
   `listHelp`. The MCP tools' message rows never carried these fields, and
   unsubscribing, mailing-list ranking and List-Id cleanup read the headers
-  themselves, so none of them change.
+  themselves, so none of them change. A List-* header written with space
+  before its colon (RFC 5322's obsolete syntax) is now recognised, here and
+  when unsubscribing; it used to be skipped.
 - **A draft's line breaks reach the reader.** The HTML half rendered a
   single newline the way CommonMark does, as a space, so a signature written
   one line under another (`Best,` / a name / a company) arrived on one line

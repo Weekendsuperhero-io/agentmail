@@ -762,6 +762,36 @@ mod tests {
         assert_eq!(message.list_help, None);
     }
 
+    #[test]
+    fn list_headers_come_only_from_the_top_level_header_block() {
+        // A List-* line in the body or in a forwarded message/rfc822 part is
+        // not this message's: the read stops at the first blank line.
+        let raw = "From: a@example.com\r\nSubject: fwd\r\n\
+                   Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+                   List-Id: <body.example>\r\n\
+                   --b\r\nContent-Type: message/rfc822\r\n\r\n\
+                   List-Id: <inner.example>\r\n\
+                   List-Unsubscribe: <mailto:inner@example.com>\r\n\
+                   Subject: inner\r\n\r\nhi\r\n--b--\r\n";
+        let message = parse_rfc822(
+            raw.as_bytes(),
+            1,
+            Vec::new(),
+            None,
+            "INBOX",
+            "work",
+            false,
+            false,
+        )
+        .expect("parse");
+        assert_eq!(message.list_id, None);
+        assert_eq!(message.list_unsubscribe, None);
+
+        // Obsolete syntax (RFC 5322 §4.5): whitespace before the colon.
+        let message = parse_headers("List-Id : <obs.example>\r\n");
+        assert_eq!(message.list_id.as_deref(), Some("<obs.example>"));
+    }
+
     /// Empty (whitespace-only) header values are skipped — no key is created,
     /// so no owned key is allocated for them.
     #[test]
