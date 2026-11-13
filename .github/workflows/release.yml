@@ -7,7 +7,7 @@ on:
 
 jobs:
   release:
-    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-rust-release.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-rust-release.yml@b77434bbb0713493c85a155570421f2153bfba7a
     with:
       validate-runs-on: ubuntu-latest
       rust-cache-provider: github
