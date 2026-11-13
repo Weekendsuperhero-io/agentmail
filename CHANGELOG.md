@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T19:20
-updated: 2026-11-09T00:00
+updated: 2026-11-13T00:00
 ---
 # Changelog
 
@@ -66,6 +66,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **rmcp 3.10.0**, version 0.9.6 — exact-pinned to the HERO workspace's rmcp,
+  so the app still links one copy. Nothing this server sends changes: the
+  protocol types are byte-identical to 3.9.0's, and rmcp-macros 3.10.0
+  differs only in its documentation, so `#[tool_handler]` and
+  `#[prompt_handler]` expand as before. 3.10.0's one behaviour change
+  (rust-sdk#1428) is in the `x-mcp-header` check its streamable-HTTP client
+  runs on `tools/list`, which this crate does not build, and its new
+  `skills-fs` feature is not enabled.
+- **The release publishes the committed `Cargo.lock`.** `release.yml` calls
+  platform-tools' release workflow at `b77434b` (from `72bbd12`), which
+  publishes a committed lock as it is (platform-tools#4). The old workflow ran
+  `cargo generate-lockfile` first, which re-resolves to newer versions and
+  leaves the tree dirty, and cargo refuses to publish from a dirty tree. The
+  v0.9.5 publish failed, so crates.io still serves 0.9.4. That dirty lock is
+  most likely why: the job's logs were not read, but eventkit-rs, whose
+  workflow at `@main` already had the fix, published the same day.
 - **parking_lot 0.13** (from 0.12), version 0.9.5 — no code change: the
   crate uses only `Mutex`, whose API is unchanged.
 - **toml 1.2 and pulldown-cmark 0.13.6** (requirement floors raised from 1.1
