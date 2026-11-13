@@ -3665,6 +3665,11 @@ mod tests {
     fn cache_uses_wal_mode() {
         let path = test_path("wal-mode");
         let connection = open_connection(&path).expect("open cache");
+        assert!(
+            rusqlite::version_number() >= 3_054_000,
+            "unpatched SQLite: {}",
+            rusqlite::version()
+        );
         let mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("read journal mode");
