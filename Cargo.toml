@@ -63,7 +63,7 @@ rmcp = { version = "=3.10.0", features = ["server", "macros", "transport-io"] }
 # sqlx-sqlite 0.9 (libsqlite3-sys >=0.30.1,<0.38) can converge on one native
 # sqlite — libsqlite3-sys has `links = "sqlite3"`, so exactly one version may
 # exist in any dependency graph. Bump together with the embedder's sqlx.
-rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 schemars = { version = "1.2", features = ["chrono04"] }
 keyring-core = "1.0"
 serde = { version = "1", features = ["derive"] }
