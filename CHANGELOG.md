@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **rmcp 3.11.0**, version 0.9.7 — exact-pinned to the HERO workspace's rmcp,
+  so the app still links one copy. Nothing this server sends changes for its
+  own tools: every tool's output is an object, so 3.11.0's handling of
+  non-object output for peers before 2026-07-28 (rust-sdk#1340) does not
+  apply, and the server overrides and declares each list method and
+  `completion/complete`, so its new `-32601` for an undeclared capability
+  (rust-sdk#1446) is never reached. rmcp-macros 3.11.0 is 3.10.0's source
+  under a new version.
 - **rmcp 3.10.0**, version 0.9.6 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. Nothing this server sends changes: the
   protocol types are byte-identical to 3.9.0's, and rmcp-macros 3.10.0
