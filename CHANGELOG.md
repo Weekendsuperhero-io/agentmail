@@ -345,6 +345,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The bundled SQLite is the one that fixes RUSTSEC-2026-0459** — rusqlite
+  moves from 0.39 to 0.41, so `libsqlite3-sys` is 0.39 and no longer the
+  advisory's affected 0.37. sqlx-sqlite 0.9.1 accepts it, so a workspace that
+  embeds this crate beside sqlx still links one SQLite. No source change.
 - **Archive write confinement** — message source and manifest filenames must be
   portable basenames, output directories are confined to
   `AGENTMAIL_FILE_ROOT`, existing files are never overwritten, every UID is
