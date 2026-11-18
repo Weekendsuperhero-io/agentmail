@@ -345,10 +345,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **The bundled SQLite is the one that fixes RUSTSEC-2026-0459** — rusqlite
-  moves from 0.39 to 0.41, so `libsqlite3-sys` is 0.39 and no longer the
-  advisory's affected 0.37. sqlx-sqlite 0.9.1 accepts it, so a workspace that
-  embeds this crate beside sqlx still links one SQLite. No source change.
+- **The bundled SQLite is one that fixes RUSTSEC-2026-0459** — rusqlite
+  moves from 0.39 to 0.43, so `libsqlite3-sys` is 0.40 and no longer the
+  advisory's affected 0.37 (fixed from 0.39). sqlx-sqlite 0.9.1 accepts
+  `libsqlite3-sys` below 0.41, so a workspace that embeds this crate beside
+  sqlx still links one SQLite. No source change.
+- **lettre 0.11.24**, its security release of 2026-11-17 — this crate uses
+  lettre's message builder and address parsing, where two of its fixes
+  apply: formatting a mailbox whose display name holds a CR or LF no longer
+  panics (it is written as a space), and parsing a mailbox keeps a quoted
+  local part as written instead of turning it into a different address. Its
+  SMTP transport fixes are in code this crate does not build.
 - **Archive write confinement** — message source and manifest filenames must be
   portable basenames, output directories are confined to
   `AGENTMAIL_FILE_ROOT`, existing files are never overwritten, every UID is
