@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, edited]
   repository_dispatch:
-    types: [muse-pr-description-ready]
+    types: [muse-pr-description-ready, hero-pr-description-ready]
 
 jobs:
   update-pr:
@@ -12,6 +12,7 @@ jobs:
       contents: read
       pull-requests: write
       actions: read
+      checks: write
     uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-description.yml@main
     with:
       trigger-phrase: "@Muse pr-title"
