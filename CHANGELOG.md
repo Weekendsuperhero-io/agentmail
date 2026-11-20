@@ -216,6 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Review bot removed**: the PR review, PR description and changelog workflows called platform-tools' Jules bot, and Jules has shut down, so they are gone.
 - **MCP tasks (SEP-1686), version 0.8.0** — the server no longer advertises
   `capabilities.tasks`, no tool declares `execution.taskSupport` (22 did), and
   `tasks/list`, `tasks/get`, `tasks/result` and `tasks/cancel` are gone, with
