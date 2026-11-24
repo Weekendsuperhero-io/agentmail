@@ -26,6 +26,7 @@ use rmcp::{
     tool_handler,
 };
 use std::sync::Arc;
+use tracing::instrument::WithSubscriber as _;
 
 /// The newest MCP revision this server speaks. A 2025-era client still opens
 /// with `initialize`, answered in [`ProtocolVersion::LATEST_WITH_INITIALIZE`]
@@ -61,33 +62,6 @@ pub const LEGACY_ADDITIONAL_ROOTS_META_KEY: &str = "io.agentmuse/additionalWorks
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-fn mask_prefix_for_log(value: &str) -> String {
-    let char_count = value.chars().count();
-    if char_count <= 1 {
-        return "***".to_string();
-    }
-
-    let visible_len = 3_usize.min(char_count - 1);
-    let visible: String = value.chars().take(visible_len).collect();
-    format!("{visible}***")
-}
-
-fn account_log_hint(account: &str) -> String {
-    let account = account.trim();
-    if account.is_empty() {
-        return "<empty>".to_string();
-    }
-
-    if let Some((local, domain)) = account.rsplit_once('@')
-        && !local.is_empty()
-        && !domain.is_empty()
-    {
-        return format!("{}@{}", mask_prefix_for_log(local), domain);
-    }
-
-    mask_prefix_for_log(account)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProgressUpdate {
@@ -879,34 +853,26 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
     // Initialization is already complete. Connection warming is bounded and
     // never delays the MCP handshake or availability of config-backed tools.
     let prewarm = tokio::spawn(async move {
-        futures::stream::iter(prewarm_agentmail.account_names())
-            .for_each_concurrent(PREWARM_CONCURRENCY, |account| {
+        let accounts = prewarm_agentmail.account_names().into_iter().enumerate();
+        futures::stream::iter(accounts)
+            .for_each_concurrent(PREWARM_CONCURRENCY, |(index, account)| {
                 let agentmail = Arc::clone(&prewarm_agentmail);
                 async move {
-                    let account_hint = account_log_hint(&account);
-                    match tokio::time::timeout(
-                        PREWARM_ACCOUNT_TIMEOUT,
-                        agentmail.check_connection(&account),
-                    )
-                    .await
-                    {
+                    // Connection tracing and errors can include account names,
+                    // usernames, and server replies. Startup logs use only the
+                    // account's position and the outcome of the probe.
+                    let probe = agentmail
+                        .check_connection(&account)
+                        .with_subscriber(tracing::Dispatch::none());
+                    let number = index + 1;
+                    match tokio::time::timeout(PREWARM_ACCOUNT_TIMEOUT, probe).await {
                         Ok(Ok(status)) if status.connected => {
-                            eprintln!("heromail: {} connected", account_hint);
+                            eprintln!("heromail: account #{number} connected");
                         }
-                        Ok(Ok(status)) => {
-                            eprintln!(
-                                "agentmail: {} connection failed: {}",
-                                account_hint,
-                                status.error.as_deref().unwrap_or("unknown")
-                            );
-                        }
-                        Ok(Err(error)) => {
-                            eprintln!("heromail: {} credential error: {}", account_hint, error);
-                        }
+                        Ok(_) => eprintln!("heromail: account #{number} connection failed"),
                         Err(_) => {
                             eprintln!(
-                                "agentmail: {} connection prewarm timed out after {}s",
-                                account_hint,
+                                "heromail: account #{number} connection prewarm timed out after {}s",
                                 PREWARM_ACCOUNT_TIMEOUT.as_secs()
                             );
                         }
