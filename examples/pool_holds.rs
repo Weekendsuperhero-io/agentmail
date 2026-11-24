@@ -19,7 +19,7 @@
 //! POOL_ACCOUNT=gmail cargo run --example pool_holds
 //! POOL_ACCOUNT=aol POOL_GAP_SECS=35 cargo run --example pool_holds
 //! ```
-//! Read-only: it only lists mailboxes. Set RUST_LOG=agentmail::connection=debug
+//! Read-only: it only lists mailboxes. Set RUST_LOG=heromail::connection=debug
 //! to also watch the per-acquire reuse/LOGIN lines.
 
 use std::time::Duration;
@@ -34,9 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gap = Duration::from_secs(env("POOL_GAP_SECS").map_or(Ok(35), |v| v.parse())?);
     let keepalive = Duration::from_secs(env("POOL_KEEPALIVE_SECS").map_or(Ok(30), |v| v.parse())?);
 
-    let config = agentmail::Config::load()?;
+    let config = heromail::Config::load()?;
     // Mirror the app: keepalive on, generous idle window.
-    let mail = agentmail::Agentmail::builder(config)
+    let mail = heromail::Agentmail::builder(config)
         .keepalive(keepalive)
         .max_idle(Duration::from_secs(20 * 60))
         .build();

@@ -114,7 +114,7 @@ enum CacheLocation {
 /// override the corresponding variables.
 ///
 /// ```no_run
-/// # use agentmail::{Agentmail, Config};
+/// # use heromail::{Agentmail, Config};
 /// # use std::time::Duration;
 /// # let config = Config::empty();
 /// let mail = Agentmail::builder(config)
@@ -1018,6 +1018,26 @@ impl Agentmail {
         include_content: bool,
         include_headers: bool,
     ) -> Result<GetMessagesByUidResponse> {
+        self.get_messages_by_uid_bounded(
+            mailbox,
+            account,
+            uids,
+            expected_uid_validity,
+            include_content.then_some(imap_client::MAX_TRANSIENT_MESSAGE_BYTES),
+            include_headers,
+        )
+        .await
+    }
+
+    pub(crate) async fn get_messages_by_uid_bounded(
+        &self,
+        mailbox: &str,
+        account: &str,
+        uids: &[u32],
+        expected_uid_validity: u32,
+        content_limit: Option<usize>,
+        include_headers: bool,
+    ) -> Result<GetMessagesByUidResponse> {
         Self::validate_uid_selector(mailbox, expected_uid_validity, uids)?;
         let (mailbox_s, account_s, uids_v) =
             (mailbox.to_string(), account.to_string(), uids.to_vec());
@@ -1030,12 +1050,12 @@ impl Agentmail {
                     expected_uid_validity,
                 )
                 .await?;
-                imap_client::fetch_by_uids(
+                imap_client::fetch_by_uids_bounded(
                     s,
                     &uids_v,
                     &mailbox_s,
                     &account_s,
-                    include_content,
+                    content_limit,
                     include_headers,
                 )
                 .await
@@ -1118,11 +1138,11 @@ impl Agentmail {
         &self,
         account: &str,
         session: &mut imap_client::ImapSession,
+        allow_uncached: bool,
     ) -> Result<Option<u32>> {
-        // UID Mode's whole-mailbox walk only pays off through the cache; with
-        // the cache disabled, the Limited-Mode live fallback (windowed) is the
-        // only working path, so stay in Limited Mode.
-        if !self.header_cache.is_persistent() {
+        // Live ranking fallback uses the limited view. Exact list
+        // mutations walk the full mailbox directly, even without the cache.
+        if !allow_uncached && !self.header_cache.is_persistent() {
             return Ok(None);
         }
         let caps = self.pool.server_caps(account, session).await?;
@@ -1168,7 +1188,9 @@ impl Agentmail {
                 });
             return Ok((session, Some(page)));
         }
-        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
+        let uid_mode = self
+            .enter_uid_mode(account, session.session(), false)
+            .await?;
         if uid_mode.is_some() {
             session.mark_uid_mode();
         }
@@ -1236,6 +1258,9 @@ impl Agentmail {
         Ok(())
     }
 
+    /// Rank senders by message count using the account's configured
+    /// addresses and the From addresses observed in its Sent mailbox to
+    /// exclude outgoing mail.
     pub async fn top_senders(
         &self,
         mailbox: Option<&str>,
@@ -1273,15 +1298,32 @@ impl Agentmail {
     ) -> Result<TopSendersResponse> {
         let (mut session, uid_mode) = self.acquire_uid_scan(account).await?;
 
+        let layout = self
+            .mailbox_catalog
+            .get_or_refresh(account, || {
+                imap_client::list_mailbox_layout(session.session())
+            })
+            .await;
+        let layout = match layout {
+            Ok(layout) => layout,
+            Err(error) if mailbox.is_some() && !error.is_connection_error() => {
+                imap_client::check_cancel(cancel)?;
+                tracing::debug!(target: "agentmail", %error, "mailbox layout unavailable for Sent lookup");
+                Default::default()
+            }
+            Err(error) => return Err(error),
+        };
+        let sent = mailbox_catalog::resolve_sent(&layout);
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
             None => {
-                self.account_scan_mailboxes(
-                    account,
-                    session.session(),
-                    scan_plan::ScanPurpose::Discovery,
-                )
-                .await?
+                let mut plan =
+                    scan_plan::plan_account_scan(&layout, scan_plan::ScanPurpose::Discovery);
+                if let Some(sent) = &sent {
+                    plan.mailboxes
+                        .retain(|mailbox| !mailbox_names_equal(mailbox, sent));
+                }
+                plan.mailboxes
             }
         };
 
@@ -1289,7 +1331,39 @@ impl Agentmail {
             .pool
             .account_config(account)
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
-        let own = self.own_addresses(account);
+        let mut own = self.own_addresses(account);
+        if let Some(sent) = sent.as_deref() {
+            let observed = async {
+                if let Some(addresses) = self
+                    .header_cache
+                    .sent_sender_addresses(
+                        session.session(),
+                        account,
+                        config,
+                        sent,
+                        uid_mode,
+                        cancel,
+                    )
+                    .await?
+                {
+                    return Ok(addresses);
+                }
+                imap_client::fetch_sender_dates(session.session(), sent, None, cancel)
+                    .await
+                    .map(|rows| rows.into_iter().map(|row| row.email).collect())
+            }
+            .await;
+            match observed {
+                Ok(addresses) => {
+                    own.extend(addresses.into_iter().filter(|address| !address.is_empty()));
+                }
+                Err(error) if error.is_connection_error() => return Err(error),
+                Err(error) => {
+                    imap_client::check_cancel(cancel)?;
+                    tracing::debug!(target: "agentmail", %error, "Sent sender addresses unavailable");
+                }
+            }
+        }
         let own_vec: Vec<String> = own.iter().cloned().collect();
         if let Some(page) = self
             .header_cache
@@ -1349,7 +1423,6 @@ impl Agentmail {
         let mut map: HashMap<(String, String), SenderSummary> = HashMap::new();
         // Dedup the same logical message across folders (Gmail labels / All Mail).
         let mut seen: HashSet<String> = HashSet::new();
-        // Don't rank the user themselves (their own sent mail).
 
         let live_rows = self
             .live_ranking_headers(session.session(), &mailboxes, on_progress, cancel)
@@ -1693,13 +1766,11 @@ impl Agentmail {
         })
     }
 
-    /// Group mailing-list messages by normalized sender email.
+    /// Rank exact List-Ids that have a sample advertising one-click unsubscribe.
     ///
-    /// Includes messages that have List-Unsubscribe or List-Unsubscribe-Post.
-    /// Display names and List-Id values do not split sender groups. The sample
-    /// identity and one-click flag come from the newest message in each group.
-    ///
-    /// When `mailbox` is `None`, scans all mailboxes in the account.
+    /// The count includes every message with that List-Id in the requested
+    /// scope. Sender metadata and the actionable identity come from the newest
+    /// eligible sample.
     pub async fn top_subscriptions(
         &self,
         mailbox: Option<&str>,
@@ -1753,8 +1824,6 @@ impl Agentmail {
             .pool
             .account_config(account)
             .ok_or_else(|| AgentmailError::AccountNotFound(account.to_string()))?;
-        let own = self.own_addresses(account);
-        let own_vec: Vec<String> = own.iter().cloned().collect();
         if let Some(page) = self
             .header_cache
             .top_subscriptions_page(
@@ -1763,7 +1832,6 @@ impl Agentmail {
                 config,
                 &mailboxes,
                 uid_mode,
-                &own_vec,
                 offset,
                 limit,
                 on_progress,
@@ -1776,8 +1844,10 @@ impl Agentmail {
                 .items
                 .into_iter()
                 .map(|row| ListSummary {
+                    list_id: row.list_id,
                     address: row.address,
-                    advertised_one_click: row.advertised_one_click,
+                    display_name: row.display_name,
+                    advertised_one_click: true,
                     sample: MailboxMessageIdentity {
                         mailbox: row.sample.mailbox,
                         uid_validity: row.sample.uid_validity,
@@ -1804,109 +1874,95 @@ impl Agentmail {
                     .cloned();
             }
             Self::uid_mode_release(session, uid_mode).await;
-            let unique_senders = usize::try_from(page.total_groups).unwrap_or(usize::MAX);
+            let unique_lists = usize::try_from(page.total_groups).unwrap_or(usize::MAX);
             return Ok(TopSubscriptionsResponse {
                 mailbox: mailbox.unwrap_or("*").to_string(),
                 account: account.to_string(),
                 total_messages: u32::try_from(page.total_messages).unwrap_or(u32::MAX),
-                unique_senders,
+                unique_lists,
                 offset,
                 limit,
-                next_offset: next_offset(offset, item_count, unique_senders),
+                next_offset: next_offset(offset, item_count, unique_lists),
                 lists,
             });
         }
 
-        use hashbrown::{HashMap, HashSet};
-        use types::ListSummary;
+        #[derive(Default)]
+        struct SubscriptionGroup {
+            count: u32,
+            oldest_date: Option<chrono::DateTime<chrono::Utc>>,
+            newest_date: Option<chrono::DateTime<chrono::Utc>>,
+            sample: Option<(MailboxMessageIdentity, String, String)>,
+        }
 
-        let mut map: HashMap<String, ListSummary> = HashMap::new();
-        // Dedup the same logical message across folders (Gmail labels / All Mail).
-        let mut seen: HashSet<String> = HashSet::new();
-        // Don't rank the user themselves (their own sent mail).
-
+        let mut groups: hashbrown::HashMap<String, SubscriptionGroup> = hashbrown::HashMap::new();
+        let mut seen = hashbrown::HashSet::new();
+        // Rows are ordered newest first, with a stable tie-breaker.
         let live_rows = self
             .live_ranking_headers(session.session(), &mailboxes, on_progress, cancel)
             .await?;
         for (mbox, row) in live_rows {
             if !scan_cache::first_seen(&mut seen, row.message_id.as_deref()) {
-                continue; // already counted this message from another folder
-            }
-            if (row.list_unsubscribe.is_none() && row.list_unsubscribe_post.is_none())
-                || row.sender_email.is_empty()
-                || own.contains(&row.sender_email)
-            {
                 continue;
             }
-            let key = row.sender_email.clone();
-            let uid_validity =
-                row.uid_validity
-                    .ok_or_else(|| AgentmailError::UidValidityUnavailable {
-                        mailbox: mbox.clone(),
-                    })?;
-            let entry = map.entry(key).or_insert_with(|| ListSummary {
-                address: row.sender_email.clone(),
-                advertised_one_click: false,
-                sample: MailboxMessageIdentity {
-                    mailbox: mbox.clone(),
-                    uid_validity,
-                    uid: row.uid,
-                },
-                subject: None,
-                count: 0,
-                oldest_date: None,
-                newest_date: None,
-            });
-
-            entry.count += 1;
-
-            // Track the newest message — its UID and unsubscribe info are used
-            let is_newer = ranking_sample_is_newer(
-                (row.date, &mbox, row.uid),
-                (
-                    entry.newest_date,
-                    Some(entry.sample.mailbox.as_str()),
-                    entry.sample.uid,
-                ),
-                entry.count == 1,
-            );
-
-            if is_newer {
-                entry.sample = MailboxMessageIdentity {
-                    mailbox: mbox.clone(),
-                    uid_validity,
-                    uid: row.uid,
-                };
-                entry.advertised_one_click = unsubscribe::advertises_one_click(
+            let Some((list_id, _)) = row.list_id.as_deref().and_then(bracketed_list_id) else {
+                continue;
+            };
+            let entry = groups.entry(list_id).or_default();
+            entry.count = entry.count.saturating_add(1);
+            if let Some(date) = row.date {
+                entry.oldest_date = Some(entry.oldest_date.map_or(date, |oldest| oldest.min(date)));
+                entry.newest_date = Some(entry.newest_date.map_or(date, |newest| newest.max(date)));
+            }
+            if entry.sample.is_none()
+                && unsubscribe::advertises_one_click(
                     row.list_unsubscribe.as_deref(),
                     row.list_unsubscribe_post.as_deref(),
-                );
-            }
-
-            if let Some(d) = row.date {
-                entry.oldest_date = Some(match entry.oldest_date {
-                    Some(existing) => existing.min(d),
-                    None => d,
-                });
-                entry.newest_date = Some(match entry.newest_date {
-                    Some(existing) => existing.max(d),
-                    None => d,
-                });
+                )
+            {
+                let uid_validity =
+                    row.uid_validity
+                        .ok_or_else(|| AgentmailError::UidValidityUnavailable {
+                            mailbox: mbox.clone(),
+                        })?;
+                entry.sample = Some((
+                    MailboxMessageIdentity {
+                        mailbox: mbox,
+                        uid_validity,
+                        uid: row.uid,
+                    },
+                    row.sender_email,
+                    row.sender_name,
+                ));
             }
         }
 
         imap_client::check_cancel(cancel)?;
 
-        let mut lists: Vec<ListSummary> = map.into_values().collect();
-        // One-click senders first, then by message count
+        let mut lists: Vec<ListSummary> = groups
+            .into_iter()
+            .filter_map(|(list_id, group)| {
+                let (sample, address, display_name) = group.sample?;
+                Some(ListSummary {
+                    list_id,
+                    address,
+                    display_name,
+                    advertised_one_click: true,
+                    sample,
+                    subject: None,
+                    count: group.count,
+                    oldest_date: group.oldest_date,
+                    newest_date: group.newest_date,
+                })
+            })
+            .collect();
         lists.sort_by(|a, b| {
-            b.advertised_one_click
-                .cmp(&a.advertised_one_click)
-                .then_with(|| b.count.cmp(&a.count))
-                .then_with(|| a.address.cmp(&b.address))
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.list_id.cmp(&b.list_id))
         });
 
-        let unique_senders = lists.len();
+        let unique_lists = lists.len();
         let total_messages = lists
             .iter()
             .fold(0_u32, |total, list| total.saturating_add(list.count));
@@ -1929,16 +1985,16 @@ impl Agentmail {
                 ))
                 .cloned();
         }
-        session.release().await;
+        Self::uid_mode_release(session, uid_mode).await;
 
         Ok(TopSubscriptionsResponse {
             mailbox: mailbox.unwrap_or("*").to_string(),
             account: account.to_string(),
             total_messages,
-            unique_senders,
+            unique_lists,
             offset,
             limit,
-            next_offset: next_offset(offset, item_count, unique_senders),
+            next_offset: next_offset(offset, item_count, unique_lists),
             lists,
         })
     }
@@ -2091,8 +2147,13 @@ impl Agentmail {
                 Some(ref id) if !id.is_empty() => id.clone(),
                 _ => continue, // Skip messages without List-Id
             };
-            let Some(list_id) = normalize_list_id(&raw_list_id) else {
+            let Some((list_id, display)) = bracketed_list_id(&raw_list_id) else {
                 continue;
+            };
+            let display = if display.is_empty() {
+                list_id.clone()
+            } else {
+                display.to_string()
             };
             let uid_validity =
                 row.uid_validity
@@ -2101,7 +2162,7 @@ impl Agentmail {
                     })?;
 
             let entry = map.entry(list_id.clone()).or_insert_with(|| {
-                let display = extract_list_id_display(&raw_list_id);
+                let display = display.to_string();
                 ListIdEntry {
                     display_name: display,
                     senders: HashSet::new(),
@@ -2132,7 +2193,7 @@ impl Agentmail {
                 entry.sample_uid = row.uid;
                 entry.sample_uid_validity = uid_validity;
                 entry.sample_mailbox = mbox.clone();
-                entry.display_name = extract_list_id_display(&raw_list_id);
+                entry.display_name = display.to_string();
             }
 
             if let Some(d) = row.date {
@@ -2216,7 +2277,6 @@ impl Agentmail {
         })
     }
 
-    /// Delete all messages with a specific List-Id across mailboxes.
     /// Upper bound on repeated search→delete passes per mailbox. Windowed
     /// servers (Yahoo/AOL pin the visible mailbox to its newest N messages)
     /// backfill older mail as matches are deleted, so one pass only clears
@@ -2224,97 +2284,8 @@ impl Agentmail {
     /// drain. Hitting it reports the mailbox as skipped (incomplete).
     const MAX_WINDOW_DRAIN_PASSES: usize = 500;
 
-    /// Whether this account's server was observed filtering List-* headers
-    /// out of HEADER.FIELDS responses (AOL/Yahoo). Such servers also cannot
-    /// match those headers in SEARCH, so an empty `HEADER List-Id` result
-    /// there means "blind", not "absent". The flag is set by ranking scans —
-    /// the workflow that produces a listId always runs one first.
-    fn list_search_untrusted(&self, account: &str) -> bool {
-        self.pool
-            .account_config(account)
-            .is_some_and(|config| self.header_cache.account_flagged_quirky(account, config))
-    }
-
-    /// Exact-List-Id candidate UIDs in the currently selected mailbox.
-    /// Server-side `SEARCH HEADER List-Id` first; when that returns nothing
-    /// on a server whose List-* handling is untrusted, enumerate the visible
-    /// mailbox and confirm locally — the List-Id confirm fetch works
-    /// everywhere because List-Id survives the servers' header filtering.
-    async fn exact_list_id_uids<T>(
-        &self,
-        session: &mut async_imap::Session<T>,
-        account: &str,
-        mailbox: &str,
-        list_id: &str,
-        mailbox_exists: u32,
-        mailbox_uid_next: Option<u32>,
-        mailbox_uid_validity: Option<u32>,
-        cancel: Option<&CancelFn>,
-    ) -> Result<Vec<u32>>
-    where
-        T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
-    {
-        let criteria = SearchCriteria {
-            header: Some(("List-Id".to_string(), list_id.to_string())),
-            deleted: Some(false),
-            ..Default::default()
-        };
-        let query = imap_client::build_search_query_pub(&criteria)?;
-        // A rejected search and an empty one are indistinguishable on servers
-        // whose tagged NO is swallowed by the client library; both fall
-        // through to the trust check below.
-        let mut candidates = imap_client::search_uids(session, &query)
-            .await
-            .unwrap_or_default();
-        if candidates.is_empty() && mailbox_exists > 0 {
-            // Two independent reasons to distrust an empty result: this
-            // process observed the List-header quirk (fast, but unarmed after
-            // a restart once the cache has healed), or the persisted
-            // projection knows this mailbox holds matches the server search
-            // failed to find (restart-proof ground truth).
-            let projected_uids = match (
-                normalize_list_id(list_id),
-                self.pool.account_config(account),
-                mailbox_uid_validity,
-            ) {
-                (Some(normalized), Some(config), Some(uid_validity)) => {
-                    self.header_cache
-                        .cached_list_id_uids(account, config, mailbox, &normalized, uid_validity)
-                        .await
-                }
-                _ => Vec::new(),
-            };
-            if !projected_uids.is_empty() {
-                // Fast path: confirm the projection's own UIDs — orders of
-                // magnitude cheaper than enumerating a 100k-message window.
-                // Fresh on the first drain pass; on later passes these UIDs
-                // are already deleted, confirm to nothing, and fall through
-                // to enumeration so window backfill is still covered.
-                let confirmed =
-                    confirm_exact_list_id(session, &projected_uids, list_id, cancel).await?;
-                if !confirmed.is_empty() {
-                    return Ok(confirmed);
-                }
-            }
-            if !projected_uids.is_empty() || self.list_search_untrusted(account) {
-                tracing::warn!(
-                    target: "agentmail",
-                    mailbox,
-                    projected = projected_uids.len(),
-                    "server List-Id search cannot be trusted here; enumerating the visible mailbox",
-                );
-                candidates =
-                    imap_client::search_all_uids_checked(session, mailbox_exists, mailbox_uid_next)
-                        .await?;
-            }
-        }
-        confirm_exact_list_id(session, &candidates, list_id, cancel).await
-    }
-
-    /// Discover the UIDs to delete in `mbox` for one sweep pass. This is the
-    /// only step that differs between the list-id, exact-sender, and
-    /// unsubscribe-cleanup deletes — the surrounding drain loop is shared in
-    /// [`Self::delete_sweep`]. `mb` is the freshly selected mailbox state.
+    /// Find live matches for one pass through the selected mailbox.
+    #[allow(clippy::too_many_arguments)]
     async fn discover_delete_uids<T>(
         &self,
         selector: &DeleteSelector,
@@ -2322,6 +2293,7 @@ impl Agentmail {
         account: &str,
         mbox: &str,
         mb: &async_imap::types::Mailbox,
+        uid_mode: Option<u32>,
         cancel: Option<&CancelFn>,
     ) -> Result<Vec<u32>>
     where
@@ -2329,19 +2301,30 @@ impl Agentmail {
     {
         match selector {
             DeleteSelector::ListId(list_id) => {
-                // `exact_list_id_uids` normalizes internally, so the raw or
-                // normalized value is equivalent here.
-                self.exact_list_id_uids(
-                    session,
-                    account,
-                    mbox,
-                    list_id,
-                    mb.exists,
-                    mb.uid_next,
-                    mb.uid_validity,
-                    cancel,
-                )
-                .await
+                // HEADER search can return a partial set, including when the
+                // identifier arrived folded. Enumerate the selected mailbox
+                // and use its live List-Id headers as the authority.
+                let candidates = if let Some(message_limit) = uid_mode {
+                    imap_client::walk_all_uids_uidmode(session, message_limit, None, cancel).await?
+                } else {
+                    let uids =
+                        imap_client::search_all_uids_checked(session, mb.exists, mb.uid_next)
+                            .await?;
+                    if uids.len() < mb.exists as usize {
+                        return Err(AgentmailError::Other(format!(
+                            "could not enumerate every UID in {mbox} for List-Id cleanup"
+                        )));
+                    }
+                    uids
+                };
+                let max_chunk_size = imap_client::MAX_FETCH_CHUNK as u32;
+                let batch_size =
+                    uid_mode.unwrap_or(max_chunk_size).clamp(1, max_chunk_size) as usize;
+                let mut matched = Vec::new();
+                for batch in candidates.chunks(batch_size) {
+                    matched.extend(confirm_exact_list_id(session, batch, list_id, cancel).await?);
+                }
+                Ok(matched)
             }
             DeleteSelector::Sender { email, name } => {
                 let candidates = candidate_sender_uids(session, email).await?;
@@ -2355,34 +2338,6 @@ impl Agentmail {
                     .filter(|(_uid, e, n)| e == email && n == name)
                     .map(|(uid, _, _)| uid)
                     .collect())
-            }
-            DeleteSelector::SubscriptionSender { email, list_id } => {
-                let candidates = candidate_sender_uids(session, email).await?;
-                if candidates.is_empty() {
-                    return Ok(Vec::new());
-                }
-                filter_subscription_sender_mail(
-                    session,
-                    &candidates,
-                    email,
-                    list_id.as_deref(),
-                    cancel,
-                )
-                .await
-            }
-            DeleteSelector::RankedSubscription { email, list_id } => {
-                let candidates = candidate_sender_uids(session, email).await?;
-                if candidates.is_empty() {
-                    return Ok(Vec::new());
-                }
-                filter_ranked_subscription_mail(
-                    session,
-                    &candidates,
-                    email,
-                    list_id.as_deref(),
-                    cancel,
-                )
-                .await
             }
             DeleteSelector::Domain(expected_domain) => {
                 let expected_domain =
@@ -2475,7 +2430,16 @@ impl Agentmail {
         // failure, so on error `session` falls out of scope here and the
         // connection closes rather than returning a half-configured session to
         // the pool.
-        let uid_mode = self.enter_uid_mode(account, session.session()).await?;
+        let uid_mode = if session.is_uid_mode() {
+            Some(Self::uid_page_size(caps))
+        } else {
+            self.enter_uid_mode(
+                account,
+                session.session(),
+                matches!(selector, DeleteSelector::ListId(_)),
+            )
+            .await?
+        };
         if uid_mode.is_some() {
             // Route release to the UID-Mode store so the next ranking scan or
             // sweep reuses this connection instead of paying another LOGIN.
@@ -2489,6 +2453,7 @@ impl Agentmail {
                 mailboxes,
                 action,
                 caps,
+                uid_mode,
                 on_progress,
                 cancel,
             )
@@ -2523,6 +2488,7 @@ impl Agentmail {
         mailboxes: &[String],
         action: SweepAction<'_>,
         caps: &imap_client::ServerCaps,
+        uid_mode: Option<u32>,
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<SweepTotals>
@@ -2555,7 +2521,7 @@ impl Agentmail {
                     }
                 };
                 let uids = match self
-                    .discover_delete_uids(selector, session, account, mbox, &mb, cancel)
+                    .discover_delete_uids(selector, session, account, mbox, &mb, uid_mode, cancel)
                     .await
                 {
                     Ok(uids) => uids,
@@ -2748,6 +2714,8 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<DeleteListIdResponse> {
+        let normalized = normalize_list_id(list_id)
+            .ok_or_else(|| AgentmailError::Other("list_id must be a usable List-Id".to_string()))?;
         let _mutation_guard = self
             .lock_account_mutation_unless_cancelled(account, cancel)
             .await?;
@@ -2764,20 +2732,31 @@ impl Agentmail {
         let mailboxes = match mailbox {
             Some(mbox) => vec![mbox.to_string()],
             None => {
-                self.account_scan_mailboxes(
+                self.list_cleanup_mailboxes(
                     account,
                     session.session(),
-                    scan_plan::ScanPurpose::Mutation,
+                    &caps,
+                    mode == DeleteMode::Permanent,
                 )
                 .await?
             }
         };
 
+        if trash.as_deref().is_some_and(|trash| {
+            mailboxes
+                .iter()
+                .any(|mailbox| mailbox_names_equal(mailbox, trash))
+        }) {
+            return Err(AgentmailError::Other(
+                "the source mailbox is already Trash".to_string(),
+            ));
+        }
+
         let totals = self
             .matching_sweep(
                 session,
                 account,
-                DeleteSelector::ListId(list_id.to_string()),
+                DeleteSelector::ListId(normalized),
                 &mailboxes,
                 SweepAction::Delete {
                     trash: trash.as_deref(),
@@ -2801,7 +2780,7 @@ impl Agentmail {
             operation_ids: totals.operation_ids,
             mailboxes: delete_tallies(totals.mailboxes),
             skipped: totals.skipped,
-            permanent: mode == DeleteMode::Permanent,
+            permanent: mode == DeleteMode::Permanent && !caps.is_gmail(),
         })
     }
 
@@ -3496,11 +3475,8 @@ impl Agentmail {
         .await
     }
 
-    /// Move every message with an exact List-Id to `destination` in one
-    /// operation — e.g. statements or a newsletter into an archive folder.
-    /// `mailbox: None` sweeps the account-wide mutation plan (destination
-    /// excluded). Discovery matches `delete_list_id`: server search, cached
-    /// projection fast-path, and a live exact-List-Id confirm before any move.
+    /// Move every message with an exact List-Id to an existing mailbox.
+    /// An account-wide move excludes the destination from the sweep.
     pub async fn move_list_id(
         &self,
         mailbox: Option<&str>,
@@ -3510,6 +3486,8 @@ impl Agentmail {
         on_progress: Option<&ProgressFn>,
         cancel: Option<&CancelFn>,
     ) -> Result<MoveListIdResponse> {
+        let normalized = normalize_list_id(list_id)
+            .ok_or_else(|| AgentmailError::Other("list_id must be a usable List-Id".to_string()))?;
         let _mutation_guard = self
             .lock_account_mutation_unless_cancelled(account, cancel)
             .await?;
@@ -3517,7 +3495,7 @@ impl Agentmail {
             .move_sweep(
                 mailbox,
                 account,
-                DeleteSelector::ListId(list_id.to_string()),
+                DeleteSelector::ListId(normalized),
                 destination,
                 on_progress,
                 cancel,
@@ -3647,8 +3625,7 @@ impl Agentmail {
     /// `top_subscriptions` sample.
     ///
     /// The sample UID is bound to its UIDVALIDITY epoch and re-fetched live.
-    /// Matching then requires the exact canonical sender email, at least one
-    /// list-action header, and the sample's normalized List-Id when it has one.
+    /// The sample supplies the exact List-Id for the move.
     /// The account-wide mutation plan is swept with the destination excluded.
     pub async fn move_subscription(
         &self,
@@ -3693,41 +3670,22 @@ impl Agentmail {
         };
         session.release().await;
 
-        let (sender, _, _, _) = parser::parse_sender_date(&sample_headers).map_err(|error| {
-            AgentmailError::Parse(format!(
-                "top_subscriptions sample UID {uid} has no usable sender: {error}"
-            ))
-        })?;
-        if sender.is_empty() {
-            return Err(AgentmailError::Parse(format!(
-                "top_subscriptions sample UID {uid} has no usable sender"
-            )));
-        }
-        let headers = unsubscribe::parse_list_headers(&sample_headers);
-        if headers.list_unsubscribe.is_none() && headers.list_unsubscribe_post.is_none() {
-            return Err(AgentmailError::Other(format!(
-                "message UID {uid} is no longer a top_subscriptions candidate; re-run top_subscriptions for a fresh sample"
-            )));
-        }
-        let list_id = headers
-            .has_single_list_id()
-            .then_some(headers.list_id.as_deref())
-            .flatten()
-            .and_then(normalize_list_id);
-        let matched_by = if list_id.is_some() {
-            "exact sender email + list-action header + exact List-Id"
-        } else {
-            "exact sender email + list-action header"
-        };
+        let (sender, _, _, _) = parser::parse_sender_date(&sample_headers).unwrap_or_default();
+        let headers = unsubscribe::parse_list_headers(&sample_headers).for_ranking();
+        let list_id = headers.normalized_list_id().filter(|_| {
+            unsubscribe::advertises_one_click(
+                headers.list_unsubscribe.as_deref(),
+                headers.list_unsubscribe_post.as_deref(),
+            )
+        }).ok_or_else(|| AgentmailError::Other(format!(
+            "message UID {uid} is no longer a top_subscriptions candidate; re-run top_subscriptions for a fresh sample"
+        )))?;
 
         let totals = self
             .move_sweep(
                 None,
                 account,
-                DeleteSelector::RankedSubscription {
-                    email: sender.clone(),
-                    list_id: list_id.clone(),
-                },
+                DeleteSelector::ListId(list_id.clone()),
                 destination,
                 on_progress,
                 cancel,
@@ -3740,8 +3698,8 @@ impl Agentmail {
             sample_uid_validity: expected_uid_validity,
             sample_uid: uid,
             sender,
-            list_id,
-            matched_by: matched_by.to_string(),
+            list_id: Some(list_id),
+            matched_by: "list-id".to_string(),
             destination: destination.trim().to_string(),
             found: totals.found,
             moved: totals.affected,
@@ -5007,8 +4965,8 @@ impl Agentmail {
 
     /// Fetch a message's raw source and parse out its MIME attachment parts
     /// as `(filename, content type, bytes)` triples in part order. Nameless
-    /// parts get the filename "unnamed". UIDVALIDITY-guarded like every other
-    /// delayed UID consumer.
+    /// parts get the filename "unnamed". Checks UIDVALIDITY and preflights
+    /// the size of the encoded message against the 70 MiB attachment limit.
     pub async fn get_attachment_data(
         &self,
         mailbox: &str,
@@ -5018,9 +4976,14 @@ impl Agentmail {
     ) -> Result<Vec<(String, String, Vec<u8>)>> {
         Self::validate_uid_selector(mailbox, expected_uid_validity, &[uid])?;
         let mut session = self.pool.acquire(account).await?;
-        let raw =
-            imap_client::get_message_source(session.session(), mailbox, uid, expected_uid_validity)
-                .await?;
+        let raw = imap_client::get_message_source_bounded(
+            session.session(),
+            mailbox,
+            uid,
+            expected_uid_validity,
+            imap_client::MAX_ATTACHMENT_MESSAGE_BYTES,
+        )
+        .await?;
         session.release().await;
 
         // Parse attachments on a blocking thread (CPU-intensive MIME parsing)
@@ -5172,24 +5135,21 @@ impl Agentmail {
             return Ok(response);
         }
 
-        let identity = match select_unsubscribe_cleanup_identity(
-            headers.list_id.as_deref(),
-            headers.has_single_list_id(),
+        let list_id = match select_unsubscribe_cleanup_identity(
+            &headers,
             response.list_id_authenticated,
-            &target_email,
-            cleanup.identity,
         ) {
-            Ok(identity) => identity,
+            Ok(list_id) => list_id,
             Err(CleanupIdentityError::UnauthenticatedListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup was skipped: the sender's DKIM signature does not cover the List-Id header (List-Id is spoofable, so an unauthenticated value must not select an account-wide delete), and cleanup.identity was \"listIdOnly\". To clean up: use cleanup.identity \"listIdOrSender\" to match exact sender email + List-Unsubscribe-Post + this List-Id, use delete_list_id with an explicitly chosen listId, or use delete_by_sender."
+                    "Cleanup needs a DKIM signature covering List-Id. You can still run delete_list_id with the exact listId you selected."
                         .to_string(),
                 );
                 return Ok(response);
             }
             Err(CleanupIdentityError::NoUsableListId) => {
                 response.cleanup_skipped_reason = Some(
-                    "Matching-message cleanup was skipped: the message carries no single usable List-Id, and cleanup.identity was \"listIdOnly\". To clean up: use cleanup.identity \"listIdOrSender\" to match the exact sender email plus List-Unsubscribe-Post, or use delete_by_sender."
+                    "Cleanup needs a single usable List-Id. Choose an exact listId from top_mailing_lists to delete existing mail separately."
                         .to_string(),
                 );
                 return Ok(response);
@@ -5221,17 +5181,8 @@ impl Agentmail {
         }
 
         let all_mailboxes = self
-            .account_scan_mailboxes(account, session.session(), scan_plan::ScanPurpose::Mutation)
+            .list_cleanup_mailboxes(account, session.session(), &caps, trash.is_none())
             .await?;
-        let selector = match &identity {
-            CleanupIdentity::ListId { normalized, .. } => {
-                DeleteSelector::ListId(normalized.clone())
-            }
-            CleanupIdentity::Sender { list_id } => DeleteSelector::SubscriptionSender {
-                email: target_email.clone(),
-                list_id: list_id.clone(),
-            },
-        };
         // A TrashFirst cleanup with no resolvable Trash is already a permanent
         // fallback before the sweep runs; carry that seed into the result.
         let seeded_trash_fallback = mode == DeleteMode::TrashFirst && trash.is_none();
@@ -5239,7 +5190,7 @@ impl Agentmail {
             .matching_sweep(
                 session,
                 account,
-                selector,
+                DeleteSelector::ListId(list_id.clone()),
                 &all_mailboxes,
                 SweepAction::Delete {
                     trash: trash.as_deref(),
@@ -5252,24 +5203,14 @@ impl Agentmail {
             .await?;
         let trash_fallback = totals.trash_fallback || seeded_trash_fallback;
 
-        let (matched_by, list_id) = match identity {
-            CleanupIdentity::ListId { raw, .. } => ("list-id", Some(raw)),
-            // The constrained fallback reports the normalized List-Id it was
-            // scoped to; matched_by distinguishes it from the authenticated
-            // List-Id match.
-            CleanupIdentity::Sender {
-                list_id: Some(normalized),
-            } => ("sender-email-list-id-fallback", Some(normalized)),
-            CleanupIdentity::Sender { list_id: None } => ("sender-email-fallback", None),
-        };
         let complete = totals.skipped.is_empty()
             && totals.failed == 0
             && totals.pending == 0
             && totals.needs_attention == 0;
         response.matching_messages = Some(MatchingMessagesResult {
-            matched_by: matched_by.to_string(),
+            matched_by: "list-id".to_string(),
             sender: target_email,
-            list_id,
+            list_id: Some(list_id),
             found: totals.found,
             deleted: totals.affected,
             failed: totals.failed,
@@ -5314,6 +5255,25 @@ impl Agentmail {
             "account-wide mailbox scan planned"
         );
         Ok(plan.mailboxes)
+    }
+
+    async fn list_cleanup_mailboxes(
+        &self,
+        account: &str,
+        session: &mut imap_client::ImapSession,
+        caps: &imap_client::ServerCaps,
+        permanent: bool,
+    ) -> Result<Vec<String>> {
+        let purpose = if caps.is_gmail() {
+            // Moving from All Mail to Trash covers Gmail's archived messages,
+            // including messages without any user-visible labels.
+            scan_plan::ScanPurpose::Discovery
+        } else if permanent {
+            scan_plan::ScanPurpose::PermanentListCleanup
+        } else {
+            scan_plan::ScanPurpose::Mutation
+        };
+        self.account_scan_mailboxes(account, session, purpose).await
     }
 
     async fn ensure_mailbox_not_in_pending_move(
@@ -6130,29 +6090,14 @@ fn validate_draft_payload(
 /// What a delete sweep matches. The discovery predicate is the only thing that
 /// differs across the list-id, exact-sender, and unsubscribe-cleanup deletes;
 /// everything else (windowed draining, chunked expunge, per-mailbox tallying,
-/// UID-Mode entry) is shared in `delete_sweep`.
+/// UID-Mode entry) is shared in `matching_sweep`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DeleteSelector {
-    /// Messages whose List-Id matches (exact). `exact_list_id_uids` normalizes
-    /// internally, so the raw header value is accepted here.
+    /// Messages carrying one exact normalized List-Id.
     ListId(String),
     /// Every message from one exact sender identity (email + display name),
     /// used by delete-by-sender and move-by-sender.
     Sender { email: String, name: String },
-    /// RFC 8058 mail from one exact sender email. A `list_id` further scopes
-    /// matches to one normalized List-Id so sibling lists from the same sender
-    /// are untouched.
-    SubscriptionSender {
-        email: String,
-        list_id: Option<String>,
-    },
-    /// A row from `top_subscriptions`: exact canonical sender email plus any
-    /// list-action header (`List-Unsubscribe` or `List-Unsubscribe-Post`).
-    /// The sample's single normalized List-Id further scopes the move.
-    RankedSubscription {
-        email: String,
-        list_id: Option<String>,
-    },
     /// Messages whose first parsed Header From address has this exact
     /// canonical domain. Parent/child domains never match implicitly.
     Domain(String),
@@ -6276,53 +6221,22 @@ fn pending_move_from_operation(operation: mutation_journal::MoveOperation) -> Op
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum CleanupIdentity {
-    ListId {
-        raw: String,
-        normalized: String,
-    },
-    /// Sender-email fallback. Every match must have the exact canonical sender
-    /// email plus List-Unsubscribe-Post. `list_id` carries the target's single
-    /// normalized List-Id when present, conjoining it with the sender email so
-    /// an unauthenticated, spoofable List-Id never selects a delete alone.
-    Sender {
-        list_id: Option<String>,
-    },
-}
-
-#[derive(Debug, PartialEq, Eq)]
 enum CleanupIdentityError {
     UnauthenticatedListId,
     NoUsableListId,
 }
 
 fn select_unsubscribe_cleanup_identity(
-    list_id: Option<&str>,
-    has_single_list_id: bool,
+    headers: &unsubscribe::ListHeaders,
     list_id_authenticated: bool,
-    target_email: &str,
-    identity_mode: CleanupIdentityMode,
-) -> std::result::Result<CleanupIdentity, CleanupIdentityError> {
-    let normalized = has_single_list_id
-        .then_some(list_id)
-        .flatten()
-        .and_then(normalize_list_id);
-
-    match (normalized, list_id_authenticated) {
-        (Some(normalized), true) => Ok(CleanupIdentity::ListId {
-            raw: list_id.unwrap_or_default().to_string(),
-            normalized,
-        }),
-        (normalized, _)
-            if identity_mode == CleanupIdentityMode::ListIdOrSender && !target_email.is_empty() =>
-        {
-            Ok(CleanupIdentity::Sender {
-                list_id: normalized,
-            })
-        }
-        (Some(_), _) => Err(CleanupIdentityError::UnauthenticatedListId),
-        (None, _) => Err(CleanupIdentityError::NoUsableListId),
+) -> std::result::Result<String, CleanupIdentityError> {
+    let list_id = headers
+        .normalized_list_id()
+        .ok_or(CleanupIdentityError::NoUsableListId)?;
+    if !list_id_authenticated {
+        return Err(CleanupIdentityError::UnauthenticatedListId);
     }
+    Ok(list_id)
 }
 
 /// The two invariant checks. The old cross-field combination rules are gone:
@@ -6344,10 +6258,7 @@ fn cleanup_policy_allows(cleanup: CleanupPolicy, unsubscribe_succeeded: bool) ->
     unsubscribe_succeeded || cleanup.when == CleanupWhen::Always
 }
 
-/// Confirm which candidate UIDs actually carry the exact List-Id. IMAP HEADER
-/// search is substring-only (and enumeration candidates are everything), so
-/// this fetch is the authority before any deletion; stale UIDs simply do not
-/// come back.
+/// Verify the exact List-Id from live headers before a bulk action.
 async fn confirm_exact_list_id<T>(
     session: &mut async_imap::Session<T>,
     candidates: &[u32],
@@ -6396,126 +6307,6 @@ where
     };
     let query = imap_client::build_search_query_pub(&criteria)?;
     imap_client::search_uids(session, &query).await
-}
-
-/// A sender-fallback message must carry RFC 8058's POST header, match the
-/// canonical sender email, and satisfy the optional normalized List-Id scope.
-fn subscription_sender_header_matches(
-    header_bytes: &[u8],
-    target_email: &str,
-    constrain_list_id: Option<&str>,
-) -> bool {
-    let header_str = String::from_utf8_lossy(header_bytes);
-    if imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe-Post").is_none()
-        || !row_list_id_matches(&header_str, constrain_list_id)
-    {
-        return false;
-    }
-
-    parser::parse_sender_date(header_bytes).is_ok_and(|(email, _, _, _)| email == target_email)
-}
-
-/// A top-subscription move uses the same bulk-mail eligibility as ranking:
-/// either list-action header, exact sender email, and the sample's List-Id
-/// when it has one. This intentionally does not weaken the one-click cleanup
-/// fallback above, which still requires `List-Unsubscribe-Post`.
-fn ranked_subscription_header_matches(
-    header_bytes: &[u8],
-    target_email: &str,
-    constrain_list_id: Option<&str>,
-) -> bool {
-    let header_str = String::from_utf8_lossy(header_bytes);
-    let has_list_action = imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe")
-        .is_some()
-        || imap_client::extract_header_value_pub(&header_str, "List-Unsubscribe-Post").is_some();
-    if !has_list_action || !row_list_id_matches(&header_str, constrain_list_id) {
-        return false;
-    }
-
-    parser::parse_sender_date(header_bytes).is_ok_and(|(email, _, _, _)| email == target_email)
-}
-
-async fn filter_subscription_sender_mail<T>(
-    session: &mut async_imap::Session<T>,
-    candidate_uids: &[u32],
-    target_email: &str,
-    constrain_list_id: Option<&str>,
-    cancel: Option<&CancelFn>,
-) -> Result<Vec<u32>>
-where
-    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
-{
-    let mut exact = Vec::new();
-    for chunk in candidate_uids.chunks(1000) {
-        imap_client::check_cancel(cancel)?;
-        let uid_set: String = chunk
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        // Full header block, not HEADER.FIELDS: Yahoo/AOL filter the
-        // List-Unsubscribe pair out of HEADER.FIELDS responses (see
-        // docs/standards/imap/yahoo-aol-quirks.md), which would silently
-        // disqualify every candidate here. Candidate sets are one sender's
-        // mail in one mailbox, so the extra bytes are negligible next to a
-        // wrong bulk-mail classification on a deletion path.
-        let fetched =
-            imap_client::timed_uid_fetch_collect_pub(session, &uid_set, "(UID BODY.PEEK[HEADER])")
-                .await?;
-
-        for item in fetched {
-            let fetch = item.map_err(AgentmailError::Imap)?;
-            let uid = match fetch.uid {
-                Some(u) => u,
-                None => continue,
-            };
-            let header_bytes = fetch.header().unwrap_or(&[]);
-            if subscription_sender_header_matches(header_bytes, target_email, constrain_list_id) {
-                exact.push(uid);
-            }
-        }
-    }
-    Ok(exact)
-}
-
-async fn filter_ranked_subscription_mail<T>(
-    session: &mut async_imap::Session<T>,
-    candidate_uids: &[u32],
-    target_email: &str,
-    constrain_list_id: Option<&str>,
-    cancel: Option<&CancelFn>,
-) -> Result<Vec<u32>>
-where
-    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
-{
-    let mut exact = Vec::new();
-    for chunk in candidate_uids.chunks(1000) {
-        imap_client::check_cancel(cancel)?;
-        let uid_set = chunk
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let fetched =
-            imap_client::timed_uid_fetch_collect_pub(session, &uid_set, "(UID BODY.PEEK[HEADER])")
-                .await?;
-
-        for item in fetched {
-            let fetch = item.map_err(AgentmailError::Imap)?;
-            let Some(uid) = fetch.uid else {
-                continue;
-            };
-            if ranked_subscription_header_matches(
-                fetch.header().unwrap_or(&[]),
-                target_email,
-                constrain_list_id,
-            ) {
-                exact.push(uid);
-            }
-        }
-    }
-    Ok(exact)
 }
 
 /// Outcome of a page-sample Subject fetch.
@@ -6618,21 +6409,6 @@ where
     SampleSubjects { subjects, missing }
 }
 
-/// Whether a message's header block satisfies an optional normalized List-Id
-/// constraint. `None` imposes nothing; `Some` requires the header to carry a
-/// List-Id that normalizes to exactly that value — a missing or different
-/// List-Id fails, so a sender-fallback cleanup scoped to one list can never
-/// take a sibling list's mail with it.
-fn row_list_id_matches(header_str: &str, constrain_list_id: Option<&str>) -> bool {
-    let Some(want) = constrain_list_id else {
-        return true;
-    };
-    imap_client::extract_header_value_pub(header_str, "List-Id")
-        .as_deref()
-        .and_then(normalize_list_id)
-        .is_some_and(|normalized| normalized == want)
-}
-
 /// Pick a stable representative when dates are absent or tied. IMAP UIDs are
 /// mailbox-local, so mailbox name is the primary tie-breaker and UID the
 /// secondary one.
@@ -6667,49 +6443,54 @@ pub(crate) fn next_offset(offset: usize, item_count: usize, total: usize) -> Opt
 /// exact list here before deleting. Compared case-insensitively after trimming;
 /// the value round-trips exactly from `top_mailing_lists`'s `listId` output.
 fn list_id_matches(requested: &str, candidate: &str) -> bool {
-    match (normalize_list_id(requested), normalize_list_id(candidate)) {
-        (Some(requested), Some(candidate)) => requested == candidate,
-        _ => requested.trim().eq_ignore_ascii_case(candidate.trim()),
-    }
+    bracketed_list_id(candidate)
+        .is_some_and(|(candidate, _)| normalize_list_id(requested).as_ref() == Some(&candidate))
 }
 
-/// Return the RFC 2919 list identifier inside angle brackets, normalized for
-/// exact comparison. The optional display phrase is deliberately ignored so
-/// harmless name changes cannot split one list or broaden a deletion.
+/// The command accepts a canonical identifier or a complete List-Id value.
 fn normalize_list_id(value: &str) -> Option<String> {
     let value = value.trim();
-    if let Some(start) = value.find('<') {
-        let end = value[start + 1..].find('>')? + start + 1;
-        if !value[end + 1..].trim().is_empty()
-            || value[..start].contains(['<', '>'])
-            || value[start + 1..end].contains(['<', '>', ' ', '\t', '\r', '\n'])
-        {
-            return None;
-        }
-        let identifier = value[start + 1..end].trim();
-        return (!identifier.is_empty()).then(|| identifier.to_ascii_lowercase());
+    if value.contains(['<', '>']) {
+        return bracketed_list_id(value).map(|(identifier, _)| identifier);
     }
-
-    (!value.is_empty() && !value.contains(['<', '>', ' ', '\t', '\r', '\n']))
-        .then(|| value.to_ascii_lowercase())
+    valid_list_id(value).then(|| value.to_ascii_lowercase())
 }
 
-/// Extract the display name from a List-Id header value.
-/// Format: `Cool List <cool.example.com>` → "Cool List"
-/// If no display name, returns the identifier: `<cool.example.com>` → "cool.example.com"
-fn extract_list_id_display(list_id: &str) -> String {
-    let trimmed = list_id.trim();
-    if let Some(bracket_start) = trimmed.find('<') {
-        let before = trimmed[..bracket_start].trim();
-        if !before.is_empty() {
-            return before.to_string();
-        }
-        // No display name — extract the identifier from angle brackets
-        if let Some(bracket_end) = trimmed.find('>') {
-            return trimmed[bracket_start + 1..bracket_end].to_string();
+/// A received List-Id has angle brackets. Ignore in-transit whitespace inside
+/// the brackets and compare the identifier ASCII case-insensitively (RFC 2919).
+fn bracketed_list_id(value: &str) -> Option<(String, &str)> {
+    let (display, bracketed) = value.trim().rsplit_once('<')?;
+    let contents = bracketed.strip_suffix('>')?;
+    // Quoted words in the display phrase can contain literal angle brackets.
+    let (mut quoted, mut escaped) = (false, false);
+    for character in display.chars() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '<' | '>' if !quoted => return None,
+            _ => {}
         }
     }
-    trimmed.to_string()
+    if quoted {
+        return None;
+    }
+    let identifier: String = contents
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    valid_list_id(&identifier).then(|| (identifier.to_ascii_lowercase(), display.trim()))
+}
+
+fn valid_list_id(value: &str) -> bool {
+    value.contains('.')
+        && value.len() <= 255
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte)
+                })
+        })
 }
 
 /// Sanitize a filename: replace path separators and control chars with underscores.
@@ -7090,10 +6871,10 @@ mod tests {
         let parsed = mail_parser::MessageParser::default()
             .parse(&raw)
             .expect("parse draft");
-        let to: Vec<_> = parsed.to().expect("To").iter().collect();
+        let to: Vec<_> = parsed.to().expect("To").mailboxes().collect();
         assert_eq!(to.len(), 3, "no recipient split at a comma");
-        assert_eq!(to[0].name.as_deref(), Some("Blake, Mark"));
-        assert_eq!(parsed.cc().expect("Cc").iter().count(), 1);
+        assert_eq!(to[0].name(), Some("Blake, Mark"));
+        assert_eq!(parsed.cc().expect("Cc").mailboxes().count(), 1);
     }
 
     #[test]
@@ -7502,22 +7283,20 @@ mod tests {
 
     #[test]
     fn list_id_matches_is_exact_not_substring() {
-        assert!(list_id_matches("news.example.com", "news.example.com"));
-        assert!(list_id_matches(
-            "Cool List <cool.example.com>",
-            "cool list <cool.example.com>"
-        )); // case-insensitive, trimmed
-        assert!(list_id_matches("news.example.com", "  news.example.com  "));
-        // Substring must NOT match — this is the over-deletion guard.
-        assert!(!list_id_matches("news", "newsletter.example.com"));
-        assert!(!list_id_matches("list.example.com", "sub.list.example.com"));
+        assert!(list_id_matches("news.example.com", "<news.example.com>"));
         assert!(list_id_matches(
             "Old Name <news.example.com>",
-            "New Name <NEWS.EXAMPLE.COM>"
+            "\"Cool <Weekly> List\" <NEWS.EXAMPLE. COM>"
         ));
+        assert!(!list_id_matches("news.example.com", "news.example.com"));
         assert!(!list_id_matches(
-            "News <news.example.com>",
-            "News <other.example.com>"
+            "list.example.com",
+            "<sub.list.example.com>"
+        ));
+        assert!(!list_id_matches("news.example.com", "<other.example.com>"));
+        assert!(!list_id_matches(
+            "news.example.com",
+            "<other.example.com> <news.example.com>"
         ));
     }
 
@@ -7611,174 +7390,24 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_identity_requires_dkim_authenticated_list_id() {
-        let list_id = Some("Newsletter <news.example.com>");
-        let strict = CleanupIdentityMode::ListIdOnly;
-        let fallback = CleanupIdentityMode::ListIdOrSender;
+    fn cleanup_identity_requires_one_dkim_authenticated_list_id() {
+        let headers =
+            unsubscribe::parse_list_headers(b"List-Id: Newsletter <News.Example. COM>\r\n");
         assert_eq!(
-            select_unsubscribe_cleanup_identity(list_id, true, true, "sender@example.com", strict),
-            Ok(CleanupIdentity::ListId {
-                raw: "Newsletter <news.example.com>".to_string(),
-                normalized: "news.example.com".to_string(),
-            })
+            select_unsubscribe_cleanup_identity(&headers, true),
+            Ok("news.example.com".to_string())
         );
         assert_eq!(
-            select_unsubscribe_cleanup_identity(list_id, true, false, "sender@example.com", strict),
+            select_unsubscribe_cleanup_identity(&headers, false),
             Err(CleanupIdentityError::UnauthenticatedListId)
         );
+        let duplicates = unsubscribe::parse_list_headers(
+            b"List-Id: <news.example.com>\r\nList-Id: <other.example.com>\r\n",
+        );
         assert_eq!(
-            select_unsubscribe_cleanup_identity(list_id, false, true, "sender@example.com", strict),
+            select_unsubscribe_cleanup_identity(&duplicates, true),
             Err(CleanupIdentityError::NoUsableListId)
         );
-        assert_eq!(
-            select_unsubscribe_cleanup_identity(None, false, false, "", fallback),
-            Err(CleanupIdentityError::NoUsableListId)
-        );
-    }
-
-    #[test]
-    fn sender_fallback_is_scoped_to_the_unauthenticated_list_id() {
-        // The pertinence ladder: an unauthenticated List-Id must not select an
-        // account-wide List-Id delete on its own (spoofable), but conjoined
-        // with the verified sender it scopes the fallback to the one list the
-        // user actually unsubscribed from.
-        let fallback = CleanupIdentityMode::ListIdOrSender;
-        assert_eq!(
-            select_unsubscribe_cleanup_identity(
-                Some("Newsletter <news.example.com>"),
-                true,
-                false,
-                "sender@example.com",
-                fallback
-            ),
-            Ok(CleanupIdentity::Sender {
-                list_id: Some("news.example.com".to_string()),
-            })
-        );
-        // No usable List-Id → sender email + List-Unsubscribe-Post.
-        assert_eq!(
-            select_unsubscribe_cleanup_identity(None, false, false, "sender@example.com", fallback),
-            Ok(CleanupIdentity::Sender { list_id: None })
-        );
-        // Multiple List-Ids (has_single = false) → ambiguous, no constraint.
-        assert_eq!(
-            select_unsubscribe_cleanup_identity(
-                Some("Newsletter <news.example.com>"),
-                false,
-                false,
-                "sender@example.com",
-                fallback
-            ),
-            Ok(CleanupIdentity::Sender { list_id: None })
-        );
-    }
-
-    #[test]
-    fn row_list_id_constraint_is_exact_and_normalized() {
-        let matching = "List-Id: Newsletter <news.example.com>\r\nFrom: a@b.c\r\n";
-        let sibling = "List-Id: Other <other.example.com>\r\nFrom: a@b.c\r\n";
-        let missing = "From: a@b.c\r\n";
-        // No constraint → everything passes (plain sender fallback).
-        assert!(row_list_id_matches(matching, None));
-        assert!(row_list_id_matches(missing, None));
-        // Constrained → only the exact normalized List-Id passes; sibling
-        // lists and List-Id-free mail from the same sender are protected.
-        assert!(row_list_id_matches(matching, Some("news.example.com")));
-        assert!(!row_list_id_matches(sibling, Some("news.example.com")));
-        assert!(!row_list_id_matches(missing, Some("news.example.com")));
-    }
-
-    #[test]
-    fn subscription_sender_match_ignores_display_name() {
-        let headers = b"From: Changed Name <sender@example.com>\r\n\
-            List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
-            List-Id: News <news.example.com>\r\n\r\n";
-
-        assert!(subscription_sender_header_matches(
-            headers,
-            "sender@example.com",
-            Some("news.example.com")
-        ));
-    }
-
-    #[test]
-    fn subscription_sender_match_requires_list_unsubscribe_post() {
-        let headers = b"From: News <sender@example.com>\r\n\
-            List-Unsubscribe: <https://example.com/unsubscribe>\r\n\
-            List-Id: News <news.example.com>\r\n\r\n";
-
-        assert!(!subscription_sender_header_matches(
-            headers,
-            "sender@example.com",
-            Some("news.example.com")
-        ));
-    }
-
-    #[test]
-    fn subscription_sender_match_rejects_a_sibling_list_id() {
-        let headers = b"From: News <sender@example.com>\r\n\
-            List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
-            List-Id: Other <other.example.com>\r\n\r\n";
-
-        assert!(!subscription_sender_header_matches(
-            headers,
-            "sender@example.com",
-            Some("news.example.com")
-        ));
-    }
-
-    #[test]
-    fn subscription_sender_match_rejects_a_different_email() {
-        let headers = b"From: News <other@example.com>\r\n\
-            List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
-            List-Id: News <news.example.com>\r\n\r\n";
-
-        assert!(!subscription_sender_header_matches(
-            headers,
-            "sender@example.com",
-            Some("news.example.com")
-        ));
-    }
-
-    #[test]
-    fn ranked_subscription_match_accepts_either_list_action_header() {
-        let list_unsubscribe = b"From: News <sender@example.com>\r\n\
-            List-Unsubscribe: <https://example.com/unsubscribe>\r\n\
-            List-Id: News <news.example.com>\r\n\r\n";
-        let list_unsubscribe_post = b"From: News <sender@example.com>\r\n\
-            List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
-            List-Id: News <news.example.com>\r\n\r\n";
-
-        assert!(ranked_subscription_header_matches(
-            list_unsubscribe,
-            "sender@example.com",
-            Some("news.example.com")
-        ));
-        assert!(ranked_subscription_header_matches(
-            list_unsubscribe_post,
-            "sender@example.com",
-            Some("news.example.com")
-        ));
-    }
-
-    #[test]
-    fn ranked_subscription_match_rejects_ordinary_mail_and_sibling_lists() {
-        let ordinary = b"From: News <sender@example.com>\r\n\
-            List-Id: News <news.example.com>\r\n\r\n";
-        let sibling = b"From: News <sender@example.com>\r\n\
-            List-Unsubscribe: <https://example.com/unsubscribe>\r\n\
-            List-Id: Other <other.example.com>\r\n\r\n";
-
-        assert!(!ranked_subscription_header_matches(
-            ordinary,
-            "sender@example.com",
-            Some("news.example.com")
-        ));
-        assert!(!ranked_subscription_header_matches(
-            sibling,
-            "sender@example.com",
-            Some("news.example.com")
-        ));
     }
 
     /// Fast test for the early validation error in create_draft.
@@ -8045,7 +7674,11 @@ mod tests {
                 } else if line.contains("SELECT") {
                     selects += 1;
                     // Pass 2 re-selects and sees the emptied mailbox.
-                    let exists = if selects == 1 { 2 } else { 0 };
+                    let exists = if selects == 1 {
+                        first_search.split_whitespace().count()
+                    } else {
+                        0
+                    };
                     format!(
                         "* {exists} EXISTS\r\n* OK [UIDVALIDITY 9] UIDs valid\r\n* OK [UIDNEXT 100] next\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
                     )
@@ -8122,6 +7755,7 @@ mod tests {
                     allow_permanent_fallback: false,
                 },
                 &caps,
+                None,
                 None,
                 None,
             )
@@ -8201,6 +7835,7 @@ mod tests {
                 &caps,
                 None,
                 None,
+                None,
             )
             .await
             .expect("scripted domain sweep succeeds");
@@ -8240,6 +7875,7 @@ mod tests {
                     allow_permanent_fallback: false,
                 },
                 &caps,
+                None,
                 None,
                 None,
             )
@@ -8336,6 +7972,7 @@ mod tests {
                     allow_permanent_fallback: false,
                 },
                 &caps,
+                None,
                 None,
                 None,
             )
@@ -8563,6 +8200,7 @@ mod tests {
                 &caps,
                 None,
                 None,
+                None,
             )
             .await
             .expect("scripted move sweep succeeds");
@@ -8592,33 +8230,42 @@ mod tests {
         );
     }
 
-    /// End-to-end sender-fallback sweep with the pertinence constraint.
     #[tokio::test]
-    async fn delete_sweep_sender_fallback_is_scoped_to_the_constrained_list_id() {
-        let (mut session, server) = scripted_sweep_session(" 11 12 13", |tag| {
-            let matching = "From: Changed Name <sender@example.com>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\nList-Id: News <news.example.com>\r\n\r\n";
-            let sibling = "From: News <sender@example.com>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\nList-Id: Other <other.example.com>\r\n\r\n";
-            let no_post = "From: News <sender@example.com>\r\nList-Unsubscribe: <https://x.example/u>\r\nList-Id: News <news.example.com>\r\n\r\n";
-            format!(
-                "* 1 FETCH (UID 11 BODY[HEADER] {{{}}}\r\n{matching})\r\n* 2 FETCH (UID 12 BODY[HEADER] {{{}}}\r\n{sibling})\r\n* 3 FETCH (UID 13 BODY[HEADER] {{{}}}\r\n{no_post})\r\n{tag} OK FETCH completed\r\n",
-                matching.len(),
-                sibling.len(),
-                no_post.len()
-            )
+    async fn list_cleanup_deletes_older_mail_without_unsubscribe_headers() {
+        let (mut session, server) = scripted_sweep_session(" 11 12 13 14", |tag| {
+            let headers = [
+                (11, "List-Id: News <news.example.com>\r\n\r\n"),
+                (12, "List-Id: Sibling <other.example.com>\r\n\r\n"),
+                (13, "List-Id : Old Name <NEWS.EXAMPLE.\r\n COM>\r\n\r\n"),
+                (
+                    14,
+                    "List-Id: <news.example.com>\r\nList-Id: <other.example.com>\r\n\r\n",
+                ),
+            ];
+            let mut reply = String::new();
+            for (index, (uid, header)) in headers.into_iter().enumerate() {
+                use std::fmt::Write;
+                write!(
+                    reply,
+                    "* {} FETCH (UID {uid} BODY[HEADER.FIELDS (LIST-ID)] {{{}}}\r\n{header})\r\n",
+                    index + 1,
+                    header.len(),
+                )
+                .unwrap();
+            }
+            reply.push_str(&format!("{tag} OK FETCH completed\r\n"));
+            reply
         })
         .await;
 
-        let mk = Agentmail::new(Config::empty());
+        let mail = Agentmail::new(Config::empty());
         let caps = imap_client::ServerCaps::from_strings(["UIDPLUS".to_string()]);
-        let totals = mk
+        let totals = mail
             .matching_sweep_loop(
                 &mut session,
                 "test-account",
-                &DeleteSelector::SubscriptionSender {
-                    email: "sender@example.com".to_string(),
-                    list_id: Some("news.example.com".to_string()),
-                },
-                &["INBOX".to_string()],
+                &DeleteSelector::ListId("news.example.com".to_string()),
+                &["Archive".to_string()],
                 SweepAction::Delete {
                     trash: None,
                     allow_permanent_fallback: false,
@@ -8626,81 +8273,79 @@ mod tests {
                 &caps,
                 None,
                 None,
+                None,
             )
             .await
-            .expect("scripted sweep succeeds");
+            .expect("list cleanup succeeds");
 
-        assert_eq!(
-            totals.found, 1,
-            "only the constrained list's message qualifies"
-        );
-        assert_eq!(totals.affected, 1);
-        assert_eq!(totals.failed, 0);
+        assert_eq!(totals.found, 2);
+        assert_eq!(totals.affected, 2);
+        assert!(totals.skipped.is_empty());
+        assert_eq!(totals.mailboxes[0].mailbox, "Archive");
 
         drop(session);
         let commands = server.await.expect("scripted server finishes");
-        let joined = commands.concat();
+        let commands = commands.concat();
+        assert!(commands.contains("UID SEARCH ALL"), "{commands}");
         assert!(
-            joined.contains("UID STORE 11 +FLAGS.SILENT (\\Deleted)"),
-            "deletes only the constrained match: {commands:?}"
+            commands.contains("UID STORE 11,13 +FLAGS.SILENT (\\Deleted)"),
+            "{commands}"
         );
-        assert!(
-            !joined.contains("UID STORE 11,12") && !joined.contains("UID STORE 11,12,13"),
-            "the sibling-list and missing-POST messages must survive: {commands:?}"
-        );
+        assert!(commands.contains("UID EXPUNGE 11,13\r\n"), "{commands}");
     }
 
     #[tokio::test]
-    async fn move_subscription_sweep_matches_ranked_bulk_mail_scope() {
-        let (mut session, server) = scripted_sweep_session(" 11 12 13", |tag| {
-            let matching = "From: Changed Name <sender@example.com>\r\nList-Unsubscribe: <https://x.example/u>\r\nList-Id: News <news.example.com>\r\n\r\n";
-            let sibling = "From: News <sender@example.com>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\nList-Id: Other <other.example.com>\r\n\r\n";
-            let ordinary = "From: News <sender@example.com>\r\nList-Id: News <news.example.com>\r\n\r\n";
-            format!(
-                "* 1 FETCH (UID 11 BODY[HEADER] {{{}}}\r\n{matching})\r\n* 2 FETCH (UID 12 BODY[HEADER] {{{}}}\r\n{sibling})\r\n* 3 FETCH (UID 13 BODY[HEADER] {{{}}}\r\n{ordinary})\r\n{tag} OK FETCH completed\r\n",
-                matching.len(),
-                sibling.len(),
-                ordinary.len()
-            )
-        })
-        .await;
-
+    async fn list_cleanup_finds_a_match_below_the_visible_uid_window() {
+        let (mut session, server) = imap_client::test_support::scripted_session(|tag, command| {
+            let reply = if command.contains("FETCH 1:* (UID) (PARTIAL -1:-2)") {
+                "* 99 UIDFETCH (UID 99)\r\n* 98 UIDFETCH (UID 98)\r\n".to_string()
+            } else if command.contains("FETCH 1:97 (UID) (PARTIAL -1:-2)") {
+                "* 5 UIDFETCH (UID 5)\r\n".to_string()
+            } else {
+                let uids: &[u32] = if command.contains("FETCH 5,98") {
+                    &[5, 98]
+                } else if command.contains("FETCH 99") {
+                    &[99]
+                } else {
+                    panic!("unexpected command: {command}");
+                };
+                let mut reply = String::new();
+                for uid in uids {
+                    use std::fmt::Write;
+                    let header = if *uid == 5 {
+                        "List-Id: <news.example.com>\r\n\r\n"
+                    } else {
+                        "\r\n"
+                    };
+                    write!(
+                        reply,
+                        "* {uid} UIDFETCH (UID {uid} BODY[HEADER.FIELDS (LIST-ID)] {{{}}}\r\n{header})\r\n",
+                        header.len()
+                    ).unwrap();
+                }
+                reply
+            };
+            Some(format!("{reply}{tag} OK FETCH\r\n"))
+        }).await;
         let mail = Agentmail::new(Config::empty());
-        let caps = imap_client::ServerCaps::from_strings(["MOVE".to_string()]);
-        let totals = mail
-            .matching_sweep_loop(
+        let matches = mail
+            .discover_delete_uids(
+                &DeleteSelector::ListId("news.example.com".to_string()),
                 &mut session,
                 "test-account",
-                &DeleteSelector::RankedSubscription {
-                    email: "sender@example.com".to_string(),
-                    list_id: Some("news.example.com".to_string()),
+                "Archive",
+                &async_imap::types::Mailbox {
+                    exists: 2,
+                    ..Default::default()
                 },
-                &["INBOX".to_string()],
-                SweepAction::Move {
-                    destination: "Subscriptions",
-                },
-                &caps,
-                None,
+                Some(2),
                 None,
             )
             .await
-            .expect("scripted subscription move succeeds");
-
-        assert_eq!(totals.found, 1);
-        assert_eq!(totals.affected, 1);
-        assert_eq!(totals.failed, 0);
-
+            .expect("UID Mode list discovery succeeds");
+        assert_eq!(matches, [5]);
         drop(session);
-        let commands = server.await.expect("scripted server finishes");
-        let joined = commands.concat();
-        assert!(
-            joined.contains("UID MOVE 11"),
-            "moves only the exact ranked-subscription match: {commands:?}"
-        );
-        assert!(
-            !joined.contains("UID MOVE 11,12") && !joined.contains("UID MOVE 11,12,13"),
-            "sibling-list and ordinary mail must stay put: {commands:?}"
-        );
+        server.commands().await;
     }
 
     /// An Agentmail with one account ("work") and its journal in a fresh
@@ -8840,8 +8485,12 @@ mod tests {
                 let words: Vec<&str> = command.split_whitespace().collect();
                 match (words.get(1).copied(), words.get(2).copied()) {
                     (Some("SELECT"), Some(mailbox)) => {
-                        *selected.lock().expect("lock") = mailbox.trim_matches('"').to_string();
-                        Some(imap_client::test_support::examine_reply(tag, 9, 100, 3))
+                        let mailbox = mailbox.trim_matches('"');
+                        *selected.lock().expect("lock") = mailbox.to_string();
+                        let exists = if mailbox == "INBOX" { 0 } else { 3 };
+                        Some(imap_client::test_support::examine_reply(
+                            tag, 9, 100, exists,
+                        ))
                     }
                     // INBOX holds no match; the connection drops during
                     // Projects' search.
@@ -8871,6 +8520,7 @@ mod tests {
                     allow_permanent_fallback: false,
                 },
                 &caps,
+                None,
                 None,
                 None,
             )
@@ -9030,6 +8680,149 @@ mod tests {
         let mk = journaled_agentmail();
         mk.pool.hold_idle_for_test("work", session).await;
         (mk, server)
+    }
+
+    #[tokio::test]
+    async fn top_senders_excludes_a_sent_alias_from_all_mail_with_or_without_cache() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for cached in [false, true] {
+            let sent_selected = AtomicBool::new(false);
+            let (mut mail, server) = agentmail_on(move |tag, command| {
+                let is_sent = command.contains("[Gmail]/Sent Mail");
+                let exists = if is_sent { 1 } else { 3 };
+                match command.split_whitespace().nth(1)? {
+                    "CAPABILITY" => Some(format!(
+                        "* CAPABILITY IMAP4rev1 X-GM-EXT-1\r\n{tag} OK CAPABILITY\r\n"
+                    )),
+                    "LIST" => Some(format!(concat!(
+                        "* LIST (\\All) \"/\" \"[Gmail]/All Mail\"\r\n",
+                        "* LIST (\\Sent) \"/\" \"[Gmail]/Sent Mail\"\r\n",
+                        "{} OK LIST\r\n"
+                    ), tag)),
+                    "STATUS" => {
+                        let mailbox = if is_sent { "[Gmail]/Sent Mail" } else { "[Gmail]/All Mail" };
+                        Some(imap_client::test_support::status_reply(tag, mailbox, 9, 10, exists))
+                    }
+                    "EXAMINE" => {
+                        sent_selected.store(is_sent, Ordering::Relaxed);
+                        Some(imap_client::test_support::examine_reply(tag, 9, 10, exists))
+                    }
+                    "UID" if command.contains("SEARCH ALL") => {
+                        let ids = if sent_selected.load(Ordering::Relaxed) { " 1" } else { " 1 2 3" };
+                        Some(format!("* SEARCH{ids}\r\n{tag} OK SEARCH\r\n"))
+                    }
+                    "UID" if command.contains("FETCH") => {
+                        let headers: &[(u32, &str)] = if sent_selected.load(Ordering::Relaxed) {
+                            &[(1, "From: Old Name <Alias@Example.COM>\r\n\r\n")]
+                        } else {
+                            &[
+                                (1, "From: New Name <alias@example.com>\r\n\r\n"),
+                                (2, "From: Same Name <me@example.com>\r\n\r\n"),
+                                (3, "From: Same Name <contact@example.com>\r\n\r\n"),
+                            ]
+                        };
+                        let mut reply = String::new();
+                        for (uid, header) in headers {
+                            use std::fmt::Write;
+                            write!(reply,
+                                "* {uid} FETCH (UID {uid} BODY[HEADER.FIELDS (FROM)] {{{}}}\r\n{header})\r\n",
+                                header.len()
+                            ).unwrap();
+                        }
+                        Some(format!("{reply}{tag} OK FETCH\r\n"))
+                    }
+                    "NOOP" => Some(format!("{tag} OK NOOP\r\n")),
+                    _ => panic!("unexpected command: {command}"),
+                }
+            }).await;
+            if !cached {
+                mail.header_cache = header_cache::HeaderCache::disabled();
+            }
+
+            for _ in 0..2 {
+                let ranking = mail
+                    .top_senders(None, "work", 0, 10, None, None)
+                    .await
+                    .expect("rank senders");
+                assert_eq!(ranking.total_messages, 1);
+                assert_eq!(ranking.senders.len(), 1);
+                assert_eq!(ranking.senders[0].address, "contact@example.com");
+                assert_eq!(ranking.senders[0].sample.mailbox, "[Gmail]/All Mail");
+            }
+            drop(mail);
+            let commands = server.commands().await;
+            let fetch_count = commands
+                .iter()
+                .filter(|command| command.contains("UID FETCH"))
+                .count();
+            assert_eq!(fetch_count, if cached { 2 } else { 4 }, "{commands:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_list_cleanup_reaches_archived_mail_and_reports_trash() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let moved = AtomicBool::new(false);
+        let (mail, server) = agentmail_on(move |tag, command| {
+            match command.split_whitespace().nth(1)? {
+                "CAPABILITY" => Some(format!(
+                    "* CAPABILITY IMAP4rev1 UIDPLUS MOVE X-GM-EXT-1\r\n{tag} OK CAPABILITY\r\n"
+                )),
+                "LIST" => Some(format!(concat!(
+                    "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n",
+                    "* LIST (\\All) \"/\" \"[Gmail]/All Mail\"\r\n",
+                    "* LIST (\\Trash) \"/\" \"[Gmail]/Trash\"\r\n",
+                    "{} OK LIST\r\n"
+                ), tag)),
+                "SELECT" if command.contains("[Gmail]/All Mail") => {
+                    let exists = u32::from(!moved.load(Ordering::Relaxed));
+                    Some(imap_client::test_support::examine_reply(tag, 9, 100, exists))
+                }
+                "UID" if command.contains("SEARCH ALL") => {
+                    let matches = if moved.load(Ordering::Relaxed) { "" } else { " 42" };
+                    Some(format!("* SEARCH{matches}\r\n{tag} OK SEARCH\r\n"))
+                }
+                "UID" if command.contains("FETCH 42") => {
+                    let header = "List-Id: News <news.example.com>\r\n\r\n";
+                    Some(format!(
+                        "* 1 FETCH (UID 42 BODY[HEADER.FIELDS (LIST-ID)] {{{}}}\r\n{header})\r\n{tag} OK FETCH\r\n",
+                        header.len(),
+                    ))
+                }
+                "UID" if command.contains("MOVE 42") && command.contains("[Gmail]/Trash") => {
+                    moved.store(true, Ordering::Relaxed);
+                    Some(format!("* 1 EXPUNGE\r\n{tag} OK MOVE\r\n"))
+                }
+                "NOOP" => Some(format!("{tag} OK NOOP\r\n")),
+                _ => panic!("unexpected command: {command}"),
+            }
+        }).await;
+
+        let result = mail
+            .delete_list_id(
+                None,
+                "work",
+                "news.example.com",
+                DeleteMode::Permanent,
+                None,
+                None,
+            )
+            .await
+            .expect("Gmail list cleanup succeeds");
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.mailboxes[0].mailbox, "[Gmail]/All Mail");
+        assert!(!result.permanent);
+        assert!(result.skipped.is_empty());
+
+        drop(mail);
+        let commands = server.commands().await;
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("UID EXPUNGE"))
+        );
     }
 
     fn flag_count(response: &ListFlagsResponse, flag: &str) -> Option<u32> {

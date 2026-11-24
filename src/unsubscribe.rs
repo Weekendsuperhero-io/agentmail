@@ -60,6 +60,27 @@ impl ListHeaders {
         Ok(())
     }
 
+    pub(crate) fn for_ranking(mut self) -> Self {
+        if self.list_unsubscribe_count != 1 {
+            self.list_unsubscribe = None;
+        }
+        if self.list_unsubscribe_post_count != 1 {
+            self.list_unsubscribe_post = None;
+        }
+        if !self.has_single_list_id() {
+            self.list_id = None;
+        }
+        self
+    }
+
+    pub(crate) fn normalized_list_id(&self) -> Option<String> {
+        if !self.has_single_list_id() {
+            return None;
+        }
+        let (identifier, _) = crate::bracketed_list_id(self.list_id.as_deref()?)?;
+        Some(identifier)
+    }
+
     pub(crate) fn has_single_list_id(&self) -> bool {
         self.list_id_count == 1
     }
@@ -97,20 +118,15 @@ struct PinnedEndpoint {
 /// which parses the RFC 2369 headers and `List-Id` as ADDRESSES.
 pub(crate) fn parse_list_headers(raw_message: &[u8]) -> ListHeaders {
     let header_text = String::from_utf8_lossy(rfc5322_header_block(raw_message));
-    let mut fields: Vec<(String, String)> = Vec::new();
-    let mut current: Option<(String, String)> = None;
+    let mut result = ListHeaders::default();
+    let mut current: Option<&mut String> = None;
 
-    for raw_line in header_text.lines() {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+    for line in header_text.lines() {
         if line.is_empty() {
-            if let Some(field) = current.take() {
-                fields.push(field);
-            }
             break;
         }
-
         if line.starts_with([' ', '\t']) {
-            if let Some((_, value)) = current.as_mut() {
+            if let Some(value) = current.as_deref_mut() {
                 let continuation = line.trim();
                 if !continuation.is_empty() {
                     if !value.is_empty() {
@@ -122,39 +138,27 @@ pub(crate) fn parse_list_headers(raw_message: &[u8]) -> ListHeaders {
             continue;
         }
 
-        if let Some(field) = current.take() {
-            fields.push(field);
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            current = Some((
-                name.trim_end().to_ascii_lowercase(),
-                value.trim().to_string(),
-            ));
-        }
-    }
-    if let Some(field) = current {
-        fields.push(field);
-    }
-
-    let mut result = ListHeaders::default();
-    for (name, value) in fields {
-        match name.as_str() {
-            "list-unsubscribe" => {
-                result.list_unsubscribe_count += 1;
-                result.list_unsubscribe.get_or_insert(value);
-            }
-            "list-unsubscribe-post" => {
-                result.list_unsubscribe_post_count += 1;
-                result.list_unsubscribe_post.get_or_insert(value);
-            }
-            "list-id" => {
-                result.list_id_count += 1;
-                result.list_id.get_or_insert(value);
-            }
-            "list-help" => {
-                result.list_help.get_or_insert(value);
-            }
-            _ => {}
+        current = None;
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim_end();
+        let field = if name.eq_ignore_ascii_case("List-Unsubscribe") {
+            result.list_unsubscribe_count += 1;
+            &mut result.list_unsubscribe
+        } else if name.eq_ignore_ascii_case("List-Unsubscribe-Post") {
+            result.list_unsubscribe_post_count += 1;
+            &mut result.list_unsubscribe_post
+        } else if name.eq_ignore_ascii_case("List-Id") {
+            result.list_id_count += 1;
+            &mut result.list_id
+        } else if name.eq_ignore_ascii_case("List-Help") {
+            &mut result.list_help
+        } else {
+            continue;
+        };
+        if field.is_none() {
+            current = Some(field.insert(value.trim().to_string()));
         }
     }
     result
@@ -296,7 +300,7 @@ async fn verify_rfc8058_dkim(
             "The complete message could not be parsed for DKIM verification.".to_string(),
         ));
     };
-    if message.dkim_headers.is_empty() {
+    if message.dkim_signatures().is_empty() {
         return Ok(Err(
             "No verifiable DKIM signature was present; RFC 8058 one-click was not attempted."
                 .to_string(),
@@ -788,22 +792,21 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use mail_auth::common::crypto::Ed25519Key;
-    use mail_auth::common::headers::HeaderWriter;
-    use mail_auth::common::parse::TxtRecordParser;
-    use mail_auth::common::verify::DomainKey;
-    use mail_auth::dkim::DkimSigner;
-    use mail_auth::{Parameters, ResolverCache, Txt};
+    use mail_auth::crypto::Ed25519Key;
+    use mail_auth::dkim::{DkimSigner, DomainKey};
+    use mail_auth::dns::TxtRecordParser;
+    use mail_auth::headers::HeaderWriter;
+    use mail_auth::{DnsCache, NoCache, Parameters, ResolverCache, TxtRecord};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
 
     #[derive(Clone)]
-    struct StaticTxtCache(Txt);
+    struct StaticTxtCache(TxtRecord);
 
-    impl ResolverCache<Box<str>, Txt> for StaticTxtCache {
-        fn get<Q>(&self, _name: &Q) -> Option<Txt>
+    impl ResolverCache<Box<str>, TxtRecord> for StaticTxtCache {
+        fn get<Q>(&self, _name: &Q) -> Option<TxtRecord>
         where
             Box<str>: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
@@ -811,7 +814,7 @@ mod tests {
             Some(self.0.clone())
         }
 
-        fn remove<Q>(&self, _name: &Q) -> Option<Txt>
+        fn remove<Q>(&self, _name: &Q) -> Option<TxtRecord>
         where
             Box<str>: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
@@ -819,7 +822,32 @@ mod tests {
             None
         }
 
-        fn insert(&self, _key: Box<str>, _value: Txt, _valid_until: std::time::Instant) {}
+        fn insert(&self, _key: Box<str>, _value: TxtRecord, _valid_until: std::time::Instant) {}
+    }
+
+    /// Every TXT lookup answers the one record; nothing else is cached.
+    impl DnsCache for StaticTxtCache {
+        type Txt = Self;
+        type Mx = NoCache;
+        type Ipv4 = NoCache;
+        type Ipv6 = NoCache;
+        type Ptr = NoCache;
+
+        fn txt(&self) -> Option<&Self::Txt> {
+            Some(self)
+        }
+        fn mx(&self) -> Option<&Self::Mx> {
+            None
+        }
+        fn ipv4(&self) -> Option<&Self::Ipv4> {
+            None
+        }
+        fn ipv6(&self) -> Option<&Self::Ipv6> {
+            None
+        }
+        fn ptr(&self) -> Option<&Self::Ptr> {
+            None
+        }
     }
 
     #[test]
@@ -1001,7 +1029,7 @@ mod tests {
             .unwrap();
         let signed = format!("{}{raw}", signature.to_header());
         let message = AuthenticatedMessage::parse(signed.as_bytes()).unwrap();
-        let cache = StaticTxtCache(Txt::DomainKey(Arc::new(
+        let cache = StaticTxtCache(TxtRecord::DomainKey(Arc::new(
             DomainKey::parse(PUBLIC_RECORD).unwrap(),
         )));
         let authenticator = MessageAuthenticator::new(
@@ -1010,7 +1038,7 @@ mod tests {
         )
         .unwrap();
         let outputs = authenticator
-            .verify_dkim(Parameters::new(&message).with_txt_cache(&cache))
+            .verify_dkim(Parameters::new(&message).with_cache(&cache))
             .await;
 
         assert!(

@@ -31,7 +31,7 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn print_stats(mail: &agentmail::Agentmail, label: &str) {
+fn print_stats(mail: &heromail::Agentmail, label: &str) {
     let s = mail.connection_stats();
     eprintln!(
         "   → fresh_logins={} idle_reuses={}   ({label})",
@@ -42,9 +42,9 @@ fn print_stats(mail: &agentmail::Agentmail, label: &str) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account = env("UID_ACCOUNT").expect("set UID_ACCOUNT to the account name to test");
-    let config = agentmail::Config::load()?;
+    let config = heromail::Config::load()?;
     // Persistent cache (the default) => born-UID on for UIDONLY-capable accounts.
-    let mail = agentmail::Agentmail::builder(config)
+    let mail = heromail::Agentmail::builder(config)
         .keepalive(Duration::from_secs(30))
         .max_idle(Duration::from_secs(20 * 60))
         .build();

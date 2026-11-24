@@ -40,7 +40,10 @@ const CACHE_SCHEMA_VERSION: i64 = 7;
 // from that sliver. The fixed walk shrinks the UID range instead and covers the
 // whole mailbox; bumping here forces the poisoned single-window memberships to
 // cold-rebuild rather than being served forever as a completeness-passing hit.
-const HEADER_PROJECTION_VERSION: i64 = 5;
+// Projection v6 reparses sender addresses with mail-parser 1.0 and recovers
+// List-* headers whose names had whitespace before the colon.
+// Projection v7 rejects duplicate action headers and normalizes List-Id whitespace.
+const HEADER_PROJECTION_VERSION: i64 = 7;
 const FETCH_CHUNK_SIZE: usize = 1_000;
 const MAX_STABLE_SEARCH_ATTEMPTS: usize = 3;
 const MAILING_LIST_SENDER_PREVIEW_LIMIT: usize = 5;
@@ -131,11 +134,12 @@ pub(crate) struct CachedDomainRank {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CachedSubscriptionRank {
+    pub(crate) list_id: String,
     pub(crate) address: String,
+    pub(crate) display_name: String,
     pub(crate) count: u64,
     pub(crate) oldest_date: Option<DateTime<Utc>>,
     pub(crate) newest_date: Option<DateTime<Utc>>,
-    pub(crate) advertised_one_click: bool,
     pub(crate) sample: CachedRankSample,
 }
 
@@ -314,24 +318,6 @@ impl HeaderCache {
         }
     }
 
-    /// Whether scans flagged this account's server as filtering List-*
-    /// headers (see `mark_account_quirky`). Deletion flows use this to
-    /// decide when a zero-result `SEARCH HEADER List-Id` cannot be trusted:
-    /// the same backends that filter the headers cannot match them in SEARCH.
-    ///
-    /// Process-local and effectively one-shot: detection happens during the
-    /// healing sync, after which cache hits never re-run it — so a restart
-    /// unarms it. Deletion flows therefore combine it with the persisted
-    /// evidence in [`Self::cached_list_id_count`].
-    pub(crate) fn account_flagged_quirky(
-        &self,
-        account_name: &str,
-        config: &AccountConfig,
-    ) -> bool {
-        let key = CacheKey::new(account_name, config, "");
-        self.account_is_quirky(&key.account)
-    }
-
     /// Whether a mailbox's stored projection shows the HEADER.FIELDS-filter
     /// poisoning: many rows carry a `List-Id` (bulk mail is clearly present)
     /// yet not one row has an unsubscribe flag. This happens when a scan built
@@ -404,59 +390,6 @@ impl HeaderCache {
                 uid,
                 "failed to prune a stale cache row; the next resync heals it"
             );
-        }
-    }
-
-    /// The projected UIDs in one mailbox epoch that carry this normalized
-    /// List-Id. Restart-proof ground truth for deletion flows: when the
-    /// server's `SEARCH HEADER List-Id` returns nothing while the projection
-    /// knows matches exist, the search is blind — and these UIDs are a far
-    /// cheaper candidate set than enumerating a 100k-message window. Stale
-    /// entries are harmless (the caller's confirm fetch drops them). Returns
-    /// empty when the cache is disabled or unreadable.
-    pub(crate) async fn cached_list_id_uids(
-        &self,
-        account_name: &str,
-        config: &AccountConfig,
-        mailbox: &str,
-        normalized_list_id: &str,
-        uid_validity: u32,
-    ) -> Vec<u32> {
-        let Some(path) = self.path.as_ref() else {
-            return Vec::new();
-        };
-        let key = CacheKey::new(account_name, config, mailbox);
-        let normalized = normalized_list_id.to_string();
-        let path = Arc::clone(path);
-        let uids = tokio::task::spawn_blocking(move || -> CacheResult<Vec<u32>> {
-            let connection = open_connection(&path)?;
-            let mut statement = connection.prepare(
-                "SELECT uid FROM header_rows
-                  WHERE account_key = ?1 AND mailbox = ?2
-                    AND projection_version = ?3 AND uid_validity = ?4
-                    AND list_id = ?5
-                  ORDER BY uid",
-            )?;
-            let rows = statement.query_map(
-                params![
-                    key.account,
-                    key.mailbox,
-                    HEADER_PROJECTION_VERSION,
-                    i64::from(uid_validity),
-                    normalized
-                ],
-                |row| row.get::<_, i64>(0),
-            )?;
-            let mut uids = Vec::new();
-            for row in rows {
-                uids.push(sql_u32(row?)?);
-            }
-            Ok(uids)
-        })
-        .await;
-        match uids {
-            Ok(Ok(uids)) => uids,
-            _ => Vec::new(),
         }
     }
 
@@ -534,6 +467,40 @@ impl HeaderCache {
         let gate = Arc::new(Mutex::new(()));
         gates.insert(gate_key, Arc::downgrade(&gate));
         gate
+    }
+
+    /// Read distinct From addresses from the current Sent mailbox membership.
+    pub(crate) async fn sent_sender_addresses(
+        &self,
+        session: &mut ImapSession,
+        account_name: &str,
+        config: &AccountConfig,
+        mailbox: &str,
+        uid_mode: Option<u32>,
+        cancel: Option<&CancelFn>,
+    ) -> crate::Result<Option<Vec<String>>> {
+        let mailboxes = [mailbox.to_string()];
+        let Some(scope) = self
+            .validated_rank_scope(
+                session,
+                account_name,
+                config,
+                &mailboxes,
+                uid_mode,
+                None,
+                cancel,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        match query_sent_sender_addresses(scope).await {
+            Ok(addresses) => Ok(Some(addresses)),
+            Err(error) => {
+                warn!(target: "agentmail", %error, "Sent sender cache query unavailable");
+                Ok(None)
+            }
+        }
     }
 
     /// Synchronize the selected mailboxes, then aggregate a bounded sender
@@ -627,7 +594,6 @@ impl HeaderCache {
         config: &AccountConfig,
         mailboxes: &[String],
         uid_mode: Option<u32>,
-        own_addresses: &[String],
         offset: usize,
         limit: usize,
         on_progress: Option<&ProgressFn>,
@@ -647,8 +613,7 @@ impl HeaderCache {
         else {
             return Ok(None);
         };
-        let own_addresses = own_addresses.to_vec();
-        match query_subscription_page(scope, own_addresses, offset, limit).await {
+        match query_subscription_page(scope, offset, limit).await {
             Ok(page) => Ok(Some(page)),
             Err(error) => {
                 warn!(target: "agentmail", error = %error, "subscription cache query unavailable");
@@ -1361,21 +1326,7 @@ fn normalize_mailbox(mailbox: &str) -> String {
 /// Return the RFC 2919 identifier and a display label without retaining the
 /// complete header field. Invalid or ambiguous List-Id values are not cached.
 fn normalized_list_id_fields(value: &str) -> Option<(String, String)> {
-    let value = value.trim();
-    let start = value.find('<')?;
-    let end = value[start + 1..].find('>')? + start + 1;
-    if !value[end + 1..].trim().is_empty()
-        || value[..start].contains(['<', '>'])
-        || value[start + 1..end].contains(['<', '>', ' ', '\t', '\r', '\n'])
-    {
-        return None;
-    }
-    let identifier = value[start + 1..end].trim();
-    if identifier.is_empty() {
-        return None;
-    }
-    let identifier = identifier.to_ascii_lowercase();
-    let display = value[..start].trim();
+    let (identifier, display) = crate::bracketed_list_id(value)?;
     let display = if display.is_empty() {
         identifier.clone()
     } else {
@@ -1678,6 +1629,37 @@ fn prepare_rank_connection(scope: &RankScope, own_addresses: &[String]) -> Cache
     Ok(connection)
 }
 
+async fn query_sent_sender_addresses(scope: RankScope) -> CacheResult<Vec<String>> {
+    tokio::task::spawn_blocking(move || {
+        let connection = open_connection(&scope.path)?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT h.sender_email
+               FROM mailbox_state AS state
+               JOIN membership AS member USING (account_key, mailbox)
+               JOIN header_rows AS h
+                 ON h.account_key = member.account_key
+                AND h.mailbox = member.mailbox
+                AND h.uid = member.uid
+                AND h.uid_validity = state.uid_validity
+                AND h.projection_version = state.projection_version
+              WHERE state.account_key = ?1 AND state.mailbox = ?2
+                AND state.projection_version = ?3 AND h.sender_email != ''",
+        )?;
+        let addresses = statement
+            .query_map(
+                params![
+                    scope.account,
+                    scope.mailboxes.first(),
+                    HEADER_PROJECTION_VERSION
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(addresses)
+    })
+    .await?
+}
+
 async fn query_sender_page(
     scope: RankScope,
     own_addresses: Vec<String>,
@@ -1838,74 +1820,64 @@ async fn query_domain_page(
 
 async fn query_subscription_page(
     scope: RankScope,
-    own_addresses: Vec<String>,
     offset: usize,
     limit: usize,
 ) -> CacheResult<CachedRankPage<CachedSubscriptionRank>> {
     tokio::task::spawn_blocking(move || {
-        let connection = prepare_rank_connection(&scope, &own_addresses)?;
+        let connection = prepare_rank_connection(&scope, &[])?;
         connection.execute_batch(
             "CREATE TEMP VIEW subscription_rank_groups AS
-             WITH eligible AS (
-                 SELECT * FROM rank_rows AS row
-                  WHERE row.has_list_headers = 1
-                    AND row.sender_email != ''
-                    AND NOT EXISTS (
-                        SELECT 1 FROM own_addresses AS own
-                         WHERE own.address = row.sender_email
-                    )
-             ),
-             grouped AS (
-                 SELECT sender_email, COUNT(*) AS message_count,
+             WITH grouped AS (
+                 SELECT list_id, COUNT(*) AS message_count,
                         MIN(date_unix_ms) AS oldest_date_unix_ms,
                         MAX(date_unix_ms) AS newest_date_unix_ms
-                   FROM eligible
-                  GROUP BY sender_email
+                   FROM rank_rows
+                  WHERE list_id IS NOT NULL
+                  GROUP BY list_id
              ),
              samples AS (
-                 SELECT sender_email, mailbox, uid_validity, uid,
-                        date_unix_ms, advertised_one_click,
+                 SELECT list_id, sender_email, sender_name, mailbox, uid_validity, uid,
+                        date_unix_ms,
                         ROW_NUMBER() OVER (
-                            PARTITION BY sender_email
+                            PARTITION BY list_id
                             ORDER BY (date_unix_ms IS NOT NULL) DESC,
                                      date_unix_ms DESC, mailbox DESC, uid DESC
                         ) AS sample_rank
-                   FROM eligible
+                   FROM rank_rows
+                  WHERE list_id IS NOT NULL AND advertised_one_click = 1
              )
-             SELECT grouped.sender_email, grouped.message_count,
-                    grouped.oldest_date_unix_ms,
+             SELECT grouped.list_id, samples.sender_email, samples.sender_name,
+                    grouped.message_count, grouped.oldest_date_unix_ms,
                     grouped.newest_date_unix_ms, samples.mailbox,
-                    samples.uid_validity, samples.uid, samples.date_unix_ms,
-                    samples.advertised_one_click
+                    samples.uid_validity, samples.uid, samples.date_unix_ms
                FROM grouped
-               JOIN samples
-                 ON samples.sender_email = grouped.sender_email
-                AND samples.sample_rank = 1;",
+               JOIN samples USING (list_id)
+              WHERE samples.sample_rank = 1;",
         )?;
         let (total_groups, total_messages) = rank_totals(&connection, "subscription_rank_groups")?;
         let mut statement = connection.prepare(
-            "SELECT sender_email, message_count,
+            "SELECT list_id, sender_email, sender_name, message_count,
                     oldest_date_unix_ms, newest_date_unix_ms, mailbox,
-                    uid_validity, uid, date_unix_ms, advertised_one_click
+                    uid_validity, uid, date_unix_ms
                FROM subscription_rank_groups
-              ORDER BY advertised_one_click DESC, message_count DESC,
-                       sender_email
+              ORDER BY message_count DESC, list_id
               LIMIT ?1 OFFSET ?2",
         )?;
         let rows =
             statement.query_map(params![sql_rank_limit(limit)?, sql_offset(offset)], |row| {
                 Ok(CachedSubscriptionRank {
-                    address: row.get(0)?,
-                    count: sql_u64(row.get::<_, i64>(1)?)?,
-                    oldest_date: sql_date(row.get(2)?),
-                    newest_date: sql_date(row.get(3)?),
+                    list_id: row.get(0)?,
+                    address: row.get(1)?,
+                    display_name: row.get(2)?,
+                    count: sql_u64(row.get::<_, i64>(3)?)?,
+                    oldest_date: sql_date(row.get(4)?),
+                    newest_date: sql_date(row.get(5)?),
                     sample: CachedRankSample {
-                        mailbox: row.get(4)?,
-                        uid_validity: sql_u32(row.get::<_, i64>(5)?)?,
-                        uid: sql_u32(row.get::<_, i64>(6)?)?,
-                        date: sql_date(row.get(7)?),
+                        mailbox: row.get(6)?,
+                        uid_validity: sql_u32(row.get::<_, i64>(7)?)?,
+                        uid: sql_u32(row.get::<_, i64>(8)?)?,
+                        date: sql_date(row.get(9)?),
                     },
-                    advertised_one_click: row.get::<_, i64>(8)? != 0,
                 })
             })?;
         let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3271,61 +3243,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_list_id_count_reports_projected_matches_per_mailbox() {
-        let cache = HeaderCache::at_path(test_path("list-id-count"));
-        let config = AccountConfig {
-            host: "imap.example.com".to_string(),
-            port: 993,
-            username: "user@example.com".to_string(),
-            email: None,
-            aliases: Vec::new(),
-            display_name: None,
-            password: None,
-            tls: true,
-            max_connections: None,
-            auth: crate::config::AuthMethod::Password,
-        };
-        let key = CacheKey::new("acct", &config, "INBOX");
-        let path = Arc::clone(cache.path.as_ref().expect("test cache path"));
-        let mut listed = test_row(1);
-        listed.list_id = Some("<mylist.example.com>".to_string());
-        let mut other = test_row(2);
-        other.list_id = Some("<other.example.com>".to_string());
-        store_headers(path, key, 10, vec![listed, other, test_row(3)])
-            .await
-            .expect("store headers");
-
-        assert_eq!(
-            cache
-                .cached_list_id_uids("acct", &config, "INBOX", "mylist.example.com", 10)
-                .await,
-            vec![1],
-            "the projection knows which INBOX message carries the list"
-        );
-        assert!(
-            cache
-                .cached_list_id_uids("acct", &config, "Archive", "mylist.example.com", 10)
-                .await
-                .is_empty(),
-            "candidates are per mailbox"
-        );
-        assert!(
-            cache
-                .cached_list_id_uids("acct", &config, "INBOX", "mylist.example.com", 11)
-                .await
-                .is_empty(),
-            "a different UIDVALIDITY epoch yields no candidates"
-        );
-        assert!(
-            cache
-                .cached_list_id_uids("acct", &config, "INBOX", "unknown.example.com", 10)
-                .await
-                .is_empty(),
-            "unknown lists yield no candidates"
-        );
-    }
-
-    #[tokio::test]
     async fn cached_domain_uids_are_canonical_exact_and_published_only() {
         let cache = HeaderCache::at_path(test_path("domain-uids"));
         let config = AccountConfig {
@@ -3977,7 +3894,7 @@ mod tests {
                     "News",
                     Some(1_000),
                     Some("<news-old@example.com>"),
-                    Some("Old Name <NEWS.Example.COM>"),
+                    Some("Old Name <NEWS.Example. COM>"),
                     true,
                     false,
                 ),
@@ -3999,6 +3916,26 @@ mod tests {
                     None,
                     Some("Current Name <news.example.com>"),
                     false,
+                    false,
+                ),
+                rank_row(
+                    4,
+                    "news@example.com",
+                    "Sibling List",
+                    Some(5_000),
+                    None,
+                    Some("<sibling.example.com>"),
+                    true,
+                    true,
+                ),
+                rank_row(
+                    5,
+                    "news@example.com",
+                    "List Without One Click",
+                    Some(6_000),
+                    None,
+                    Some("<no-one-click.example.com>"),
+                    true,
                     false,
                 ),
             ],
@@ -4033,23 +3970,29 @@ mod tests {
         .await;
         let scope = test_scope(&cache, &["INBOX", "Archive"]);
 
-        let subscriptions = query_subscription_page(scope.clone(), Vec::new(), 0, 10)
+        let subscriptions = query_subscription_page(scope.clone(), 0, 10)
             .await
             .expect("query subscriptions");
-        assert_eq!(subscriptions.total_messages, 2);
-        assert_eq!(subscriptions.total_groups, 1);
+        assert_eq!(subscriptions.total_messages, 5);
+        assert_eq!(subscriptions.total_groups, 2);
         let subscription = &subscriptions.items[0];
         assert_eq!(subscription.address, "news@example.com");
-        assert_eq!(subscription.count, 2);
-        assert!(subscription.advertised_one_click);
+        assert_eq!(subscription.count, 4);
+        assert_eq!(subscription.list_id, "news.example.com");
+        assert_eq!(subscription.display_name, "Latest News");
         assert_eq!(subscription.sample.mailbox, "INBOX");
         assert_eq!(subscription.sample.uid, 2);
+
+        let sibling = &subscriptions.items[1];
+        assert_eq!(sibling.list_id, "sibling.example.com");
+        assert_eq!(sibling.address, subscription.address);
+        assert_eq!(sibling.sample.uid, 4);
 
         let lists = query_mailing_list_page(scope, 0, 10)
             .await
             .expect("query mailing lists");
-        assert_eq!(lists.total_messages, 4);
-        assert_eq!(lists.total_groups, 1);
+        assert_eq!(lists.total_messages, 6);
+        assert_eq!(lists.total_groups, 3);
         let list = &lists.items[0];
         assert_eq!(list.list_id, "news.example.com");
         assert_eq!(list.display_name, "Newest Name");

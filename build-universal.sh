@@ -25,9 +25,9 @@ cargo build $RELEASE_FLAG --target aarch64-apple-darwin
 echo "==> Building x86_64..."
 cargo build $RELEASE_FLAG --target x86_64-apple-darwin
 
-ARM="target/aarch64-apple-darwin/$PROFILE_DIR/agentmail"
-X86="target/x86_64-apple-darwin/$PROFILE_DIR/agentmail"
-UNIVERSAL="target/agentmail-universal"
+ARM="target/aarch64-apple-darwin/$PROFILE_DIR/heromail"
+X86="target/x86_64-apple-darwin/$PROFILE_DIR/heromail"
+UNIVERSAL="target/heromail-universal"
 
 echo "==> Creating universal binary..."
 lipo -create -output "$UNIVERSAL" "$ARM" "$X86"

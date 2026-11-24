@@ -23,7 +23,7 @@ ok()   { printf '  \033[32mOK\033[0m   %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 info() { printf '       %s\n' "$1"; }
 
-echo "== agentmail deploy doctor =="
+echo "== HeroMail deploy doctor =="
 
 # 1. Source repo state.
 SRC_SHA=$(git -C "$SRC_DIR" rev-parse --short=9 HEAD 2>/dev/null || echo "?")
@@ -61,7 +61,7 @@ fi
 
 # 4. Workspace artifacts vs the clone's newest commit.
 CLONE_TIME=$(git -C "$CLONE_DIR" log -1 --format=%ct 2>/dev/null || echo 0)
-NEWEST_ARTIFACT=$(find "$APP_DIR/target" -maxdepth 3 -name 'libagentmail*.rlib' -o -maxdepth 3 -name 'agentmail*.d' 2>/dev/null | head -50 | xargs stat -f '%m %N' 2>/dev/null | sort -rn | head -1)
+NEWEST_ARTIFACT=$(find "$APP_DIR/target" -maxdepth 3 \( -name 'libheromail*.rlib' -o -name 'libagentmail*.rlib' -o -name 'heromail*.d' -o -name 'agentmail*.d' \) 2>/dev/null | head -50 | xargs stat -f '%m %N' 2>/dev/null | sort -rn | head -1)
 ART_TIME=${NEWEST_ARTIFACT%% *}
 if [ -n "$NEWEST_ARTIFACT" ] && [ "${ART_TIME:-0}" -ge "$CLONE_TIME" ]; then
   ok "workspace artifacts newer than the clone's last commit"
@@ -95,7 +95,7 @@ info "  lines) is pinned at SESSION CREATION time — a resumed session replays"
 info "  its old tool surface AND its old conversation (stale UIDs included)."
 info "  After any backend upgrade: start a FRESH agent session."
 info "initialize/serverInfo.version ends with '(<sha>)' — must equal the clone SHA above; absent = pre-fingerprint build"
-info "log line 'agentmail MCP server starting' carries version+build on every backend spawn"
+info "log line 'HeroMail MCP server starting' carries version+build on every backend spawn"
 info "bridge registers 23 Agentmail tools (move_list_id + move_by_sender present); 21 = stale build"
 info "'Message not found' errors include '(… re-run the ranking …)'; bare text = stale build"
 info "cooldown fast-fails mention 'strike N'; strike-less text = stale build"

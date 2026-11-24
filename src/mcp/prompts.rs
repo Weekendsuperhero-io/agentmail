@@ -115,24 +115,16 @@ impl AgentMailServer {
             Role::User,
             format!(
                 "Help me clean up mailing list clutter in account \"{}\". \
-                 Step 1: Use top_subscriptions with mailbox and limit omitted to get the default account-wide page of 10 \
-                 of bulk-mail sender addresses. Results are grouped by normalized sender email and sorted by advertised one-click \
-                 syntax first, then count; execution still requires live DKIM verification. \
-                 Step 2: Present each row's address, count, advertisedOneClick, and nested \
-                 sample {{mailbox, uidValidity, uid}} with its resource_link. Offer either filing with move_subscription \
-                 or an unsubscribe POST; ask me to approve each action and destination. For filing, map the sample \
-                 to mailbox, expectedUidValidity, and uid; move_subscription derives the live exact sender and \
-                 optional List-Id scope and moves matching bulk mail account-wide. \
-                 Step 3: For each filing I approve, call move_subscription with sample.uid as uid, \
-                 sample.uidValidity as expectedUidValidity, sample.mailbox as mailbox, and my approved destination. \
-                 For each unsubscribe POST I approve, call unsubscribe_message with the same sample mapping and \
-                 confirmOneClick=true. Filing approval is not unsubscribe consent, and unsubscribe approval is not \
-                 filing approval. Omit cleanup \
-                 unless I separately approve deleting matching mail. If I approve cleanup, use \
-                 cleanup {{when: \"afterSuccess\", identity: \"listIdOrSender\", deletion: \"trash\"}}. This prefers a \
-                 DKIM-authenticated List-Id; its sender fallback requires exact sender email + List-Unsubscribe-Post + \
-                 the sample's List-Id when it has one. Never use when=\"always\", deletion=\"trashThenPermanent\", or \
-                 deletion=\"permanent\" unless I separately and explicitly authorize that higher-risk policy.",
+                 Use top_subscriptions for an account-wide ranking by exact List-Id. Present the listId, count, \
+                 sample sender, and sample message link. The count includes older messages with broken or missing \
+                 action headers. Ask me once which list and which actions I want. For filing, call move_subscription \
+                 with the sample mailbox, uid, expectedUidValidity, and approved destination. For one-click \
+                 unsubscribe, call unsubscribe_message with the sample identity and confirmOneClick=true. When I \
+                 approve deleting existing messages too, pass cleanup {{when: \"afterSuccess\", deletion: \"trash\"}}. \
+                 Honor my choice of permanent deletion, and use when=always if I want the backlog deleted even \
+                 when the unsubscribe fails. Cleanup uses the DKIM-authenticated List-Id. If one-click or authenticated \
+                 cleanup is unavailable, offer delete_list_id for the selected listId independently. For a list without \
+                 a one-click sample, use top_mailing_lists.",
                 params.0.account
             ),
         )]

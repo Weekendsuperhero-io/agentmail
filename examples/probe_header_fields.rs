@@ -18,9 +18,9 @@
 //! of a recent bulk message (e.g. a LinkedIn or retailer mail) — one that
 //! certainly carries List-Unsubscribe. Find one via `get_messages`.
 
-use agentmail::config::AccountConfig;
-use agentmail::imap_client::{self, extract_header_value_pub, timed_uid_fetch_collect_pub};
-use agentmail::secret::Secret;
+use heromail::config::AccountConfig;
+use heromail::imap_client::{self, extract_header_value_pub, timed_uid_fetch_collect_pub};
+use heromail::secret::Secret;
 
 const VARIANTS: &[(&str, &str)] = &[
     (
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         password: Some(Secret::new_raw(&pass)),
         tls: true,
         max_connections: None,
-        auth: agentmail::AuthMethod::Password,
+        auth: heromail::AuthMethod::Password,
     };
 
     let mut session = imap_client::connect(&account, &pass).await?;

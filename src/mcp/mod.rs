@@ -26,6 +26,7 @@ use rmcp::{
     tool_handler,
 };
 use std::sync::Arc;
+use tracing::instrument::WithSubscriber as _;
 
 /// The newest MCP revision this server speaks. A 2025-era client still opens
 /// with `initialize`, answered in [`ProtocolVersion::LATEST_WITH_INITIALIZE`]
@@ -61,33 +62,6 @@ pub const LEGACY_ADDITIONAL_ROOTS_META_KEY: &str = "io.agentmuse/additionalWorks
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-fn mask_prefix_for_log(value: &str) -> String {
-    let char_count = value.chars().count();
-    if char_count <= 1 {
-        return "***".to_string();
-    }
-
-    let visible_len = 3_usize.min(char_count - 1);
-    let visible: String = value.chars().take(visible_len).collect();
-    format!("{visible}***")
-}
-
-fn account_log_hint(account: &str) -> String {
-    let account = account.trim();
-    if account.is_empty() {
-        return "<empty>".to_string();
-    }
-
-    if let Some((local, domain)) = account.rsplit_once('@')
-        && !local.is_empty()
-        && !domain.is_empty()
-    {
-        return format!("{}@{}", mask_prefix_for_log(local), domain);
-    }
-
-    mask_prefix_for_log(account)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProgressUpdate {
@@ -228,6 +202,7 @@ fn to_mcp_error(e: &crate::AgentmailError) -> McpError {
         | E::InvalidSearch(_)
         | E::Config(_)
         | E::Credential(_) => McpError::invalid_params(e.to_string(), None),
+        E::MessageTooLarge { .. } => McpError::invalid_request(e.to_string(), None),
         E::Imap(_)
         | E::Tls(_)
         | E::Io(_)
@@ -345,7 +320,7 @@ impl AgentMailServer {
             .filter(|root| !root.is_empty())
             .ok_or_else(|| {
                 McpError::invalid_params(
-                    "this embedded AgentMail file operation requires an active session workspace",
+                    "this embedded HeroMail file operation requires an active session workspace",
                     None,
                 )
             })?;
@@ -572,17 +547,20 @@ impl ServerHandler for AgentMailServer {
             // identify the exact running build — deploy skew (an app compiled
             // from a stale agentmail checkout) becomes visible instead of being
             // inferred from behavioral fingerprints.
-            .with_server_info(Implementation::new(
-                "agentmail",
-                concat!(
-                    env!("CARGO_PKG_VERSION"),
-                    " (",
-                    env!("AGENTMAIL_BUILD_SHA"),
-                    ")"
-                ),
-            ))
+            .with_server_info(
+                Implementation::new(
+                    "heromail",
+                    concat!(
+                        env!("CARGO_PKG_VERSION"),
+                        " (",
+                        env!("AGENTMAIL_BUILD_SHA"),
+                        ")"
+                    ),
+                )
+                .with_title("HeroMail"),
+            )
             .with_instructions(
-                "# AgentMail\n\
+                "# HeroMail\n\
              \n\
              Read, organize, draft and archive IMAP mail. **This server never sends.**\n\
              Drafts are saved to the server; nothing is transmitted to a recipient.\n\
@@ -694,13 +672,14 @@ impl ServerHandler for AgentMailServer {
              \n\
              Grouping is exact and never widens:\n\
              \n\
-             - `top_senders` groups by (email, display name). One address under two display\n\
-               names is two rows.\n\
+             - `top_senders` groups by (email, display name). It excludes addresses from the\n\
+               account configuration and the From addresses visible in Sent.\n\
              - `top_domains` keeps parents and subdomains apart. Acting on `example.com`\n\
                never touches `mail.example.com`; `registrableDomain` and `subdomain` are\n\
                context, not scope.\n\
-             - `top_mailing_lists` groups by List-Id (RFC 2919) across senders. Use\n\
-               `delete_list_id` to remove a whole list.\n\
+             - `top_mailing_lists` and `top_subscriptions` group by exact List-Id across senders.\n\
+               `top_subscriptions` includes lists with an advertised one-click sample.\n\
+               Use `delete_list_id` with the selected listId to remove the backlog.\n\
              \n\
              **Never use `delete_by_sender` to clean up a mailing list.** It deletes every\n\
              message from that sender, including their non-bulk mail.\n\
@@ -711,23 +690,23 @@ impl ServerHandler for AgentMailServer {
              `unsubscribe_message` re-fetches the exact headers and verifies DKIM itself.\n\
              \n\
              It requires `confirmOneClick: true`. Matching-message cleanup is the optional\n\
-             nested `cleanup {when, identity, deletion}` object; omit it to unsubscribe and\n\
-             nothing else. Cleanup prefers the DKIM-authenticated List-Id, and otherwise\n\
-             requires an exact sender address, `List-Unsubscribe-Post`, and the sample's\n\
-             List-Id when present. It stops after a failed POST unless `when` is `always`,\n\
-             and never escalates a failed Trash move to permanent deletion unless `deletion`\n\
-             is `trashThenPermanent`.\n\
+             nested `cleanup {when, identity, deletion}` object. Cleanup requires the sample's\n\
+             DKIM-authenticated List-Id and includes older messages with broken or missing\n\
+             action headers. Use `when: \"always\"` to allow deletion after a failed POST.\n\
+             Choose `deletion: \"permanent\"` for a targeted purge on standard IMAP. Gmail\n\
+             moves the matches to Trash.\n\
              \n\
              ## Account-wide scans\n\
              \n\
              Discovery uses one selectable All mailbox where the server has it. Otherwise it\n\
              enumerates storage mailboxes and skips Trash, Junk, Spam, Drafts and virtual\n\
-             aggregate views. A destructive scan never writes through an aggregate view.\n\
+             aggregate views. On Gmail, List-Id deletion uses All Mail when available to reach\n\
+             archived messages and move them to Trash. Standard IMAP permanent List-Id deletion\n\
+             includes matching messages already in Trash.\n\
              \n\
              On a provider with a visible-window limit (Yahoo, AOL), rankings and\n\
-             account-wide sweeps cover the ENTIRE mailbox through RFC 9586 UID Mode when a\n\
-             persistent cache is available. Without one, a sweep repeats passes as older mail\n\
-             backfills into view.\n\
+             exact List-Id sweeps walk the entire mailbox through RFC 9586 UID Mode. Rankings\n\
+             use the same mode for whole-mailbox discovery when a persistent cache is available.\n\
              \n\
              ## Saving to disk\n\
              \n\
@@ -764,7 +743,8 @@ impl ServerHandler for AgentMailServer {
              - `/headers` — exact headers\n\
              - `/source` — bounded raw RFC822\n\
              - `/info` — JSON metadata and the sibling URIs\n\
-             - `/attachments/{index}` — one attachment as a blob, 4 MiB limit\n\
+             - `/attachments/{index}` — one attachment as a blob, 10 MiB decoded limit\n\
+               Use `download_attachments` to save larger parts to disk.\n\
              \n\
              Percent-encode the account and mailbox segments, including a `/` inside a\n\
              mailbox name as `%2F`.\n\
@@ -833,7 +813,7 @@ where
         target: "agentmail",
         version = env!("CARGO_PKG_VERSION"),
         build = env!("AGENTMAIL_BUILD_SHA"),
-        "agentmail MCP server starting"
+        "HeroMail MCP server starting"
     );
     serve_server(transport, AgentMailServer::new_embedded(mk)).await
 }
@@ -849,7 +829,7 @@ where
 {
     let tasks = Arc::clone(&server.tasks);
     let service = server.serve(transport).await.inspect_err(|e| {
-        eprintln!("agentmail: server error: {}", e);
+        eprintln!("heromail: server error: {}", e);
     })?;
     let result = service.waiting().await;
     tasks.shutdown().await;
@@ -859,7 +839,7 @@ where
 
 /// Serve the MCP server over stdio.
 ///
-/// This is the entry point for the standalone `agentmail serve` binary.
+/// This is the entry point for the standalone `heromail serve` binary.
 pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error::Error>> {
     let server = AgentMailServer::new(mk);
     let prewarm_agentmail = Arc::clone(&server.agentmail);
@@ -868,39 +848,31 @@ pub async fn serve_stdio(mk: crate::Agentmail) -> Result<(), Box<dyn std::error:
         .serve(rmcp::transport::io::stdio())
         .await
         .inspect_err(|e| {
-            eprintln!("agentmail: server error: {}", e);
+            eprintln!("heromail: server error: {}", e);
         })?;
     // Initialization is already complete. Connection warming is bounded and
     // never delays the MCP handshake or availability of config-backed tools.
     let prewarm = tokio::spawn(async move {
-        futures::stream::iter(prewarm_agentmail.account_names())
-            .for_each_concurrent(PREWARM_CONCURRENCY, |account| {
+        let accounts = prewarm_agentmail.account_names().into_iter().enumerate();
+        futures::stream::iter(accounts)
+            .for_each_concurrent(PREWARM_CONCURRENCY, |(index, account)| {
                 let agentmail = Arc::clone(&prewarm_agentmail);
                 async move {
-                    let account_hint = account_log_hint(&account);
-                    match tokio::time::timeout(
-                        PREWARM_ACCOUNT_TIMEOUT,
-                        agentmail.check_connection(&account),
-                    )
-                    .await
-                    {
+                    // Connection tracing and errors can include account names,
+                    // usernames, and server replies. Startup logs use only the
+                    // account's position and the outcome of the probe.
+                    let probe = agentmail
+                        .check_connection(&account)
+                        .with_subscriber(tracing::Dispatch::none());
+                    let number = index + 1;
+                    match tokio::time::timeout(PREWARM_ACCOUNT_TIMEOUT, probe).await {
                         Ok(Ok(status)) if status.connected => {
-                            eprintln!("agentmail: {} connected", account_hint);
+                            eprintln!("heromail: account #{number} connected");
                         }
-                        Ok(Ok(status)) => {
-                            eprintln!(
-                                "agentmail: {} connection failed: {}",
-                                account_hint,
-                                status.error.as_deref().unwrap_or("unknown")
-                            );
-                        }
-                        Ok(Err(error)) => {
-                            eprintln!("agentmail: {} credential error: {}", account_hint, error);
-                        }
+                        Ok(_) => eprintln!("heromail: account #{number} connection failed"),
                         Err(_) => {
                             eprintln!(
-                                "agentmail: {} connection prewarm timed out after {}s",
-                                account_hint,
+                                "heromail: account #{number} connection prewarm timed out after {}s",
                                 PREWARM_ACCOUNT_TIMEOUT.as_secs()
                             );
                         }

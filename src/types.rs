@@ -191,24 +191,26 @@ pub struct SenderSummary {
     pub newest_date: Option<DateTime<Utc>>,
 }
 
-/// Summary of mailing-list messages grouped by normalized sender email.
+/// Summary of messages grouped by normalized List-Id.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
 pub struct ListSummary {
-    /// Normalized sender email address and sole grouping key.
+    /// Normalized List-Id shared by all messages in the row.
+    pub list_id: String,
+    /// Sender address from the sample, for display.
     pub address: String,
-    /// Whether the newest message advertises syntactically valid RFC 8058
-    /// one-click headers. Execution still re-fetches the message and requires
-    /// a passing DKIM signature over both headers.
+    /// Sender display name from the sample.
+    pub display_name: String,
+    /// The sample advertises RFC 8058 one-click syntax. Execution verifies DKIM.
     pub advertised_one_click: bool,
-    /// Newest message that can be safely passed to unsubscribe_message.
+    /// Newest message in the list advertising one-click unsubscribe.
     pub sample: MailboxMessageIdentity,
     /// Decoded Subject of the sample message, fetched live at page time so a
     /// caller can see WHAT the subscription is before acting. Never persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
-    /// Number of messages from this sender with list-action headers.
+    /// Number of messages with this List-Id, including older mail with unusable unsubscribe headers.
     pub count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_date: Option<DateTime<Utc>>,
@@ -466,7 +468,7 @@ pub struct TopSubscriptionsResponse {
     pub mailbox: String,
     pub account: String,
     pub total_messages: u32,
-    pub unique_senders: usize,
+    pub unique_lists: usize,
     pub offset: usize,
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -531,8 +533,8 @@ pub struct DeleteListIdResponse {
     pub operation_ids: Vec<String>,
     pub mailboxes: Vec<PerMailboxDeleteResult>,
     pub skipped: Vec<String>,
-    /// True when the caller requested a permanent delete (Trash bypassed on
-    /// standard IMAP; Gmail safely routes the request through Trash).
+    /// True when the operation uses targeted permanent deletion.
+    /// Gmail moves matches to Trash and returns false.
     pub permanent: bool,
 }
 
@@ -557,21 +559,19 @@ pub enum CleanupWhen {
     /// Only after the one-click POST verifiably succeeded.
     #[default]
     AfterSuccess,
-    /// Even when DKIM, URL validation, DNS, or the HTTPS POST failed. Cleanup
-    /// identity requirements (authenticated List-Id or the sender fallback)
-    /// still apply unchanged.
+    /// Run cleanup after an unsuccessful POST if a DKIM-authenticated
+    /// List-Id was established.
     Always,
 }
 
 /// Which identity cleanup may match messages by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CleanupIdentityMode {
-    /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
-    ListIdOnly,
-    /// Prefer the authenticated List-Id; when there is none, fall back to
-    /// messages from the exact sender email that carry List-Unsubscribe-Post.
-    /// When the target has one usable List-Id, require that same List-Id too.
+    /// Only a DKIM-authenticated List-Id.
     #[default]
+    ListIdOnly,
+    /// Compatibility variant for existing callers. Requires a
+    /// DKIM-authenticated List-Id, like ListIdOnly.
     ListIdOrSender,
 }
 
@@ -590,8 +590,7 @@ pub enum CleanupDeletion {
     Permanent,
 }
 
-/// Matching-message cleanup policy. The three axes are orthogonal; every
-/// combination is meaningful, so no cross-field validation exists.
+/// Matching-message cleanup policy for an authenticated List-Id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CleanupPolicy {
     pub when: CleanupWhen,
@@ -808,7 +807,7 @@ pub struct MoveSubscriptionResponse {
     pub mailbox: String,
     pub account: String,
     /// Mailbox from the UIDVALIDITY-guarded ranking sample used to derive the
-    /// live sender and optional List-Id scope.
+    /// live List-Id scope.
     pub sample_mailbox: String,
     pub sample_uid_validity: u32,
     pub sample_uid: u32,

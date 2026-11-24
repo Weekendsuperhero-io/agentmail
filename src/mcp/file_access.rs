@@ -42,12 +42,13 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug, Clone)]
 pub(crate) struct FileAccessPolicy {
     /// The sandbox roots as configured (absolute-ish but not necessarily
-    /// canonical or existing yet — [`Self::ensure_root`] / [`Self::roots`] do
-    /// that). NEVER empty: every constructor supplies at least one.
+    /// canonical or existing yet). Every constructor supplies at least one.
     ///
     /// `roots[0]` is the primary: relative joins and the default output
     /// directory. The rest widen containment only.
     roots: Vec<PathBuf>,
+    /// Only the standalone fallback directory may be created on demand.
+    create_primary: bool,
 }
 
 impl FileAccessPolicy {
@@ -58,12 +59,19 @@ impl FileAccessPolicy {
     /// Standalone mode has exactly one root — there is no Project to bind
     /// additional directories to.
     pub(crate) fn from_env() -> Self {
-        let root = std::env::var_os("AGENTMAIL_FILE_ROOT")
+        if let Some(root) = std::env::var_os("AGENTMAIL_FILE_ROOT")
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
-            .or_else(|| dirs::home_dir().map(|h| h.join(".agentmail").join("files")))
+        {
+            return Self::with_roots(root, []);
+        }
+        let root = dirs::home_dir()
+            .map(|h| h.join(".agentmail").join("files"))
             .unwrap_or_else(|| PathBuf::from(".agentmail").join("files"));
-        Self { roots: vec![root] }
+        Self {
+            roots: vec![root],
+            create_primary: true,
+        }
     }
 
     /// Build a policy with a primary root plus additional granted directories.
@@ -83,48 +91,35 @@ impl FileAccessPolicy {
                 roots.push(extra);
             }
         }
-        Self { roots }
+        Self {
+            roots,
+            create_primary: false,
+        }
     }
 
-    /// The PRIMARY root: created if needed, returned canonical.
-    ///
-    /// Only the primary is created on demand. An additional root the user
-    /// bound and then deleted should fail as absent rather than be silently
-    /// recreated by an email tool.
-    fn ensure_root(&self) -> Result<PathBuf, String> {
+    fn primary_root(&self) -> Result<PathBuf, String> {
         let primary = &self.roots[0];
-        std::fs::create_dir_all(primary).map_err(|e| {
+        if self.create_primary {
+            std::fs::create_dir_all(primary).map_err(|e| {
+                format!(
+                    "cannot create the default workspace '{}' ({e})",
+                    primary.display()
+                )
+            })?;
+        }
+        let canonical = primary.canonicalize().map_err(|e| {
             format!(
-                "cannot create the file sandbox root {}: {e}",
+                "primary workspace '{}' is unavailable ({e})",
                 primary.display()
             )
         })?;
-        primary.canonicalize().map_err(|e| {
-            format!(
-                "cannot resolve the file sandbox root {}: {e}",
+        if !canonical.is_dir() {
+            return Err(format!(
+                "primary workspace '{}' must be a directory",
                 primary.display()
-            )
-        })
-    }
-
-    /// Every root in canonical form, primary first.
-    ///
-    /// An additional root that cannot be canonicalized (moved, unmounted,
-    /// never existed) is DROPPED rather than erroring: it is one of several
-    /// grants, and a stale one must not take down access to the others. The
-    /// primary is created by [`Self::ensure_root`], so it is always present.
-    fn roots(&self) -> Result<Vec<PathBuf>, String> {
-        let mut out = vec![self.ensure_root()?];
-        for extra in &self.roots[1..] {
-            // Canonicalizing can collapse two configured roots onto one (a
-            // symlinked bind), so dedupe AFTER resolving rather than before.
-            if let Ok(canonical) = extra.canonicalize()
-                && !out.contains(&canonical)
-            {
-                out.push(canonical);
-            }
+            ));
         }
-        Ok(out)
+        Ok(canonical)
     }
 
     /// Whether `candidate` (already canonical) lies inside any granted root.
@@ -132,40 +127,50 @@ impl FileAccessPolicy {
         roots.iter().any(|root| candidate.starts_with(root))
     }
 
-    /// Resolve a requested path against the root: absolute paths are taken as
-    /// given (still subject to the containment check), relative paths join the
-    /// root. Rejects any `..` component up front — a cheap lexical guard before
-    /// the canonical containment check catches symlink escapes.
-    fn resolve(root: &Path, requested: &str) -> Result<PathBuf, String> {
-        let requested = requested.trim();
-        if requested.is_empty() {
-            return Err("path is empty".to_string());
+    /// Resolve a path and collect the currently available directory grants.
+    /// An absolute path may use a live additional grant when the primary is gone.
+    fn resolve(&self, requested: Option<&str>) -> Result<(PathBuf, Vec<PathBuf>), String> {
+        let path = requested.map(Path::new);
+        if let Some(path) = path {
+            if path.as_os_str().is_empty() {
+                return Err("path is empty".to_string());
+            }
+            if path.components().any(|c| c == Component::ParentDir) {
+                return Err(format!("path '{}' must not contain '..'", path.display()));
+            }
         }
-        let path = Path::new(requested);
-        if path.components().any(|c| c == Component::ParentDir) {
-            return Err(format!("path '{requested}' must not contain '..'"));
+        let primary = self.primary_root();
+        let candidate = match path {
+            Some(path) if path.is_absolute() => path.to_path_buf(),
+            Some(path) => primary.as_ref().map_err(Clone::clone)?.join(path),
+            None => primary.as_ref().map_err(Clone::clone)?.clone(),
+        };
+        let mut roots: Vec<PathBuf> = primary.iter().cloned().collect();
+        for extra in &self.roots[1..] {
+            if let Ok(canonical) = extra.canonicalize()
+                && canonical.is_dir()
+                && !roots.contains(&canonical)
+            {
+                roots.push(canonical);
+            }
         }
-        Ok(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            root.join(path)
-        })
+        if roots.is_empty()
+            && let Err(error) = primary
+        {
+            return Err(error);
+        }
+        Ok((candidate, roots))
     }
 
-    /// Names EVERY granted root, not just the primary.
-    ///
-    /// With one root the old message told you where you were allowed to write.
-    /// With several it would have named one of them and left the model
-    /// guessing whether the others existed — and the model's next move after a
-    /// refusal is to invent a path.
-    fn escape_error(&self, requested: &str) -> String {
-        let roots = self
-            .roots
+    /// List the same available roots that were used to check containment.
+    fn escape_error(roots: &[PathBuf], requested: &str) -> String {
+        let root_count = roots.len();
+        let roots = roots
             .iter()
             .map(|r| r.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        if self.roots.len() == 1 {
+        if root_count == 1 {
             format!("path '{requested}' is outside the allowed workspace root ({roots})")
         } else {
             format!("path '{requested}' is outside the allowed workspace roots ({roots})")
@@ -175,16 +180,14 @@ impl FileAccessPolicy {
     /// Confine a file to READ: it must resolve to an existing file within the
     /// root. Returns the canonical path safe to open.
     pub(crate) fn confine_read(&self, requested: &str) -> Result<PathBuf, String> {
-        let roots = self.roots()?;
-        // Relative paths join the PRIMARY root — see the module docs.
-        let candidate = Self::resolve(&roots[0], requested)?;
+        let (candidate, roots) = self.resolve(Some(requested.trim()))?;
         // canonicalize requires existence, which also resolves symlinks — a
         // symlink inside the root pointing out lands outside and is rejected.
         let canonical = candidate
             .canonicalize()
             .map_err(|e| format!("cannot access '{requested}': {e}"))?;
         if !Self::contained(&roots, &canonical) {
-            return Err(self.escape_error(requested));
+            return Err(Self::escape_error(&roots, requested));
         }
         if !canonical.is_file() {
             return Err(format!("'{requested}' is not a regular file"));
@@ -197,29 +200,17 @@ impl FileAccessPolicy {
     /// is canonicalized and checked before creation so a symlinked ancestor
     /// cannot redirect the write outside the root.
     pub(crate) fn confine_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
-        let roots = self.roots()?;
-        // An omitted `outputDir` writes to the PRIMARY root, never to an
-        // additional one — the default must stay where the user expects it.
-        let target = match requested.map(str::trim).filter(|s| !s.is_empty()) {
-            None => roots[0].clone(),
-            Some(p) => Self::resolve(&roots[0], p)?,
-        };
+        let (target, roots) = self.resolve(requested.map(str::trim).filter(|s| !s.is_empty()))?;
         // Check the nearest existing ancestor's canonical location first.
-        let mut ancestor = target.as_path();
-        let existing = loop {
-            if ancestor.exists() {
-                break ancestor.to_path_buf();
-            }
-            match ancestor.parent() {
-                Some(parent) => ancestor = parent,
-                None => break roots[0].clone(),
-            }
-        };
+        let existing = target
+            .ancestors()
+            .find(|path| path.exists())
+            .ok_or_else(|| format!("cannot find an existing parent for '{}'", target.display()))?;
         let canonical_ancestor = existing
             .canonicalize()
             .map_err(|e| format!("cannot resolve '{}': {e}", existing.display()))?;
         if !Self::contained(&roots, &canonical_ancestor) {
-            return Err(self.escape_error(requested.unwrap_or_default()));
+            return Err(Self::escape_error(&roots, requested.unwrap_or_default()));
         }
         std::fs::create_dir_all(&target)
             .map_err(|e| format!("cannot create '{}': {e}", target.display()))?;
@@ -227,7 +218,7 @@ impl FileAccessPolicy {
             .canonicalize()
             .map_err(|e| format!("cannot resolve '{}': {e}", target.display()))?;
         if !Self::contained(&roots, &canonical) {
-            return Err(self.escape_error(requested.unwrap_or_default()));
+            return Err(Self::escape_error(&roots, requested.unwrap_or_default()));
         }
         Ok(canonical)
     }
@@ -410,6 +401,47 @@ mod tests {
         );
         // The absent one is simply not a root.
         assert!(policy.confine_dir(Some(gone.to_str().unwrap())).is_err());
+
+        let denied = temp_root("multi-stale-unbound");
+        let error = policy
+            .confine_dir(Some(denied.to_str().unwrap()))
+            .expect_err("an unbound directory stays outside the workspace");
+        assert!(error.contains(primary.to_str().unwrap()), "{error}");
+        assert!(error.contains(bound.to_str().unwrap()), "{error}");
+        assert!(!error.contains(gone.to_str().unwrap()), "{error}");
+    }
+
+    #[test]
+    fn a_missing_configured_workspace_is_not_recreated() {
+        let parent = temp_root("missing-primary");
+        let missing = parent.join("missing");
+        let bound = temp_root("live-additional");
+        let policy = FileAccessPolicy::with_roots(&missing, [bound.clone()]);
+
+        for error in [
+            policy.confine_dir(None).unwrap_err(),
+            policy.confine_dir(Some("downloads")).unwrap_err(),
+            policy.confine_read("input.txt").unwrap_err(),
+        ] {
+            assert!(error.contains("is unavailable"), "{error}");
+        }
+        let output = policy
+            .confine_dir(Some(bound.join("downloads").to_str().unwrap()))
+            .expect("an absolute path can use a live grant");
+        assert_eq!(output, bound.join("downloads"));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn the_default_standalone_workspace_is_created_on_demand() {
+        let root = temp_root("standalone-default").join("files");
+        let policy = FileAccessPolicy {
+            roots: vec![root.clone()],
+            create_primary: true,
+        };
+
+        assert_eq!(policy.confine_dir(None).unwrap(), root);
+        assert!(root.is_dir());
     }
 
     /// Relative and duplicate entries never become roots.

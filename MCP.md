@@ -2,7 +2,7 @@
 created: 2026-05-29T19:20
 updated: 2026-10-27T00:00
 ---
-# Agentmail MCP — Tool & Prompt Reference
+# HeroMail MCP — Tool & Prompt Reference
 
 MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK) | Transport: stdio (standalone) or AsyncRead+AsyncWrite (in-process)
 
@@ -30,7 +30,7 @@ the revision moves by decision, never with rmcp.
   required; nothing defaults to INBOX, because a UID and
   `expectedUidValidity` are only meaningful with the mailbox they came from.
 
-AgentMail reads, organizes, archives, and saves drafts. It does not expose a
+HeroMail reads, organizes, archives, and saves drafts. It does not expose a
 send operation.
 
 **Account discovery costs no call.** The configured accounts are patched into
@@ -134,7 +134,7 @@ an unknown account raises `-32602`.
 | 8   | `list_flags`       | All IMAP flags in use with counts. Resolves Apple $MailFlagBit colors. Omit mailbox to scan all.    | `read_only` |
 | 9   | `find_attachments` | Scan for messages with attachments (mixed + related), paginated. Omit mailbox to scan all.          | `read_only` |
 | 10  | `top_senders`     | Top senders by volume (email, display name) with counts + date ranges. Omit mailbox to scan all.    | `read_only` |
-| 11  | `top_subscriptions` | Top bulk-mail senders with advertised one-click syntax and UIDVALIDITY-guarded samples.             | `read_only` |
+| 11  | `top_subscriptions` | Top List-Ids with an advertised one-click sample, ranked by backlog size.             | `read_only` |
 | 12  | `top_mailing_lists`     | Top mailing lists by List-Id (RFC 2919). Groups across senders. Omit mailbox to scan all.           | `read_only` |
 | 13  | `top_domains`     | Exact canonical Header From domains and subdomains with counts, dates, and a live sample subject.   | `read_only` |
 | 14  | `list_pending_moves` | List durable COPY-fallback MOVE operations awaiting reconciliation or review.                       | `read_only`             |
@@ -231,29 +231,32 @@ default to 10 rows; domain rankings default to 20. All accept at most 100.
 
 **Windowed providers:** Yahoo/AOL Limited Mode exposes only a recent mailbox
 window (see `docs/standards/imap/yahoo-aol-quirks.md`). When the server
-advertises RFC 9586 UIDONLY and the persistent cache is enabled, Agentmail uses
+advertises RFC 9586 UIDONLY and the persistent cache is enabled, HeroMail uses
 UID Mode and a resumable membership walk so rankings cover the full mailbox.
 Without UIDONLY, discovery is limited to what the server exposes; destructive
 sweeps repeat passes as older mail backfills into view. Account-wide discovery uses one selectable
 `\All` mailbox when available. Otherwise it enumerates storage mailboxes,
 excludes Trash/Junk/Drafts and virtual All/Flagged/Important views, and
-deduplicates by Message-ID across folders. Sender rankings exclude the
-account's own address.
+deduplicates by Message-ID across folders. `top_senders` excludes the
+account’s configured addresses and From addresses found in its Sent mailbox,
+including when it ranks All Mail. If Sent is unavailable, the ranking uses
+the configured addresses.
 
 **top_subscriptions**
 ```json
 { "mailbox": "INBOX" | "*", "account", "totalMessages", "total",
   "offset", "limit", "nextOffset?",
   "lists": [{
-    "address", "advertisedOneClick": bool,
+    "listId", "address", "displayName", "advertisedOneClick": true,
     "count", "subject?", "oldestDate?", "newestDate?",
     "sample": MessageIdentity
   }] }
 ```
-Grouped only by normalized sender email; display names and `List-Id` values do
-not split a sender's row. Sorted: advertised one-click senders first, then by
-count. `advertisedOneClick` checks exact local RFC 2369/8058 syntax; it does not
-claim DKIM success.
+Rows group by normalized List-Id and sort by total message count. Each row
+has a sample with valid RFC 8058 one-click syntax. The count includes older
+messages in that list whose unsubscribe headers are missing or broken.
+`address` and `displayName` describe the sample sender. The action verifies
+DKIM when it fetches the sample.
 Opaque unsubscribe URLs and recipient tokens are not exposed. Use the nested
 `sample` identity for a later `move_subscription` or `unsubscribe_message`
 call. `subject` is the sample message's decoded Subject, fetched live for the
@@ -352,7 +355,7 @@ shown by the preview to a later `export_thread_record` confirmation.
 | --- | ---------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------- |
 | 16  | `delete_messages`      | Delete by UID (up to 500). Moves to Trash, or permanently expunges when `permanent=true`. | `destructive`, `idempotent`   |
 | 17  | `delete_by_sender`     | Delete all from an exact sender identity (`email` + `name` from a ranking row). Omit `mailbox` for account-wide. `permanent=true` bypasses Trash. | `destructive`                 |
-| 18  | `delete_list_id`       | Delete all messages with an **exact** List-Id across all mailboxes. `permanent=true` bypasses Trash. | `destructive`                 |
+| 18  | `delete_list_id`       | Delete messages with an **exact** List-Id, including archived mail. `permanent=true` purges matches on standard IMAP with UIDPLUS. | `destructive`                 |
 | 19  | `delete_by_domain`     | Delete all messages from one exact canonical domain from `top_domains`; subdomains are never implicit. | `destructive`                 |
 | 20  | `move_list_id`         | Move all messages with an **exact** List-Id to a destination mailbox in one operation (e.g. archive a statement list). Omit `mailbox` for account-wide; destination excluded. | —                                        |
 | 21  | `move_by_sender`       | Move all messages from an exact sender identity (`email` + `name`) to a destination mailbox in one operation. Omit `mailbox` for account-wide; destination excluded. | —                                        |
@@ -382,17 +385,15 @@ UIDs. `unsubscribe_message` cleanup permits escalation only via
 share the delete tools' mutation and durable recovery machinery. The first
 three take their ranking identity directly. `move_subscription` instead
 re-fetches the selected `top_subscriptions` sample under its UIDVALIDITY epoch,
-then requires the exact canonical sender plus either `List-Unsubscribe` or
-`List-Unsubscribe-Post`; when the sample has one usable List-Id, every match
-must also carry that exact normalized List-Id. This covers the same bulk-mail
-surface as the ranking without sweeping ordinary mail from that sender.
+then uses its exact normalized List-Id for every match. The move includes
+older messages in that list with missing or broken unsubscribe headers.
 
 All four bulk movers live-confirm candidates and feed matches into the same
 window-draining, UID-Mode-aware move engine and durable COPY-fallback recovery
 path. The destination must already exist and is always excluded from
 account-wide sweeps.
 
-**Gmail:** on Gmail (`X-GM-EXT-1`), in-place `\Deleted`+EXPUNGE only removes a *label* — the message survives in All Mail. agentmail therefore routes every delete, including `permanent`, through `[Gmail]/Trash` (which removes the message from all labels; Gmail purges Trash on its own schedule). Immediate hard-purge isn't available on Gmail.
+**Gmail:** on Gmail (`X-GM-EXT-1`), in-place `\Deleted`+EXPUNGE only removes a *label* — the message survives in All Mail. HeroMail therefore routes every delete, including `permanent`, through `[Gmail]/Trash` (which removes the message from all labels; Gmail purges Trash on its own schedule). List-Id deletion uses All Mail when exposed by Gmail over IMAP, so it also reaches archived messages. Gmail results report `permanent: false`. Gmail's **Delete forever** action in Trash removes selected messages immediately.
 
 `delete_messages` accepts at most 500 explicitly supplied UIDs over MCP. `delete_by_sender`, `delete_by_domain`, `delete_list_id`, `move_by_sender`, `move_by_domain`, `move_list_id`, `move_subscription`, and unsubscribe matching have no total match limit; they split server mutations into 500-UID wire batches. A `top_*` ranking `limit` never becomes a mutation limit.
 
@@ -454,7 +455,9 @@ truncation fields preserve audit completeness.
   "skipped": ["mailbox"], "skippedTotal", "skippedTruncated",
   "permanent": bool }
 ```
-`mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched, were not fully drained, or came after a lost connection (see **Coverage** under find_attachments); policy-excluded special-use views are not reported as errors.
+`mailboxes` is present when scanning all mailboxes. `skipped` lists planned mailboxes that could not be selected or searched, were not fully drained, or came after a lost connection (see **Coverage** under find_attachments); policy-excluded special-use views are not reported as errors. Account-wide
+permanent deletion on standard IMAP also checks Trash for exact matches.
+See [How subscription cleanup works](docs/standards/email/subscription-cleanup.md).
 
 **delete_by_domain**
 ```json
@@ -554,7 +557,7 @@ PendingMove = {
 ```
 
 Native `UID MOVE` does not create a journal record. When the server lacks MOVE,
-Agentmail records intent in a separate durable SQLite journal before COPY,
+HeroMail records intent in a separate durable SQLite journal before COPY,
 consumes the exact tagged command completion, records `COPYUID` when supplied,
 and only then removes the source. An EOF or timeout is ambiguous, so the pooled
 session is discarded and the response reports `reconciliationPending` with an
@@ -602,7 +605,7 @@ closed. INBOX and mailboxes referenced by a pending MOVE journal are never
 eligible (reconcile the move, or dismiss it, to release them). Special-use and descendant-bearing mailboxes need separate
 acknowledgements; deleting a non-empty mailbox needs `confirmNonEmpty` as well.
 The rename destination must not exist. A missing delete target is an idempotent
-success. After a transport error, AgentMail re-lists the mailbox catalog and
+success. After a transport error, HeroMail re-lists the mailbox catalog and
 reports success only when the resulting state is unambiguous.
 
 **create_draft**
@@ -654,7 +657,7 @@ message carries the original Markdown either way, so nothing is lost.
 
 Pass `plainTextOnly: true` (`create_draft`, `update_draft`) for a single
 unrendered `text/plain` part — for a plain-text-only
-recipient, a mailing list, or a body that must not be reinterpreted. AgentMail
+recipient, a mailing list, or a body that must not be reinterpreted. HeroMail
 never emits Outlook's TNEF "Rich Text" (`application/ms-tnef`), which reaches
 non-Outlook recipients as `winmail.dat`.
 
@@ -672,7 +675,7 @@ Reply-To, In-Reply-To, and References headers, then appends it to a selectable
 Drafts mailbox with the `\Draft` flag. Bcc is deliberately retained in the
 stored draft. The identity fields are best-effort: after APPEND the generated
 Message-ID is searched when an APPENDUID is unavailable. If APPEND loses its
-tagged completion, AgentMail discards that connection and searches the same
+tagged completion, HeroMail discards that connection and searches the same
 Message-ID on a fresh one. It reports success only when the draft is found;
 otherwise it directs the caller to inspect Drafts before retrying.
 
@@ -697,7 +700,7 @@ reply goes to the wrong people. This tool never sends mail.
 ```
 
 The input is a complete replacement specification, including attachments.
-AgentMail verifies the live UIDVALIDITY and `\Draft` flag and preserves the
+HeroMail verifies the live UIDVALIDITY and `\Draft` flag and preserves the
 Apple draft UUID. It also preserves the draft's sender: without `from`, the
 replacement keeps the current `From` — name included, the display name filling
 a blank one — when that address is one of the account's identities, so a sender
@@ -705,7 +708,7 @@ chosen in another mail client survives an edit here; a foreign `From` is
 replaced by the primary identity. `from` follows the `create_draft` rules.
 
 Where the server advertises RFC 8508 REPLACE the swap is one atomic command.
-Where it does not — Gmail and iCloud among them — AgentMail emulates it as
+Where it does not — Gmail and iCloud among them — HeroMail emulates it as
 APPEND-then-discard, in that order: the replacement is durable before anything
 is destroyed, so the worst failure is a duplicate draft, never a lost one. The
 superseded draft is discarded through the same policy-aware path
@@ -724,7 +727,9 @@ A replaced draft always has a NEW UID. Use the one this returns.
   "downloaded": [{ "index", "filename", "path", "contentType", "size" }] }
 ```
 
-`path` is absolute. The download is all or nothing: every target name is
+`path` is absolute. The encoded message can be up to 70 MiB. The tool writes
+the decoded attachment bytes directly to disk, including parts above the
+10 MiB inline resource limit. The download is all or nothing: every target name is
 checked before the first byte is written (an existing file is refused, never
 overwritten), and a failure partway removes the files already written, so a
 retry starts clean.
@@ -759,16 +764,18 @@ JSON manifest. It does not discover or infer thread membership. All UIDs must
 belong to the same mailbox and UIDVALIDITY epoch; existing source or manifest
 filenames cause a no-overwrite failure.
 
-For embedded AgentMail, HERO injects the trusted absolute workspace root
+For embedded HeroMail, HERO injects the trusted absolute workspace root
 as request metadata (`com.makeyourhero/workspaceRoot`; versions before HERO
 send `io.agentmuse/workspaceRoot`, still accepted) on every call. Only the
-in-process backend named `agentmail` receives
+in-process mail backend receives
 it; a missing or invalid root fails closed, and other backends never receive
 the value. The Project's other bound directories ride beside the root as
 `additionalWorkspaceRoots` under the same prefix, and a request that carries
-the `com.makeyourhero/` root is read under that prefix alone. Standalone
-`agentmail serve` uses `AGENTMAIL_FILE_ROOT` or its `~/.agentmail/files`
-default instead.
+the `com.makeyourhero/` root is read under that prefix alone. Configured roots
+must already exist. An unavailable primary root blocks relative paths and
+default output. An absolute path can still use an available additional grant.
+Standalone `heromail serve` uses `AGENTMAIL_FILE_ROOT`, with on-demand creation
+of `~/.agentmail/files` when that setting is omitted.
 
 **export_thread_record**
 
@@ -806,7 +813,6 @@ Required action identity and consent:
   "confirmOneClick": true,
   "cleanup": {
     "when": "afterSuccess",
-    "identity": "listIdOrSender",
     "deletion": "trash"
   }
 }
@@ -814,18 +820,17 @@ Required action identity and consent:
 
 The fields through `confirmOneClick` identify a live-ranked message and record
 explicit RFC 8058 consent. Omit `cleanup` to perform only the unsubscribe POST.
-When cleanup is present, `identity: "listIdOrSender"` first prefers the single
-List-Id covered by the passing DKIM signature. Its fallback requires the exact
-normalized sender email plus `List-Unsubscribe-Post`; when the sampled message
-has one usable List-Id, matching messages must carry that same normalized
-List-Id too. Display names do not affect fallback matching.
+Cleanup uses the selected message’s single List-Id covered by the passing
+DKIM signature. The account-wide sweep matches that same List-Id, including
+messages with missing or broken unsubscribe headers. If no authenticated
+List-Id is available, `delete_list_id` can remove the backlog of an
+explicitly selected list independently.
 
-Cleanup defaults are `when: "afterSuccess"`, `identity: "listIdOrSender"`, and
-`deletion: "trash"`. `"always"` permits cleanup after a failed unsubscribe.
-`"trashThenPermanent"` permits an irreversible UID EXPUNGE fallback when Trash
-cannot be used, while `"permanent"` requests hard deletion directly. Gmail
-routes permanent disposal through Trash because in-place EXPUNGE only removes
-a label.
+Cleanup defaults to `when: "afterSuccess"` and `deletion: "trash"`.
+`"always"` permits cleanup after a failed unsubscribe when the List-Id was
+authenticated. `"trashThenPermanent"` permits an irreversible UID EXPUNGE
+fallback. `"permanent"` requests a targeted purge on standard IMAP with
+UIDPLUS. Gmail moves the matches to Trash.
 
 ```json
 { "mailbox", "account", "uid", "uidValidity", "listId?",
@@ -893,7 +898,7 @@ Returns the full updated flag set after the operation.
 
 ## Tasks (SEP-2663)
 
-AgentMail offers the `io.modelcontextprotocol/tasks` extension on both
+HeroMail offers the `io.modelcontextprotocol/tasks` extension on both
 revisions. The server decides which calls become tasks, never the client: a
 call becomes one only when the client declared the extension, the tool is one
 of the 22 below, and the call is still running after **2 seconds**. Everything
@@ -962,7 +967,7 @@ makes the resource surface navigable while avoiding an unbounded static list.
 | `email://{account}/{mailbox}/{uidValidity}/{uid}/headers`                 | `text/rfc822-headers` | Exact RFC822 header block, maximum 64 KiB    |
 | `email://{account}/{mailbox}/{uidValidity}/{uid}/source`                  | `message/rfc822`      | Lossless base64 MCP blob, maximum 256 KiB    |
 | `email://{account}/{mailbox}/{uidValidity}/{uid}/info`                    | `application/json`    | Message metadata + attachment inventory      |
-| `email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}`     | per part              | One MIME attachment blob, maximum 4 MiB      |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}`     | per part              | One MIME attachment blob, maximum 10 MiB decoded |
 
 `account` and `mailbox` are percent-encoded URI segments; a `/` inside a
 mailbox name must be encoded as `%2F`, for example
@@ -984,16 +989,19 @@ nomenclature everywhere: the canonical filename is
 `{uid}_{index}_{sanitized-name}` (`unnamed` for nameless parts), shortened to
 240 bytes with its extension kept when the original name is longer than a
 filesystem allows — exactly what `download_attachments` writes to disk. `/attachments/{index}` (zero-based part
-index, stable within a UIDVALIDITY epoch) returns the part as an MCP resource
-`blob` served with the part's own content type; parts above 4 MiB fail with
-guidance to use the `download_attachments` tool instead.
+index, stable within a UIDVALIDITY epoch) returns the part as a base64 MCP
+resource `blob` with the part's own content type. The 10 MiB decoded limit
+keeps the encoded reply within HERO's 16 MiB backend response budget. Use
+`download_attachments` for larger parts.
 
 Every resource read selects the mailbox and validates the expected epoch before
 fetching. A missing UID, unavailable UIDVALIDITY, changed epoch, or
-out-of-range attachment index returns resource-not-found. Body, info, and
-attachment reads may transiently fetch at most 64 MiB before rendering the
-bounded view; oversized headers/source representations fail with guidance to
-use the narrower resource or filesystem-writing tools. `/source` returns an MCP
+out-of-range attachment index returns resource-not-found. Body reads may
+transiently fetch at most 64 MiB. `/info`, attachment reads, and
+`download_attachments` accept encoded messages up to 70 MiB, which covers
+the [70 MB Gmail Workspace Enterprise Plus receiving limit](https://knowledge.workspace.google.com/admin/gmail/gmail-receiving-limits-in-google-workspace).
+Oversized resources fail with guidance to use a narrower resource or a
+filesystem-writing tool. `/source` returns an MCP
 resource `blob` whose field value is base64, preserving the original RFC822
 bytes without lossy UTF-8 conversion. For evidence archives or complete sources
 that should not traverse model context, use `download_message_source` or

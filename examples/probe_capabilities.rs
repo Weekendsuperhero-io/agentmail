@@ -7,9 +7,9 @@
 //! PROBE_PASS='app-password' cargo run --example probe_capabilities
 //! ```
 
-use agentmail::config::AccountConfig;
-use agentmail::imap_client;
-use agentmail::secret::Secret;
+use heromail::config::AccountConfig;
+use heromail::imap_client;
+use heromail::secret::Secret;
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         password: Some(Secret::new_raw(&pass)),
         tls: true,
         max_connections: None,
-        auth: agentmail::AuthMethod::Password,
+        auth: heromail::AuthMethod::Password,
     };
     let mut session = imap_client::connect(&account, &pass).await?;
     let capabilities = session.capabilities().await?;
