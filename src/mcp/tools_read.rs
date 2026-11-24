@@ -294,7 +294,7 @@ impl AgentMailServer {
     #[tool(
         name = "top_senders",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopSendersOutput>(),
-        description = "List the senders who email you most, by message count. Omit mailbox for account-wide discovery: one selectable \\All mailbox is scanned alone when available; otherwise selectable storage mailboxes are enumerated, virtual/excluded views are skipped, and Message-ID deduplicates across folders. Excludes your own address and groups by exact address + display name. Every row has a safe nested sample {mailbox, uidValidity, uid} for inspection, linked from the result as a resource_link; pass its exact address and displayName to delete_by_sender or move_by_sender. Live offset pagination defaults to 10 rows (max 100).",
+        description = "List the senders who email you most, by message count. Omit mailbox for account-wide discovery: the ranking prefers a selectable \\All mailbox and otherwise uses selectable storage mailboxes with Message-ID deduplication. Excludes the account’s configured addresses and From addresses observed in Sent. Groups by exact address and display name. Every row has a safe nested sample {mailbox, uidValidity, uid} for inspection, linked from the result as a resource_link; pass its exact address and displayName to delete_by_sender or move_by_sender. Live offset pagination defaults to 10 rows (max 100).",
         annotations(title = "Top Senders", read_only_hint = true)
     )]
     async fn top_senders_tool(
@@ -364,7 +364,7 @@ impl AgentMailServer {
     #[tool(
         name = "top_subscriptions",
         output_schema = rmcp::handler::server::tool::schema_for_output::<TopSubscriptionsOutput>(),
-        description = "List bulk/marketing subscriptions by message count. Omit mailbox for account-wide discovery, which prefers one selectable \\All mailbox and otherwise enumerates storage mailboxes. Rows are grouped only by normalized sender email; display names and List-Id values do not split a sender's row. Rows are sorted by advertised one-click syntax, then count. Each has a nested sample {mailbox, uidValidity, uid}, linked from the result as a resource_link, and, when available, the sample message's decoded subject — what this subscription's mail actually looks like. Map the sample to move_subscription to file exact bulk-mail matches without an unsubscribe request, or to unsubscribe_message for a consented verified unsubscribe. advertisedOneClick is syntactic only—the unsubscribe action re-fetches the complete message and verifies DKIM. Live offset pagination defaults to 10 rows (max 100).",
+        description = "Rank subscriptions by total messages for each exact List-Id with a sample that advertises RFC 8058 one-click unsubscribe. The count includes old messages with missing or broken unsubscribe headers. The address and displayName describe the sample sender. Map sample to unsubscribe_message, or pass listId to delete_list_id for cleanup alone. One-click syntax is checked while ranking and DKIM is verified when acting. Omit mailbox for account-wide discovery. Pagination defaults to 10 rows with a maximum of 100.",
         annotations(title = "Top Subscriptions", read_only_hint = true)
     )]
     async fn top_subscriptions_tool(

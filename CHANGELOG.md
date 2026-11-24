@@ -11,8 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes for 1.0.0
+
+- **HeroMail** — the Rust crate and CLI command are now `heromail`. MCP
+  advertises `heromail` as its server name. Existing configuration, keyring
+  entries, caches, move journals, and `AGENTMAIL_*` settings are reused.
+  See the [upgrade guide](README.md#upgrading-from-agentmail).
+
 ### Added
 
+- **`top-list-ids` CLI command** — ranks mailing lists by List-Id across
+  senders, using the same ranking as MCP's `top_mailing_lists`. Also available
+  as `top-mailing-lists` on the CLI.
 - **MCP tasks, as the SEP-2663 extension** (`io.modelcontextprotocol/tasks`,
   offered on both revisions) — a call to one of 22 long-running tools (the
   scans, bulk moves and deletes, unsubscribing, downloads and thread exports)
@@ -66,6 +76,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Attachment limits** — inline MCP attachment reads allow 10 MiB of
+  decoded data. Attachment downloads and `/info` accept encoded messages
+  up to 70 MiB to accommodate Gmail Workspace Enterprise Plus mail.
+- **Resource size errors** — oversized message source and header resources
+  report the applicable byte limit and suggest another way to read the mail.
+- **Workspace paths** — configured workspace roots must already exist. The
+  default standalone directory can still be created on demand. Path errors
+  list available directory grants.
+
+- **Top senders** — excludes From addresses found in the account’s Sent
+  mailbox, including aliases that appear in All Mail but are absent from the
+  account configuration.
+
+- **Subscription backlog cleanup** — `top_subscriptions` ranks exact List-Ids
+  with a one-click sample. Its count includes old mail with missing or broken
+  unsubscribe headers. Combined cleanup requires the sample’s DKIM-signed
+  List-Id. `delete_list_id` can remove an explicitly selected list
+  independently and scans live headers for complete matches. Permanent
+  cleanup includes Trash on standard IMAP with UIDPLUS. Gmail cleanup uses
+  All Mail when available and moves matching messages to Trash.
+
+- **`mail-auth` 0.16.0 and `mail-parser` 1.0.2** — the mail crates now share
+  `aws-lc-sys` 0.47 with the TLS stack. The system certificate verifier remains
+  enabled. Attachment listings still include inline media, and text attachments
+  are saved as UTF-8. The raw headers map uses canonical names for newly
+  recognized fields such as `X-Mailer`.
 - **rmcp 3.11.0**, version 0.9.7 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. Nothing this server sends changes for its
   own tools: every tool's output is an object, so 3.11.0's handling of
@@ -233,6 +269,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- **Ranking headers** — rankings recognize List-* fields with whitespace
+  before the colon. The first ranking after upgrading refreshes cached
+  headers to pick up the corrected list fields and sender parsing.
 
 - **A message's `List-Unsubscribe`, `List-Id` and `List-Help` were always
   missing.** mail-parser parses those headers as addresses, and

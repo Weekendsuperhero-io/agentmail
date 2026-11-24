@@ -6,7 +6,11 @@ use std::io::{IsTerminal, Write};
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "agentmail", about = "IMAP email client and MCP server")]
+#[command(
+    name = "heromail",
+    version,
+    about = "HeroMail IMAP email client and MCP server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -57,10 +61,11 @@ enum CliCommand {
         #[arg(long)]
         mailbox: Option<String>,
     },
-    /// Top senders by message count (omit --mailbox to scan all mailboxes)
+    /// Top senders by message count, grouped by address and display name
     TopSenders {
         #[arg(long)]
         account: String,
+        /// Omit for account-wide discovery
         #[arg(long)]
         mailbox: Option<String>,
         #[arg(long, default_value = "0")]
@@ -79,10 +84,24 @@ enum CliCommand {
         #[arg(long, default_value = "20")]
         limit: usize,
     },
-    /// Top bulk-mail senders by List-Unsubscribe-Post presence, then count (omit --mailbox to scan all)
+    /// Top List-Ids with a one-click sample, ranked by total list messages
     TopSubscriptions {
         #[arg(long)]
         account: String,
+        /// Omit for account-wide discovery
+        #[arg(long)]
+        mailbox: Option<String>,
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+    /// Top mailing lists by List-Id across senders, ranked by message count
+    #[command(visible_alias = "top-mailing-lists")]
+    TopListIds {
+        #[arg(long)]
+        account: String,
+        /// Omit for account-wide discovery
         #[arg(long)]
         mailbox: Option<String>,
         #[arg(long, default_value = "0")]
@@ -201,6 +220,7 @@ enum CliCommand {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
     // Initialize tracing — logs to stderr so MCP JSON-RPC on stdout is unaffected.
     // ANSI only when stderr is a terminal: MCP hosts capture stderr to log files.
     tracing_subscriber::fmt()
@@ -212,50 +232,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    agentmail::secret::init_service_name("agentmail");
+    heromail::secret::init_service_name("agentmail");
     init_platform_keyring();
-    let cli = Cli::parse();
 
     match cli.command.unwrap_or(CliCommand::Serve) {
         CliCommand::Serve => {
-            let mk = agentmail::Agentmail::from_default_config().map_err(|e| {
-                eprintln!("agentmail: failed to load config: {}", e);
+            let mk = heromail::Agentmail::from_default_config().map_err(|e| {
+                eprintln!("heromail: failed to load config: {}", e);
                 e
             })?;
-            agentmail::mcp::serve_stdio(mk).await
+            heromail::mcp::serve_stdio(mk).await
         }
         CliCommand::ListAccounts => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk.list_accounts().await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         CliCommand::ListMailboxes { account } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk.list_mailboxes(account.as_deref()).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         CliCommand::CreateMailbox { account, name } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk.create_mailbox(&account, &name).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         CliCommand::CheckConnection { account } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let status = mk.check_connection(&account).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
         }
         CliCommand::ListCapabilities { account } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk.list_capabilities(&account).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         CliCommand::SetPassword { account } => {
-            let config = agentmail::Config::load()?;
+            let config = heromail::Config::load()?;
             let acct_config = config
                 .accounts
                 .get(&account)
@@ -266,13 +285,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 account, acct_config.username
             ))?;
 
-            agentmail::credentials::set_password(&account, acct_config, &password).await?;
+            heromail::credentials::set_password(&account, acct_config, &password).await?;
             eprintln!("Password stored successfully.");
             Ok(())
         }
         CliCommand::Configure { provider } => configure_account(provider.as_deref()).await,
         CliCommand::ListFlags { account, mailbox } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .list_flags(mailbox.as_deref(), &account, None, None)
                 .await?;
@@ -286,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             expected_uid_validity,
             output_dir,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .download_attachments(
                     &mailbox,
@@ -305,7 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             offset,
             limit,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .find_attachments(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
@@ -318,7 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             offset,
             limit,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .top_senders(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
@@ -331,7 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             offset,
             limit,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .top_domains(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
@@ -344,9 +363,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             offset,
             limit,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .top_subscriptions(mailbox.as_deref(), &account, offset, limit, None, None)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        CliCommand::TopListIds {
+            account,
+            mailbox,
+            offset,
+            limit,
+        } => {
+            let mk = heromail::Agentmail::from_default_config()?;
+            let value = mk
+                .top_mailing_lists(mailbox.as_deref(), &account, offset, limit, None, None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -359,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             include_content,
             include_headers,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .get_messages(
                     &mailbox,
@@ -380,7 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             expected_uid_validity,
             include_content,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .get_messages_by_uid(
                     &mailbox,
@@ -402,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             flags,
             color,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .add_flags(
                     &mailbox,
@@ -425,7 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cc,
             bcc,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk
                 .create_draft_with_headers(
                     &account,
@@ -440,14 +472,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &[],
                     &[],
                     None,
-                    agentmail::draft::BodyFormat::default(),
+                    heromail::draft::BodyFormat::default(),
                 )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         CliCommand::ListPendingMoves { account } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = mk.list_pending_moves(&account).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -457,7 +489,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             operation_id,
             dismiss,
         } => {
-            let mk = agentmail::Agentmail::from_default_config()?;
+            let mk = heromail::Agentmail::from_default_config()?;
             let value = match operation_id.as_deref() {
                 Some(operation_id) if dismiss => mk.dismiss_move(&account, operation_id).await?,
                 operation_id => {
@@ -690,7 +722,7 @@ fn toml_string(value: &str) -> String {
 /// The `[accounts.<name>]` table for one validated account.
 fn account_section(
     account_name: &str,
-    account: &agentmail::AccountConfig,
+    account: &heromail::AccountConfig,
     password_toml: &str,
 ) -> String {
     let mut section = format!("[accounts.{}]\n", toml_string(account_name));
@@ -819,7 +851,7 @@ fn provider_preset(name: &str) -> Option<ProviderPreset> {
 }
 
 async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("agentmail account setup\n");
+    eprintln!("HeroMail account setup\n");
 
     // 1. Resolve provider
     let provider_name = match provider {
@@ -872,7 +904,7 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         return Err("Host and username are required".into());
     }
 
-    let suggested_email = agentmail::config::canonicalize_email(&username).unwrap_or_default();
+    let suggested_email = heromail::config::canonicalize_email(&username).unwrap_or_default();
     let email = if suggested_email.is_empty() {
         prompt("Primary email (optional, used to recognize your own mail): ")?
     } else {
@@ -886,7 +918,7 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         .collect::<Vec<_>>();
     let display_name = prompt("Your name (shown on drafts, optional): ")?;
 
-    let mut account_config = agentmail::AccountConfig::new(&host, &username)
+    let mut account_config = heromail::AccountConfig::new(&host, &username)
         .with_port(port)
         .with_aliases(aliases);
     if !email.is_empty() {
@@ -896,7 +928,7 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         account_config = account_config.with_display_name(display_name);
     }
     let validated =
-        agentmail::Config::try_from_accounts(vec![(account_name.clone(), account_config)])?;
+        heromail::Config::try_from_accounts(vec![(account_name.clone(), account_config)])?;
     let account_config = validated
         .accounts
         .get(&account_name)
@@ -940,9 +972,9 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
     };
 
     // 5. Write config file
-    let config_path = agentmail::Config::default_path();
+    let config_path = heromail::Config::default_path();
     let existing = if config_path.exists() {
-        let config = agentmail::Config::load_from(&config_path)?;
+        let config = heromail::Config::load_from(&config_path)?;
         if config.accounts.contains_key(&account_name) {
             return Err(format!(
                 "Account '{}' already exists in {}. Edit the file directly to modify it.",
@@ -964,7 +996,7 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
         "\n"
     };
     let combined = format!("{existing}{separator}\n{section}");
-    let mut parsed: agentmail::Config = toml::from_str(&combined)
+    let mut parsed: heromail::Config = toml::from_str(&combined)
         .map_err(|error| format!("Generated config is invalid: {}", error.message()))?;
     parsed.normalize_and_validate()?;
     write_private_atomic(&config_path, combined.as_bytes())?;
@@ -981,7 +1013,7 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
             account_name, username
         ))?;
 
-        let mut secret = agentmail::secret::Secret::new_keyring(format!("mail.{}", username));
+        let mut secret = heromail::secret::Secret::new_keyring(format!("mail.{}", username));
         secret
             .set(&pw)
             .await
@@ -993,8 +1025,8 @@ async fn configure_account(provider: Option<&str>) -> Result<(), Box<dyn std::er
     let test = prompt_default("\nTest connection?", "y")?;
     if test.starts_with('y') || test.starts_with('Y') {
         eprintln!("Connecting to {}:{}...", host, port);
-        let config = agentmail::Config::load()?;
-        let mk = agentmail::Agentmail::new(config);
+        let config = heromail::Config::load()?;
+        let mk = heromail::Agentmail::new(config);
         let status = mk.check_connection(&account_name).await?;
         if status.connected {
             eprintln!("Connected successfully!");
@@ -1019,7 +1051,7 @@ mod tests {
     #[test]
     fn a_generated_account_section_round_trips_through_toml() {
         let display_name = "Jose\u{301} \"Pepe\" Bla\\ke";
-        let account = agentmail::AccountConfig::new("imap.example.com", "me@example.com")
+        let account = heromail::AccountConfig::new("imap.example.com", "me@example.com")
             .with_port(1993)
             .with_aliases(["sales@example.com"])
             .with_display_name(display_name);
@@ -1029,7 +1061,7 @@ mod tests {
             &format!("password.keyring = {}", toml_string("mail.me@example.com")),
         );
 
-        let mut parsed: agentmail::Config = toml::from_str(&section).expect("valid TOML");
+        let mut parsed: heromail::Config = toml::from_str(&section).expect("valid TOML");
         parsed.normalize_and_validate().expect("valid config");
         let work = &parsed.accounts["work"];
         assert_eq!(work.display_name.as_deref(), Some(display_name));
@@ -1040,7 +1072,7 @@ mod tests {
     #[test]
     fn create_draft_cli_accepts_a_sender() {
         let cli = Cli::try_parse_from([
-            "agentmail",
+            "heromail",
             "create-draft",
             "--account",
             "work",
@@ -1070,8 +1102,29 @@ mod tests {
     }
 
     #[test]
+    fn list_id_cli_names_parse_with_the_same_defaults() {
+        for command in ["top-list-ids", "top-mailing-lists"] {
+            let cli = Cli::try_parse_from(["heromail", command, "--account", "work"])
+                .expect("valid command");
+            let Some(CliCommand::TopListIds {
+                account,
+                mailbox,
+                offset,
+                limit,
+            }) = cli.command
+            else {
+                panic!("expected List-Id ranking for {command}");
+            };
+            assert_eq!(
+                (account.as_str(), mailbox, offset, limit),
+                ("work", None, 0, 10)
+            );
+        }
+    }
+
+    #[test]
     fn top_domains_cli_uses_the_documented_page_defaults() {
-        let cli = Cli::try_parse_from(["agentmail", "top-domains", "--account", "work"])
+        let cli = Cli::try_parse_from(["heromail", "top-domains", "--account", "work"])
             .expect("valid command");
 
         match cli.command.expect("subcommand") {
@@ -1093,7 +1146,7 @@ mod tests {
     #[test]
     fn top_domains_cli_preserves_explicit_offset_and_limit() {
         let cli = Cli::try_parse_from([
-            "agentmail",
+            "heromail",
             "top-domains",
             "--account",
             "work",
@@ -1116,7 +1169,7 @@ mod tests {
     #[test]
     fn reconcile_moves_cli_accepts_one_operation_id() {
         let cli = Cli::try_parse_from([
-            "agentmail",
+            "heromail",
             "reconcile-moves",
             "--account",
             "work",
@@ -1142,7 +1195,7 @@ mod tests {
     #[test]
     fn reconcile_moves_cli_dismisses_only_a_named_operation() {
         let cli = Cli::try_parse_from([
-            "agentmail",
+            "heromail",
             "reconcile-moves",
             "--account",
             "work",
@@ -1158,7 +1211,7 @@ mod tests {
 
         assert!(
             Cli::try_parse_from([
-                "agentmail",
+                "heromail",
                 "reconcile-moves",
                 "--account",
                 "work",

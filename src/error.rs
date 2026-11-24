@@ -44,6 +44,13 @@ pub enum AgentmailError {
     )]
     MessageNotFound(u32),
 
+    #[error("message UID {uid} exceeds the {limit} byte limit ({observed} bytes reported or read)")]
+    MessageTooLarge {
+        uid: u32,
+        observed: usize,
+        limit: usize,
+    },
+
     #[error(
         "mailbox '{mailbox}' did not provide UIDVALIDITY; refusing a stale-UID-sensitive action"
     )]

@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
-use agentmail::secret::Secret;
-use agentmail::{AccountConfig, Agentmail, Config};
+use heromail::secret::Secret;
+use heromail::{AccountConfig, Agentmail, Config};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 
@@ -33,7 +33,7 @@ impl McpClient {
                 json!({
                     "protocolVersion": "2025-11-25",
                     "capabilities": {},
-                    "clientInfo": {"name": "agentmail-tests", "version": "0"}
+                    "clientInfo": {"name": "heromail-tests", "version": "0"}
                 }),
             )
             .await;
@@ -47,7 +47,7 @@ impl McpClient {
     async fn connect(config: Config) -> Self {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         tokio::spawn(async move {
-            let _ = agentmail::mcp::serve_on(server_io, Agentmail::new(config)).await;
+            let _ = heromail::mcp::serve_on(server_io, Agentmail::new(config)).await;
         });
         let (r, w) = tokio::io::split(client_io);
         Self {
@@ -226,8 +226,8 @@ async fn initialize_reports_capabilities_and_identity() {
 
     assert_eq!(
         init["serverInfo"]["name"].as_str(),
-        Some("agentmail"),
-        "server must announce itself as agentmail, not rmcp"
+        Some("heromail"),
+        "server advertises the HeroMail server identifier"
     );
     let version = init["serverInfo"]["version"]
         .as_str()
@@ -662,7 +662,7 @@ fn dummy_config() -> Config {
             password: Some(Secret::new_raw("unused")),
             tls: true,
             max_connections: None,
-            auth: agentmail::AuthMethod::Password,
+            auth: heromail::AuthMethod::Password,
         },
     )])
 }
@@ -673,7 +673,7 @@ fn dummy_config() -> Config {
 fn stateless_meta(version: &str, capabilities: &Value) -> Value {
     json!({
         "io.modelcontextprotocol/protocolVersion": version,
-        "io.modelcontextprotocol/clientInfo": {"name": "agentmail-tests", "version": "0"},
+        "io.modelcontextprotocol/clientInfo": {"name": "heromail-tests", "version": "0"},
         "io.modelcontextprotocol/clientCapabilities": capabilities,
     })
 }
@@ -695,7 +695,7 @@ async fn a_2026_07_28_client_is_negotiated_down_to_2025_11_25() {
             json!({
                 "protocolVersion": "2026-07-28",
                 "capabilities": {},
-                "clientInfo": {"name": "agentmail-tests", "version": "0"}
+                "clientInfo": {"name": "heromail-tests", "version": "0"}
             }),
         )
         .await;
@@ -732,7 +732,7 @@ async fn server_discover_at_2026_07_28_opens_the_stateless_lifecycle() {
         "{resp:#}"
     );
     assert_eq!(
-        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "agentmail",
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "heromail",
         "{resp:#}"
     );
 
@@ -770,7 +770,7 @@ async fn server_discover_at_a_2025_version_is_method_not_found() {
             json!({
                 "protocolVersion": "2025-11-25",
                 "capabilities": {},
-                "clientInfo": {"name": "agentmail-tests", "version": "0"}
+                "clientInfo": {"name": "heromail-tests", "version": "0"}
             }),
         )
         .await;
@@ -1481,11 +1481,7 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
     let cleanup = &schema["properties"]["cleanup"];
     for (axis, values, default) in [
         ("when", vec!["afterSuccess", "always"], "afterSuccess"),
-        (
-            "identity",
-            vec!["listIdOnly", "listIdOrSender"],
-            "listIdOrSender",
-        ),
+        ("identity", vec!["listIdOnly"], "listIdOnly"),
         (
             "deletion",
             vec!["trash", "trashThenPermanent", "permanent"],
@@ -1672,7 +1668,7 @@ async fn unsubscribe_schema_requires_identity_and_consent_with_safe_defaults() {
 }
 
 #[tokio::test]
-async fn unsubscribe_identity_schema_documents_the_email_post_fallback() {
+async fn unsubscribe_identity_schema_documents_the_authenticated_list_id() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
@@ -1683,10 +1679,8 @@ async fn unsubscribe_identity_schema_documents_the_email_post_fallback() {
             .expect("cleanup identity description");
 
     assert!(
-        description.contains("exact sender email")
-            && description.contains("List-Unsubscribe-Post")
-            && description.contains("target's List-Id"),
-        "cleanup identity must document every fallback constraint: {description}"
+        description.contains("DKIM-authenticated List-Id") && description.contains("listIdOnly"),
+        "cleanup identity must document exact signed List-Id matching: {description}"
     );
 }
 
@@ -1882,7 +1876,7 @@ async fn rank_outputs_expose_nested_action_identities() {
 }
 
 #[tokio::test]
-async fn top_subscriptions_schema_omits_display_name() {
+async fn top_subscriptions_schema_has_list_identity_and_sample_sender() {
     let mut client = McpClient::start().await;
     let resp = client.request("tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().expect("tools array");
@@ -1893,10 +1887,12 @@ async fn top_subscriptions_schema_omits_display_name() {
         .as_object()
         .expect("subscription row properties");
 
-    assert!(
-        !properties.contains_key("displayName"),
-        "top_subscriptions must group and identify rows by address only: {subscription:#}"
-    );
+    for field in ["listId", "address", "displayName"] {
+        assert!(
+            properties.contains_key(field),
+            "missing {field}: {subscription:#}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2196,7 +2192,7 @@ async fn prompts_list_has_6_prompts() {
 }
 
 #[tokio::test]
-async fn unsubscribe_cleanup_prompt_uses_the_current_email_fallback_contract() {
+async fn unsubscribe_cleanup_prompt_uses_exact_list_id_contract() {
     let mut client = McpClient::start().await;
     let resp = client
         .request(
@@ -2212,13 +2208,12 @@ async fn unsubscribe_cleanup_prompt_uses_the_current_email_fallback_contract() {
         .expect("unsubscribe cleanup prompt text");
 
     assert!(
-        text.contains("exact sender email + List-Unsubscribe-Post")
-            && text.contains("identity: \"listIdOrSender\"")
+        text.contains("Cleanup uses the DKIM-authenticated List-Id")
+            && text.contains("delete_list_id")
             && text.contains("move_subscription")
-            && text.contains("Filing approval is not unsubscribe consent")
-            && !text.contains("deleteMatching")
-            && !text.contains("display name"),
-        "unsubscribe prompt must separate filing consent and describe the current cleanup contract: {text}"
+            && text.contains("permanent deletion")
+            && !text.contains("listIdOrSender"),
+        "unsubscribe prompt must describe exact list cleanup: {text}"
     );
 }
 

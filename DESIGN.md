@@ -1,8 +1,8 @@
-# Agentmail Design
+# HeroMail Design
 
 ## Overview
 
-Agentmail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 36 tools and 6 prompts for reading, searching, composing, organizing, archiving, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
+HeroMail is a cross-platform IMAP email client library with an MCP (Model Context Protocol) server for AI assistant integration. It provides 36 tools and 6 prompts for reading, searching, composing, organizing, archiving, and managing email across multiple accounts. [MCP.md](MCP.md) is the authoritative wire-contract catalog.
 
 MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) (stateless) and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (`initialize`; also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | rmcp 3.6.0
 
@@ -19,7 +19,7 @@ graph TB
         GW[MCP Bridge]
     end
 
-    subgraph "agentmail-mcp (in-process)"
+    subgraph "HeroMail (in-process)"
         MCP[AgentMailServer<br/>36 tools, 6 prompts]
         MK[Agentmail Facade]
         POOL[ConnectionPool<br/>provider-aware cap/account]
@@ -52,7 +52,7 @@ graph TB
 ```mermaid
 graph LR
     subgraph "Standalone"
-        CLI[agentmail serve] -->|stdio| MCP1[AgentMailServer]
+        CLI[heromail serve] -->|stdio| MCP1[AgentMailServer]
         MCP1 --> MK1[Agentmail]
         MK1 -->|config.toml| FS[platform config dir/agentmail/]
     end
@@ -66,11 +66,11 @@ graph LR
 
 |                 | Standalone                        | In-Process                                      |
 | --------------- | --------------------------------- | ----------------------------------------------- |
-| Binary          | `agentmail serve`                 | None (library)                                  |
+| Binary          | `heromail serve`                 | None (library)                                  |
 | Transport       | stdio                             | DuplexStream                                    |
 | Account config  | `<config dir>/agentmail/config.toml`¹ | Passed at spawn via `serve_on()`            |
 | Password source | keyring (agentmail service)       | keyring (the app's bundle identifier)           |
-| Entry point     | `main.rs`                         | `agentmail_mcp::serve_on(transport, agentmail)` |
+| Entry point     | `main.rs`                         | `heromail::mcp::serve_on(transport, agentmail)` |
 
 ¹ `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` (`~/.config`) on
 Linux, `%APPDATA%` on Windows; `AGENTMAIL_CONFIG` overrides it everywhere.
@@ -158,7 +158,7 @@ flowchart TD
     Default -->|not found| Error[Error: no password]
 ```
 
-When running in-process, HERO calls `agentmail::init_service_name(&app_identifier)` at startup with its runtime bundle identifier (`Agent.weekendsuperhero.io`, `Agent.weekendsuperhero.io.beta` or `Agent.weekendsuperhero.io.dev`), so passwords are stored under that keyring service, one per channel, not "agentmail". The signed app avoids macOS Keychain popups.
+When running in-process, HERO calls `heromail::secret::init_service_name(&app_identifier)` at startup with its runtime bundle identifier (`Agent.weekendsuperhero.io`, `Agent.weekendsuperhero.io.beta` or `Agent.weekendsuperhero.io.dev`), so passwords are stored under that keyring service, one per channel, not "agentmail". The signed app avoids macOS Keychain popups.
 
 Credential commands run with stdin closed, a 15-second deadline, and 64 KiB
 bounds on each output stream. Non-zero exit, invalid UTF-8, empty output,

@@ -10,6 +10,7 @@ use crate::imap_client::MailboxLayout;
 pub(crate) enum ScanPurpose {
     Discovery,
     Mutation,
+    PermanentListCleanup,
 }
 
 impl ScanPurpose {
@@ -17,6 +18,7 @@ impl ScanPurpose {
         match self {
             Self::Discovery => "discovery",
             Self::Mutation => "mutation",
+            Self::PermanentListCleanup => "permanent_list_cleanup",
         }
     }
 }
@@ -59,7 +61,15 @@ pub(crate) fn plan_account_scan(entries: &[MailboxLayout], purpose: ScanPurpose)
 
     let mut mailboxes: Vec<String> = entries
         .iter()
-        .filter(|entry| is_enumerated_scan_target(entry))
+        .filter(|entry| {
+            is_enumerated_scan_target(entry)
+                || (purpose == ScanPurpose::PermanentListCleanup
+                    && !entry.no_select
+                    && (entry.has_role("trash")
+                        || (entry.roles.is_empty()
+                            && inferred_category(&entry.path, entry.delimiter.as_deref())
+                                == Some(InferredCategory::Trash))))
+        })
         .map(|entry| entry.path.clone())
         .collect();
     mailboxes.sort_by(|left, right| {
@@ -172,6 +182,19 @@ mod tests {
             no_inferiors: false,
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn permanent_list_cleanup_covers_archive_and_trash() {
+        let entries = [
+            entry("All Mail", &["all"]),
+            entry("Archive", &["archive"]),
+            entry("INBOX", &[]),
+            entry("Spam", &["junk"]),
+            entry("Trash", &["trash"]),
+        ];
+        let cleanup = plan_account_scan(&entries, ScanPurpose::PermanentListCleanup);
+        assert_eq!(cleanup.mailboxes, ["Archive", "INBOX", "Trash"]);
     }
 
     #[test]

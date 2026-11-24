@@ -22,6 +22,7 @@
 //! be confused with the URI segment separator.
 
 use super::{AgentMailServer, to_mcp_error};
+use crate::imap_client::{MAX_ATTACHMENT_MESSAGE_BYTES, MAX_TRANSIENT_MESSAGE_BYTES};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use rmcp::ErrorData as McpError;
@@ -60,8 +61,9 @@ pub(super) const EMAIL_INFO_MIME: &str = "application/json";
 const MAX_BODY_CHARS: usize = 100_000;
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
-const MAX_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TRANSIENT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+// Base64 expands 10 MiB to about 13.3 MiB, leaving room for the JSON envelope
+// within HERO's 16 MiB backend response budget.
+const MAX_INLINE_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Characters percent-encoded inside a single URI segment. `/` is the
 /// critical one (mailbox hierarchy vs. URI segment separator) and `%` must
@@ -116,7 +118,7 @@ pub(super) fn account_resources(accounts: impl IntoIterator<Item = String>) -> V
         .into_iter()
         .map(|account| {
             Resource::new(account_resource_uri(&account), format!("{account} mail"))
-                .with_title(format!("AgentMail account: {account}"))
+                .with_title(format!("HeroMail account: {account}"))
                 .with_description(
                     "Selectable mailbox catalog. Read this resource to discover mailbox resource URIs.",
                 )
@@ -378,8 +380,8 @@ pub(super) fn email_resource_templates() -> Vec<ResourceTemplate> {
                 "One MIME attachment of a live message, addressed by zero-based \
                  part index and returned as a base64 blob with the part's own \
                  content type. Discover indices, names, and sizes via the /info \
-                 resource. Attachments above 4 MiB are refused — use the \
-                 download_attachments tool to save large files to disk.",
+                 resource. This resource returns up to 10 MiB of decoded data. \
+                 Use download_attachments to save larger parts to disk.",
             )
             .with_annotations(user_and_assistant_annotations(0.8)),
     ]
@@ -565,6 +567,22 @@ fn map_resource_error(parsed: &EmailResourceUri, error: &crate::AgentmailError) 
         | crate::AgentmailError::UidValidityChanged { .. } => {
             resource_not_found(parsed, &error.to_string())
         }
+        crate::AgentmailError::MessageTooLarge {
+            observed, limit, ..
+        } => {
+            let (representation, alternative) = match parsed.kind {
+                EmailResourceKind::Headers => (
+                    "header block",
+                    "Use get_messages or search_messages for metadata",
+                ),
+                EmailResourceKind::Source => (
+                    "raw source",
+                    "Use /headers for exact headers or download_message_source for messages up to 64 MiB",
+                ),
+                _ => ("message", "Use /headers or get_messages for metadata"),
+            };
+            oversize_error(parsed, representation, *observed, *limit, alternative)
+        }
         _ => to_mcp_error(error),
     }
 }
@@ -572,13 +590,13 @@ fn map_resource_error(parsed: &EmailResourceUri, error: &crate::AgentmailError) 
 fn oversize_error(
     parsed: &EmailResourceUri,
     representation: &str,
-    actual: usize,
+    observed: usize,
     maximum: usize,
     alternative: &str,
 ) -> McpError {
     McpError::invalid_request(
         format!(
-            "{representation} for mailbox '{}' UID {} is {actual} bytes, above the {maximum}-byte resource limit; {alternative}",
+            "{representation} for mailbox '{}' UID {} exceeds the {maximum}-byte resource limit ({observed} bytes reported or read). {alternative}.",
             parsed.mailbox, parsed.uid
         ),
         None,
@@ -766,12 +784,12 @@ impl AgentMailServer {
             EmailResourceKind::Info => {
                 let response = self
                     .agentmail
-                    .get_messages_by_uid(
+                    .get_messages_by_uid_bounded(
                         &parsed.mailbox,
                         &parsed.account,
                         &[parsed.uid],
                         parsed.uid_validity,
-                        true,
+                        Some(MAX_ATTACHMENT_MESSAGE_BYTES),
                         false,
                     )
                     .await
@@ -779,8 +797,7 @@ impl AgentMailServer {
                 let Some(message) = response.messages.into_iter().next() else {
                     return Err(resource_not_found(&parsed, "the UID no longer exists"));
                 };
-                // No oversize guard: the rendered info document is bounded by
-                // the attachment inventory, not the message body size.
+                // Return the inventory and metadata without the decoded body.
                 Ok(ReadResourceResult::new(vec![
                     ResourceContents::text(render_message_info(&parsed, &message), uri)
                         .with_mime_type("application/json"),
@@ -806,13 +823,13 @@ impl AgentMailServer {
                         ),
                     ));
                 };
-                if bytes.len() > MAX_ATTACHMENT_BYTES {
+                if bytes.len() > MAX_INLINE_ATTACHMENT_BYTES {
                     return Err(oversize_error(
                         &parsed,
                         &format!("attachment {index} ('{name}')"),
                         bytes.len(),
-                        MAX_ATTACHMENT_BYTES,
-                        "use the download_attachments tool to save it to disk instead",
+                        MAX_INLINE_ATTACHMENT_BYTES,
+                        "Use download_attachments to save it to disk",
                     ));
                 }
                 Ok(ReadResourceResult::new(vec![
@@ -1425,6 +1442,153 @@ mod tests {
         let mapped = map_resource_error(&parsed, &error);
 
         assert_eq!(mapped.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oversized_messages_and_headers_return_actionable_resource_errors() {
+        use crate::imap_client::test_support;
+
+        for (resource, limit, alternative) in [
+            ("source", MAX_SOURCE_BYTES, "download_message_source"),
+            ("headers", MAX_HEADERS_BYTES, "search_messages"),
+            (
+                "attachments/0",
+                MAX_ATTACHMENT_MESSAGE_BYTES,
+                "get_messages",
+            ),
+        ] {
+            let (session, imap) = test_support::scripted_session(move |tag, command| {
+                if command.contains(" NOOP") {
+                    Some(format!("{tag} OK NOOP\r\n"))
+                } else if command.contains(" EXAMINE") {
+                    Some(test_support::examine_reply(tag, 9, 43, 1))
+                } else if resource != "headers" && command.contains("RFC822.SIZE") {
+                    let size = limit + 1;
+                    Some(format!("* 1 FETCH (UID 42 RFC822.SIZE {size})\r\n{tag} OK FETCH\r\n"))
+                } else if resource == "headers" && command.contains("BODY.PEEK[HEADER]") {
+                    let header = "x".repeat(limit + 1);
+                    Some(format!(
+                        "* 1 FETCH (UID 42 BODY[HEADER]<0> {{{}}}\r\n{header})\r\n{tag} OK FETCH\r\n",
+                        header.len()
+                    ))
+                } else {
+                    panic!("unexpected IMAP command: {command}");
+                }
+            })
+            .await;
+            let config = crate::Config::from_accounts(vec![(
+                "work".to_string(),
+                crate::AccountConfig::new("imap.example.com", "me@example.com"),
+            )]);
+            let mail = crate::Agentmail::builder(config).disable_cache().build();
+            mail.pool.hold_idle_for_test("work", session).await;
+            let server = AgentMailServer::new_embedded(mail);
+            let error = server
+                .read_email_resource(&format!("email://work/INBOX/9/42/{resource}"))
+                .await
+                .expect_err("the resource must refuse a response over its byte limit");
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_REQUEST);
+            assert!(
+                error.message.contains(&format!("{limit}-byte")),
+                "{error:?}"
+            );
+            assert!(error.message.contains(alternative), "{error:?}");
+            drop(server);
+            imap.commands().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_limit_fits_inline_transport_and_larger_parts_save_to_disk() {
+        use crate::imap_client::test_support;
+
+        for size in [MAX_INLINE_ATTACHMENT_BYTES, MAX_INLINE_ATTACHMENT_BYTES + 1] {
+            let mut message = String::from(
+                "From: sender@example.com\r\nMIME-Version: 1.0\r\n\
+                 Content-Type: multipart/mixed; boundary=test\r\n\r\n\
+                 --test\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Disposition: attachment; filename=large.bin\r\n\
+                 Content-Transfer-Encoding: base64\r\n\r\n",
+            );
+            let encoded = STANDARD.encode(vec![b'x'; size]);
+            for line in encoded.as_bytes().chunks(76) {
+                message.push_str(std::str::from_utf8(line).unwrap());
+                message.push_str("\r\n");
+            }
+            message.push_str("--test--\r\n");
+            let (session, imap) = test_support::scripted_session(move |tag, command| {
+                let message_size = message.len();
+                if command.contains(" NOOP") {
+                    Some(format!("{tag} OK NOOP\r\n"))
+                } else if command.contains(" EXAMINE") {
+                    Some(test_support::examine_reply(tag, 9, 43, 1))
+                } else if command.contains("BODY.PEEK[]") {
+                    assert!(
+                        command.contains(&format!("<0.{}>", MAX_ATTACHMENT_MESSAGE_BYTES + 1)),
+                        "attachment fetch should use the encoded message limit: {command}"
+                    );
+                    Some(format!(
+                        "* 1 FETCH (UID 42 RFC822.SIZE {message_size} BODY[]<0> {{{message_size}}}\r\n{message})\r\n{tag} OK FETCH\r\n"
+                    ))
+                } else if command.contains("RFC822.SIZE") {
+                    Some(format!(
+                        "* 1 FETCH (UID 42 RFC822.SIZE {message_size})\r\n{tag} OK FETCH\r\n"
+                    ))
+                } else {
+                    panic!("unexpected IMAP command: {command}");
+                }
+            })
+            .await;
+            let config = crate::Config::from_accounts(vec![(
+                "work".to_string(),
+                crate::AccountConfig::new("imap.example.com", "me@example.com"),
+            )]);
+            let mail = crate::Agentmail::builder(config).disable_cache().build();
+            mail.pool.hold_idle_for_test("work", session).await;
+            let server = AgentMailServer::new_embedded(mail);
+            let result = server
+                .read_email_resource("email://work/INBOX/9/42/attachments/0")
+                .await;
+
+            if size == MAX_INLINE_ATTACHMENT_BYTES {
+                let result = result.expect("attachment at the inline limit");
+                let ResourceContents::BlobResourceContents { blob, .. } = &result.contents[0]
+                else {
+                    panic!("an inline attachment must be a blob");
+                };
+                assert_eq!(STANDARD.decode(blob).unwrap().len(), size);
+                let reply = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result});
+                assert!(serde_json::to_vec(&reply).unwrap().len() < 16 * 1024 * 1024);
+            } else {
+                let error = result.expect_err("attachment above the inline limit");
+                assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_REQUEST);
+                assert!(error.message.contains("download_attachments"));
+                let info = server
+                    .read_email_resource("email://work/INBOX/9/42/info")
+                    .await
+                    .expect("attachment inventory");
+                let ResourceContents::TextResourceContents { text, .. } = &info.contents[0] else {
+                    panic!("the inventory must be text");
+                };
+                let info: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(info["attachments"][0]["size"], size);
+
+                let dir = std::env::temp_dir().join(format!("heromail-{}", uuid::Uuid::new_v4()));
+                let files = server
+                    .agentmail
+                    .download_attachments("INBOX", "work", 42, 9, &dir)
+                    .await
+                    .expect("a larger attachment can be saved to disk");
+                assert_eq!(files.downloaded.len(), 1);
+                let file = tokio::fs::read(&files.downloaded[0].path).await.unwrap();
+                assert_eq!(file.len(), size);
+                assert!(file.iter().all(|&byte| byte == b'x'));
+                tokio::fs::remove_dir_all(dir).await.unwrap();
+            }
+
+            drop(server);
+            imap.commands().await;
+        }
     }
 
     #[test]

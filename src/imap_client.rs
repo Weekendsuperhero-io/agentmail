@@ -257,6 +257,9 @@ pub(crate) const MAX_FETCH_CHUNK: usize = 1000;
 /// without imposing any ceiling on matching-message cleanup.
 const MAX_UNSUBSCRIBE_MESSAGE_BYTES: u32 = 64 * 1024 * 1024;
 pub(crate) const MAX_TRANSIENT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Encoded message limit for attachment reads and inventory. Covers Gmail
+/// Workspace Enterprise Plus messages up to Google's 70 MB receiving limit.
+pub(crate) const MAX_ATTACHMENT_MESSAGE_BYTES: usize = 70 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Timeout helpers
@@ -2105,11 +2108,7 @@ async fn fetch_rank_header_rows(
 
         for (uid, fetch) in answered_fetches(session, fetched, chunk).await? {
             let header_bytes = fetch.header().unwrap_or(&[]);
-            let header_str = String::from_utf8_lossy(header_bytes);
-
-            let list_unsub = extract_header_value(&header_str, "List-Unsubscribe");
-            let list_id = extract_header_value(&header_str, "List-Id");
-            let list_unsub_post = extract_header_value(&header_str, "List-Unsubscribe-Post");
+            let headers = crate::unsubscribe::parse_list_headers(header_bytes).for_ranking();
 
             let (sender_email, sender_name, date, message_id) =
                 parser::parse_sender_date(header_bytes).unwrap_or_default();
@@ -2117,9 +2116,9 @@ async fn fetch_rank_header_rows(
             results.push(ListHeaderRow {
                 uid,
                 uid_validity: None,
-                list_unsubscribe: list_unsub,
-                list_unsubscribe_post: list_unsub_post,
-                list_id,
+                list_unsubscribe: headers.list_unsubscribe,
+                list_unsubscribe_post: headers.list_unsubscribe_post,
+                list_id: headers.list_id,
                 sender_email,
                 sender_name,
                 date,
@@ -2177,9 +2176,25 @@ where
             "(UID BODY.PEEK[HEADER.FIELDS (List-Id)])",
         )
         .await?;
-        for (uid, fetch) in answered_fetches(session, fetched, chunk).await? {
-            let header_str = String::from_utf8_lossy(fetch.header().unwrap_or(&[]));
-            results.push((uid, extract_header_value(&header_str, "List-Id")));
+        let answers = answered_fetches(session, fetched, chunk).await?;
+        if answers.len() != chunk.len() {
+            return Err(AgentmailError::Other(
+                "List-Id fetch did not cover every requested UID".to_string(),
+            ));
+        }
+        for (uid, fetch) in answers {
+            let header = fetch.header().ok_or_else(|| {
+                AgentmailError::Other(format!(
+                    "List-Id fetch did not include headers for UID {uid}"
+                ))
+            })?;
+            let headers = crate::unsubscribe::parse_list_headers(header);
+            let list_id = if headers.has_single_list_id() {
+                headers.list_id
+            } else {
+                None
+            };
+            results.push((uid, list_id));
         }
     }
     check_cancel(cancel)?;
@@ -2195,6 +2210,25 @@ pub async fn fetch_by_uids(
     include_content: bool,
     include_headers: bool,
 ) -> Result<Vec<MessageInfo>> {
+    fetch_by_uids_bounded(
+        session,
+        uids,
+        mailbox,
+        account_name,
+        include_content.then_some(MAX_TRANSIENT_MESSAGE_BYTES),
+        include_headers,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_by_uids_bounded(
+    session: &mut ImapSession,
+    uids: &[u32],
+    mailbox: &str,
+    account_name: &str,
+    content_limit: Option<usize>,
+    include_headers: bool,
+) -> Result<Vec<MessageInfo>> {
     let uid_set: String = uids
         .iter()
         .map(|u| u.to_string())
@@ -2203,10 +2237,11 @@ pub async fn fetch_by_uids(
 
     // RFC 3501 requires parentheses around multiple fetch attributes.
     // async_imap does not add them automatically.
-    let fetch_items = if include_content {
+    let include_content = content_limit.is_some();
+    let fetch_items = if let Some(limit) = content_limit {
         format!(
             "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[]<0.{}>)",
-            MAX_TRANSIENT_MESSAGE_BYTES + 1
+            limit + 1
         )
     } else {
         "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])".to_string()
@@ -2225,12 +2260,17 @@ pub async fn fetch_by_uids(
     let mut raw_items: RawFetchItems = Vec::with_capacity(fetched.len());
     for (uid, fetch) in answered_fetches(session, fetched, uids).await? {
         let size = fetch.size;
-        if include_content && size.is_none_or(|value| value as usize > MAX_TRANSIENT_MESSAGE_BYTES)
-        {
-            return Err(AgentmailError::Other(format!(
-                "message UID {uid} is missing a usable RFC822.SIZE or exceeds the {} byte transient fetch limit",
-                MAX_TRANSIENT_MESSAGE_BYTES
-            )));
+        if let Some(limit) = content_limit {
+            let size = size.ok_or_else(|| {
+                AgentmailError::Other(format!("message UID {uid} is missing RFC822.SIZE"))
+            })? as usize;
+            if size > limit {
+                return Err(AgentmailError::MessageTooLarge {
+                    uid,
+                    observed: size,
+                    limit,
+                });
+            }
         }
         let flags: Vec<String> = fetch.flags().map(|f| flag_to_string(&f)).collect();
         let raw = if include_content {
@@ -2238,11 +2278,13 @@ pub async fn fetch_by_uids(
         } else {
             fetch.header().unwrap_or(&[])
         };
-        if raw.len() > MAX_TRANSIENT_MESSAGE_BYTES {
-            return Err(AgentmailError::Other(format!(
-                "message UID {uid} exceeds the {} byte transient fetch limit",
-                MAX_TRANSIENT_MESSAGE_BYTES
-            )));
+        let limit = content_limit.unwrap_or(MAX_TRANSIENT_MESSAGE_BYTES);
+        if raw.len() > limit {
+            return Err(AgentmailError::MessageTooLarge {
+                uid,
+                observed: raw.len(),
+                limit,
+            });
         }
         raw_items.push((uid, size, flags, raw.to_vec()));
     }
@@ -3766,9 +3808,11 @@ where
         .map(|value| value as usize)
         .ok_or(AgentmailError::MessageNotFound(uid))?;
     if size > max_bytes {
-        return Err(AgentmailError::Other(format!(
-            "message UID {uid} is {size} bytes; this resource is limited to {max_bytes} bytes"
-        )));
+        return Err(AgentmailError::MessageTooLarge {
+            uid,
+            observed: size,
+            limit: max_bytes,
+        });
     }
 
     let fetch_items = format!("(UID BODY.PEEK[]<0.{}>)", max_bytes.saturating_add(1));
@@ -3778,9 +3822,17 @@ where
         .body()
         .map(<[u8]>::to_vec)
         .ok_or(AgentmailError::MessageNotFound(uid))?;
-    if body.len() > max_bytes || body.len() != size {
+    if body.len() > max_bytes {
+        return Err(AgentmailError::MessageTooLarge {
+            uid,
+            observed: body.len(),
+            limit: max_bytes,
+        });
+    }
+    if body.len() != size {
         return Err(AgentmailError::Other(format!(
-            "message UID {uid} source was truncated or exceeded the {max_bytes} byte resource limit"
+            "message UID {uid} source length differs from RFC822.SIZE ({size} bytes expected, {} received)",
+            body.len(),
         )));
     }
     Ok(body)
@@ -3807,9 +3859,11 @@ where
         .map(<[u8]>::to_vec)
         .ok_or(AgentmailError::MessageNotFound(uid))?;
     if headers.len() > max_bytes {
-        return Err(AgentmailError::Other(format!(
-            "message UID {uid} headers exceed the {max_bytes} byte resource limit"
-        )));
+        return Err(AgentmailError::MessageTooLarge {
+            uid,
+            observed: headers.len(),
+            limit: max_bytes,
+        });
     }
     Ok(headers)
 }
@@ -4235,7 +4289,11 @@ fn extract_header_value(headers: &str, name: &str) -> Option<String> {
         let Some((field_name, field_value)) = line.split_once(':') else {
             continue;
         };
-        if field_name.eq_ignore_ascii_case(name) {
+        // RFC 5322 obsolete fields may have whitespace before the colon.
+        if field_name
+            .trim_end_matches([' ', '\t'])
+            .eq_ignore_ascii_case(name)
+        {
             value = Some(field_value.trim().to_string());
         }
     }
@@ -4449,11 +4507,11 @@ mod tests {
     }
 
     #[test]
-    fn header_extraction_unfolds_rfc_continuation_lines() {
+    fn header_extraction_accepts_folding_and_whitespace_before_the_colon() {
         let headers = concat!(
-            "List-Unsubscribe: <mailto:leave@example.com>,\r\n",
+            "List-Unsubscribe : <mailto:leave@example.com>,\r\n",
             " <https://example.com/unsubscribe/token>\r\n",
-            "List-Id: Example <list.example.com>\r\n",
+            "List-Id\t: Example <list.example.com>\r\n",
             "\r\n",
         );
         assert_eq!(

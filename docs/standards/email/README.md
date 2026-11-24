@@ -1,18 +1,18 @@
 # Email list and authentication standards
 
-This directory records the standards boundary for AgentMail features that act
-on Internet Message Format headers but are not IMAP protocol extensions. The
-RFC Editor remains authoritative; these notes describe the implemented safety
-profile rather than mirroring full RFC text.
+This directory records the email header and authentication standards AgentMail
+uses for subscription discovery, unsubscribe, and cleanup. See
+[How subscription cleanup works](subscription-cleanup.md) for the complete
+workflow. The RFC Editor remains authoritative for the standards.
 
 ## Implemented standards
 
 | RFC | Subject | AgentMail use |
 | --- | --- | --- |
 | [2369](https://www.rfc-editor.org/rfc/rfc2369.html) | List command header URI syntax | Parses ordered angle-bracket URIs, comments, folding, URI-internal commas, and broken-MTA whitespace |
-| [2919](https://www.rfc-editor.org/rfc/rfc2919.html) | `List-Id` | Normalizes the identifier inside angle brackets for exact cleanup matching |
+| [2919](rfc-2919-list-id.md) | `List-Id` | Uses the identifier inside angle brackets for list ranking and exact cleanup matching |
 | [6376](https://www.rfc-editor.org/rfc/rfc6376.html) | DKIM | Verifies the complete live-fetched message and inspects the passing signature's `h=` coverage |
-| [8058](https://www.rfc-editor.org/rfc/rfc8058.html) | One-click unsubscribe | Requires exact headers, consent, one HTTPS URI, DKIM coverage, a form POST, no redirect, and direct 2xx success |
+| [8058](rfc-8058-one-click-unsubscribe.md) | One-click unsubscribe | Requires exact headers, consent, one HTTPS URI, DKIM coverage, a form POST, and direct 2xx success |
 
 ## One-click execution invariants
 
@@ -41,10 +41,10 @@ profile rather than mirroring full RFC text.
    `application/x-www-form-urlencoded`. Only the direct endpoint's 2xx response
    is success.
 8. `confirmOneClick=true` is mandatory. Cleanup is a separate decision and
-   defaults off; a failed unsubscribe, missing or unauthenticated List-Id,
-   sender fallback, or permanent Trash fallback each requires its own explicit
-   policy opt-in. Gmail never uses in-place EXPUNGE as a permanent fallback
-   because it only removes the selected label.
+   defaults off. Combined cleanup requires a signed List-Id. Cleanup after a
+   failed unsubscribe and permanent disposal each require explicit policy
+   choices. Gmail routes deletion through Trash because in-place EXPUNGE only
+   removes the selected label.
 
 ## Cache privacy boundary
 

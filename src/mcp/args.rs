@@ -467,12 +467,10 @@ pub(super) enum CleanupWhenArg {
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
 pub(super) enum CleanupIdentityArg {
-    /// Only a DKIM-authenticated List-Id; skip cleanup when there is none.
-    ListIdOnly,
-    /// Prefer the authenticated List-Id; otherwise require the exact sender
-    /// email plus List-Unsubscribe-Post, and the target's List-Id when present.
+    /// Match the single DKIM-authenticated List-Id.
     #[default]
-    ListIdOrSender,
+    #[serde(alias = "listIdOrSender")]
+    ListIdOnly,
 }
 
 /// How cleanup disposes of matched messages.
@@ -495,7 +493,7 @@ pub(super) enum CleanupDeletionArg {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(
     inline,
-    description = "Matching-message cleanup policy. The three axes are independent; every combination is valid."
+    description = "Matching-message cleanup policy for the authenticated List-Id."
 )]
 pub(super) struct UnsubscribeCleanupSpec {
     #[serde(default)]
@@ -505,7 +503,7 @@ pub(super) struct UnsubscribeCleanupSpec {
     pub(super) when: CleanupWhenArg,
     #[serde(default)]
     #[schemars(
-        description = "Cleanup identity: \"listIdOrSender\" (default) prefers the DKIM-authenticated List-Id and otherwise requires the exact sender email plus List-Unsubscribe-Post, also requiring the target's List-Id when one exists; \"listIdOnly\" requires the authenticated List-Id strictly."
+        description = "Cleanup uses the selected message's single DKIM-authenticated List-Id. The default is \"listIdOnly\"."
     )]
     pub(super) identity: CleanupIdentityArg,
     #[serde(default)]
@@ -613,13 +611,13 @@ pub(super) struct DeleteListIdArgs {
         description = "Account name (required). Use list_accounts to discover valid names."
     )]
     pub(super) account: String,
-    #[schemars(description = "The List-Id header value to match (from top_mailing_lists).")]
+    #[schemars(description = "Exact listId from top_subscriptions or top_mailing_lists.")]
     pub(super) list_id: String,
-    #[schemars(description = "Mailbox to search. Omit to use the account-wide mutation plan.")]
+    #[schemars(description = "Mailbox to search. Omit to include archived messages account-wide.")]
     pub(super) mailbox: Option<String>,
     #[serde(default = "default_false")]
     #[schemars(
-        description = "When true, permanently delete (flag \\Deleted + UID EXPUNGE), bypassing Trash. Irreversible. Defaults to false (move to Trash when available)."
+        description = "When true, permanently delete with targeted UID EXPUNGE on standard IMAP. Irreversible. When false or omitted, move matches to Trash. Gmail routes both settings through Trash."
     )]
     pub(super) permanent: bool,
 }
@@ -734,7 +732,7 @@ pub(super) struct MoveSubscriptionArgs {
     pub(super) mailbox: String,
     #[schemars(
         range(min = 1),
-        description = "UID from top_subscriptions sample.uid. The live sample supplies the exact sender and optional List-Id scope."
+        description = "UID from top_subscriptions sample.uid. The live sample supplies the exact List-Id."
     )]
     pub(super) uid: u32,
     #[schemars(

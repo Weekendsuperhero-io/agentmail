@@ -393,7 +393,6 @@ fn cleanup_policy(spec: UnsubscribeCleanupSpec) -> CleanupPolicy {
         },
         identity: match spec.identity {
             CleanupIdentityArg::ListIdOnly => CleanupIdentityMode::ListIdOnly,
-            CleanupIdentityArg::ListIdOrSender => CleanupIdentityMode::ListIdOrSender,
         },
         deletion: match spec.deletion {
             CleanupDeletionArg::Trash => CleanupDeletion::Trash,
@@ -831,7 +830,7 @@ impl AgentMailServer {
     #[tool(
         name = "download_attachments",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadAttachmentsOutput>(),
-        description = "Download all attachments from one message to disk. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Each file is saved as {uid}_{index}_{name} with the name sanitized (and shortened, extension kept, when it is too long for a filesystem) — the same canonical filename /info reports for that part. Omit outputDir to write into the session workspace. Returns absolute paths, content types, and sizes. All or nothing: a name that already exists is refused before anything is written, and a failure partway removes the files already written.",
+        description = "Download all attachments from one message to disk. Accepts encoded messages up to 70 MiB, including attachments above the 10 MiB inline resource limit. Pass mailbox, uid, and expectedUidValidity from the same find_attachments hit; the download fails before filesystem writes if the mailbox UID epoch changed. Each file is saved as {uid}_{index}_{name} with the name sanitized (and shortened, extension kept, when it is too long for a filesystem) — the same canonical filename /info reports for that part. Omit outputDir to write into the session workspace. Returns absolute paths, content types, and sizes. All or nothing: a name that already exists is refused before anything is written, and a failure partway removes the files already written.",
         annotations(
             title = "Download Attachments",
             read_only_hint = false,
@@ -1278,7 +1277,7 @@ impl AgentMailServer {
     #[tool(
         name = "unsubscribe_message",
         output_schema = rmcp::handler::server::tool::schema_for_output::<UnsubscribeMessageOutput>(),
-        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally delete matching messages account-wide. Map a top_subscriptions row's nested sample to mailbox, uid, and expectedUidValidity, and require explicit confirmOneClick=true. The POST requires exact headers, local DKIM verification covering both action headers, one public HTTPS destination, no redirects, and a direct 2xx. Omit cleanup to only unsubscribe. When cleanup is present it deletes by the DKIM-authenticated List-Id, or (identity \"listIdOrSender\", the default) falls back to exact sender email + List-Unsubscribe-Post + the target's List-Id when it has one; cleanup.when gates running after a failed attempt and cleanup.deletion controls Trash versus permanent disposal.",
+        description = "Perform a live-validated RFC 8058 one-click unsubscribe and optionally delete the list's existing messages account-wide. Map a top_subscriptions row's sample to mailbox, uid, and expectedUidValidity. The POST requires explicit confirmOneClick=true, DKIM covering both action headers, one public HTTPS destination, and a direct 2xx. Omit cleanup to unsubscribe only. Cleanup uses the sample's single DKIM-authenticated List-Id and includes older mail with missing or broken unsubscribe headers. Use cleanup.when=always when the user wants the backlog deleted even if the POST fails. Use delete_list_id with the selected listId when no authenticated List-Id is available.",
         annotations(
             title = "Unsubscribe from Mailing List",
             destructive_hint = true,
@@ -1323,7 +1322,7 @@ impl AgentMailServer {
     #[tool(
         name = "delete_list_id",
         output_schema = rmcp::handler::server::tool::schema_for_output::<DeleteListIdOutput>(),
-        description = "Delete all messages with a specific List-Id. Identifies the list by its exact List-Id value from top_mailing_lists and deletes matching messages regardless of sender. Omit mailbox to enumerate selectable storage mailboxes; mutation planning excludes Trash/Junk/Drafts and never writes through \\All, \\Flagged, or \\Important aggregate views.",
+        description = "Delete messages with an exact List-Id from top_subscriptions or top_mailing_lists, including mail with missing or broken unsubscribe headers. Omit mailbox to include archive folders. With permanent=true, standard IMAP uses targeted UID EXPUNGE and also checks Trash. On Gmail, account-wide cleanup uses All Mail when available and moves matches to Trash, including for permanent requests.",
         annotations(title = "Delete Mailing List by List-Id", destructive_hint = true)
     )]
     async fn delete_list_id_tool(
@@ -1484,7 +1483,7 @@ impl AgentMailServer {
     #[tool(
         name = "move_subscription",
         output_schema = rmcp::handler::server::tool::schema_for_output::<MoveSubscriptionOutput>(),
-        description = "Move the exact bulk-mail subscription represented by one top_subscriptions row to an existing destination mailbox. Map the row's nested sample to mailbox, expectedUidValidity, and uid; the action re-fetches that sample live, derives its canonical sender email and single List-Id when present, then sweeps the account-wide mutation plan. Every moved message must have the exact sender plus List-Unsubscribe or List-Unsubscribe-Post, and must also have the same List-Id when the sample has one. The destination is excluded. This files mail only; it does not send an unsubscribe request.",
+        description = "File mail from the exact List-Id represented by a top_subscriptions sample. Map the sample to mailbox, expectedUidValidity, and uid. The action re-fetches the sample live and moves messages with its exact List-Id, including messages with missing or broken unsubscribe headers. The destination is excluded from the sweep.",
         annotations(
             title = "Move Top Subscription",
             read_only_hint = false,

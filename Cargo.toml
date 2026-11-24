@@ -8,25 +8,25 @@
 imap-proto = { path = "vendor/imap-proto" }
 
 [package]
-name = "agentmail"
-version = "0.9.7"
+name = "heromail"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.99.1"
-description = "IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
-documentation = "https://docs.rs/agentmail"
+description = "HeroMail IMAP email client, MCP server, and CLI — read, search, delete, unsubscribe, and manage mailboxes"
+documentation = "https://docs.rs/heromail"
 readme = "README.md"
-homepage = "https://github.com/weekendsuperhero-io/agentmail"
-repository = "https://github.com/weekendsuperhero-io/agentmail"
+exclude = ["/.claude/"]
+repository = "https://github.com/weekendsuperhero-io/heromail"
 license = "Apache-2.0"
 keywords = ["agent", "email", "imap", "mail", "mcp"]
 categories = ["email", "network-programming"]
 
 [lib]
-name = "agentmail"
+name = "heromail"
 path = "src/lib.rs"
 
 [[bin]]
-name = "agentmail"
+name = "heromail"
 path = "src/main.rs"
 
 [dependencies]
@@ -46,10 +46,10 @@ futures = "0.3"
 hashbrown = { version = "0.17", features = ["rayon", "serde"] }
 idna = "1"
 lettre = { version = "0.11", default-features = false, features = ["builder"] }
-mail-parser = "0.11"
+mail-parser = "1.0.2"
 # aws-lc-rs, not ring: HERO links this crate and ships one rustls crypto
-# provider. The feature also picks hickory's TLS and DNSSEC backends.
-mail-auth = { version = "0.13.3", default-features = false, features = ["aws-lc-rs"] }
+# provider. mail-auth 0.16 uses the same aws-lc-sys 0.47 as aws-lc-rs 1.19.
+mail-auth = { version = "0.16", default-features = false, features = ["aws-lc-rs", "rustls-platform-verifier"] }
 parking_lot = "0.13"
 percent-encoding = "2"
 printpdf = { version = "0.12", default-features = false }
@@ -66,7 +66,7 @@ rmcp = { version = "=3.11.0", features = ["server", "macros", "transport-io"] }
 # must converge on it. Bump together with the embedder's sqlx.
 rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 schemars = { version = "1.2", features = ["chrono04"] }
-keyring-core = "1.0"
+keyring-core = "1.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -113,6 +113,6 @@ unnested_or_patterns = "warn"
 
 [dev-dependencies]
 proptest = "1"
-mail-parser = "0.11"
+mail-parser = "1.0.2"
 # oauth_token example only (loopback PKCE flow to mint an access token).
 rand = "0.10"

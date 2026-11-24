@@ -2,13 +2,13 @@
 created: 2026-05-29T19:20
 updated: 2026-10-27T00:00
 ---
-# agentmail
+# HeroMail
 
 IMAP email client exposed as both a CLI and an MCP (Model Context Protocol) server, built with Rust.
 
 MCP protocol: [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (also negotiates 2025-06-18, 2025-03-26, and 2024-11-05) | [rmcp](https://crates.io/crates/rmcp) (official Rust MCP SDK)
 
-One binary: `agentmail serve` starts the MCP stdio server, all other subcommands are a direct CLI.
+One binary: `heromail serve` starts the MCP stdio server, all other subcommands are a direct CLI.
 
 See also: [DESIGN.md](DESIGN.md) for architecture diagrams and design decisions,
 [MCP.md](MCP.md) for the full MCP tool and prompt reference with output schemas,
@@ -26,11 +26,29 @@ during protocol design and review.
 cargo build --release
 ```
 
-Output binary: `target/release/agentmail`
+Output binary: `target/release/heromail`
+
+### Upgrading from AgentMail
+
+HeroMail 1.0.0 builds the `heromail` Rust crate and command. Use the GitHub
+release binary or run `cargo install --path .` from this checkout. Point your
+MCP client's command at the new binary and keep the `serve` argument. An
+existing installation of the `agentmail` package continues to run its
+installed version until you switch commands.
+
+Crates.io installations use the upstream IMAP parser. Use a GitHub release
+binary or a checkout build for Yahoo/AOL's full-mailbox UID mode, which
+depends on the [vendored parser patch](docs/patches/imap-proto-uidfetch.md).
+
+HeroMail uses the existing AgentMail configuration, keyring entries, cache,
+and move journal. The `AGENTMAIL_*` environment variables and existing
+storage paths still apply. Rust embedders can update their dependency to
+`heromail` or specify `package = "heromail"` on an existing dependency alias
+to preserve their import paths.
 
 ## Configuration
 
-agentmail reads its config from a single TOML file, at the platform's config
+HeroMail reads its config from a single TOML file, at the platform's config
 directory unless `AGENTMAIL_CONFIG` names another path:
 
 | Platform | Default path                                                |
@@ -49,10 +67,10 @@ The fastest way to add an account is the interactive `configure` command:
 
 ```bash
 # With a provider preset (gmail, icloud, outlook, fastmail, yahoo)
-agentmail configure gmail
+heromail configure gmail
 
 # Or fully custom
-agentmail configure
+heromail configure
 ```
 
 This prompts for your username and password method, writes the config file using
@@ -144,7 +162,7 @@ Trash and drafts mailboxes are auto-detected at runtime via RFC 6154 special-use
 
 ### Passwords
 
-agentmail's built-in secret abstraction supports three credential sources. Its
+HeroMail's built-in secret abstraction supports three credential sources. Its
 debug representation always redacts the raw value, keyring identifier, or
 command text.
 
@@ -182,7 +200,7 @@ password.keyring = "you@gmail.com"
 Stores and retrieves from the system credential store (macOS Keychain, Windows Credential Manager, Linux Secret Service). The value is the keyring entry key; the service name is `"agentmail"`. Store a password with:
 
 ```bash
-agentmail set-password --account gmail
+heromail set-password --account gmail
 ```
 
 **Raw string** (not recommended — plaintext in config file):
@@ -217,7 +235,7 @@ security find-internet-password -s "imap.gmail.com"
 
 ### Password resolution order
 
-When connecting, agentmail tries these sources in order and uses the first one found:
+When connecting, HeroMail tries these sources in order and uses the first one found:
 
 1. `AGENTMAIL_PASSWORD_<ACCOUNT>` environment variable (override for CI/Docker)
 2. `password` field in config (command, keyring, or raw)
@@ -238,13 +256,13 @@ The variable name is `AGENTMAIL_PASSWORD_` followed by the account name uppercas
 
 ```bash
 # 1. Check that the account appears in the config
-agentmail list-accounts
+heromail list-accounts
 
 # 2. Test IMAP connectivity and authentication
-agentmail check-connection --account gmail
+heromail check-connection --account gmail
 
 # 3. List mailboxes to confirm full access
-agentmail list-mailboxes --account gmail
+heromail list-mailboxes --account gmail
 ```
 
 ### OAuth 2.0 (XOAUTH2)
@@ -262,7 +280,7 @@ auth = "xoauth2"
 password.cmd = "oauth-helper --provider google --email you@gmail.com"
 ```
 
-agentmail deliberately does not run the interactive consent flow or token
+HeroMail deliberately does not run the interactive consent flow or token
 refresh itself — the token source (`password.cmd`, the embedding app, or the
 `AGENTMAIL_PASSWORD_<ACCOUNT>` env override) owns that. A stale token fails
 authentication like a bad password; the secret is re-resolved on the next
@@ -286,7 +304,7 @@ password.raw = "<paste access token>"   # valid ~1h; fine for a smoke test
 ```
 
 ```bash
-agentmail check-connection --account gmail
+heromail check-connection --account gmail
 ```
 
 Provider documentation:
@@ -313,7 +331,7 @@ password.keyring = "you@gmail.com"
 ```
 
 ```bash
-agentmail set-password --account gmail
+heromail set-password --account gmail
 # paste the 16-character app password
 ```
 
@@ -330,9 +348,9 @@ OAuth documentation publishes only the
 [`edu.users.read` and `edu.classes.read` scopes](https://developer.apple.com/documentation/AccountOrganizationalDataSharing/Request-an-authorization).
 
 Consequently, Apple's public developer documentation does not currently give
-AgentMail a self-service iCloud Mail OAuth registration, Mail scope, token
+HeroMail a self-service iCloud Mail OAuth registration, Mail scope, token
 refresh contract, or IMAP XOAUTH2 mapping. Until Apple supplies that integration
-to AgentMail as a supported app, use the documented
+to HeroMail as a supported app, use the documented
 [app-specific password](https://support.apple.com/en-us/102525). The IMAP login
 is usually your iCloud username; try the full address if the short username is
 not accepted:
@@ -366,7 +384,7 @@ If you're upgrading from a version that used `keychain_service` or `password = "
 ### MCP Server
 
 ```bash
-agentmail serve
+heromail serve
 ```
 
 Starts an MCP stdio server. Logs go to stderr; JSON-RPC on stdin/stdout.
@@ -374,31 +392,32 @@ Starts an MCP stdio server. Logs go to stderr; JSON-RPC on stdin/stdout.
 ### CLI
 
 ```bash
-agentmail configure gmail              # interactive account setup
-agentmail configure                    # interactive setup (custom provider)
-agentmail list-accounts
-agentmail list-mailboxes --account gmail
-agentmail create-mailbox --account gmail --name "Archive/2024"
-agentmail check-connection --account gmail
-agentmail list-capabilities --account gmail
-agentmail set-password --account gmail
-agentmail get-messages --account gmail --mailbox INBOX --limit 10
-agentmail get-messages-by-uid --account gmail --mailbox INBOX --uids 123 456 --expected-uid-validity 3857529045
-agentmail top-senders --account gmail --limit 20
-agentmail top-domains --account gmail --limit 20
-agentmail top-subscriptions --account gmail --limit 20
-agentmail find-attachments --account gmail
-agentmail download-attachments --account gmail --mailbox INBOX --uid 123 --expected-uid-validity 3857529045 --output-dir ./downloads
-agentmail list-flags --account gmail
-agentmail add-flags --account gmail --mailbox INBOX --uid 123 --expected-uid-validity 3857529045 --flags "\\Seen" --color red
-agentmail create-draft --account gmail --subject "Hello" --body "Hi there" --to user@example.com
-agentmail create-draft --account gmail --from "Mark Blake <sales@example.com>" --subject "Hello" --body "Hi" --to user@example.com
-agentmail list-pending-moves --account gmail
-agentmail reconcile-moves --account gmail --operation-id <operation-id>
-agentmail reconcile-moves --account gmail --operation-id <operation-id> --dismiss
+heromail configure gmail              # interactive account setup
+heromail configure                    # interactive setup (custom provider)
+heromail list-accounts
+heromail list-mailboxes --account gmail
+heromail create-mailbox --account gmail --name "Archive/2024"
+heromail check-connection --account gmail
+heromail list-capabilities --account gmail
+heromail set-password --account gmail
+heromail get-messages --account gmail --mailbox INBOX --limit 10
+heromail get-messages-by-uid --account gmail --mailbox INBOX --uids 123 456 --expected-uid-validity 3857529045
+heromail top-senders --account gmail --limit 20
+heromail top-domains --account gmail --limit 20
+heromail top-subscriptions --account gmail --limit 20
+heromail top-list-ids --account gmail --limit 20
+heromail find-attachments --account gmail
+heromail download-attachments --account gmail --mailbox INBOX --uid 123 --expected-uid-validity 3857529045 --output-dir ./downloads
+heromail list-flags --account gmail
+heromail add-flags --account gmail --mailbox INBOX --uid 123 --expected-uid-validity 3857529045 --flags "\\Seen" --color red
+heromail create-draft --account gmail --subject "Hello" --body "Hi there" --to user@example.com
+heromail create-draft --account gmail --from "Mark Blake <sales@example.com>" --subject "Hello" --body "Hi" --to user@example.com
+heromail list-pending-moves --account gmail
+heromail reconcile-moves --account gmail --operation-id <operation-id>
+heromail reconcile-moves --account gmail --operation-id <operation-id> --dismiss
 ```
 
-Full subcommand list: `agentmail --help`
+Full subcommand list: `heromail --help`
 
 ## MCP Client Configuration
 
@@ -407,8 +426,8 @@ Add to your MCP client config (Claude Desktop, Claude Code, etc.):
 ```json
 {
   "mcpServers": {
-    "agentmail": {
-      "command": "/path/to/agentmail",
+    "heromail": {
+      "command": "/path/to/heromail",
       "args": ["serve"]
     }
   }
@@ -420,8 +439,8 @@ To pass passwords via environment variables instead of keychain:
 ```json
 {
   "mcpServers": {
-    "agentmail": {
-      "command": "/path/to/agentmail",
+    "heromail": {
+      "command": "/path/to/heromail",
       "args": ["serve"],
       "env": {
         "AGENTMAIL_PASSWORD_GMAIL": "your-app-password"
@@ -434,7 +453,7 @@ To pass passwords via environment variables instead of keychain:
 ### Debugging with MCP Inspector
 
 ```bash
-npx @modelcontextprotocol/inspector /path/to/agentmail serve
+npx @modelcontextprotocol/inspector /path/to/heromail serve
 ```
 
 Opens a web UI to exercise all advertised tools and 6 prompts interactively.
@@ -442,7 +461,7 @@ Opens a web UI to exercise all advertised tools and 6 prompts interactively.
 ## MCP Tools
 
 36 tools cover account discovery, mailbox management, message reading, search,
-bulk operations, recovery, evidence archiving, flag management, and composition. AgentMail saves drafts but never sends mail. Long-running tools
+bulk operations, recovery, evidence archiving, flag management, and composition. HeroMail saves drafts but never sends mail. Long-running tools
 report progress notifications, and for a client that declared the MCP tasks
 extension (SEP-2663) a slow call becomes a task it polls; see
 [MCP.md](MCP.md#tasks-sep-2663).
@@ -462,7 +481,7 @@ extension (SEP-2663) a slow call becomes a task it polls; see
 | `list_flags`           | List all flags in use with counts; resolves Apple Mail color flags                    |
 | `top_senders`         | Top senders by message volume across one or all mailboxes                             |
 | `top_domains`         | Exact sender domains and subdomains with counts and a live sample subject              |
-| `top_subscriptions`     | Top bulk-mail sender addresses with UIDVALIDITY-guarded samples and advertised one-click syntax |
+| `top_subscriptions`     | Rank List-Ids by backlog size with UIDVALIDITY-guarded one-click samples |
 | `top_mailing_lists`         | Top mailing lists by List-Id header (RFC 2919), groups regardless of sender           |
 | `list_pending_moves`  | List durable COPY-fallback MOVE operations awaiting recovery or review                |
 | `find_attachments`     | Scan for messages with attachments (multipart/mixed or multipart/related)              |
@@ -542,18 +561,13 @@ extension (SEP-2663) a slow call becomes a task it polls; see
   A changed live message count invalidates confirmation, and special-use or
   descendant-bearing mailboxes require separate acknowledgement. Deleting a
   non-empty mailbox requires its own acknowledgement as well.
-- `top_subscriptions` returns a nested `sample` identity, not an unsubscribe
-  URL or raw list-action header. `unsubscribe_message` additionally requires
-  explicit `confirmOneClick=true`. Its `advertisedOneClick` field describes
-  cached header syntax only; execution re-fetches the complete message and
-  locally verifies a passing DKIM signature that covers both list headers.
-  Subscription rows are grouped only by normalized sender email; display names
-  and `List-Id` values do not create additional rows.
-- `move_subscription` maps that same nested sample to `mailbox`,
-  `expectedUidValidity`, and `uid`, re-fetches its exact headers live, and moves
-  account-wide matches having the exact sender plus either list-action header.
-  When the sample has one usable List-Id, matches must also have that exact
-  List-Id. The destination mailbox is excluded from the sweep.
+- `top_subscriptions` ranks exact List-Ids with a one-click sample. The count
+  includes older messages with missing or broken unsubscribe headers.
+  The sender details describe the sample. Pass the nested `sample` to
+  `unsubscribe_message` with `confirmOneClick=true`. HeroMail verifies DKIM
+  over both action headers before the POST.
+- `move_subscription` re-fetches that sample and files messages with the
+  same List-Id. It excludes the destination mailbox from its sweep.
 - The action-time DKIM source fetch is preceded by `RFC822.SIZE`, capped at 64 MiB, and fetched with a bounded IMAP partial. This per-source safety bound does not limit matching-message cleanup counts.
 - `download_message_source` saves exact RFC822 bytes directly from IMAP to a
   private file inside the active agent session workspace; the bytes do not cross model
@@ -564,14 +578,14 @@ extension (SEP-2663) a slow call becomes a task it polls; see
   SPF is omitted because independent SPF evaluation needs delivery-time SMTP
   client IP, HELO, and envelope-sender inputs that are not present in an RFC822
   archive.
-- Embedded AgentMail accepts the workspace root only as trusted request
+- Embedded HeroMail accepts the workspace root only as trusted request
   metadata from HERO (`com.makeyourhero/workspaceRoot`; versions before HERO
   send `io.agentmuse/workspaceRoot`, still accepted) on every call.
   Missing or invalid metadata fails closed. Standalone
-  `agentmail serve` instead uses `AGENTMAIL_FILE_ROOT` (falling back to
-  `~/.agentmail/files`). Caller-supplied output directories are confined below
-  that root; a process-wide environment variable is never used for embedded
-  sessions.
+  `heromail serve` uses `AGENTMAIL_FILE_ROOT` or creates `~/.agentmail/files`
+  on demand when that setting is omitted. Configured workspace roots must
+  already exist. Relative paths and default downloads use the primary root.
+  Absolute paths may use an available additional directory granted by HERO.
 - `preview_thread_record` follows only exact normalized `Message-ID`,
   `In-Reply-To`, and `References` relationships across eligible mailboxes;
   subject similarity is never evidence of membership. `export_thread_record`
@@ -582,8 +596,16 @@ extension (SEP-2663) a slow call becomes a task it polls; see
   `submittable: true`. Those flags mean the packet is complete and can be
   handed to a recipient; they make no claim about legal admissibility.
 - RFC 8058 requests accept exactly one parsed HTTPS URI, reject credentials, fragments, HTTP alternatives, private/link-local/loopback destinations, mixed public/private DNS answers, proxies, retries, and redirects, and require a direct 2xx response. The resolved public addresses are pinned for the request.
-- Matching-message cleanup is one optional `cleanup {when, identity, deletion}` object; omitting it means unsubscribe only. Defaults are fail-safe: `when: "afterSuccess"` (a failed unsubscribe never triggers cleanup unless `"always"` is explicit), `deletion: "trash"` (never permanent unless `"trashThenPermanent"` or `"permanent"` is explicit). Cleanup matches the normalized RFC 2919 List-Id only when the same passing DKIM signature covered that single List-Id; otherwise `identity: "listIdOrSender"` (default) requires exact normalized sender email plus `List-Unsubscribe-Post`, and also requires the target's normalized List-Id whenever the sampled message has one. Display names never affect this fallback.
-- Account-wide destructive operations use a separate mutation plan: they enumerate selectable storage mailboxes and never issue writes through `\All`, `\Flagged`, or `\Important` aggregate views. An explicitly supplied mailbox is always honored.
+- An optional `cleanup` object on `unsubscribe_message` deletes the backlog
+  for the sample’s DKIM-authenticated List-Id. The default moves matches
+  to Trash after the POST succeeds. Set `deletion: "permanent"` for a
+  targeted purge on a server supporting UIDPLUS. Use `when: "always"` when
+  cleanup should run after a failed POST if the sample’s List-Id passed
+  authentication. Use `delete_list_id` with a selected exact List-Id for
+  independent cleanup. [Subscription cleanup guide](docs/standards/email/subscription-cleanup.md)
+- Account-wide List-Id deletion includes Archive on standard IMAP and uses
+  All Mail when Gmail exposes it. On standard IMAP, permanent List-Id
+  cleanup also checks Trash for exact matches.
 - `delete_by_sender`, `delete_list_id`, and unsubscribe matching have no total-message ceiling; server mutations are split into 500-UID wire batches. Only the MCP `delete_messages` tool limits an explicitly supplied UID array to 500 per call.
 - `search_messages` supports date range (`since`/`before`, YYYY-MM-DD) and size (`larger_than`/`smaller_than`, bytes) for "older than" / "bigger than" cleanup, plus AND-combined case-insensitive substring text filters. `delete_list_id` matches the List-Id exactly (not as a substring).
 - On Gmail, deletes route through `[Gmail]/Trash` (in-place expunge only removes a label); `permanent` also goes to Trash, which Gmail purges on its own.
@@ -623,7 +645,7 @@ Embedding applications configure the same knobs programmatically — explicit
 builder settings override the environment variables:
 
 ```rust,no_run
-# use agentmail::{Agentmail, ClientIdentity, Config};
+# use heromail::{Agentmail, ClientIdentity, Config};
 # use std::time::Duration;
 # let config = Config::empty();
 let mail = Agentmail::builder(config)
@@ -669,7 +691,7 @@ All four tables use SQLite `WITHOUT ROWID`; this is a derived projection, not
 an offline mailbox or source-of-truth message store.
 
 SQLite runs in WAL mode with `synchronous=NORMAL` and foreign keys enabled.
-The file is not application-encrypted. On Unix, AgentMail restricts the cache
+The file is not application-encrypted. On Unix, HeroMail restricts the cache
 directory to `0700` and the database file to `0600`. Upgrading an older cache
 rebuilds this disposable projection with secure deletion, `VACUUM`, and a
 truncated WAL so obsolete token-bearing columns are not retained.
@@ -685,10 +707,10 @@ an operation ID instead of claiming success. Inspect and resume those operations
 with:
 
 ```bash
-agentmail list-pending-moves --account gmail
-agentmail reconcile-moves --account gmail --operation-id <operation-id>
+heromail list-pending-moves --account gmail
+heromail reconcile-moves --account gmail --operation-id <operation-id>
 # Omit --operation-id to reconcile every pending operation for the account.
-agentmail reconcile-moves --account gmail --operation-id <operation-id> --dismiss
+heromail reconcile-moves --account gmail --operation-id <operation-id> --dismiss
 # Closes one move reconciliation can't finish. Check both mailboxes first:
 # dismissing moves, copies and deletes nothing.
 ```
@@ -721,9 +743,9 @@ destination against rename and delete until it finishes or is dismissed.
 After changing draft composition or replacement, validate against a real test
 account in Apple Mail:
 
-1. Create a draft through AgentMail, open it in Apple Mail, click Send, and
+1. Create a draft through HeroMail, open it in Apple Mail, click Send, and
    confirm the draft disappears and exactly one copy appears in Sent.
-2. Create another draft, update it through AgentMail, then repeat the same
+2. Create another draft, update it through HeroMail, then repeat the same
    open-and-send check.
 
 This is intentionally a manual outward-facing acceptance test. The automated
@@ -744,7 +766,11 @@ Single messages are then addressable without constructing an identity by hand:
 | `email://{account}/{mailbox}/{uidValidity}/{uid}/headers`           | `text/rfc822-headers` | Exact RFC822 header block, maximum 64 KiB |
 | `email://{account}/{mailbox}/{uidValidity}/{uid}/source`            | `message/rfc822`      | Lossless base64 MCP blob, maximum 256 KiB |
 | `email://{account}/{mailbox}/{uidValidity}/{uid}/info`              | `application/json`    | Metadata, sibling URIs, and attachment inventory |
-| `email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}` | per MIME part       | One attachment blob, maximum 4 MiB       |
+| `email://{account}/{mailbox}/{uidValidity}/{uid}/attachments/{index}` | per MIME part       | One attachment blob, maximum 10 MiB decoded |
+
+`/info` and attachment reads can fetch encoded messages up to 70 MiB.
+`download_attachments` can save parts above the 10 MiB inline limit directly
+to disk from messages within that 70 MiB ceiling.
 
 Encoding rules: `account` and `mailbox` are percent-encoded URI segments — a
 `/` inside a mailbox name must be encoded as `%2F`, for example
@@ -769,7 +795,7 @@ Argument autocompletion (`completion/complete`) is supported for the prompts and
 ## Architecture
 
 ```
-agentmail (binary crate: agentmail-mcp)
+HeroMail (Rust crate and binary: heromail)
   ├── serve                → MCP stdio server (tokio + rmcp)
   │                          36 tools + 6 prompts, progress notifications
   ├── list-accounts        → CLI
@@ -782,6 +808,7 @@ agentmail (binary crate: agentmail-mcp)
   ├── top-senders          → CLI
   ├── top-domains          → CLI
   ├── top-subscriptions    → CLI
+  ├── top-list-ids         → CLI (MCP tool top_mailing_lists)
   ├── find-attachments     → CLI
   ├── download-attachments → CLI
   ├── list-flags           → CLI
@@ -827,8 +854,8 @@ is needed.
 
 ## Troubleshooting
 
-1. Run `agentmail check-connection --account <name>` to test connectivity.
-2. Verify your password: `agentmail set-password --account <name>` to re-store it.
+1. Run `heromail check-connection --account <name>` to test connectivity.
+2. Verify your password: `heromail set-password --account <name>` to re-store it.
 3. Gmail users: ensure you're using an [App Password](https://myaccount.google.com/apppasswords), not your Google account password.
 4. Check that your IMAP server allows external clients (some providers disable IMAP by default).
 5. If the MCP server appears empty in Inspector, call `initialize` first, then `tools/list`.

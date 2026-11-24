@@ -882,7 +882,9 @@ impl WireOutput for TopDomainsOutput {
 #[serde(rename_all = "camelCase")]
 #[schemars(inline)]
 pub(super) struct SubscriptionRankOutput {
+    pub(super) list_id: String,
     pub(super) address: String,
+    pub(super) display_name: String,
     pub(super) advertised_one_click: bool,
     pub(super) count: u32,
     /// Decoded Subject of the newest (sample) message — what this
@@ -903,7 +905,7 @@ pub(super) struct TopSubscriptionsOutput {
     pub(super) account: String,
     pub(super) mailbox: String,
     pub(super) total_messages: u32,
-    /// Total ranked rows (unique sender addresses) — the pagination universe.
+    /// Total ranked rows (unique List-Ids) — the pagination universe.
     pub(super) total: usize,
     pub(super) offset: usize,
     pub(super) limit: usize,
@@ -920,7 +922,9 @@ impl From<crate::TopSubscriptionsResponse> for TopSubscriptionsOutput {
                 .lists
                 .into_iter()
                 .map(|list| SubscriptionRankOutput {
+                    list_id: list.list_id,
                     address: list.address,
+                    display_name: list.display_name,
                     advertised_one_click: list.advertised_one_click,
                     count: list.count,
                     subject: list.subject,
@@ -932,7 +936,7 @@ impl From<crate::TopSubscriptionsResponse> for TopSubscriptionsOutput {
             account,
             mailbox: value.mailbox,
             total_messages: value.total_messages,
-            total: value.unique_senders,
+            total: value.unique_lists,
             offset: value.offset,
             limit: value.limit,
             next_offset: value.next_offset,
